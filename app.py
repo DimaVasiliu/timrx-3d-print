@@ -293,7 +293,7 @@ def upload_url_to_s3(url: str, content_type: str = None, prefix: str = "models",
     s3_url = upload_bytes_to_s3(resp.content, ct, prefix, name, user_id, key=key)
     return _wrap_upload_result(s3_url, content_hash, return_hash)
 
-def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None, key: str = None, key_base: str = None, infer_content_type: bool = True, return_hash: bool = False) -> str:
+def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None, key: str = None, key_base: str = None, infer_content_type: bool = True, return_hash: bool = False, upstream_id: str = None, stage: str = None) -> str:
     """
     Safely upload URL to S3, returning original URL if S3 upload fails or user_id missing.
     Also handles base64 data URLs.
@@ -335,6 +335,10 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
     if not user_id:
         user_id = "anonymous"
         print(f"[S3] INFO: No user_id provided, using 'anonymous' folder for {prefix}")
+    if not key and not key_base and upstream_id and stage and prefix in ("models", "thumbnails"):
+        safe_upstream = sanitize_filename(str(upstream_id)) or "asset"
+        safe_stage = sanitize_filename(str(stage)) or "asset"
+        key_base = f"{prefix}/{user_id}/{safe_upstream}/{safe_stage}"
     if key_base and not key:
         key = ensure_s3_key_ext(key_base, content_type)
     try:
@@ -613,7 +617,7 @@ def ensure_history_table():
         print("[DB] Could not connect to database for table verification")
         return
     try:
-        with conn, conn.cursor() as cur:
+        with conn, conn.cursor(row_factory=dict_row) as cur:
             # Just verify tables exist, don't try to create them
             cur.execute("""
                 SELECT EXISTS (
@@ -963,7 +967,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 """, (image_id,))
             existing = cur.fetchone()
             if existing:
-                existing_history_id = str(existing[0])
+                existing_history_id = str(existing["id"])
 
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
             s3_name = prompt or "image"
@@ -1036,7 +1040,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 """, ("openai", image_content_hash))
                 row = cur.fetchone()
                 if row:
-                    existing_by_hash_id = row[0]
+                    existing_by_hash_id = row["id"]
 
             if existing_by_hash_id:
                 cur.execute(f"""
@@ -1202,7 +1206,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             image_row = cur.fetchone()
             if not image_row:
                 raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
-            returned_image_id = image_row[0]
+            returned_image_id = image_row["id"]
 
             if existing_history_id:
                 cur.execute(f"""
@@ -1279,7 +1283,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
 
         conn.close()
         print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
-        return True
+        return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
         import traceback
@@ -1288,7 +1292,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             conn.close()
         except Exception:
             pass
-        return False
+        return None
 
 def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta: dict, job_type: str = 'model', user_id: str = None):
     """
@@ -1392,6 +1396,15 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 print(f"[DB] asset_saves precheck failed (continuing): {e}")
                 existing_save = None
 
+            try:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.asset_saves (provider, upstream_id, stage)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (provider, upstream_id, stage) DO NOTHING
+                """, (provider, str(job_id), final_stage))
+            except Exception as e:
+                print(f"[DB] asset_saves stage insert failed (continuing): {e}")
+
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
             s3_name_safe = sanitize_filename(s3_name) or "model"
@@ -1406,7 +1419,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
             print(f"[DB]   textured_glb_url: {textured_glb_url[:80] if textured_glb_url else 'None'}...")
             print(f"[DB] job_meta: title={job_meta.get('title')}, prompt={job_meta.get('prompt', '')[:50]}...")
-            print(f"[DB] S3 filename will use: {s3_key_name[:80]}...")
+            print(f"[DB] S3 model key will use: {job_key}/{final_stage}")
 
             # Upload ALL URLs to S3 for permanent storage (Meshy URLs expire)
             model_content_hash = None
@@ -1418,8 +1431,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     job_key,
                     user_id=user_id,
-                    key_base=f"models/{s3_user_id}/{s3_key_name}",
                     return_hash=True,
+                    upstream_id=job_key,
+                    stage=final_stage,
                 )
                 primary_glb_url, model_content_hash = _unpack_upload_result(upload_result)
                 glb_url = primary_glb_url
@@ -1432,8 +1446,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "thumbnails",
                     job_key,
                     user_id=user_id,
-                    key_base=f"thumbnails/{s3_user_id}/{s3_key_name}",
                     infer_content_type=False,
+                    upstream_id=job_key,
+                    stage=final_stage,
                 )
             if rigged_glb_url:
                 rigged_glb_url = safe_upload_to_s3(
@@ -1442,7 +1457,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     job_key,
                     user_id=user_id,
-                    key_base=f"models/{s3_user_id}/{s3_key_name}",
+                    upstream_id=job_key,
+                    stage=final_stage,
                 )
             if rigged_fbx_url:
                 rigged_fbx_url = safe_upload_to_s3(
@@ -1451,7 +1467,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     job_key,
                     user_id=user_id,
-                    key_base=f"models/{s3_user_id}/{s3_key_name}",
+                    upstream_id=job_key,
+                    stage=final_stage,
                 )
 
             # Prefer textured output as the canonical model when available
@@ -1485,7 +1502,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "stl": "model/stl",
                 "usdz": "model/vnd.usdz+zip",
             }
-            model_key_base = f"models/{s3_user_id}/{s3_key_name}"
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
 
@@ -1500,7 +1516,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     f"{job_key}_{fmt_key}",
                     user_id=user_id,
-                    key_base=model_key_base,
+                    upstream_id=job_key,
+                    stage=final_stage,
                 )
                 textured_model_urls_uploaded[fmt_key] = uploaded
                 model_urls_uploaded[fmt_key] = uploaded
@@ -1518,7 +1535,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     f"{job_key}_{fmt_key}",
                     user_id=user_id,
-                    key_base=model_key_base,
+                    upstream_id=job_key,
+                    stage=final_stage,
                 )
 
             model_urls = model_urls_uploaded
