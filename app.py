@@ -1870,6 +1870,29 @@ def build_source_payload(body: dict):
 def health():
     return jsonify({"ok": True})
 
+@app.route("/api/db-check", methods=["GET"])
+def db_check():
+    if not USE_DB:
+        return jsonify({"ok": False, "error": "db_disabled"}), 503
+    conn = get_db_conn()
+    if not conn:
+        return jsonify({"ok": False, "error": "db_unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1;")
+            one = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM timrx_app.history_items;")
+            count = cur.fetchone()[0]
+        conn.close()
+        return jsonify({"ok": True, "select_1": one, "history_items_count": count})
+    except Exception as e:
+        print(f"[DB] db_check failed: {e}")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "db_query_failed"}), 503
+
 # ---- Start preview (Text → 3D) ----
 @app.route("/api/text-to-3d/start", methods=["POST", "OPTIONS"])
 def api_text_to_3d_start():
