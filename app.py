@@ -375,7 +375,7 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
         content_type: MIME type
         prefix: folder prefix
         name: optional human-readable name to include in the S3 key
-        user_id: user UUID for namespacing (uses 'anonymous' folder if missing)
+        user_id: user UUID for namespacing (uses a public namespace if missing)
     """
     original_url = url
     if isinstance(url, dict):
@@ -402,11 +402,11 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
         return _wrap_upload_result(url, None, return_hash)
     if REQUIRE_AWS_UPLOADS and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY):
         raise RuntimeError("[S3] AWS credentials not configured")
-    # Allow anonymous uploads to prevent asset loss (Meshy URLs expire)
-    # Use "anonymous" folder for unauthenticated users
-    if not user_id:
-        user_id = "anonymous"
-        print(f"[S3] INFO: No user_id provided, using 'anonymous' folder for {prefix}")
+    # Allow uploads when user_id is missing (Meshy URLs expire)
+    # Only apply a public namespace if we need to build a key automatically.
+    if not user_id and not key and not key_base:
+        user_id = "public"
+        print(f"[S3] INFO: No user_id provided, using 'public' namespace for {prefix}")
     if not key and not key_base and upstream_id:
         safe_upstream = sanitize_filename(str(upstream_id)) or "asset"
         safe_name = sanitize_filename(str(name)) if name else ""
@@ -800,7 +800,7 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         glb_url = job_meta.get("glb_url")
         image_url = job_meta.get("image_url")
 
-        s3_user_id = user_id or "anonymous"
+        s3_user_id = user_id or "public"
         thumb_key_base = f"thumbnails/{s3_user_id}/{job_id}"
         image_key_base = f"images/{s3_user_id}/{job_id}"
         if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
@@ -1047,7 +1047,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 existing_history_id = str(existing["id"])
 
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
-            s3_user_id = user_id or "anonymous"
+            s3_user_id = user_id or "public"
             image_key_base = f"images/{s3_user_id}/{image_id}"
             image_content_hash = None
             if image_url:
@@ -1394,8 +1394,18 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
             thumbnail_url = status_data.get("thumbnail_url")
             image_url = status_data.get("image_url")
-            model_urls = status_data.get("model_urls") or {}
-            textured_model_urls = status_data.get("textured_model_urls") or {}
+            def _filter_model_urls(urls: Any) -> dict:
+                if not isinstance(urls, dict):
+                    return {}
+                filtered = {}
+                for key in ("glb", "obj"):
+                    val = urls.get(key)
+                    if val:
+                        filtered[key] = val
+                return filtered
+
+            model_urls = _filter_model_urls(status_data.get("model_urls") or {})
+            textured_model_urls = _filter_model_urls(status_data.get("textured_model_urls") or {})
             textured_glb_url = status_data.get("textured_glb_url")
             rigged_glb_url = status_data.get("rigged_character_glb_url")
             rigged_fbx_url = status_data.get("rigged_character_fbx_url")
@@ -1486,10 +1496,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
             s3_name_safe = sanitize_filename(s3_name) or "model"
-            s3_name_safe = s3_name_safe[:60]
-            s3_user_id = user_id or "anonymous"
+            s3_name_safe = s3_name_safe[:80]
             job_key = str(job_id)
-            s3_key_name = f"{s3_name_safe}_{job_key}"
+            s3_key_name = s3_name_safe
 
             print(f"[DB] save_finished_job: job_id={job_id}, job_type={job_type}")
             print(f"[DB] Input URLs from Meshy:")
@@ -1497,60 +1506,51 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
             print(f"[DB]   textured_glb_url: {textured_glb_url[:80] if textured_glb_url else 'None'}...")
             print(f"[DB] job_meta: title={job_meta.get('title')}, prompt={job_meta.get('prompt', '')[:50]}...")
-            print(f"[DB] S3 model key will use: {job_key}/{final_stage}")
+            print(f"[DB] S3 model key will use: models/{job_key}/{s3_name_safe}.glb")
 
             # Upload ALL URLs to S3 for permanent storage (Meshy URLs expire)
             model_content_hash = None
-            primary_glb_source = textured_glb_url or glb_url
-            if primary_glb_source:
+            glb_candidate = textured_glb_url or glb_url or textured_model_urls.get("glb") or model_urls.get("glb")
+            obj_candidate = textured_model_urls.get("obj") or model_urls.get("obj") or status_data.get("obj_url")
+            primary_model_source = glb_candidate or obj_candidate or rigged_glb_url
+            primary_content_type = get_content_type_from_url(primary_model_source) if primary_model_source else "model/gltf-binary"
+            if primary_content_type == "application/octet-stream":
+                primary_content_type = "model/gltf-binary"
+            if primary_model_source:
+                model_key_base = f"models/{job_key}/{s3_name_safe}"
                 upload_result = safe_upload_to_s3(
-                    primary_glb_source,
-                    "model/gltf-binary",
+                    primary_model_source,
+                    primary_content_type,
                     "models",
-                    job_key,
+                    s3_name_safe,
                     user_id=user_id,
+                    key_base=model_key_base,
                     return_hash=True,
-                    upstream_id=job_key,
-                    stage=final_stage,
                 )
                 primary_glb_url, model_content_hash = _unpack_upload_result(upload_result)
                 glb_url = primary_glb_url
-                if textured_glb_url:
-                    textured_glb_url = primary_glb_url
+                if primary_content_type.startswith("model/gltf"):
+                    if textured_glb_url:
+                        textured_glb_url = primary_glb_url
+                    if rigged_glb_url:
+                        rigged_glb_url = primary_glb_url
+                else:
+                    textured_glb_url = None
+                    rigged_glb_url = None
             if thumbnail_url:
                 thumbnail_url = safe_upload_to_s3(
                     thumbnail_url,
                     "image/png",
                     "thumbnails",
-                    job_key,
+                    s3_name_safe,
                     user_id=user_id,
+                    key_base=f"thumbnails/{job_key}/{s3_name_safe}",
                     infer_content_type=False,
-                    upstream_id=job_key,
-                    stage=final_stage,
                 )
-            if rigged_glb_url:
-                rigged_glb_url = safe_upload_to_s3(
-                    rigged_glb_url,
-                    "model/gltf-binary",
-                    "models",
-                    job_key,
-                    user_id=user_id,
-                    upstream_id=job_key,
-                    stage=final_stage,
-                )
-            if rigged_fbx_url:
-                rigged_fbx_url = safe_upload_to_s3(
-                    rigged_fbx_url,
-                    "application/x-fbx",
-                    "models",
-                    job_key,
-                    user_id=user_id,
-                    upstream_id=job_key,
-                    stage=final_stage,
-                )
+            rigged_fbx_url = None
 
             # Prefer textured output as the canonical model when available
-            if not primary_glb_source:
+            if not primary_model_source:
                 primary_glb_url = None
 
             # Upload texture images to S3
@@ -1558,64 +1558,27 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             texture_urls = []
             for idx, (map_type, url) in enumerate(normalized_textures):
                 safe_map_type = sanitize_filename(map_type) or f"texture_{idx}"
+                texture_key_base = f"textures/{job_key}/{s3_key_name}/{safe_map_type}"
                 uploaded_url = safe_upload_to_s3(
                     url,
                     "image/png",
                     "textures",
                     f"{s3_name}_{safe_map_type}",
                     user_id=user_id,
-                    key_base=f"textures/{s3_user_id}/{s3_key_name}/{safe_map_type}",
+                    key_base=texture_key_base,
                     infer_content_type=False,
                 )
                 texture_s3_urls[safe_map_type] = uploaded_url
                 if uploaded_url:
                     texture_urls.append(uploaded_url)
 
-            # Upload model format URLs to S3 (prefer textured variants)
-            format_content_types = {
-                "glb": "model/gltf-binary",
-                "gltf": "model/gltf+json",
-                "fbx": "application/x-fbx",
-                "obj": "model/obj",
-                "stl": "model/stl",
-                "usdz": "model/vnd.usdz+zip",
-            }
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
-
-            for fmt, url in (textured_model_urls or {}).items():
-                if not url:
-                    continue
-                fmt_key = str(fmt).lower()
-                ct = format_content_types.get(fmt_key) or get_content_type_from_url(url)
-                uploaded = safe_upload_to_s3(
-                    url,
-                    ct,
-                    "models",
-                    f"{job_key}_{fmt_key}",
-                    user_id=user_id,
-                    upstream_id=job_key,
-                    stage=final_stage,
-                )
-                textured_model_urls_uploaded[fmt_key] = uploaded
-                model_urls_uploaded[fmt_key] = uploaded
-
-            for fmt, url in (model_urls or {}).items():
-                if not url:
-                    continue
-                fmt_key = str(fmt).lower()
-                if fmt_key in model_urls_uploaded:
-                    continue
-                ct = format_content_types.get(fmt_key) or get_content_type_from_url(url)
-                model_urls_uploaded[fmt_key] = safe_upload_to_s3(
-                    url,
-                    ct,
-                    "models",
-                    f"{job_key}_{fmt_key}",
-                    user_id=user_id,
-                    upstream_id=job_key,
-                    stage=final_stage,
-                )
+            if primary_glb_url:
+                primary_ext = "obj" if primary_content_type == "model/obj" else "glb"
+                model_urls_uploaded[primary_ext] = primary_glb_url
+                if textured_glb_url and primary_ext == "glb":
+                    textured_model_urls_uploaded["glb"] = primary_glb_url
 
             model_urls = model_urls_uploaded
             textured_model_urls = textured_model_urls_uploaded
@@ -1751,7 +1714,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             title = COALESCE(%s, title),
                             prompt = COALESCE(%s, prompt),
                             root_prompt = COALESCE(%s, root_prompt),
-                            upstream_job_id = COALESCE(upstream_job_id, %s),
+                            upstream_id = COALESCE(upstream_id, %s),
                             status = 'ready',
                             glb_url = COALESCE(%s, glb_url),
                             thumbnail_url = COALESCE(%s, thumbnail_url),
@@ -1781,7 +1744,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         INSERT INTO {APP_SCHEMA}.models (
                             id, identity_id,
                             title, prompt, root_prompt,
-                            provider, upstream_job_id,
+                            provider, upstream_id,
                             status,
                             glb_url, thumbnail_url,
                             glb_s3_key, thumbnail_s3_key,
@@ -1797,7 +1760,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             %s,
                             %s
                         )
-                        ON CONFLICT (provider, upstream_job_id) DO UPDATE
+                        ON CONFLICT (provider, upstream_id) DO UPDATE
                         SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.models.identity_id),
                             title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.models.title),
                             prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.models.prompt),
@@ -2306,29 +2269,33 @@ def extract_model_urls(ms: dict):
     rigged_fbx = None
     glb_candidates: list[str] = []
 
+    def _filter_model_urls(urls: Any) -> dict:
+        if not isinstance(urls, dict):
+            return {}
+        filtered = {}
+        for key in ("glb", "obj"):
+            val = urls.get(key)
+            if val:
+                filtered[key] = val
+        return filtered
+
     def pick_url(container: dict) -> str | None:
         if not isinstance(container, dict):
             return None
-        return (
-            container.get("glb")
-            or container.get("textured_glb")
-            or container.get("textured")
-            or container.get("usdz")
-            or container.get("obj")
-        )
+        return container.get("glb") or container.get("obj")
 
     for c in containers:
         if not isinstance(c, dict):
             continue
         if not model_urls and isinstance(c.get("model_urls"), dict):
-            model_urls = c.get("model_urls") or {}
+            model_urls = _filter_model_urls(c.get("model_urls") or {})
         if not textured_model_urls and isinstance(c.get("textured_model_urls"), dict):
-            textured_model_urls = c.get("textured_model_urls") or {}
+            textured_model_urls = _filter_model_urls(c.get("textured_model_urls") or {})
         # Some responses put outputs in a nested "output" dict
         if not model_urls and isinstance(c.get("output_model_urls"), dict):
-            model_urls = c.get("output_model_urls") or {}
+            model_urls = _filter_model_urls(c.get("output_model_urls") or {})
         if not textured_model_urls and isinstance(c.get("output_textured_model_urls"), dict):
-            textured_model_urls = c.get("output_textured_model_urls") or {}
+            textured_model_urls = _filter_model_urls(c.get("output_textured_model_urls") or {})
         if not textured_glb_url and c.get("textured_glb_url"):
             textured_glb_url = c.get("textured_glb_url")
         if not rigged_glb and c.get("rigged_character_glb_url"):
@@ -2338,11 +2305,9 @@ def extract_model_urls(ms: dict):
 
         glb_candidates.extend([
             url for url in [
-                # Prioritize textured models for texture jobs
                 c.get("textured_glb_url"),
                 c.get("textured_model_url"),
                 pick_url(c.get("textured_model_urls") or {}),
-                # Then regular models
                 c.get("glb_url"),
                 c.get("model_url"),
                 c.get("output_model_url"),
@@ -2350,7 +2315,6 @@ def extract_model_urls(ms: dict):
                 c.get("mesh_download_url"),
                 c.get("gltf_url"),
                 c.get("gltf_download_url"),
-                c.get("usdz_url"),
                 pick_url(c.get("model_urls") or {}),
                 pick_url(c.get("output_model_urls") or {}),
                 c.get("rigged_character_glb_url"),
@@ -2364,9 +2328,11 @@ def extract_model_urls(ms: dict):
     # Prioritize textured models, then regular models
     glb_url = (
         textured_glb_url
-        or pick_url(textured_model_urls)
+        or textured_model_urls.get("glb")
+        or model_urls.get("glb")
         or next((u for u in glb_candidates if u), None)
-        or pick_url(model_urls)
+        or textured_model_urls.get("obj")
+        or model_urls.get("obj")
         or rigged_glb
     )
 
@@ -3314,10 +3280,10 @@ def api_image_to_3d_start():
             return jsonify({"error": "No job id in response", "raw": resp}), 502
 
         s3_name = prompt if prompt else "image_to_3d_source"
-        s3_user_id = user_id or "anonymous"
+        s3_user_id = user_id or "public"
 
         # Upload source image to S3 for permanent storage with deterministic key
-        # safe_upload_to_s3 handles anonymous uploads (user_id=None -> "anonymous" folder)
+        # safe_upload_to_s3 handles unauthenticated uploads (user_id=None -> public namespace)
         s3_image_url = image_url
         if AWS_BUCKET_MODELS:
             try:
@@ -3691,7 +3657,7 @@ def api_history():
                                         use_id = str(uuid.uuid4())
                                         item["original_id"] = item_id
 
-                                s3_user_id = user_id or "anonymous"
+                                s3_user_id = user_id or "public"
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
                                         thumbnail_url,
@@ -3849,7 +3815,7 @@ def api_history_item_add():
                                     use_id = str(uuid.uuid4())
                                     item["original_id"] = item_id
 
-                            s3_user_id = user_id or "anonymous"
+                            s3_user_id = user_id or "public"
                             if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                 thumbnail_url = ensure_s3_url_for_data_uri(
                                     thumbnail_url,
@@ -4089,7 +4055,7 @@ def api_history_item_update(item_id):
                                 glb_url = updates.get("glb_url")
                                 image_url = updates.get("image_url")
 
-                                s3_user_id = user_id or "anonymous"
+                                s3_user_id = user_id or "public"
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
                                         thumbnail_url,
