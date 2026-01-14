@@ -967,8 +967,10 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
 
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
             s3_name = prompt or "image"
+            s3_name_safe = sanitize_filename(s3_name) or "image"
+            s3_name_safe = s3_name_safe[:60]
             s3_user_id = user_id or "anonymous"
-            image_key_base = f"images/{s3_user_id}/{image_id}"
+            image_key_base = f"images/{s3_user_id}/{s3_name_safe}_{image_id}"
             image_content_hash = None
             if image_url:
                 upload_result = safe_upload_to_s3(
@@ -1374,22 +1376,29 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     conn.close()
                     return True
 
-            cur.execute(f"""
-                SELECT stage, canonical_url
-                FROM {APP_SCHEMA}.asset_saves
-                WHERE provider = %s AND asset_type = %s AND upstream_id = %s
-                LIMIT 1
-            """, (provider, asset_type, str(job_id)))
-            existing_save = cur.fetchone()
-            if existing_save and existing_save.get("stage") == final_stage and existing_save.get("canonical_url"):
-                print(f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})")
-                conn.close()
-                return True
+            try:
+                cur.execute(f"""
+                    SELECT stage, canonical_url
+                    FROM {APP_SCHEMA}.asset_saves
+                    WHERE provider = %s AND asset_type = %s AND upstream_id = %s
+                    LIMIT 1
+                """, (provider, asset_type, str(job_id)))
+                existing_save = cur.fetchone()
+                if existing_save and existing_save.get("stage") == final_stage and existing_save.get("canonical_url"):
+                    print(f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})")
+                    conn.close()
+                    return True
+            except Exception as e:
+                print(f"[DB] asset_saves precheck failed (continuing): {e}")
+                existing_save = None
 
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
+            s3_name_safe = sanitize_filename(s3_name) or "model"
+            s3_name_safe = s3_name_safe[:60]
             s3_user_id = user_id or "anonymous"
             job_key = str(job_id)
+            s3_key_name = f"{s3_name_safe}_{job_key}"
 
             print(f"[DB] save_finished_job: job_id={job_id}, job_type={job_type}")
             print(f"[DB] Input URLs from Meshy:")
@@ -1397,7 +1406,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
             print(f"[DB]   textured_glb_url: {textured_glb_url[:80] if textured_glb_url else 'None'}...")
             print(f"[DB] job_meta: title={job_meta.get('title')}, prompt={job_meta.get('prompt', '')[:50]}...")
-            print(f"[DB] S3 filename will use: {s3_name[:50]}...")
+            print(f"[DB] S3 filename will use: {s3_key_name[:80]}...")
 
             # Upload ALL URLs to S3 for permanent storage (Meshy URLs expire)
             model_content_hash = None
@@ -1409,7 +1418,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     job_key,
                     user_id=user_id,
-                    key_base=f"models/{s3_user_id}/{job_key}",
+                    key_base=f"models/{s3_user_id}/{s3_key_name}",
                     return_hash=True,
                 )
                 primary_glb_url, model_content_hash = _unpack_upload_result(upload_result)
@@ -1423,7 +1432,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "thumbnails",
                     job_key,
                     user_id=user_id,
-                    key_base=f"thumbnails/{s3_user_id}/{job_key}",
+                    key_base=f"thumbnails/{s3_user_id}/{s3_key_name}",
                     infer_content_type=False,
                 )
             if rigged_glb_url:
@@ -1433,7 +1442,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     job_key,
                     user_id=user_id,
-                    key_base=f"models/{s3_user_id}/{job_key}",
+                    key_base=f"models/{s3_user_id}/{s3_key_name}",
                 )
             if rigged_fbx_url:
                 rigged_fbx_url = safe_upload_to_s3(
@@ -1442,7 +1451,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "models",
                     job_key,
                     user_id=user_id,
-                    key_base=f"models/{s3_user_id}/{job_key}",
+                    key_base=f"models/{s3_user_id}/{s3_key_name}",
                 )
 
             # Prefer textured output as the canonical model when available
@@ -1460,7 +1469,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "textures",
                     f"{s3_name}_{safe_map_type}",
                     user_id=user_id,
-                    key_base=f"textures/{s3_user_id}/{job_key}/{safe_map_type}",
+                    key_base=f"textures/{s3_user_id}/{s3_key_name}/{safe_map_type}",
                     infer_content_type=False,
                 )
                 texture_s3_urls[safe_map_type] = uploaded_url
@@ -1476,7 +1485,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "stl": "model/stl",
                 "usdz": "model/vnd.usdz+zip",
             }
-            model_key_base = f"models/{s3_user_id}/{job_key}"
+            model_key_base = f"models/{s3_user_id}/{s3_key_name}"
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
 
@@ -1526,32 +1535,35 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             else:
                 canonical_row = None
 
-            if canonical_row:
-                cur.execute(f"""
-                    INSERT INTO {APP_SCHEMA}.asset_saves (
-                        provider, asset_type, upstream_id, canonical_url, stage
-                    ) VALUES (
-                        %s, %s, %s, %s, %s
-                    )
-                    ON CONFLICT (provider, asset_type, canonical_url) DO UPDATE
-                    SET upstream_id = COALESCE({APP_SCHEMA}.asset_saves.upstream_id, EXCLUDED.upstream_id),
-                        stage = EXCLUDED.stage,
-                        saved_at = NOW()
-                    RETURNING id
-                """, (provider, asset_type, str(job_id), canonical_url, final_stage))
-            else:
-                cur.execute(f"""
-                    INSERT INTO {APP_SCHEMA}.asset_saves (
-                        provider, asset_type, upstream_id, canonical_url, stage
-                    ) VALUES (
-                        %s, %s, %s, %s, %s
-                    )
-                    ON CONFLICT (provider, asset_type, upstream_id) DO UPDATE
-                    SET canonical_url = COALESCE(EXCLUDED.canonical_url, {APP_SCHEMA}.asset_saves.canonical_url),
-                        stage = EXCLUDED.stage,
-                        saved_at = NOW()
-                    RETURNING id
-                """, (provider, asset_type, str(job_id), canonical_url, final_stage))
+            try:
+                if canonical_row:
+                    cur.execute(f"""
+                        INSERT INTO {APP_SCHEMA}.asset_saves (
+                            provider, asset_type, upstream_id, canonical_url, stage
+                        ) VALUES (
+                            %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (provider, asset_type, canonical_url) DO UPDATE
+                        SET upstream_id = COALESCE({APP_SCHEMA}.asset_saves.upstream_id, EXCLUDED.upstream_id),
+                            stage = EXCLUDED.stage,
+                            saved_at = NOW()
+                        RETURNING id
+                    """, (provider, asset_type, str(job_id), canonical_url, final_stage))
+                else:
+                    cur.execute(f"""
+                        INSERT INTO {APP_SCHEMA}.asset_saves (
+                            provider, asset_type, upstream_id, canonical_url, stage
+                        ) VALUES (
+                            %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (provider, asset_type, upstream_id) DO UPDATE
+                        SET canonical_url = COALESCE(EXCLUDED.canonical_url, {APP_SCHEMA}.asset_saves.canonical_url),
+                            stage = EXCLUDED.stage,
+                            saved_at = NOW()
+                        RETURNING id
+                    """, (provider, asset_type, str(job_id), canonical_url, final_stage))
+            except Exception as e:
+                print(f"[DB] asset_saves upsert failed (continuing): {e}")
 
             # Determine item type
             item_type = 'model'
