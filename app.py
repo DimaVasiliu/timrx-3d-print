@@ -1311,6 +1311,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             # Merge status_data and job_meta
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
             thumbnail_url = status_data.get("thumbnail_url")
+            image_url = status_data.get("image_url")
             model_urls = status_data.get("model_urls") or {}
             textured_model_urls = status_data.get("textured_model_urls") or {}
             textured_glb_url = status_data.get("textured_glb_url")
@@ -1343,6 +1344,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             final_prompt = job_meta.get("prompt")
             root_prompt = job_meta.get("root_prompt") or final_prompt
             provider = _map_provider(job_type)
+            asset_type = "image" if job_type in ("image", "openai_image") else "model"
 
             # Idempotency guard: already finished with S3 URL for this asset type
             if user_id:
@@ -1372,15 +1374,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     conn.close()
                     return True
 
-            # Idempotency guard: only run once per provider/upstream_id/stage
             cur.execute(f"""
-                INSERT INTO {APP_SCHEMA}.asset_saves (provider, upstream_id, stage)
-                VALUES (%s, %s, %s)
-                ON CONFLICT DO NOTHING
-                RETURNING id
-            """, (provider, str(job_id), final_stage))
-            save_row = cur.fetchone()
-            if not save_row:
+                SELECT stage, canonical_url
+                FROM {APP_SCHEMA}.asset_saves
+                WHERE provider = %s AND asset_type = %s AND upstream_id = %s
+                LIMIT 1
+            """, (provider, asset_type, str(job_id)))
+            existing_save = cur.fetchone()
+            if existing_save and existing_save.get("stage") == final_stage and existing_save.get("canonical_url"):
                 print(f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})")
                 conn.close()
                 return True
@@ -1513,6 +1514,44 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             model_urls = model_urls_uploaded
             textured_model_urls = textured_model_urls_uploaded
+
+            canonical_url = primary_glb_url if asset_type == "model" else (image_url or thumbnail_url)
+            if canonical_url:
+                cur.execute(f"""
+                    SELECT id FROM {APP_SCHEMA}.asset_saves
+                    WHERE provider = %s AND asset_type = %s AND canonical_url = %s
+                    LIMIT 1
+                """, (provider, asset_type, canonical_url))
+                canonical_row = cur.fetchone()
+            else:
+                canonical_row = None
+
+            if canonical_row:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.asset_saves (
+                        provider, asset_type, upstream_id, canonical_url, stage
+                    ) VALUES (
+                        %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (provider, asset_type, canonical_url) DO UPDATE
+                    SET upstream_id = COALESCE({APP_SCHEMA}.asset_saves.upstream_id, EXCLUDED.upstream_id),
+                        stage = EXCLUDED.stage,
+                        saved_at = NOW()
+                    RETURNING id
+                """, (provider, asset_type, str(job_id), canonical_url, final_stage))
+            else:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.asset_saves (
+                        provider, asset_type, upstream_id, canonical_url, stage
+                    ) VALUES (
+                        %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (provider, asset_type, upstream_id) DO UPDATE
+                    SET canonical_url = COALESCE(EXCLUDED.canonical_url, {APP_SCHEMA}.asset_saves.canonical_url),
+                        stage = EXCLUDED.stage,
+                        saved_at = NOW()
+                    RETURNING id
+                """, (provider, asset_type, str(job_id), canonical_url, final_stage))
 
             # Determine item type
             item_type = 'model'
