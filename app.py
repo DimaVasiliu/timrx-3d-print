@@ -1,9 +1,9 @@
-import os, json, time, base64, uuid, hashlib
+import os, json, time, base64, uuid, hashlib, re
 import boto3
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, quote, unquote
 from datetime import datetime
 from botocore.exceptions import ClientError
 
@@ -187,6 +187,78 @@ def is_s3_url(url: str) -> bool:
         return False
     return "s3." in url and "amazonaws.com" in url
 
+def get_s3_key_from_url(url: str) -> str:
+    return parse_s3_key(url)
+
+def parse_s3_key(url: str) -> str:
+    if not is_s3_url(url):
+        return None
+    try:
+        parsed = urlparse(url)
+        return parsed.path.lstrip("/") or None
+    except Exception:
+        return None
+
+def build_canonical_url(url: str) -> str:
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        return None
+    try:
+        parsed = urlparse(url.strip())
+        if not parsed.scheme or not parsed.netloc:
+            base = url.split("?", 1)[0].split("#", 1)[0].strip()
+            return base or None
+        host = (parsed.hostname or parsed.netloc).lower()
+        netloc = host
+        if parsed.port:
+            netloc = f"{host}:{parsed.port}"
+        path = unquote(parsed.path or "")
+        path = re.sub(r"\s+", " ", path).strip()
+        path = quote(path, safe="/-_.~")
+        return urlunparse((parsed.scheme, netloc, path, "", "", ""))
+    except Exception:
+        return url.split("?", 1)[0].split("#", 1)[0].strip() or None
+
+def collect_s3_keys(history_row: dict) -> list:
+    keys = set()
+    if not isinstance(history_row, dict):
+        return []
+
+    for field in ("thumbnail_url", "glb_url", "image_url"):
+        key = parse_s3_key(history_row.get(field))
+        if key:
+            keys.add(key)
+
+    payload = history_row.get("payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if isinstance(payload, dict):
+        for key_name in ("model_urls", "texture_urls", "image_urls"):
+            value = payload.get(key_name)
+            if isinstance(value, dict):
+                for entry in value.values():
+                    s3_key = parse_s3_key(entry)
+                    if s3_key:
+                        keys.add(s3_key)
+            elif isinstance(value, (list, tuple, set)):
+                for entry in value:
+                    s3_key = parse_s3_key(entry)
+                    if s3_key:
+                        keys.add(s3_key)
+            else:
+                s3_key = parse_s3_key(value)
+                if s3_key:
+                    keys.add(s3_key)
+
+    return sorted(keys)
+
+def log_db_continue(op: str, err: Exception) -> None:
+    print(f"[DB] CONTINUE: {op} failed: {type(err).__name__}: {err}")
+
 def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: str = None, name: str = None) -> str:
     if not isinstance(url, str) or not url.startswith("data:"):
         return url
@@ -335,10 +407,15 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
     if not user_id:
         user_id = "anonymous"
         print(f"[S3] INFO: No user_id provided, using 'anonymous' folder for {prefix}")
-    if not key and not key_base and upstream_id and stage and prefix in ("models", "thumbnails"):
+    if not key and not key_base and upstream_id:
         safe_upstream = sanitize_filename(str(upstream_id)) or "asset"
-        safe_stage = sanitize_filename(str(stage)) or "asset"
-        key_base = f"{prefix}/{user_id}/{safe_upstream}/{safe_stage}"
+        safe_name = sanitize_filename(str(name)) if name else ""
+        if prefix in ("models", "thumbnails"):
+            safe_stage = sanitize_filename(str(stage)) or "asset"
+            filename = safe_name or "asset"
+            key_base = f"{prefix}/{user_id}/{safe_upstream}/{safe_stage}/{filename}"
+        elif prefix == "images":
+            key_base = f"{prefix}/{user_id}/{safe_upstream}"
     if key_base and not key:
         key = ensure_s3_key_ext(key_base, content_type)
     try:
@@ -970,18 +1047,15 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 existing_history_id = str(existing["id"])
 
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
-            s3_name = prompt or "image"
-            s3_name_safe = sanitize_filename(s3_name) or "image"
-            s3_name_safe = s3_name_safe[:60]
             s3_user_id = user_id or "anonymous"
-            image_key_base = f"images/{s3_user_id}/{s3_name_safe}_{image_id}"
+            image_key_base = f"images/{s3_user_id}/{image_id}"
             image_content_hash = None
             if image_url:
                 upload_result = safe_upload_to_s3(
                     image_url,
                     "image/png",
                     "images",
-                    s3_name,
+                    image_id,
                     user_id=user_id,
                     key_base=image_key_base,
                     return_hash=True,
@@ -993,7 +1067,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         url,
                         "image/png",
                         "images",
-                        f"{s3_name}_{i}",
+                        f"{image_id}_{i}",
                         user_id=user_id,
                         key_base=f"{image_key_base}_{i}",
                     ) if url else url
@@ -1012,6 +1086,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             # Generate UUIDs for idempotent writes
             history_uuid = existing_history_id or str(uuid.uuid4())
             image_uuid = str(uuid.uuid4())
+            upstream_id = image_id if image_id else None
 
             # Store extra metadata in payload JSONB
             payload = {
@@ -1063,7 +1138,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     user_id,
                     title,
                     prompt,
-                    image_id,
+                    upstream_id,
                     "ready",
                     image_url,
                     image_url,
@@ -1073,7 +1148,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     image_meta,
                     existing_by_hash_id,
                 ))
-            elif image_id:
+            elif upstream_id:
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.images (
                         id, identity_id,
@@ -1111,7 +1186,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     title,
                     prompt,
                     "openai",
-                    image_id,
+                    upstream_id,
                     "ready",
                     image_url,
                     image_url,
@@ -1314,6 +1389,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
     try:
         with conn, conn.cursor(row_factory=dict_row) as cur:
+            db_errors = []
             # Merge status_data and job_meta
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
             thumbnail_url = status_data.get("thumbnail_url")
@@ -1378,7 +1454,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if existing_history.get("status") == "finished" and is_s3_url(asset_url):
                     print(f"[DB] save_finished_job skipped: already finished with S3 (job_id={job_id}, stage={final_stage})")
                     conn.close()
-                    return True
+                    return {"success": True, "db_ok": True, "skipped": True}
 
             try:
                 cur.execute(f"""
@@ -1391,9 +1467,10 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if existing_save and existing_save.get("stage") == final_stage and existing_save.get("canonical_url"):
                     print(f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})")
                     conn.close()
-                    return True
+                    return {"success": True, "db_ok": len(db_errors) == 0, "db_errors": db_errors or None, "skipped": True}
             except Exception as e:
-                print(f"[DB] asset_saves precheck failed (continuing): {e}")
+                log_db_continue("asset_saves_precheck", e)
+                db_errors.append({"op": "asset_saves_precheck", "error": str(e)})
                 existing_save = None
 
             try:
@@ -1403,7 +1480,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     ON CONFLICT (provider, upstream_id, stage) DO NOTHING
                 """, (provider, str(job_id), final_stage))
             except Exception as e:
-                print(f"[DB] asset_saves stage insert failed (continuing): {e}")
+                log_db_continue("asset_saves_stage_insert", e)
+                db_errors.append({"op": "asset_saves_stage_insert", "error": str(e)})
 
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
@@ -1542,7 +1620,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             model_urls = model_urls_uploaded
             textured_model_urls = textured_model_urls_uploaded
 
-            canonical_url = primary_glb_url if asset_type == "model" else (image_url or thumbnail_url)
+            canonical_raw = primary_glb_url if asset_type == "model" else (image_url or thumbnail_url)
+            canonical_url = build_canonical_url(canonical_raw)
             if canonical_url:
                 cur.execute(f"""
                     SELECT id FROM {APP_SCHEMA}.asset_saves
@@ -1581,7 +1660,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         RETURNING id
                     """, (provider, asset_type, str(job_id), canonical_url, final_stage))
             except Exception as e:
-                print(f"[DB] asset_saves upsert failed (continuing): {e}")
+                log_db_continue("asset_saves_upsert", e)
+                db_errors.append({"op": "asset_saves_upsert", "error": str(e)})
 
             # Determine item type
             item_type = 'model'
@@ -1632,6 +1712,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             # Log final URLs after S3 upload
             final_title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else DEFAULT_MODEL_TITLE)
+            glb_s3_key = get_s3_key_from_url(primary_glb_url)
+            thumbnail_s3_key = get_s3_key_from_url(thumbnail_url)
             print(f"[DB] Final URLs after S3 upload:")
             print(f"[DB]   glb_url: {primary_glb_url[:80] if primary_glb_url else 'None'}...")
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
@@ -1673,6 +1755,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             status = 'ready',
                             glb_url = COALESCE(%s, glb_url),
                             thumbnail_url = COALESCE(%s, thumbnail_url),
+                            glb_s3_key = COALESCE(%s, glb_s3_key),
+                            thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
                             content_hash = COALESCE(%s, content_hash),
                             meta = COALESCE(%s, meta),
                             updated_at = NOW()
@@ -1686,6 +1770,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         job_id,
                         primary_glb_url,
                         thumbnail_url,
+                        glb_s3_key,
+                        thumbnail_s3_key,
                         model_content_hash,
                         json.dumps(model_meta),
                         existing_by_hash_id,
@@ -1698,6 +1784,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             provider, upstream_job_id,
                             status,
                             glb_url, thumbnail_url,
+                            glb_s3_key, thumbnail_s3_key,
                             content_hash,
                             meta
                         ) VALUES (
@@ -1705,6 +1792,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             %s, %s, %s,
                             %s, %s,
                             %s,
+                            %s, %s,
                             %s, %s,
                             %s,
                             %s
@@ -1717,6 +1805,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             status = 'ready',
                             glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.models.glb_url),
                             thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.models.thumbnail_url),
+                            glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {APP_SCHEMA}.models.glb_s3_key),
+                            thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.models.thumbnail_s3_key),
                             content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.models.content_hash),
                             meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.models.meta),
                             updated_at = NOW()
@@ -1732,6 +1822,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         "ready",
                         primary_glb_url,
                         thumbnail_url,
+                        glb_s3_key,
+                        thumbnail_s3_key,
                         model_content_hash,
                         json.dumps(model_meta),
                     ))
@@ -1794,6 +1886,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         # Return the S3 URLs so the calling endpoint can use them in the API response
         return {
             "success": True,
+            "db_ok": len(db_errors) == 0,
+            "db_errors": db_errors or None,
             "glb_url": primary_glb_url,
             "thumbnail_url": thumbnail_url,
             "textured_glb_url": textured_glb_url,
@@ -2691,6 +2785,12 @@ def api_text_to_3d_status(job_id):
                 out["model_urls"] = s3_result["model_urls"]
             if s3_result.get("texture_urls"):
                 out["texture_urls"] = s3_result["texture_urls"]
+            if s3_result.get("db_ok") is False:
+                out["db_ok"] = False
+                out["db_errors"] = s3_result.get("db_errors")
+            if s3_result.get("db_ok") is False:
+                out["db_ok"] = False
+                out["db_errors"] = s3_result.get("db_errors")
 
     return jsonify(out)
 
@@ -2924,6 +3024,9 @@ def api_mesh_remesh_status(job_id):
                 out["thumbnail_url"] = s3_result["thumbnail_url"]
             if s3_result.get("model_urls"):
                 out["model_urls"] = s3_result["model_urls"]
+            if s3_result.get("db_ok") is False:
+                out["db_ok"] = False
+                out["db_errors"] = s3_result.get("db_errors")
 
     return jsonify(out)
 
@@ -3053,6 +3156,9 @@ def api_mesh_retexture_status(job_id):
                 out["texture_urls"] = s3_result["texture_urls"]
             if s3_result.get("model_urls"):
                 out["model_urls"] = s3_result["model_urls"]
+            if s3_result.get("db_ok") is False:
+                out["db_ok"] = False
+                out["db_errors"] = s3_result.get("db_errors")
 
     return jsonify(out)
 
@@ -3170,6 +3276,9 @@ def api_mesh_rigging_status(job_id):
                 out["rigged_character_fbx_url"] = s3_result["rigged_character_fbx_url"]
             if s3_result.get("model_urls"):
                 out["model_urls"] = s3_result["model_urls"]
+            if s3_result.get("db_ok") is False:
+                out["db_ok"] = False
+                out["db_errors"] = s3_result.get("db_errors")
 
     return jsonify(out)
 
@@ -3522,6 +3631,8 @@ def api_history():
         if not isinstance(payload, list):
             return jsonify({"error": "Payload must be a list"}), 400
 
+        db_ok = None
+        db_errors = []
         if USE_DB:
             conn = get_db_conn()
             if conn:
@@ -3646,18 +3757,24 @@ def api_history():
                                 saved += 1
                     conn.close()
                     print(f"[History] Saved {saved} items to DB")
+                    db_ok = True
                 except Exception as e:
-                    print(f"[History] DB write failed: {e}")
+                    log_db_continue("history_bulk_write", e)
+                    db_errors.append({"op": "history_bulk_write", "error": str(e)})
                     import traceback
                     traceback.print_exc()
                     try:
                         conn.close()
                     except Exception:
                         pass
+                    db_ok = False
+            else:
+                db_ok = False
+                db_errors.append({"op": "history_bulk_connect", "error": "db_unavailable"})
 
         # DEV ONLY: sync to local JSON (no-op in production)
         save_history_store(payload)
-        return jsonify({"ok": True, "count": len(payload)})
+        return jsonify({"ok": True, "count": len(payload), "db": db_ok, "db_errors": db_errors or None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3678,6 +3795,7 @@ def api_history_item_add():
         # Always keep a copy of the ID on the payload for local fallback writes
         item["id"] = item_id
         db_ok = False
+        db_errors = []
 
         if USE_DB:
             conn = get_db_conn()
@@ -3798,12 +3916,15 @@ def api_history_item_add():
                             item_id = use_id  # Return the actual UUID used
                     conn.close()
                 except Exception as e:
-                    print(f"[History] DB add item failed: {e}")
+                    log_db_continue("history_item_add", e)
+                    db_errors.append({"op": "history_item_add", "error": str(e)})
                     try: conn.close()
                     except Exception: pass
+            else:
+                db_errors.append({"op": "history_item_add_connect", "error": "db_unavailable"})
 
         local_ok = upsert_history_local(item, merge=False)
-        return jsonify({"ok": True, "id": item_id, "db": db_ok, "local": local_ok})
+        return jsonify({"ok": True, "id": item_id, "db": db_ok, "db_errors": db_errors or None, "local": local_ok})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3824,41 +3945,110 @@ def api_history_item_update(item_id):
 
     if request.method == "DELETE":
         db_ok = False
+        db_errors = []
+        s3_deleted = 0
         if USE_DB:
             conn = get_db_conn()
-            if conn:
+            if not conn:
+                db_errors.append({"op": "history_item_delete_connect", "error": "db_unavailable"})
+                local_ok = delete_history_local(item_id)
+                return jsonify({"ok": False, "error": "db_unavailable"}), 503
+            try:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    if user_id:
+                        cur.execute(f"""
+                            SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
+                            LIMIT 1
+                        """, (str(item_id), user_id))
+                    else:
+                        cur.execute(f"""
+                            SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE id::text = %s AND identity_id IS NULL
+                            LIMIT 1
+                        """, (str(item_id),))
+                    row = cur.fetchone()
+                if not row:
+                    conn.close()
+                    return jsonify({"ok": False, "error": "not_found"}), 404
+
+                history_id = row["id"]
+                model_id = row["model_id"]
+                image_id = row["image_id"]
+                payload = row["payload"] if row["payload"] else {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = {}
+
+                row["payload"] = payload
+                s3_keys = collect_s3_keys(row)
+
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            # Delete by UUID id (only if user owns it or user_id is NULL)
                             if user_id:
-                                cur.execute(f"""DELETE FROM {APP_SCHEMA}.history_items
-                                               WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL);""",
-                                            (str(item_id), user_id))
-                                cur.execute(f"""DELETE FROM {APP_SCHEMA}.history_items
-                                               WHERE (payload->>'original_id' = %s OR payload->>'job_id' = %s)
-                                                 AND (identity_id = %s OR identity_id IS NULL);""",
-                                            (str(item_id), str(item_id), user_id))
+                                cur.execute(f"""
+                                    DELETE FROM {APP_SCHEMA}.history_items
+                                    WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
+                                """, (str(item_id), user_id))
                             else:
-                                # Anonymous user can only delete items without user_id
-                                cur.execute(f"""DELETE FROM {APP_SCHEMA}.history_items
-                                               WHERE id::text = %s AND identity_id IS NULL;""", (str(item_id),))
-                                cur.execute(f"""DELETE FROM {APP_SCHEMA}.history_items
-                                               WHERE (payload->>'original_id' = %s OR payload->>'job_id' = %s)
-                                                 AND identity_id IS NULL;""", (str(item_id), str(item_id)))
-                    conn.close()
+                                cur.execute(f"""
+                                    DELETE FROM {APP_SCHEMA}.history_items
+                                    WHERE id::text = %s AND identity_id IS NULL
+                                """, (str(item_id),))
+
+                            if model_id:
+                                cur.execute(f"DELETE FROM {APP_SCHEMA}.models WHERE id = %s", (model_id,))
+                            if image_id:
+                                cur.execute(f"DELETE FROM {APP_SCHEMA}.images WHERE id = %s", (image_id,))
                     db_ok = True
                 except Exception as e:
-                    print(f"[History] DB delete failed for {item_id}: {e}")
-                    try: conn.close()
-                    except Exception: pass
+                    log_db_continue("history_item_delete_db", e)
+                    db_errors.append({"op": "history_item_delete_db", "error": str(e)})
+                    conn.close()
+                    local_ok = delete_history_local(item_id)
+                    return jsonify({"ok": False, "error": "db_delete_failed"}), 500
+
+                if s3_keys and AWS_BUCKET_MODELS:
+                    try:
+                        keys_list = [{"Key": k} for k in s3_keys if k]
+                        for i in range(0, len(keys_list), 1000):
+                            chunk = keys_list[i:i + 1000]
+                            resp = s3.delete_objects(Bucket=AWS_BUCKET_MODELS, Delete={"Objects": chunk, "Quiet": True})
+                            s3_deleted += len(resp.get("Deleted", []) or [])
+                            errs = resp.get("Errors") or []
+                            if errs:
+                                raise RuntimeError(f"S3 delete errors: {errs}")
+                    except Exception as e:
+                        log_db_continue("history_item_delete_s3", e)
+                        db_errors.append({"op": "history_item_delete_s3", "error": str(e)})
+                        conn.close()
+                        local_ok = delete_history_local(item_id)
+                        return jsonify({"ok": False, "error": "s3_delete_failed"}), 500
+
+                conn.close()
+            except Exception as e:
+                log_db_continue("history_item_delete_lookup", e)
+                db_errors.append({"op": "history_item_delete_lookup", "error": str(e)})
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                local_ok = delete_history_local(item_id)
+                return jsonify({"ok": False, "error": "lookup_failed"}), 500
+
         local_ok = delete_history_local(item_id)
-        return jsonify({"ok": True, "deleted": item_id, "db": db_ok, "local": local_ok})
+        return jsonify({"ok": True})
 
     if request.method == "PATCH":
         try:
             updates = request.get_json(silent=True) or {}
             db_ok = False
+            db_errors = []
             if USE_DB:
                 conn = get_db_conn()
                 if conn:
@@ -3960,9 +4150,12 @@ def api_history_item_update(item_id):
                         conn.close()
                         db_ok = True
                     except Exception as e:
-                        print(f"[History] DB update failed for {item_id}: {e}")
+                        log_db_continue("history_item_update", e)
+                        db_errors.append({"op": "history_item_update", "error": str(e)})
                         try: conn.close()
                         except Exception: pass
+                else:
+                    db_errors.append({"op": "history_item_update_connect", "error": "db_unavailable"})
 
             # DEV ONLY: persist updates to local JSON (no-op in production)
             local_ok = False
@@ -3977,7 +4170,7 @@ def api_history_item_update(item_id):
                 merged_local = {**(existing_local or {}), **updates, "id": item_id}
                 local_ok = upsert_history_local(merged_local, merge=True)
 
-            return jsonify({"ok": True, "id": item_id, "db": db_ok, "local": local_ok})
+            return jsonify({"ok": True, "id": item_id, "db": db_ok, "db_errors": db_errors or None, "local": local_ok})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
