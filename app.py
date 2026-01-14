@@ -1,10 +1,11 @@
-import os, json, time, base64, uuid
+import os, json, time, base64, uuid, hashlib
 import boto3
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, Any
 from urllib.parse import urlparse
 from datetime import datetime
+from botocore.exceptions import ClientError
 
 load_dotenv()
 
@@ -117,6 +118,7 @@ def get_extension_for_content_type(content_type: str) -> str:
         "image/jpg": ".jpg",
         "image/webp": ".webp",
         "application/x-fbx": ".fbx",
+        "model/vnd.usdz+zip": ".usdz",
         "model/obj": ".obj",
         "model/stl": ".stl",
     }
@@ -130,6 +132,7 @@ def get_content_type_for_extension(ext: str) -> str:
         ".fbx": "application/x-fbx",
         ".obj": "model/obj",
         ".stl": "model/stl",
+        ".usdz": "model/vnd.usdz+zip",
         ".png": "image/png",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
@@ -146,7 +149,64 @@ def get_content_type_from_url(url: str) -> str:
     except Exception:
         return "application/octet-stream"
 
-def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet-stream", prefix: str = "models", name: str = None, user_id: str = None) -> str:
+def compute_sha256(data_bytes: bytes) -> str:
+    return hashlib.sha256(data_bytes).hexdigest()
+
+def _wrap_upload_result(value: str, content_hash: str, return_hash: bool):
+    return (value, content_hash) if return_hash else value
+
+def _unpack_upload_result(result):
+    if isinstance(result, tuple) and len(result) == 2:
+        return result[0], result[1]
+    return result, None
+
+def ensure_s3_key_ext(key: str, content_type: str) -> str:
+    if not key:
+        return key
+    ext = os.path.splitext(key)[1]
+    if ext:
+        return key
+    suffix = get_extension_for_content_type(content_type)
+    return f"{key}{suffix}" if suffix else key
+
+def build_s3_url(key: str) -> str:
+    return f"https://{AWS_BUCKET_MODELS}.s3.{AWS_REGION}.amazonaws.com/{key}"
+
+def s3_key_exists(key: str) -> bool:
+    try:
+        s3.head_object(Bucket=AWS_BUCKET_MODELS, Key=key)
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+def is_s3_url(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    return "s3." in url and "amazonaws.com" in url
+
+def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: str = None, name: str = None) -> str:
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return url
+    try:
+        s3_url = safe_upload_to_s3(
+            url,
+            "image/png",
+            prefix,
+            name or prefix,
+            user_id=user_id,
+            key_base=key_base,
+        )
+    except Exception as e:
+        print(f"[S3] ERROR: Failed to upload data URI for {prefix}: {e}")
+        return None
+    if isinstance(s3_url, str) and s3_url.startswith("data:"):
+        return None
+    return s3_url
+
+def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet-stream", prefix: str = "models", name: str = None, user_id: str = None, key: str = None, return_hash: bool = False) -> str:
     """
     Upload raw bytes to S3 and return the public URL.
     Key structure: {prefix}/{user_id}/{name}_{uuid}{ext} or {prefix}/{user_id}/{uuid}{ext}
@@ -162,20 +222,29 @@ def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet
         print("[S3] ERROR: AWS_BUCKET_MODELS not configured!")
         raise RuntimeError("AWS_BUCKET_MODELS not configured")
 
-    if not user_id:
-        print("[S3] ERROR: user_id required for S3 upload (per-user namespacing)")
-        raise ValueError("user_id required for S3 upload")
+    if not key:
+        if not user_id:
+            print("[S3] ERROR: user_id required for S3 upload (per-user namespacing)")
+            raise ValueError("user_id required for S3 upload")
 
-    # Get file extension based on content type
-    ext = get_extension_for_content_type(content_type)
+        # Get file extension based on content type
+        ext = get_extension_for_content_type(content_type)
 
-    # Build key with user namespace: {prefix}/{user_id}/{name}_{uuid}{ext}
-    unique_id = uuid.uuid4().hex[:12]  # Shorter unique ID
-    if name:
-        safe_name = sanitize_filename(name)
-        key = f"{prefix}/{user_id}/{safe_name}_{unique_id}{ext}" if safe_name else f"{prefix}/{user_id}/{unique_id}{ext}"
+        # Build key with user namespace: {prefix}/{user_id}/{name}_{uuid}{ext}
+        unique_id = uuid.uuid4().hex[:12]  # Shorter unique ID
+        if name:
+            safe_name = sanitize_filename(name)
+            key = f"{prefix}/{user_id}/{safe_name}_{unique_id}{ext}" if safe_name else f"{prefix}/{user_id}/{unique_id}{ext}"
+        else:
+            key = f"{prefix}/{user_id}/{unique_id}{ext}"
     else:
-        key = f"{prefix}/{user_id}/{unique_id}{ext}"
+        key = ensure_s3_key_ext(key.lstrip("/"), content_type)
+
+    content_hash = compute_sha256(data_bytes) if return_hash else None
+    if s3_key_exists(key):
+        s3_url = build_s3_url(key)
+        print(f"[S3] SKIP: Key exists -> {s3_url}")
+        return _wrap_upload_result(s3_url, content_hash, return_hash)
 
     print(f"[S3] Uploading {len(data_bytes)} bytes to bucket={AWS_BUCKET_MODELS}, key={key}, content_type={content_type}")
     try:
@@ -186,9 +255,9 @@ def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet
             ContentType=content_type,
             ACL='public-read',  # Make the object publicly readable
         )
-        s3_url = f"https://{AWS_BUCKET_MODELS}.s3.{AWS_REGION}.amazonaws.com/{key}"
+        s3_url = build_s3_url(key)
         print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
-        return s3_url
+        return _wrap_upload_result(s3_url, content_hash, return_hash)
     except Exception as e:
         print(f"[S3] ERROR: put_object failed for {key}: {e}")
         print(f"[S3] HINT: If you see AccessControlListNotSupported, disable 'Block public access' in S3 bucket settings")
@@ -196,7 +265,7 @@ def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet
         traceback.print_exc()
         raise
 
-def upload_url_to_s3(url: str, content_type: str = None, prefix: str = "models", name: str = None, user_id: str = None) -> str:
+def upload_url_to_s3(url: str, content_type: str = None, prefix: str = "models", name: str = None, user_id: str = None, key: str = None, return_hash: bool = False) -> str:
     """
     Download file from URL and upload to S3.
     Returns the S3 public URL.
@@ -208,14 +277,23 @@ def upload_url_to_s3(url: str, content_type: str = None, prefix: str = "models",
         name: optional human-readable name to include in the key
         user_id: REQUIRED - user UUID for namespacing
     """
+    if key:
+        key = ensure_s3_key_ext(key.lstrip("/"), content_type or "application/octet-stream")
+        if s3_key_exists(key):
+            s3_url = build_s3_url(key)
+            print(f"[S3] SKIP: Key exists -> {s3_url}")
+            return _wrap_upload_result(s3_url, None, return_hash)
+
     print(f"[S3] Downloading from URL: {url[:100]}...")
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
     ct = content_type or resp.headers.get("Content-Type", "application/octet-stream")
     print(f"[S3] Downloaded {len(resp.content)} bytes, content-type={ct}")
-    return upload_bytes_to_s3(resp.content, ct, prefix, name, user_id)
+    content_hash = compute_sha256(resp.content) if return_hash else None
+    s3_url = upload_bytes_to_s3(resp.content, ct, prefix, name, user_id, key=key)
+    return _wrap_upload_result(s3_url, content_hash, return_hash)
 
-def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None) -> str:
+def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None, key: str = None, key_base: str = None, infer_content_type: bool = True, return_hash: bool = False) -> str:
     """
     Safely upload URL to S3, returning original URL if S3 upload fails or user_id missing.
     Also handles base64 data URLs.
@@ -232,23 +310,24 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
         url = url.get("url") or url.get("href")
     if not isinstance(url, str):
         print(f"[S3] SKIP: URL not a string for {prefix} (type={type(original_url).__name__})")
-        return original_url
-    url_preview = url[:60] if url else "None"
-    inferred_type = "application/octet-stream"
-    if url and not url.startswith("data:"):
-        inferred_type = get_content_type_from_url(url)
-        if inferred_type != "application/octet-stream":
-            content_type = inferred_type
+        return _wrap_upload_result(original_url, None, return_hash)
+    url_preview = (url[:60] if isinstance(url, str) else str(url)[:60]) if url is not None else "None"
+    if infer_content_type:
+        inferred_type = "application/octet-stream"
+        if url and not url.startswith("data:"):
+            inferred_type = get_content_type_from_url(url)
+            if inferred_type != "application/octet-stream":
+                content_type = inferred_type
     print(f"[S3] safe_upload_to_s3 called: prefix={prefix}, user_id={user_id}, name={name}, url={url_preview}...")
     if not url:
         print(f"[S3] SKIP: No URL provided for {prefix}")
-        return url
+        return _wrap_upload_result(url, None, return_hash)
     if not AWS_BUCKET_MODELS:
         msg = "[S3] SKIP: AWS_BUCKET_MODELS not configured, returning original URL"
         if REQUIRE_AWS_UPLOADS:
             raise RuntimeError(msg)
         print(msg)
-        return url
+        return _wrap_upload_result(url, None, return_hash)
     if REQUIRE_AWS_UPLOADS and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY):
         raise RuntimeError("[S3] AWS credentials not configured")
     # Allow anonymous uploads to prevent asset loss (Meshy URLs expire)
@@ -256,14 +335,16 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
     if not user_id:
         user_id = "anonymous"
         print(f"[S3] INFO: No user_id provided, using 'anonymous' folder for {prefix}")
+    if key_base and not key:
+        key = ensure_s3_key_ext(key_base, content_type)
     try:
         # Handle base64 data URLs
         if url.startswith("data:"):
-            s3_url = upload_base64_to_s3(url, prefix, name, user_id)
+            s3_url = upload_base64_to_s3(url, prefix, name, user_id, key=key, key_base=key_base, return_hash=return_hash)
             print(f"[S3] SUCCESS: Uploaded base64 {prefix} -> {s3_url}")
             return s3_url
         # Handle regular URLs
-        s3_url = upload_url_to_s3(url, content_type, prefix, name, user_id)
+        s3_url = upload_url_to_s3(url, content_type, prefix, name, user_id, key=key, return_hash=return_hash)
         print(f"[S3] SUCCESS: Uploaded {prefix}: {url[:60]}... -> {s3_url}")
         return s3_url
     except Exception as e:
@@ -273,7 +354,7 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
         traceback.print_exc()
         raise
 
-def upload_base64_to_s3(data_url: str, prefix: str = "images", name: str = None, user_id: str = None) -> str:
+def upload_base64_to_s3(data_url: str, prefix: str = "images", name: str = None, user_id: str = None, key: str = None, key_base: str = None, return_hash: bool = False) -> str:
     """
     Upload a base64 data URL to S3 and return the public URL.
 
@@ -295,7 +376,11 @@ def upload_base64_to_s3(data_url: str, prefix: str = "images", name: str = None,
         image_bytes = base64.b64decode(b64data)
 
         # Upload to S3
-        return upload_bytes_to_s3(image_bytes, mime, prefix, name, user_id)
+        if key_base and not key:
+            key = ensure_s3_key_ext(key_base, mime)
+        content_hash = compute_sha256(image_bytes) if return_hash else None
+        s3_url = upload_bytes_to_s3(image_bytes, mime, prefix, name, user_id, key=key)
+        return _wrap_upload_result(s3_url, content_hash, return_hash)
     except Exception as e:
         print(f"[S3] Failed to parse/upload base64: {e}")
         raise
@@ -634,6 +719,16 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         glb_url = job_meta.get("glb_url")
         image_url = job_meta.get("image_url")
 
+        s3_user_id = user_id or "anonymous"
+        thumb_key_base = f"thumbnails/{s3_user_id}/{job_id}"
+        image_key_base = f"images/{s3_user_id}/{job_id}"
+        if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
+            thumbnail_url = ensure_s3_url_for_data_uri(thumbnail_url, "thumbnails", thumb_key_base, user_id=user_id, name="thumbnail")
+        if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
+            image_url = ensure_s3_url_for_data_uri(image_url, "images", image_key_base, user_id=user_id, name="image")
+        payload["thumbnail_url"] = thumbnail_url
+        payload["image_url"] = image_url
+
         with conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(f"""
                 INSERT INTO {APP_SCHEMA}.history_items (
@@ -854,7 +949,6 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
         with conn, conn.cursor() as cur:
             # Check if this image already exists for this user (idempotent updates)
             existing_history_id = None
-            existing_image_id = None
             if user_id:
                 cur.execute(f"""
                     SELECT id, image_id FROM {APP_SCHEMA}.history_items
@@ -870,34 +964,33 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             existing = cur.fetchone()
             if existing:
                 existing_history_id = str(existing[0])
-                existing_image_id = str(existing[1]) if existing[1] else None
-
-            if not existing_image_id:
-                if user_id:
-                    cur.execute(f"""
-                        SELECT id FROM {APP_SCHEMA}.images
-                        WHERE provider = 'openai' AND upstream_id = %s
-                          AND (identity_id = %s OR identity_id IS NULL)
-                        LIMIT 1
-                    """, (image_id, user_id))
-                else:
-                    cur.execute(f"""
-                        SELECT id FROM {APP_SCHEMA}.images
-                        WHERE provider = 'openai' AND upstream_id = %s
-                          AND identity_id IS NULL
-                        LIMIT 1
-                    """, (image_id,))
-                image_row = cur.fetchone()
-                if image_row:
-                    existing_image_id = str(image_row[0])
 
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
             s3_name = prompt or "image"
+            s3_user_id = user_id or "anonymous"
+            image_key_base = f"images/{s3_user_id}/{image_id}"
+            image_content_hash = None
             if image_url:
-                image_url = safe_upload_to_s3(image_url, "image/png", "images", s3_name, user_id=user_id)
+                upload_result = safe_upload_to_s3(
+                    image_url,
+                    "image/png",
+                    "images",
+                    s3_name,
+                    user_id=user_id,
+                    key_base=image_key_base,
+                    return_hash=True,
+                )
+                image_url, image_content_hash = _unpack_upload_result(upload_result)
             if image_urls:
                 image_urls = [
-                    safe_upload_to_s3(url, "image/png", "images", f"{s3_name}_{i}", user_id=user_id) if url else url
+                    safe_upload_to_s3(
+                        url,
+                        "image/png",
+                        "images",
+                        f"{s3_name}_{i}",
+                        user_id=user_id,
+                        key_base=f"{image_key_base}_{i}",
+                    ) if url else url
                     for i, url in enumerate(image_urls)
                 ]
 
@@ -910,9 +1003,9 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 except ValueError:
                     pass
 
-            # Generate or reuse UUIDs for idempotent writes
+            # Generate UUIDs for idempotent writes
             history_uuid = existing_history_id or str(uuid.uuid4())
-            image_uuid = existing_image_id or str(uuid.uuid4())
+            image_uuid = str(uuid.uuid4())
 
             # Store extra metadata in payload JSONB
             payload = {
@@ -932,22 +1025,82 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 "image_urls": image_urls or [image_url],
             })
 
-            if existing_image_id:
+            existing_by_hash_id = None
+            if image_content_hash:
+                cur.execute(f"""
+                    SELECT id FROM {APP_SCHEMA}.images
+                    WHERE provider = %s AND content_hash = %s
+                    LIMIT 1
+                """, ("openai", image_content_hash))
+                row = cur.fetchone()
+                if row:
+                    existing_by_hash_id = row[0]
+
+            if existing_by_hash_id:
                 cur.execute(f"""
                     UPDATE {APP_SCHEMA}.images
                     SET identity_id = COALESCE(%s, identity_id),
                         title = COALESCE(%s, title),
                         prompt = COALESCE(%s, prompt),
-                        provider = %s,
-                        upstream_id = %s,
+                        upstream_id = COALESCE(upstream_id, %s),
                         status = %s,
                         image_url = COALESCE(%s, image_url),
                         thumbnail_url = COALESCE(%s, thumbnail_url),
                         width = COALESCE(%s, width),
                         height = COALESCE(%s, height),
-                        meta = %s
+                        content_hash = COALESCE(%s, content_hash),
+                        meta = %s,
+                        updated_at = NOW()
                     WHERE id = %s
+                    RETURNING id
                 """, (
+                    user_id,
+                    title,
+                    prompt,
+                    image_id,
+                    "ready",
+                    image_url,
+                    image_url,
+                    width,
+                    height,
+                    image_content_hash,
+                    image_meta,
+                    existing_by_hash_id,
+                ))
+            elif image_id:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.images (
+                        id, identity_id,
+                        title, prompt,
+                        provider, upstream_id, status,
+                        image_url, thumbnail_url,
+                        width, height,
+                        content_hash,
+                        meta
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s,
+                        %s
+                    )
+                    ON CONFLICT (provider, upstream_id) DO UPDATE
+                    SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.images.identity_id),
+                        title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.images.title),
+                        prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.images.prompt),
+                        status = EXCLUDED.status,
+                        image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.images.image_url),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.images.thumbnail_url),
+                        width = COALESCE(EXCLUDED.width, {APP_SCHEMA}.images.width),
+                        height = COALESCE(EXCLUDED.height, {APP_SCHEMA}.images.height),
+                        content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.images.content_hash),
+                        meta = EXCLUDED.meta,
+                        updated_at = NOW()
+                    RETURNING id
+                """, (
+                    image_uuid,
                     user_id,
                     title,
                     prompt,
@@ -958,8 +1111,55 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     image_url,
                     width,
                     height,
+                    image_content_hash,
                     image_meta,
+                ))
+            elif image_url:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.images (
+                        id, identity_id,
+                        title, prompt,
+                        provider, upstream_id, status,
+                        image_url, thumbnail_url,
+                        width, height,
+                        content_hash,
+                        meta
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s,
+                        %s
+                    )
+                    ON CONFLICT (provider, image_url) WHERE upstream_id IS NULL AND image_url IS NOT NULL DO UPDATE
+                    SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.images.identity_id),
+                        title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.images.title),
+                        prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.images.prompt),
+                        status = EXCLUDED.status,
+                        image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.images.image_url),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.images.thumbnail_url),
+                        width = COALESCE(EXCLUDED.width, {APP_SCHEMA}.images.width),
+                        height = COALESCE(EXCLUDED.height, {APP_SCHEMA}.images.height),
+                        content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.images.content_hash),
+                        meta = EXCLUDED.meta,
+                        updated_at = NOW()
+                    RETURNING id
+                """, (
                     image_uuid,
+                    user_id,
+                    title,
+                    prompt,
+                    "openai",
+                    None,
+                    "ready",
+                    image_url,
+                    image_url,
+                    width,
+                    height,
+                    image_content_hash,
+                    image_meta,
                 ))
             else:
                 cur.execute(f"""
@@ -969,6 +1169,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         provider, upstream_id, status,
                         image_url, thumbnail_url,
                         width, height,
+                        content_hash,
                         meta
                     ) VALUES (
                         %s, %s,
@@ -976,22 +1177,30 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         %s, %s, %s,
                         %s, %s,
                         %s, %s,
+                        %s,
                         %s
                     )
+                    RETURNING id
                 """, (
                     image_uuid,
                     user_id,
                     title,
                     prompt,
                     "openai",
-                    image_id,
+                    None,
                     "ready",
-                    image_url,
-                    image_url,
+                    None,
+                    None,
                     width,
                     height,
+                    image_content_hash,
                     image_meta,
                 ))
+
+            image_row = cur.fetchone()
+            if not image_row:
+                raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
+            returned_image_id = image_row[0]
 
             if existing_history_id:
                 cur.execute(f"""
@@ -1019,7 +1228,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     user_id,
                     image_url,
                     image_url,
-                    image_uuid,
+                    returned_image_id,
                     json.dumps(payload),
                     history_uuid,
                 ))
@@ -1038,6 +1247,19 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         %s,
                         %s
                     )
+                    ON CONFLICT (id) DO UPDATE
+                    SET item_type = EXCLUDED.item_type,
+                        status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
+                        stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
+                        title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                        prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                        root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                        identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                        image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                        image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
+                        payload = EXCLUDED.payload,
+                        updated_at = NOW()
                 """, (
                     history_uuid,
                     user_id,
@@ -1049,7 +1271,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     None,
                     image_url,
                     image_url,
-                    image_uuid,
+                    returned_image_id,
                     json.dumps(payload),
                 ))
 
@@ -1094,30 +1316,79 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             textured_glb_url = status_data.get("textured_glb_url")
             rigged_glb_url = status_data.get("rigged_character_glb_url")
             rigged_fbx_url = status_data.get("rigged_character_fbx_url")
-            raw_texture_urls = status_data.get("texture_urls") or []
-            normalized_texture_urls = []
-            if isinstance(raw_texture_urls, dict):
-                direct_url = raw_texture_urls.get("url") or raw_texture_urls.get("href")
-                if direct_url:
-                    normalized_texture_urls = [direct_url]
-                else:
-                    normalized_texture_urls = list(raw_texture_urls.values())
+            raw_texture_urls = status_data.get("texture_urls")
+            texture_items = []
+            if isinstance(raw_texture_urls, str):
+                texture_items = [("texture", raw_texture_urls)]
             elif isinstance(raw_texture_urls, list):
-                normalized_texture_urls = raw_texture_urls
+                for idx, item in enumerate(raw_texture_urls):
+                    label = f"texture_{idx}"
+                    url = item
+                    if isinstance(item, dict):
+                        url = item.get("url") or item.get("href")
+                    texture_items.append((label, url))
+            elif isinstance(raw_texture_urls, dict):
+                texture_items = list(raw_texture_urls.items())
+            elif raw_texture_urls:
+                texture_items = [("texture", raw_texture_urls)]
+
+            normalized_textures = []
+            for map_type, url in texture_items:
+                if isinstance(url, dict):
+                    url = url.get("url") or url.get("href")
+                if isinstance(url, str) and url:
+                    normalized_textures.append((str(map_type or "texture"), url))
+
+            final_stage = status_data.get("stage") or job_meta.get("stage") or "preview"
+            final_prompt = job_meta.get("prompt")
+            root_prompt = job_meta.get("root_prompt") or final_prompt
+            provider = _map_provider(job_type)
+
+            # Idempotency guard: already finished with S3 URL for this asset type
+            if user_id:
+                cur.execute(f"""
+                    SELECT status, glb_url, image_url, item_type
+                    FROM {APP_SCHEMA}.history_items
+                    WHERE (id::text = %s OR payload->>'original_job_id' = %s)
+                      AND (identity_id = %s OR identity_id IS NULL)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (str(job_id), str(job_id), user_id))
             else:
-                normalized_texture_urls = [raw_texture_urls]
+                cur.execute(f"""
+                    SELECT status, glb_url, image_url, item_type
+                    FROM {APP_SCHEMA}.history_items
+                    WHERE (id::text = %s OR payload->>'original_job_id' = %s)
+                      AND identity_id IS NULL
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (str(job_id), str(job_id)))
+            existing_history = cur.fetchone()
+            if existing_history:
+                asset_type = existing_history.get("item_type") or ("image" if job_type in ("image", "openai_image") else "model")
+                asset_url = existing_history.get("image_url") if asset_type == "image" else existing_history.get("glb_url")
+                if existing_history.get("status") == "finished" and is_s3_url(asset_url):
+                    print(f"[DB] save_finished_job skipped: already finished with S3 (job_id={job_id}, stage={final_stage})")
+                    conn.close()
+                    return True
 
-            flattened_texture_urls = []
-            for item in normalized_texture_urls:
-                if isinstance(item, dict):
-                    flattened_texture_urls.append(item.get("url") or item.get("href"))
-                else:
-                    flattened_texture_urls.append(item)
-
-            texture_urls = [u for u in flattened_texture_urls if isinstance(u, str) and u]
+            # Idempotency guard: only run once per provider/upstream_id/stage
+            cur.execute(f"""
+                INSERT INTO {APP_SCHEMA}.asset_saves (provider, upstream_id, stage)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            """, (provider, str(job_id), final_stage))
+            save_row = cur.fetchone()
+            if not save_row:
+                print(f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})")
+                conn.close()
+                return True
 
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
+            s3_user_id = user_id or "anonymous"
+            job_key = str(job_id)
 
             print(f"[DB] save_finished_job: job_id={job_id}, job_type={job_type}")
             print(f"[DB] Input URLs from Meshy:")
@@ -1128,34 +1399,120 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB] S3 filename will use: {s3_name[:50]}...")
 
             # Upload ALL URLs to S3 for permanent storage (Meshy URLs expire)
-            if glb_url:
-                glb_url = safe_upload_to_s3(glb_url, "model/gltf-binary", "models", s3_name, user_id=user_id)
+            model_content_hash = None
+            primary_glb_source = textured_glb_url or glb_url
+            if primary_glb_source:
+                upload_result = safe_upload_to_s3(
+                    primary_glb_source,
+                    "model/gltf-binary",
+                    "models",
+                    job_key,
+                    user_id=user_id,
+                    key_base=f"models/{s3_user_id}/{job_key}",
+                    return_hash=True,
+                )
+                primary_glb_url, model_content_hash = _unpack_upload_result(upload_result)
+                glb_url = primary_glb_url
+                if textured_glb_url:
+                    textured_glb_url = primary_glb_url
             if thumbnail_url:
-                thumbnail_url = safe_upload_to_s3(thumbnail_url, "image/png", "thumbnails", s3_name, user_id=user_id)
-            if textured_glb_url:
-                textured_glb_url = safe_upload_to_s3(textured_glb_url, "model/gltf-binary", "models", f"{s3_name}_textured", user_id=user_id)
+                thumbnail_url = safe_upload_to_s3(
+                    thumbnail_url,
+                    "image/png",
+                    "thumbnails",
+                    job_key,
+                    user_id=user_id,
+                    key_base=f"thumbnails/{s3_user_id}/{job_key}",
+                    infer_content_type=False,
+                )
             if rigged_glb_url:
-                rigged_glb_url = safe_upload_to_s3(rigged_glb_url, "model/gltf-binary", "models", f"{s3_name}_rigged", user_id=user_id)
+                rigged_glb_url = safe_upload_to_s3(
+                    rigged_glb_url,
+                    "model/gltf-binary",
+                    "models",
+                    job_key,
+                    user_id=user_id,
+                    key_base=f"models/{s3_user_id}/{job_key}",
+                )
             if rigged_fbx_url:
-                rigged_fbx_url = safe_upload_to_s3(rigged_fbx_url, "application/octet-stream", "models", f"{s3_name}_rigged_fbx", user_id=user_id)
+                rigged_fbx_url = safe_upload_to_s3(
+                    rigged_fbx_url,
+                    "application/x-fbx",
+                    "models",
+                    job_key,
+                    user_id=user_id,
+                    key_base=f"models/{s3_user_id}/{job_key}",
+                )
 
             # Prefer textured output as the canonical model when available
-            primary_glb_url = textured_glb_url or glb_url
+            if not primary_glb_source:
+                primary_glb_url = None
 
             # Upload texture images to S3
-            if texture_urls:
-                texture_urls = [
-                    safe_upload_to_s3(url, "image/png", "textures", f"{s3_name}_tex{i}", user_id=user_id)
-                    for i, url in enumerate(texture_urls)
-                ]
+            texture_s3_urls = {}
+            texture_urls = []
+            for idx, (map_type, url) in enumerate(normalized_textures):
+                safe_map_type = sanitize_filename(map_type) or f"texture_{idx}"
+                uploaded_url = safe_upload_to_s3(
+                    url,
+                    "image/png",
+                    "textures",
+                    f"{s3_name}_{safe_map_type}",
+                    user_id=user_id,
+                    key_base=f"textures/{s3_user_id}/{job_key}/{safe_map_type}",
+                    infer_content_type=False,
+                )
+                texture_s3_urls[safe_map_type] = uploaded_url
+                if uploaded_url:
+                    texture_urls.append(uploaded_url)
 
-            # Upload model format URLs to S3
-            for fmt in list(model_urls.keys()):
-                if model_urls[fmt]:
-                    model_urls[fmt] = safe_upload_to_s3(model_urls[fmt], "application/octet-stream", "models", f"{s3_name}_{fmt}", user_id=user_id)
-            for fmt in list(textured_model_urls.keys()):
-                if textured_model_urls[fmt]:
-                    textured_model_urls[fmt] = safe_upload_to_s3(textured_model_urls[fmt], "application/octet-stream", "models", f"{s3_name}_textured_{fmt}", user_id=user_id)
+            # Upload model format URLs to S3 (prefer textured variants)
+            format_content_types = {
+                "glb": "model/gltf-binary",
+                "gltf": "model/gltf+json",
+                "fbx": "application/x-fbx",
+                "obj": "model/obj",
+                "stl": "model/stl",
+                "usdz": "model/vnd.usdz+zip",
+            }
+            model_key_base = f"models/{s3_user_id}/{job_key}"
+            model_urls_uploaded = {}
+            textured_model_urls_uploaded = {}
+
+            for fmt, url in (textured_model_urls or {}).items():
+                if not url:
+                    continue
+                fmt_key = str(fmt).lower()
+                ct = format_content_types.get(fmt_key) or get_content_type_from_url(url)
+                uploaded = safe_upload_to_s3(
+                    url,
+                    ct,
+                    "models",
+                    f"{job_key}_{fmt_key}",
+                    user_id=user_id,
+                    key_base=model_key_base,
+                )
+                textured_model_urls_uploaded[fmt_key] = uploaded
+                model_urls_uploaded[fmt_key] = uploaded
+
+            for fmt, url in (model_urls or {}).items():
+                if not url:
+                    continue
+                fmt_key = str(fmt).lower()
+                if fmt_key in model_urls_uploaded:
+                    continue
+                ct = format_content_types.get(fmt_key) or get_content_type_from_url(url)
+                model_urls_uploaded[fmt_key] = safe_upload_to_s3(
+                    url,
+                    ct,
+                    "models",
+                    f"{job_key}_{fmt_key}",
+                    user_id=user_id,
+                    key_base=model_key_base,
+                )
+
+            model_urls = model_urls_uploaded
+            textured_model_urls = textured_model_urls_uploaded
 
             # Determine item type
             item_type = 'model'
@@ -1199,6 +1556,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "rigged_character_glb_url": rigged_glb_url,
                 "rigged_character_fbx_url": rigged_fbx_url,
                 "texture_urls": texture_urls,
+                "texture_s3_urls": texture_s3_urls,
                 "model_urls": model_urls,
                 "textured_model_urls": textured_model_urls,
             }
@@ -1211,64 +1569,57 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   title: {final_title}")
             print(f"[DB] Inserting history_items with id={history_uuid}")
 
-            final_stage = status_data.get("stage") or job_meta.get("stage") or 'preview'
-            final_prompt = job_meta.get("prompt")
-            root_prompt = job_meta.get("root_prompt") or final_prompt
-
             model_id = None
             if primary_glb_url or model_urls or textured_model_urls or rigged_glb_url:
-                provider = _map_provider(job_type)
                 model_meta = {
                     "textured_glb_url": textured_glb_url,
                     "rigged_character_glb_url": rigged_glb_url,
                     "rigged_fbx_url": rigged_fbx_url,
                     "texture_urls": texture_urls,
+                    "texture_s3_urls": texture_s3_urls,
                     "model_urls": model_urls,
                     "textured_model_urls": textured_model_urls,
                     "stage": final_stage,
                 }
 
-                if user_id:
+                existing_by_hash_id = None
+                if model_content_hash:
                     cur.execute(f"""
                         SELECT id FROM {APP_SCHEMA}.models
-                        WHERE provider = %s AND upstream_job_id = %s
-                          AND (identity_id = %s OR identity_id IS NULL)
-                        ORDER BY created_at DESC
+                        WHERE provider = %s AND content_hash = %s
                         LIMIT 1
-                    """, (provider, job_id, user_id))
-                else:
-                    cur.execute(f"""
-                        SELECT id FROM {APP_SCHEMA}.models
-                        WHERE provider = %s AND upstream_job_id = %s
-                          AND identity_id IS NULL
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                    """, (provider, job_id))
-                existing_model = cur.fetchone()
+                    """, (provider, model_content_hash))
+                    row = cur.fetchone()
+                    if row:
+                        existing_by_hash_id = row["id"]
 
-                if existing_model:
-                    model_id = existing_model["id"]
+                if existing_by_hash_id:
                     cur.execute(f"""
                         UPDATE {APP_SCHEMA}.models
                         SET identity_id = COALESCE(%s, identity_id),
                             title = COALESCE(%s, title),
                             prompt = COALESCE(%s, prompt),
                             root_prompt = COALESCE(%s, root_prompt),
+                            upstream_job_id = COALESCE(upstream_job_id, %s),
                             status = 'ready',
-                            glb_url = %s,
-                            thumbnail_url = %s,
-                            meta = %s,
+                            glb_url = COALESCE(%s, glb_url),
+                            thumbnail_url = COALESCE(%s, thumbnail_url),
+                            content_hash = COALESCE(%s, content_hash),
+                            meta = COALESCE(%s, meta),
                             updated_at = NOW()
                         WHERE id = %s
+                        RETURNING id
                     """, (
                         user_id,
                         final_title,
                         final_prompt,
                         root_prompt,
+                        job_id,
                         primary_glb_url,
                         thumbnail_url,
+                        model_content_hash,
                         json.dumps(model_meta),
-                        model_id,
+                        existing_by_hash_id,
                     ))
                 else:
                     cur.execute(f"""
@@ -1278,6 +1629,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             provider, upstream_job_id,
                             status,
                             glb_url, thumbnail_url,
+                            content_hash,
                             meta
                         ) VALUES (
                             %s, %s,
@@ -1285,8 +1637,20 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             %s, %s,
                             %s,
                             %s, %s,
+                            %s,
                             %s
                         )
+                        ON CONFLICT (provider, upstream_job_id) DO UPDATE
+                        SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.models.identity_id),
+                            title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.models.title),
+                            prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.models.prompt),
+                            root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.models.root_prompt),
+                            status = 'ready',
+                            glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.models.glb_url),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.models.thumbnail_url),
+                            content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.models.content_hash),
+                            meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.models.meta),
+                            updated_at = NOW()
                         RETURNING id
                     """, (
                         str(uuid.uuid4()),
@@ -1299,12 +1663,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         "ready",
                         primary_glb_url,
                         thumbnail_url,
+                        model_content_hash,
                         json.dumps(model_meta),
                     ))
-                    model_row = cur.fetchone()
-                    if not model_row:
-                        raise RuntimeError("[DB] Failed to insert model row (no id returned)")
-                    model_id = model_row["id"]
+                model_row = cur.fetchone()
+                if not model_row:
+                    raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
+                model_id = model_row["id"]
 
             cur.execute(f"""
                 INSERT INTO {APP_SCHEMA}.history_items (
@@ -1366,6 +1731,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             "rigged_character_glb_url": rigged_glb_url,
             "rigged_character_fbx_url": rigged_fbx_url,
             "texture_urls": texture_urls,
+            "texture_s3_urls": texture_s3_urls,
             "model_urls": model_urls,
             "textured_model_urls": textured_model_urls,
         }
@@ -2755,18 +3121,6 @@ def api_image_to_3d_start():
         return jsonify({"error": "image_url required"}), 400
 
     prompt = (body.get("prompt") or "").strip()
-    s3_name = prompt if prompt else "image_to_3d_source"
-
-    # Upload source image to S3 for permanent storage with readable name
-    # safe_upload_to_s3 handles anonymous uploads (user_id=None -> "anonymous" folder)
-    s3_image_url = image_url
-    if AWS_BUCKET_MODELS:
-        try:
-            s3_image_url = safe_upload_to_s3(image_url, "image/png", "source_images", s3_name, user_id=user_id)
-            print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
-        except Exception as e:
-            print(f"[image-to-3d] Failed to upload source image to S3: {e}, using original URL")
-
     payload = {
         "image_url": image_url,  # Send original URL to Meshy (they need to fetch it)
         "prompt": prompt,
@@ -2780,6 +3134,26 @@ def api_image_to_3d_start():
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        s3_name = prompt if prompt else "image_to_3d_source"
+        s3_user_id = user_id or "anonymous"
+
+        # Upload source image to S3 for permanent storage with deterministic key
+        # safe_upload_to_s3 handles anonymous uploads (user_id=None -> "anonymous" folder)
+        s3_image_url = image_url
+        if AWS_BUCKET_MODELS:
+            try:
+                s3_image_url = safe_upload_to_s3(
+                    image_url,
+                    "image/png",
+                    "source_images",
+                    s3_name,
+                    user_id=user_id,
+                    key_base=f"source_images/{s3_user_id}/{job_id}",
+                )
+                print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
+            except Exception as e:
+                print(f"[image-to-3d] Failed to upload source image to S3: {e}, using original URL")
 
         # Save metadata to store so we can retrieve it when job finishes
         store = load_store()
@@ -3137,6 +3511,26 @@ def api_history():
                                         use_id = str(uuid.uuid4())
                                         item["original_id"] = item_id
 
+                                s3_user_id = user_id or "anonymous"
+                                if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
+                                    thumbnail_url = ensure_s3_url_for_data_uri(
+                                        thumbnail_url,
+                                        "thumbnails",
+                                        f"thumbnails/{s3_user_id}/{use_id}",
+                                        user_id=user_id,
+                                        name="thumbnail",
+                                    )
+                                if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
+                                    image_url = ensure_s3_url_for_data_uri(
+                                        image_url,
+                                        "images",
+                                        f"images/{s3_user_id}/{use_id}",
+                                        user_id=user_id,
+                                        name="image",
+                                    )
+                                item["thumbnail_url"] = thumbnail_url
+                                item["image_url"] = image_url
+
                                 item["id"] = use_id
 
                                 if existing_id:
@@ -3163,7 +3557,20 @@ def api_history():
                                         f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
                                                root_prompt, thumbnail_url, glb_url, image_url, payload)
                                            VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s);""",
+                                               %s, %s, %s, %s, %s)
+                                           ON CONFLICT (id) DO UPDATE
+                                           SET item_type = EXCLUDED.item_type,
+                                               status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
+                                               stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
+                                               title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                                               prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                                               root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                                               identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                                               thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                                               glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
+                                               image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                                               payload = EXCLUDED.payload,
+                                               updated_at = NOW();""",
                                         (use_id, user_id, item_type, status, stage, title, prompt,
                                          root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
                                     )
@@ -3255,6 +3662,26 @@ def api_history_item_add():
                                     use_id = str(uuid.uuid4())
                                     item["original_id"] = item_id
 
+                            s3_user_id = user_id or "anonymous"
+                            if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
+                                thumbnail_url = ensure_s3_url_for_data_uri(
+                                    thumbnail_url,
+                                    "thumbnails",
+                                    f"thumbnails/{s3_user_id}/{use_id}",
+                                    user_id=user_id,
+                                    name="thumbnail",
+                                )
+                            if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
+                                image_url = ensure_s3_url_for_data_uri(
+                                    image_url,
+                                    "images",
+                                    f"images/{s3_user_id}/{use_id}",
+                                    user_id=user_id,
+                                    name="image",
+                                )
+                            item["thumbnail_url"] = thumbnail_url
+                            item["image_url"] = image_url
+
                             item["id"] = use_id
 
                             if existing_id:
@@ -3281,7 +3708,20 @@ def api_history_item_add():
                                     f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
                                            root_prompt, thumbnail_url, glb_url, image_url, payload)
                                        VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s);""",
+                                           %s, %s, %s, %s, %s)
+                                       ON CONFLICT (id) DO UPDATE
+                                       SET item_type = EXCLUDED.item_type,
+                                           status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
+                                           stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
+                                           title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                                           prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                                           root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                                           identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                                           thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                                           glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
+                                           image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                                           payload = EXCLUDED.payload,
+                                           updated_at = NOW();""",
                                     (use_id, user_id, item_type, status, stage, title, prompt,
                                      root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
                                 )
@@ -3389,6 +3829,27 @@ def api_history_item_update(item_id):
                                 thumbnail_url = updates.get("thumbnail_url")
                                 glb_url = updates.get("glb_url")
                                 image_url = updates.get("image_url")
+
+                                s3_user_id = user_id or "anonymous"
+                                if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
+                                    thumbnail_url = ensure_s3_url_for_data_uri(
+                                        thumbnail_url,
+                                        "thumbnails",
+                                        f"thumbnails/{s3_user_id}/{actual_id}",
+                                        user_id=user_id,
+                                        name="thumbnail",
+                                    )
+                                    updates["thumbnail_url"] = thumbnail_url
+                                if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
+                                    image_url = ensure_s3_url_for_data_uri(
+                                        image_url,
+                                        "images",
+                                        f"images/{s3_user_id}/{actual_id}",
+                                        user_id=user_id,
+                                        name="image",
+                                    )
+                                    updates["image_url"] = image_url
+                                existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url"}})
 
                                 # Update with column values if provided (with ownership check)
                                 if user_id:
