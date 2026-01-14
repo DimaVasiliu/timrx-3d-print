@@ -816,24 +816,44 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
 
     try:
         with conn, conn.cursor() as cur:
-            # Check if this image already exists for this user (prevent duplicates)
+            # Check if this image already exists for this user (idempotent updates)
+            existing_history_id = None
+            existing_image_id = None
             if user_id:
                 cur.execute(f"""
-                    SELECT id FROM {APP_SCHEMA}.history_items
+                    SELECT id, image_id FROM {APP_SCHEMA}.history_items
                     WHERE payload->>'original_id' = %s AND identity_id = %s
                     LIMIT 1
                 """, (image_id, user_id))
             else:
                 cur.execute(f"""
-                    SELECT id FROM {APP_SCHEMA}.history_items
+                    SELECT id, image_id FROM {APP_SCHEMA}.history_items
                     WHERE payload->>'original_id' = %s AND identity_id IS NULL
                     LIMIT 1
                 """, (image_id,))
             existing = cur.fetchone()
             if existing:
-                print(f"[DB] Image {image_id} already exists for user {user_id}, skipping duplicate")
-                conn.close()
-                return True
+                existing_history_id = str(existing[0])
+                existing_image_id = str(existing[1]) if existing[1] else None
+
+            if not existing_image_id:
+                if user_id:
+                    cur.execute(f"""
+                        SELECT id FROM {APP_SCHEMA}.images
+                        WHERE provider = 'openai' AND upstream_id = %s
+                          AND (identity_id = %s OR identity_id IS NULL)
+                        LIMIT 1
+                    """, (image_id, user_id))
+                else:
+                    cur.execute(f"""
+                        SELECT id FROM {APP_SCHEMA}.images
+                        WHERE provider = 'openai' AND upstream_id = %s
+                          AND identity_id IS NULL
+                        LIMIT 1
+                    """, (image_id,))
+                image_row = cur.fetchone()
+                if image_row:
+                    existing_image_id = str(image_row[0])
 
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
             s3_name = prompt or "image"
@@ -854,9 +874,9 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 except ValueError:
                     pass
 
-            # Generate a proper UUID for the history item
-            history_uuid = str(uuid.uuid4())
-            image_uuid = str(uuid.uuid4())
+            # Generate or reuse UUIDs for idempotent writes
+            history_uuid = existing_history_id or str(uuid.uuid4())
+            image_uuid = existing_image_id or str(uuid.uuid4())
 
             # Store extra metadata in payload JSONB
             payload = {
@@ -868,77 +888,134 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
 
             title = (prompt[:50] if prompt else "Generated Image")
 
-            # Insert image row
-            cur.execute(f"""
-                INSERT INTO {APP_SCHEMA}.images (
-                    id, identity_id,
-                    title, prompt,
-                    provider, upstream_id, status,
-                    image_url, thumbnail_url,
-                    width, height,
-                    meta
-                ) VALUES (
-                    %s, %s,
-                    %s, %s,
-                    %s, %s, %s,
-                    %s, %s,
-                    %s, %s,
-                    %s
-                )
-                RETURNING id
-            """, (
-                image_uuid,
-                user_id,
-                title,
-                prompt,
-                "openai",
-                image_id,
-                "ready",
-                image_url,
-                image_url,
-                width,
-                height,
-                json.dumps({
-                    "prompt": prompt,
-                    "ai_model": ai_model,
-                    "size": size,
-                    "format": "png",
-                    "image_urls": image_urls or [image_url],
-                }),
-            ))
-            returned_image_id = cur.fetchone()[0]
+            image_meta = json.dumps({
+                "prompt": prompt,
+                "ai_model": ai_model,
+                "size": size,
+                "format": "png",
+                "image_urls": image_urls or [image_url],
+            })
 
-            # Insert history row
-            cur.execute(f"""
-                INSERT INTO {APP_SCHEMA}.history_items (
-                    id, identity_id, item_type, status, stage,
-                    title, prompt, root_prompt,
-                    thumbnail_url, image_url,
+            if existing_image_id:
+                cur.execute(f"""
+                    UPDATE {APP_SCHEMA}.images
+                    SET identity_id = COALESCE(%s, identity_id),
+                        title = COALESCE(%s, title),
+                        prompt = COALESCE(%s, prompt),
+                        provider = %s,
+                        upstream_id = %s,
+                        status = %s,
+                        image_url = COALESCE(%s, image_url),
+                        thumbnail_url = COALESCE(%s, thumbnail_url),
+                        width = COALESCE(%s, width),
+                        height = COALESCE(%s, height),
+                        meta = %s
+                    WHERE id = %s
+                """, (
+                    user_id,
+                    title,
+                    prompt,
+                    "openai",
                     image_id,
-                    payload
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s,
-                    %s,
-                    %s
-                )
-                RETURNING id
-            """, (
-                history_uuid,
-                user_id,
-                "image",
-                "finished",
-                "image",
-                title,
-                prompt,
-                None,
-                image_url,
-                image_url,
-                returned_image_id,
-                json.dumps(payload),
-            ))
-            _ = cur.fetchone()[0]
+                    "ready",
+                    image_url,
+                    image_url,
+                    width,
+                    height,
+                    image_meta,
+                    image_uuid,
+                ))
+            else:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.images (
+                        id, identity_id,
+                        title, prompt,
+                        provider, upstream_id, status,
+                        image_url, thumbnail_url,
+                        width, height,
+                        meta
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s
+                    )
+                """, (
+                    image_uuid,
+                    user_id,
+                    title,
+                    prompt,
+                    "openai",
+                    image_id,
+                    "ready",
+                    image_url,
+                    image_url,
+                    width,
+                    height,
+                    image_meta,
+                ))
+
+            if existing_history_id:
+                cur.execute(f"""
+                    UPDATE {APP_SCHEMA}.history_items
+                    SET item_type = %s,
+                        status = COALESCE(%s, status),
+                        stage = COALESCE(%s, stage),
+                        title = COALESCE(%s, title),
+                        prompt = COALESCE(%s, prompt),
+                        root_prompt = COALESCE(%s, root_prompt),
+                        identity_id = COALESCE(%s, identity_id),
+                        thumbnail_url = COALESCE(%s, thumbnail_url),
+                        image_url = COALESCE(%s, image_url),
+                        image_id = %s,
+                        payload = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                """, (
+                    "image",
+                    "finished",
+                    "image",
+                    title,
+                    prompt,
+                    None,
+                    user_id,
+                    image_url,
+                    image_url,
+                    image_uuid,
+                    json.dumps(payload),
+                    history_uuid,
+                ))
+            else:
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.history_items (
+                        id, identity_id, item_type, status, stage,
+                        title, prompt, root_prompt,
+                        thumbnail_url, image_url,
+                        image_id,
+                        payload
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s,
+                        %s
+                    )
+                """, (
+                    history_uuid,
+                    user_id,
+                    "image",
+                    "finished",
+                    "image",
+                    title,
+                    prompt,
+                    None,
+                    image_url,
+                    image_url,
+                    image_uuid,
+                    json.dumps(payload),
+                ))
 
         conn.close()
         print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
@@ -973,37 +1050,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
     try:
         with conn, conn.cursor(row_factory=dict_row) as cur:
-            # Check if this job already has S3 URLs - if so, skip re-upload
-            # Also verify user ownership
-            if user_id:
-                cur.execute(f"""
-                    SELECT id, thumbnail_url, glb_url FROM {APP_SCHEMA}.history_items
-                    WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
-                    LIMIT 1
-                """, (job_id, user_id))
-            else:
-                cur.execute(f"""
-                    SELECT id, thumbnail_url, glb_url FROM {APP_SCHEMA}.history_items
-                    WHERE id::text = %s AND identity_id IS NULL
-                    LIMIT 1
-                """, (job_id,))
-            existing = cur.fetchone()
-            if existing:
-                existing_id = existing["id"]
-                existing_thumb = existing["thumbnail_url"]
-                existing_glb = existing["glb_url"]
-                # Check if existing entry already has S3 URLs
-                has_s3 = any(
-                    url and 's3.' in url and 'amazonaws.com' in url
-                    for url in [existing_thumb, existing_glb] if url
-                )
-                if has_s3:
-                    print(f"[DB] Job {job_id} already exists with S3 URLs (id={existing_id}), skipping")
-                    conn.close()
-                    return True
-                else:
-                    print(f"[DB] Job {job_id} exists with Meshy URLs, will update to S3 version...")
-
             # Merge status_data and job_meta
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
             thumbnail_url = status_data.get("thumbnail_url")
@@ -1199,7 +1245,10 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         thumbnail_url,
                         json.dumps(model_meta),
                     ))
-                    model_id = cur.fetchone()[0]
+                    model_row = cur.fetchone()
+                    if not model_row:
+                        raise RuntimeError("[DB] Failed to insert model row (no id returned)")
+                    model_id = model_row["id"]
 
             cur.execute(f"""
                 INSERT INTO {APP_SCHEMA}.history_items (
@@ -1244,7 +1293,10 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 model_id,
                 json.dumps(payload),
             ))
-            returned_id = cur.fetchone()[0]
+            history_row = cur.fetchone()
+            if not history_row:
+                raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
+            returned_id = history_row["id"]
             print(f"[DB] Upserted history_items with id={returned_id}")
 
         conn.close()
@@ -1880,11 +1932,9 @@ def db_check():
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT 1;")
-            one = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM timrx_app.history_items;")
-            count = cur.fetchone()[0]
+            _ = cur.fetchone()
         conn.close()
-        return jsonify({"ok": True, "select_1": one, "history_items_count": count})
+        return jsonify({"ok": True, "db": "connected"})
     except Exception as e:
         print(f"[DB] db_check failed: {e}")
         try:
@@ -2979,17 +3029,16 @@ def api_history():
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            skipped = 0
                             saved = 0
                             for item in payload:
                                 item_id = item.get("id") or item.get("job_id")
                                 if not item_id:
                                     continue
 
-                                # Check if this item already exists with S3 URLs (for this user)
+                                # Check if this item already exists for this user
                                 if user_id:
                                     cur.execute(f"""
-                                        SELECT id, thumbnail_url, glb_url, image_url FROM {APP_SCHEMA}.history_items
+                                        SELECT id FROM {APP_SCHEMA}.history_items
                                         WHERE (id::text = %s
                                            OR payload->>'original_job_id' = %s
                                            OR payload->>'original_id' = %s
@@ -2999,7 +3048,7 @@ def api_history():
                                     """, (str(item_id), str(item_id), str(item_id), str(item_id), user_id))
                                 else:
                                     cur.execute(f"""
-                                        SELECT id, thumbnail_url, glb_url, image_url FROM {APP_SCHEMA}.history_items
+                                        SELECT id FROM {APP_SCHEMA}.history_items
                                         WHERE (id::text = %s
                                            OR payload->>'original_job_id' = %s
                                            OR payload->>'original_id' = %s
@@ -3008,17 +3057,7 @@ def api_history():
                                         LIMIT 1
                                     """, (str(item_id), str(item_id), str(item_id), str(item_id)))
                                 existing = cur.fetchone()
-
-                                if existing:
-                                    _, existing_thumb, existing_glb, existing_img = existing
-                                    has_s3 = any(
-                                        url and 's3.' in url and 'amazonaws.com' in url
-                                        for url in [existing_thumb, existing_glb, existing_img]
-                                        if url
-                                    )
-                                    if has_s3:
-                                        skipped += 1
-                                        continue  # Skip - already saved with S3 URLs
+                                existing_id = existing[0] if existing else None
 
                                 # Extract fields for the schema
                                 item_type = item.get("type") or item.get("item_type") or "model"
@@ -3026,53 +3065,55 @@ def api_history():
                                 stage = item.get("stage")
                                 title = item.get("title")
                                 prompt = item.get("prompt")
+                                root_prompt = item.get("root_prompt")
                                 thumbnail_url = item.get("thumbnail_url")
                                 glb_url = item.get("glb_url")
                                 image_url = item.get("image_url")
 
                                 # Check if item has valid UUID id
-                                try:
-                                    # Validate as UUID
-                                    uuid.UUID(str(item_id))
-                                    use_id = str(item_id)
-                                except (ValueError, TypeError, AttributeError):
-                                    # Generate new UUID, store original id in payload
-                                    use_id = str(uuid.uuid4())
-                                    item["original_id"] = item_id
+                                if existing_id:
+                                    use_id = str(existing_id)
+                                else:
+                                    try:
+                                        uuid.UUID(str(item_id))
+                                        use_id = str(item_id)
+                                    except (ValueError, TypeError, AttributeError):
+                                        use_id = str(uuid.uuid4())
+                                        item["original_id"] = item_id
 
-                                # Preserve S3 URLs - don't overwrite with Meshy URLs
-                                cur.execute(
-                                    f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                           thumbnail_url, glb_url, image_url, payload)
-                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                       ON CONFLICT (id) DO UPDATE
-                                       SET item_type = EXCLUDED.item_type,
-                                           status = EXCLUDED.status,
-                                           stage = EXCLUDED.stage,
-                                           title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
-                                           prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
-                                           identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                                           -- Keep S3 URLs if they exist, otherwise use new value
-                                           thumbnail_url = CASE
-                                               WHEN {APP_SCHEMA}.history_items.thumbnail_url LIKE '%%s3.%%amazonaws.com%%' THEN {APP_SCHEMA}.history_items.thumbnail_url
-                                               ELSE COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url)
-                                           END,
-                                           glb_url = CASE
-                                               WHEN {APP_SCHEMA}.history_items.glb_url LIKE '%%s3.%%amazonaws.com%%' THEN {APP_SCHEMA}.history_items.glb_url
-                                               ELSE COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url)
-                                           END,
-                                           image_url = CASE
-                                               WHEN {APP_SCHEMA}.history_items.image_url LIKE '%%s3.%%amazonaws.com%%' THEN {APP_SCHEMA}.history_items.image_url
-                                               ELSE COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url)
-                                           END,
-                                           payload = EXCLUDED.payload,
-                                           updated_at = NOW();""",
-                                    (use_id, user_id, item_type, status, stage, title, prompt,
-                                     thumbnail_url, glb_url, image_url, json.dumps(item))
-                                )
+                                item["id"] = use_id
+
+                                if existing_id:
+                                    cur.execute(
+                                        f"""UPDATE {APP_SCHEMA}.history_items
+                                           SET item_type = %s,
+                                               status = COALESCE(%s, status),
+                                               stage = COALESCE(%s, stage),
+                                               title = COALESCE(%s, title),
+                                               prompt = COALESCE(%s, prompt),
+                                               root_prompt = COALESCE(%s, root_prompt),
+                                               identity_id = COALESCE(%s, identity_id),
+                                               thumbnail_url = COALESCE(%s, thumbnail_url),
+                                               glb_url = COALESCE(%s, glb_url),
+                                               image_url = COALESCE(%s, image_url),
+                                               payload = %s,
+                                               updated_at = NOW()
+                                           WHERE id = %s;""",
+                                        (item_type, status, stage, title, prompt, root_prompt, user_id,
+                                         thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
+                                    )
+                                else:
+                                    cur.execute(
+                                        f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
+                                               root_prompt, thumbnail_url, glb_url, image_url, payload)
+                                           VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                               %s, %s, %s, %s, %s);""",
+                                        (use_id, user_id, item_type, status, stage, title, prompt,
+                                         root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
+                                    )
                                 saved += 1
                     conn.close()
-                    print(f"[History] Saved {saved} items to DB, skipped {skipped} with S3 URLs")
+                    print(f"[History] Saved {saved} items to DB")
                 except Exception as e:
                     print(f"[History] DB write failed: {e}")
                     import traceback
@@ -3112,10 +3153,10 @@ def api_history_item_add():
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            # Check if this item already exists with S3 URLs (for this user)
+                            # Check if this item already exists (for this user)
                             if user_id:
                                 cur.execute(f"""
-                                    SELECT id, thumbnail_url, glb_url, image_url FROM {APP_SCHEMA}.history_items
+                                    SELECT id FROM {APP_SCHEMA}.history_items
                                     WHERE (id::text = %s
                                        OR payload->>'original_job_id' = %s
                                        OR payload->>'original_id' = %s
@@ -3125,7 +3166,7 @@ def api_history_item_add():
                                 """, (str(item_id), str(item_id), str(item_id), str(item_id), user_id))
                             else:
                                 cur.execute(f"""
-                                    SELECT id, thumbnail_url, glb_url, image_url FROM {APP_SCHEMA}.history_items
+                                    SELECT id FROM {APP_SCHEMA}.history_items
                                     WHERE (id::text = %s
                                        OR payload->>'original_job_id' = %s
                                        OR payload->>'original_id' = %s
@@ -3134,19 +3175,7 @@ def api_history_item_add():
                                     LIMIT 1
                                 """, (str(item_id), str(item_id), str(item_id), str(item_id)))
                             existing = cur.fetchone()
-
-                            if existing:
-                                # Check if existing entry has S3 URLs - if so, skip to avoid overwriting
-                                _, existing_thumb, existing_glb, existing_img = existing
-                                has_s3 = any(
-                                    url and 's3.' in url and 'amazonaws.com' in url
-                                    for url in [existing_thumb, existing_glb, existing_img]
-                                    if url
-                                )
-                                if has_s3:
-                                    print(f"[History] Item {item_id} already exists with S3 URLs for user {user_id}, skipping")
-                                    conn.close()
-                                    return jsonify({"ok": True, "id": item_id, "skipped": True, "reason": "already_saved_with_s3"})
+                            existing_id = existing[0] if existing else None
 
                             # Extract fields for the schema
                             item_type = item.get("type") or item.get("item_type") or "model"
@@ -3154,48 +3183,52 @@ def api_history_item_add():
                             stage = item.get("stage")
                             title = item.get("title")
                             prompt = item.get("prompt")
+                            root_prompt = item.get("root_prompt")
                             thumbnail_url = item.get("thumbnail_url")
                             glb_url = item.get("glb_url")
                             image_url = item.get("image_url")
 
                             # Check if item has valid UUID id
-                            try:
-                                uuid.UUID(str(item_id))
-                                use_id = str(item_id)
-                            except (ValueError, TypeError, AttributeError):
-                                use_id = str(uuid.uuid4())
-                                item["original_id"] = item_id
+                            if existing_id:
+                                use_id = str(existing_id)
+                            else:
+                                try:
+                                    uuid.UUID(str(item_id))
+                                    use_id = str(item_id)
+                                except (ValueError, TypeError, AttributeError):
+                                    use_id = str(uuid.uuid4())
+                                    item["original_id"] = item_id
 
-                            # Preserve S3 URLs - don't overwrite with Meshy URLs
-                            cur.execute(
-                                f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                       thumbnail_url, glb_url, image_url, payload)
-                                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                   ON CONFLICT (id) DO UPDATE
-                                   SET item_type = EXCLUDED.item_type,
-                                       status = EXCLUDED.status,
-                                       stage = EXCLUDED.stage,
-                                       title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
-                                       prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
-                                       identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                                       -- Keep S3 URLs if they exist, otherwise use new value
-                                       thumbnail_url = CASE
-                                           WHEN {APP_SCHEMA}.history_items.thumbnail_url LIKE '%%s3.%%amazonaws.com%%' THEN {APP_SCHEMA}.history_items.thumbnail_url
-                                           ELSE COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url)
-                                       END,
-                                       glb_url = CASE
-                                           WHEN {APP_SCHEMA}.history_items.glb_url LIKE '%%s3.%%amazonaws.com%%' THEN {APP_SCHEMA}.history_items.glb_url
-                                           ELSE COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url)
-                                       END,
-                                       image_url = CASE
-                                           WHEN {APP_SCHEMA}.history_items.image_url LIKE '%%s3.%%amazonaws.com%%' THEN {APP_SCHEMA}.history_items.image_url
-                                           ELSE COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url)
-                                       END,
-                                       payload = EXCLUDED.payload,
-                                       updated_at = NOW();""",
-                                (use_id, user_id, item_type, status, stage, title, prompt,
-                                 thumbnail_url, glb_url, image_url, json.dumps(item))
-                            )
+                            item["id"] = use_id
+
+                            if existing_id:
+                                cur.execute(
+                                    f"""UPDATE {APP_SCHEMA}.history_items
+                                       SET item_type = %s,
+                                           status = COALESCE(%s, status),
+                                           stage = COALESCE(%s, stage),
+                                           title = COALESCE(%s, title),
+                                           prompt = COALESCE(%s, prompt),
+                                           root_prompt = COALESCE(%s, root_prompt),
+                                           identity_id = COALESCE(%s, identity_id),
+                                           thumbnail_url = COALESCE(%s, thumbnail_url),
+                                           glb_url = COALESCE(%s, glb_url),
+                                           image_url = COALESCE(%s, image_url),
+                                           payload = %s,
+                                           updated_at = NOW()
+                                       WHERE id = %s;""",
+                                    (item_type, status, stage, title, prompt, root_prompt, user_id,
+                                     thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
+                                )
+                            else:
+                                cur.execute(
+                                    f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
+                                           root_prompt, thumbnail_url, glb_url, image_url, payload)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                           %s, %s, %s, %s, %s);""",
+                                    (use_id, user_id, item_type, status, stage, title, prompt,
+                                     root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
+                                )
                             db_ok = True
                             item_id = use_id  # Return the actual UUID used
                     conn.close()
