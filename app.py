@@ -326,7 +326,7 @@ CORS(
     supports_credentials=True,  # Required for httpOnly cookies
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 )
 
 @app.before_request
@@ -471,7 +471,10 @@ def get_db_conn():
     if not USE_DB:
         return None
     try:
-        return psycopg.connect(DATABASE_URL, connect_timeout=5)
+        conn = psycopg.connect(DATABASE_URL, connect_timeout=5)
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO timrx_app, timrx_billing, public;")
+        return conn
     except Exception as e:
         print(f"[DB] Connection error: {e}")
         return None
