@@ -2887,56 +2887,58 @@ def api_history():
     if request.method == "GET":
         if USE_DB:
             conn = get_db_conn()
-            if conn:
-                try:
-                    with conn.cursor(row_factory=dict_row) as cur:
-                        # Fetch history items (filtered by user if logged in)
-                        if user_id:
-                            cur.execute(f"""
-                                SELECT id, item_type, status, stage, title, prompt,
-                                       thumbnail_url, glb_url, image_url, payload, created_at
-                                FROM {APP_SCHEMA}.history_items
-                                WHERE identity_id = %s
-                                ORDER BY created_at DESC;
-                            """, (user_id,))
-                        else:
-                            # Anonymous: return all items without user_id (legacy data)
-                            cur.execute(f"""
-                                SELECT id, item_type, status, stage, title, prompt,
-                                       thumbnail_url, glb_url, image_url, payload, created_at
-                                FROM {APP_SCHEMA}.history_items
-                                WHERE identity_id IS NULL
-                                ORDER BY created_at DESC;
-                            """)
-                        rows = cur.fetchall()
-                    conn.close()
-                    print(f"[History] GET: Fetched {len(rows)} items from database")
-                    # Merge DB fields with payload for full item data
-                    items = []
-                    for r in rows:
-                        item = r["payload"] if r["payload"] else {}
-                        # Add DB fields to item
-                        item["id"] = str(r["id"])
-                        item["type"] = r["item_type"]
-                        item["status"] = r["status"]
-                        if r["stage"]: item["stage"] = r["stage"]
-                        if r["title"]: item["title"] = r["title"]
-                        if r["prompt"]: item["prompt"] = r["prompt"]
-                        if r["thumbnail_url"]: item["thumbnail_url"] = r["thumbnail_url"]
-                        if r["glb_url"]: item["glb_url"] = r["glb_url"]
-                        if r["image_url"]: item["image_url"] = r["image_url"]
-                        if r["created_at"]: item["created_at"] = int(r["created_at"].timestamp() * 1000)
-                        items.append(item)
-                    # Log first few items for debugging
-                    for i, item in enumerate(items[:3]):
-                        print(f"[History] Item {i}: title={item.get('title')}, thumbnail={item.get('thumbnail_url', 'None')[:60] if item.get('thumbnail_url') else 'None'}...")
-                    # DEV ONLY: sync to local JSON (no-op in production)
-                    save_history_store(items)
-                    return jsonify(items)
-                except Exception as e:
-                    print(f"[History] DB read failed: {e}")
-                    try: conn.close()
-                    except Exception: pass
+            if not conn:
+                return jsonify({"error": "db_unavailable"}), 503
+            try:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    # Fetch history items (filtered by user if logged in)
+                    if user_id:
+                        cur.execute(f"""
+                            SELECT id, item_type, status, stage, title, prompt,
+                                   thumbnail_url, glb_url, image_url, payload, created_at
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE identity_id = %s
+                            ORDER BY created_at DESC;
+                        """, (user_id,))
+                    else:
+                        # Anonymous: return all items without user_id (legacy data)
+                        cur.execute(f"""
+                            SELECT id, item_type, status, stage, title, prompt,
+                                   thumbnail_url, glb_url, image_url, payload, created_at
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE identity_id IS NULL
+                            ORDER BY created_at DESC;
+                        """)
+                    rows = cur.fetchall()
+                conn.close()
+                print(f"[History] GET: Fetched {len(rows)} items from database")
+                # Merge DB fields with payload for full item data
+                items = []
+                for r in rows:
+                    item = r["payload"] if r["payload"] else {}
+                    # Add DB fields to item
+                    item["id"] = str(r["id"])
+                    item["type"] = r["item_type"]
+                    item["status"] = r["status"]
+                    if r["stage"]: item["stage"] = r["stage"]
+                    if r["title"]: item["title"] = r["title"]
+                    if r["prompt"]: item["prompt"] = r["prompt"]
+                    if r["thumbnail_url"]: item["thumbnail_url"] = r["thumbnail_url"]
+                    if r["glb_url"]: item["glb_url"] = r["glb_url"]
+                    if r["image_url"]: item["image_url"] = r["image_url"]
+                    if r["created_at"]: item["created_at"] = int(r["created_at"].timestamp() * 1000)
+                    items.append(item)
+                # Log first few items for debugging
+                for i, item in enumerate(items[:3]):
+                    print(f"[History] Item {i}: title={item.get('title')}, thumbnail={item.get('thumbnail_url', 'None')[:60] if item.get('thumbnail_url') else 'None'}...")
+                # DEV ONLY: sync to local JSON (no-op in production)
+                save_history_store(items)
+                return jsonify(items)
+            except Exception as e:
+                print(f"[History] DB read failed: {e}")
+                try: conn.close()
+                except Exception: pass
+                return jsonify({"error": "db_query_failed"}), 503
         # DEV ONLY: fallback to local JSON (returns [] in production)
         return jsonify(load_history_store())
 
