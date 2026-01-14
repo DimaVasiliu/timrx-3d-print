@@ -122,6 +122,30 @@ def get_extension_for_content_type(content_type: str) -> str:
     }
     return ext_map.get(content_type, "")
 
+def get_content_type_for_extension(ext: str) -> str:
+    """Get MIME type based on file extension."""
+    ext_map = {
+        ".glb": "model/gltf-binary",
+        ".gltf": "model/gltf+json",
+        ".fbx": "application/x-fbx",
+        ".obj": "model/obj",
+        ".stl": "model/stl",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }
+    return ext_map.get((ext or "").lower(), "application/octet-stream")
+
+def get_content_type_from_url(url: str) -> str:
+    """Infer MIME type from URL extension when possible."""
+    try:
+        path = urlparse(url).path or ""
+        ext = os.path.splitext(path)[1]
+        return get_content_type_for_extension(ext)
+    except Exception:
+        return "application/octet-stream"
+
 def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet-stream", prefix: str = "models", name: str = None, user_id: str = None) -> str:
     """
     Upload raw bytes to S3 and return the public URL.
@@ -203,7 +227,19 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
         name: optional human-readable name to include in the S3 key
         user_id: user UUID for namespacing (uses 'anonymous' folder if missing)
     """
-    print(f"[S3] safe_upload_to_s3 called: prefix={prefix}, user_id={user_id}, name={name}, url={url[:60] if url else 'None'}...")
+    original_url = url
+    if isinstance(url, dict):
+        url = url.get("url") or url.get("href")
+    if not isinstance(url, str):
+        print(f"[S3] SKIP: URL not a string for {prefix} (type={type(original_url).__name__})")
+        return original_url
+    url_preview = url[:60] if url else "None"
+    inferred_type = "application/octet-stream"
+    if url and not url.startswith("data:"):
+        inferred_type = get_content_type_from_url(url)
+        if inferred_type != "application/octet-stream":
+            content_type = inferred_type
+    print(f"[S3] safe_upload_to_s3 called: prefix={prefix}, user_id={user_id}, name={name}, url={url_preview}...")
     if not url:
         print(f"[S3] SKIP: No URL provided for {prefix}")
         return url
@@ -1058,7 +1094,27 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             textured_glb_url = status_data.get("textured_glb_url")
             rigged_glb_url = status_data.get("rigged_character_glb_url")
             rigged_fbx_url = status_data.get("rigged_character_fbx_url")
-            texture_urls = status_data.get("texture_urls") or []
+            raw_texture_urls = status_data.get("texture_urls") or []
+            normalized_texture_urls = []
+            if isinstance(raw_texture_urls, dict):
+                direct_url = raw_texture_urls.get("url") or raw_texture_urls.get("href")
+                if direct_url:
+                    normalized_texture_urls = [direct_url]
+                else:
+                    normalized_texture_urls = list(raw_texture_urls.values())
+            elif isinstance(raw_texture_urls, list):
+                normalized_texture_urls = raw_texture_urls
+            else:
+                normalized_texture_urls = [raw_texture_urls]
+
+            flattened_texture_urls = []
+            for item in normalized_texture_urls:
+                if isinstance(item, dict):
+                    flattened_texture_urls.append(item.get("url") or item.get("href"))
+                else:
+                    flattened_texture_urls.append(item)
+
+            texture_urls = [u for u in flattened_texture_urls if isinstance(u, str) and u]
 
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
@@ -1087,9 +1143,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             primary_glb_url = textured_glb_url or glb_url
 
             # Upload texture images to S3
-            if texture_urls and isinstance(texture_urls, list):
+            if texture_urls:
                 texture_urls = [
-                    safe_upload_to_s3(url, "image/png", "textures", f"{s3_name}_tex{i}", user_id=user_id) if url else url
+                    safe_upload_to_s3(url, "image/png", "textures", f"{s3_name}_tex{i}", user_id=user_id)
                     for i, url in enumerate(texture_urls)
                 ]
 
