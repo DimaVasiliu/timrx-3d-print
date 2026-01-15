@@ -855,7 +855,7 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
                     identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
                     thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
                     glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
-                    image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                    image_url = EXCLUDED.image_url,
                     payload = EXCLUDED.payload,
                     updated_at = NOW()
             """, (
