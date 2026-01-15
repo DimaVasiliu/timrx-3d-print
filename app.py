@@ -4338,6 +4338,10 @@ def api_history_item_update(item_id):
                                 status = updates.get("status")
                                 stage = updates.get("stage")
                                 title = updates.get("title")
+                                if isinstance(title, str):
+                                    title_norm = title.strip().lower()
+                                    if title_norm in ("", "untitled", "(untitled)"):
+                                        title = None
                                 prompt = updates.get("prompt")
                                 thumbnail_url = updates.get("thumbnail_url")
                                 glb_url = updates.get("glb_url")
