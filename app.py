@@ -83,8 +83,6 @@ PROXY_ALLOWED_HOSTS = set(
     if h.strip()
 ) or DEFAULT_PROXY_HOSTS
 
-import re
-
 def sanitize_filename(name: str, max_length: int = 50) -> str:
     """
     Sanitize a string to be safe for use in S3 keys/filenames.
@@ -258,6 +256,32 @@ def collect_s3_keys(history_row: dict) -> list:
 
 def log_db_continue(op: str, err: Exception) -> None:
     print(f"[DB] CONTINUE: {op} failed: {type(err).__name__}: {err}")
+
+# Module-level helper to filter model URLs (used in multiple places)
+def _filter_model_urls(urls: Any) -> dict:
+    """Filter model URLs dict to only include glb and obj formats."""
+    if not isinstance(urls, dict):
+        return {}
+    filtered = {}
+    for key in ("glb", "obj"):
+        val = urls.get(key)
+        if val:
+            filtered[key] = val
+    return filtered
+
+# Module-level status mapping for Meshy API responses
+MESHY_STATUS_MAP = {
+    "PENDING": "pending",
+    "IN_PROGRESS": "running",
+    "SUCCEEDED": "done",
+    "FAILED": "failed",
+    "COMPLETED": "done",
+    "FINISHED": "done",
+    "SUCCESS": "done",
+    "CANCELED": "failed",
+    "CANCELLED": "failed",
+    "TIMEOUT": "failed",
+}
 
 def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: str = None, name: str = None) -> str:
     if not isinstance(url, str) or not url.startswith("data:"):
@@ -503,7 +527,6 @@ if _env_origins == "*":
     # Wildcard mode: allow all origins dynamically
     # NOTE: With credentials=True, we can't use literal "*" - must echo the requesting origin
     ALLOW_ALL_ORIGINS = True
-    import re
     ALLOWED_ORIGINS = [
         # Match any origin - we'll echo it back
         re.compile(r".*"),
@@ -1394,16 +1417,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
             thumbnail_url = status_data.get("thumbnail_url")
             image_url = status_data.get("image_url")
-            def _filter_model_urls(urls: Any) -> dict:
-                if not isinstance(urls, dict):
-                    return {}
-                filtered = {}
-                for key in ("glb", "obj"):
-                    val = urls.get(key)
-                    if val:
-                        filtered[key] = val
-                return filtered
-
             model_urls = _filter_model_urls(status_data.get("model_urls") or {})
             textured_model_urls = _filter_model_urls(status_data.get("textured_model_urls") or {})
             textured_glb_url = status_data.get("textured_glb_url")
@@ -1482,16 +1495,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 log_db_continue("asset_saves_precheck", e)
                 db_errors.append({"op": "asset_saves_precheck", "error": str(e)})
                 existing_save = None
-
-            try:
-                cur.execute(f"""
-                    INSERT INTO {APP_SCHEMA}.asset_saves (provider, upstream_id, stage)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (provider, upstream_id, stage) DO NOTHING
-                """, (provider, str(job_id), final_stage))
-            except Exception as e:
-                log_db_continue("asset_saves_stage_insert", e)
-                db_errors.append({"op": "asset_saves_stage_insert", "error": str(e)})
 
             # Get the name for S3 files from prompt or title
             s3_name = job_meta.get("prompt") or job_meta.get("title") or "model"
@@ -1585,44 +1588,33 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             canonical_raw = primary_glb_url if asset_type == "model" else (image_url or thumbnail_url)
             canonical_url = build_canonical_url(canonical_raw)
-            if canonical_url:
-                cur.execute(f"""
-                    SELECT id FROM {APP_SCHEMA}.asset_saves
-                    WHERE provider = %s AND asset_type = %s AND canonical_url = %s
-                    LIMIT 1
-                """, (provider, asset_type, canonical_url))
-                canonical_row = cur.fetchone()
-            else:
-                canonical_row = None
 
             try:
-                if canonical_row:
-                    cur.execute(f"""
-                        INSERT INTO {APP_SCHEMA}.asset_saves (
-                            provider, asset_type, upstream_id, canonical_url, stage
-                        ) VALUES (
-                            %s, %s, %s, %s, %s
-                        )
-                        ON CONFLICT (provider, asset_type, canonical_url) DO UPDATE
-                        SET upstream_id = COALESCE({APP_SCHEMA}.asset_saves.upstream_id, EXCLUDED.upstream_id),
-                            stage = EXCLUDED.stage,
-                            saved_at = NOW()
-                        RETURNING id
-                    """, (provider, asset_type, str(job_id), canonical_url, final_stage))
-                else:
-                    cur.execute(f"""
-                        INSERT INTO {APP_SCHEMA}.asset_saves (
-                            provider, asset_type, upstream_id, canonical_url, stage
-                        ) VALUES (
-                            %s, %s, %s, %s, %s
-                        )
-                        ON CONFLICT (provider, asset_type, upstream_id) DO UPDATE
-                        SET canonical_url = COALESCE(EXCLUDED.canonical_url, {APP_SCHEMA}.asset_saves.canonical_url),
-                            stage = EXCLUDED.stage,
-                            saved_at = NOW()
-                        RETURNING id
-                    """, (provider, asset_type, str(job_id), canonical_url, final_stage))
+                cur.execute("SAVEPOINT asset_saves_upsert")
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.asset_saves (
+                        provider,
+                        upstream_id,
+                        asset_type,
+                        stage,
+                        canonical_url,
+                        created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, NOW()
+                    )
+                    ON CONFLICT (provider, upstream_id, asset_type)
+                    DO UPDATE
+                    SET canonical_url = EXCLUDED.canonical_url,
+                        stage = EXCLUDED.stage,
+                        updated_at = NOW()
+                """, (provider, str(job_id), asset_type, final_stage, canonical_url))
+                cur.execute("RELEASE SAVEPOINT asset_saves_upsert")
             except Exception as e:
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT asset_saves_upsert")
+                    cur.execute("RELEASE SAVEPOINT asset_saves_upsert")
+                except Exception:
+                    pass
                 log_db_continue("asset_saves_upsert", e)
                 db_errors.append({"op": "asset_saves_upsert", "error": str(e)})
 
@@ -1721,6 +1713,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             glb_s3_key = COALESCE(%s, glb_s3_key),
                             thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
                             content_hash = COALESCE(%s, content_hash),
+                            stage = COALESCE(%s, stage),
                             meta = COALESCE(%s, meta),
                             updated_at = NOW()
                         WHERE id = %s
@@ -1736,6 +1729,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         glb_s3_key,
                         thumbnail_s3_key,
                         model_content_hash,
+                        final_stage,
                         json.dumps(model_meta),
                         existing_by_hash_id,
                     ))
@@ -1749,6 +1743,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             glb_url, thumbnail_url,
                             glb_s3_key, thumbnail_s3_key,
                             content_hash,
+                            stage,
                             meta
                         ) VALUES (
                             %s, %s,
@@ -1757,6 +1752,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             %s,
                             %s, %s,
                             %s, %s,
+                            %s,
                             %s,
                             %s
                         )
@@ -1771,6 +1767,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {APP_SCHEMA}.models.glb_s3_key),
                             thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.models.thumbnail_s3_key),
                             content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.models.content_hash),
+                            stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.models.stage),
                             meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.models.meta),
                             updated_at = NOW()
                         RETURNING id
@@ -1788,6 +1785,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         glb_s3_key,
                         thumbnail_s3_key,
                         model_content_hash,
+                        final_stage,
                         json.dumps(model_meta),
                     ))
                 model_row = cur.fetchone()
@@ -2269,16 +2267,6 @@ def extract_model_urls(ms: dict):
     rigged_fbx = None
     glb_candidates: list[str] = []
 
-    def _filter_model_urls(urls: Any) -> dict:
-        if not isinstance(urls, dict):
-            return {}
-        filtered = {}
-        for key in ("glb", "obj"):
-            val = urls.get(key)
-            if val:
-                filtered[key] = val
-        return filtered
-
     def pick_url(container: dict) -> str | None:
         if not isinstance(container, dict):
             return None
@@ -2367,20 +2355,8 @@ def normalize_status(ms: dict) -> dict:
     Map Meshy task to the shape your frontend expects.
     """
     containers = _task_containers(ms)
-    status_map = {
-        "PENDING": "pending",
-        "IN_PROGRESS": "running",
-        "SUCCEEDED": "done",
-        "FAILED": "failed",
-        "COMPLETED": "done",
-        "FINISHED": "done",
-        "SUCCESS": "done",
-        "CANCELED": "failed",
-        "CANCELLED": "failed",
-        "TIMEOUT": "failed",
-    }
     st_raw = (_pick_first(containers, ["status", "task_status"]) or "").upper()
-    status = status_map.get(st_raw, st_raw.lower() or "pending")
+    status = MESHY_STATUS_MAP.get(st_raw, st_raw.lower() or "pending")
     try:
         pct = int(
             _pick_first(containers, ["progress", "progress_percentage", "progress_percent", "percent"]) or 0
@@ -2410,20 +2386,8 @@ def normalize_status(ms: dict) -> dict:
 
 def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
     containers = _task_containers(ms)
-    status_map = {
-        "PENDING": "pending",
-        "IN_PROGRESS": "running",
-        "SUCCEEDED": "done",
-        "FAILED": "failed",
-        "CANCELED": "failed",
-        "COMPLETED": "done",
-        "FINISHED": "done",
-        "SUCCESS": "done",
-        "CANCELLED": "failed",
-        "TIMEOUT": "failed",
-    }
     st_raw = (_pick_first(containers, ["status", "task_status"]) or "").upper()
-    status = status_map.get(st_raw, st_raw.lower() or "pending")
+    status = MESHY_STATUS_MAP.get(st_raw, st_raw.lower() or "pending")
     try:
         pct = int(
             _pick_first(containers, ["progress", "progress_percentage", "progress_percent", "percent"]) or 0
@@ -2751,9 +2715,6 @@ def api_text_to_3d_status(job_id):
                 out["model_urls"] = s3_result["model_urls"]
             if s3_result.get("texture_urls"):
                 out["texture_urls"] = s3_result["texture_urls"]
-            if s3_result.get("db_ok") is False:
-                out["db_ok"] = False
-                out["db_errors"] = s3_result.get("db_errors")
             if s3_result.get("db_ok") is False:
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
