@@ -376,6 +376,17 @@ def main() -> int:
     if args.apply and not AWS_BUCKET_MODELS:
         print("[backfill_s3] ERROR: AWS_BUCKET_MODELS not configured")
         return 1
+    if db_url:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(db_url)
+            safe_netloc = parsed.hostname or parsed.netloc
+            safe_db = (parsed.path or "").lstrip("/")
+        except Exception:
+            safe_netloc = "unknown"
+            safe_db = "unknown"
+        print(f"[backfill_s3] Target DB: host={safe_netloc} db={safe_db} schema={APP_SCHEMA}")
+        print(f"[backfill_s3] S3 bucket={AWS_BUCKET_MODELS or 'unset'} apply={args.apply} limit={args.limit}")
 
     conn = psycopg.connect(db_url)
     with conn.cursor() as cur:
