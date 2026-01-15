@@ -1105,15 +1105,15 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             if user_id:
                 cur.execute(f"""
                     SELECT id, image_id FROM {APP_SCHEMA}.history_items
-                    WHERE payload->>'original_id' = %s AND identity_id = %s
+                    WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
                     LIMIT 1
-                """, (image_id, user_id))
+                """, (image_id, image_id, user_id))
             else:
                 cur.execute(f"""
                     SELECT id, image_id FROM {APP_SCHEMA}.history_items
-                    WHERE payload->>'original_id' = %s AND identity_id IS NULL
+                    WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id IS NULL
                     LIMIT 1
-                """, (image_id,))
+                """, (image_id, image_id))
             existing = cur.fetchone()
             if existing:
                 existing_history_id = str(existing[0])
@@ -3719,8 +3719,10 @@ def api_openai_image():
             urls.append(f"data:image/png;base64,{item['b64_json']}")
 
     # Save to normalized DB tables
+    image_id = None
     if urls:
-        image_id = f"img_{int(time.time() * 1000)}"
+        client_id = (body.get("client_id") or "").strip()
+        image_id = client_id or f"img_{int(time.time() * 1000)}"
         save_image_to_normalized_db(
             image_id=image_id,
             image_url=urls[0],
@@ -3732,6 +3734,7 @@ def api_openai_image():
         )
 
     return jsonify({
+        "image_id": image_id,
         "image_url": urls[0] if urls else None,
         "image_urls": urls,
         "image_base64": b64_first,
