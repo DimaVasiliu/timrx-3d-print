@@ -1069,9 +1069,13 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             if existing:
                 existing_history_id = str(existing["id"])
 
+            title = (prompt[:50] if prompt else "Generated Image")
+            s3_slug = sanitize_filename(title or prompt or "image") or "image"
+            s3_slug = s3_slug[:60]
+            s3_user_id = str(user_id) if user_id else "public"
+            job_key = sanitize_filename(str(image_id)) or "image"
+            image_key_base = f"images/{s3_user_id}/{job_key}/{s3_slug}"
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
-            s3_user_id = user_id or "public"
-            image_key_base = f"images/{s3_user_id}/{image_id}"
             image_content_hash = None
             if image_url:
                 upload_result = safe_upload_to_s3(
@@ -1096,6 +1100,8 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     ) if url else url
                     for i, url in enumerate(image_urls)
                 ]
+            image_s3_key = get_s3_key_from_url(image_url)
+            thumbnail_s3_key = get_s3_key_from_url(image_url)
 
             # Parse size for width/height
             width, height = 1024, 1024
@@ -1117,9 +1123,8 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 "ai_model": ai_model,
                 "size": size,
                 "image_urls": image_urls or [image_url],
+                "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
             }
-
-            title = (prompt[:50] if prompt else "Generated Image")
 
             image_meta = json.dumps({
                 "prompt": prompt,
@@ -1140,6 +1145,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 if row:
                     existing_by_hash_id = row["id"]
 
+            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             if existing_by_hash_id:
                 cur.execute(f"""
                     UPDATE {APP_SCHEMA}.images
@@ -1148,8 +1154,11 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         prompt = COALESCE(%s, prompt),
                         upstream_id = COALESCE(upstream_id, %s),
                         status = %s,
+                        s3_bucket = COALESCE(%s, s3_bucket),
                         image_url = COALESCE(%s, image_url),
                         thumbnail_url = COALESCE(%s, thumbnail_url),
+                        image_s3_key = COALESCE(%s, image_s3_key),
+                        thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
                         width = COALESCE(%s, width),
                         height = COALESCE(%s, height),
                         content_hash = COALESCE(%s, content_hash),
@@ -1163,8 +1172,11 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     prompt,
                     upstream_id,
                     "ready",
+                    s3_bucket,
                     image_url,
                     image_url,
+                    image_s3_key,
+                    thumbnail_s3_key,
                     width,
                     height,
                     image_content_hash,
@@ -1177,14 +1189,18 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         id, identity_id,
                         title, prompt,
                         provider, upstream_id, status,
+                        s3_bucket,
                         image_url, thumbnail_url,
+                        image_s3_key, thumbnail_s3_key,
                         width, height,
                         content_hash,
                         meta
                     ) VALUES (
                         %s, %s,
                         %s, %s,
+                        %s, %s,
                         %s, %s, %s,
+                        %s,
                         %s, %s,
                         %s, %s,
                         %s,
@@ -1195,8 +1211,11 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                         title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.images.title),
                         prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.images.prompt),
                         status = EXCLUDED.status,
+                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.images.s3_bucket),
                         image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.images.image_url),
                         thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.images.thumbnail_url),
+                        image_s3_key = COALESCE(EXCLUDED.image_s3_key, {APP_SCHEMA}.images.image_s3_key),
+                        thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.images.thumbnail_s3_key),
                         width = COALESCE(EXCLUDED.width, {APP_SCHEMA}.images.width),
                         height = COALESCE(EXCLUDED.height, {APP_SCHEMA}.images.height),
                         content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.images.content_hash),
@@ -1211,8 +1230,11 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     "openai",
                     upstream_id,
                     "ready",
+                    s3_bucket,
                     image_url,
                     image_url,
+                    image_s3_key,
+                    thumbnail_s3_key,
                     width,
                     height,
                     image_content_hash,
@@ -1449,7 +1471,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             final_prompt = job_meta.get("prompt")
             root_prompt = job_meta.get("root_prompt") or final_prompt
             provider = _map_provider(job_type)
-            asset_type = "image" if job_type in ("image", "openai_image") else "model"
+            image_job_types = ("image", "image-studio", "openai-image", "image-gen", "openai_image")
+            is_image_output = (
+                (job_type or "").lower() in image_job_types
+                or bool(status_data.get("image_url"))
+                or (job_meta.get("stage") == "image")
+                or (job_meta.get("item_type") == "image")
+            )
+            asset_type = "image" if is_image_output else "model"
 
             # Idempotency guard: already finished with S3 URL for this asset type
             if user_id:
@@ -1598,7 +1627,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         asset_type,
                         stage,
                         canonical_url,
-                        created_at
+                        saved_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, NOW()
                     )
@@ -1606,7 +1635,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     DO UPDATE
                     SET canonical_url = EXCLUDED.canonical_url,
                         stage = EXCLUDED.stage,
-                        updated_at = NOW()
+                        saved_at = NOW()
                 """, (provider, str(job_id), asset_type, final_stage, canonical_url))
                 cur.execute("RELEASE SAVEPOINT asset_saves_upsert")
             except Exception as e:
@@ -1619,9 +1648,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 db_errors.append({"op": "asset_saves_upsert", "error": str(e)})
 
             # Determine item type
-            item_type = 'model'
-            if job_type in ('image', 'openai_image'):
-                item_type = 'image'
+            item_type = "image" if is_image_output else "model"
 
             # Use the original job_id as the history item ID if it's a valid UUID
             # This ensures frontend and backend use the same ID
@@ -1650,6 +1677,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "source_task_id": job_meta.get("source_task_id"),
                 "cover_image_url": status_data.get("cover_image_url"),
                 "texture_prompt": job_meta.get("texture_prompt"),
+                "s3_bucket": s3_bucket,
                 "enable_pbr": job_meta.get("enable_pbr", False),
                 "enable_original_uv": job_meta.get("enable_original_uv", False),
                 "topology": job_meta.get("topology"),
@@ -1669,6 +1697,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             final_title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else DEFAULT_MODEL_TITLE)
             glb_s3_key = get_s3_key_from_url(primary_glb_url)
             thumbnail_s3_key = get_s3_key_from_url(thumbnail_url)
+            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             print(f"[DB] Final URLs after S3 upload:")
             print(f"[DB]   glb_url: {primary_glb_url[:80] if primary_glb_url else 'None'}...")
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
@@ -1676,6 +1705,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB] Inserting history_items with id={history_uuid}")
 
             model_id = None
+            image_id = None
             if primary_glb_url or model_urls or textured_model_urls or rigged_glb_url:
                 model_meta = {
                     "textured_glb_url": textured_glb_url,
@@ -1686,6 +1716,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "model_urls": model_urls,
                     "textured_model_urls": textured_model_urls,
                     "stage": final_stage,
+                    "s3_bucket": s3_bucket,
                 }
 
                 existing_by_hash_id = None
@@ -1708,6 +1739,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             root_prompt = COALESCE(%s, root_prompt),
                             upstream_id = COALESCE(upstream_id, %s),
                             status = 'ready',
+                            s3_bucket = COALESCE(%s, s3_bucket),
                             glb_url = COALESCE(%s, glb_url),
                             thumbnail_url = COALESCE(%s, thumbnail_url),
                             glb_s3_key = COALESCE(%s, glb_s3_key),
@@ -1724,6 +1756,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         final_prompt,
                         root_prompt,
                         job_id,
+                        s3_bucket,
                         primary_glb_url,
                         thumbnail_url,
                         glb_s3_key,
@@ -1740,6 +1773,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             title, prompt, root_prompt,
                             provider, upstream_id,
                             status,
+                            s3_bucket,
                             glb_url, thumbnail_url,
                             glb_s3_key, thumbnail_s3_key,
                             content_hash,
@@ -1749,6 +1783,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             %s, %s,
                             %s, %s, %s,
                             %s, %s,
+                            %s,
                             %s,
                             %s, %s,
                             %s, %s,
@@ -1762,6 +1797,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.models.prompt),
                             root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.models.root_prompt),
                             status = 'ready',
+                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.models.s3_bucket),
                             glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.models.glb_url),
                             thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.models.thumbnail_url),
                             glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {APP_SCHEMA}.models.glb_s3_key),
@@ -1780,6 +1816,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         provider,
                         job_id,
                         "ready",
+                        s3_bucket,
                         primary_glb_url,
                         thumbnail_url,
                         glb_s3_key,
@@ -1793,18 +1830,84 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
                 model_id = model_row["id"]
 
+            if item_type == "image" and image_url:
+                image_meta = {
+                    "stage": final_stage,
+                    "job_type": job_type,
+                }
+                image_upstream_id = job_meta.get("image_id") or status_data.get("image_id") or str(job_id)
+                image_s3_key = get_s3_key_from_url(image_url)
+                thumb_s3_key = get_s3_key_from_url(thumbnail_url)
+                image_content_hash = None
+                cur.execute(f"""
+                    INSERT INTO {APP_SCHEMA}.images (
+                        id, identity_id,
+                        title, prompt,
+                        provider, upstream_id,
+                        status,
+                        s3_bucket,
+                        image_url, thumbnail_url,
+                        image_s3_key, thumbnail_s3_key,
+                        content_hash,
+                        meta
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s,
+                        %s,
+                        %s, %s,
+                        %s, %s,
+                        %s,
+                        %s
+                    )
+                    ON CONFLICT (provider, upstream_id) DO UPDATE
+                    SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.images.identity_id),
+                        title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.images.title),
+                        prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.images.prompt),
+                        status = 'ready',
+                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.images.s3_bucket),
+                        image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.images.image_url),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.images.thumbnail_url),
+                        image_s3_key = COALESCE(EXCLUDED.image_s3_key, {APP_SCHEMA}.images.image_s3_key),
+                        thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.images.thumbnail_s3_key),
+                        content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.images.content_hash),
+                        meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.images.meta),
+                        updated_at = NOW()
+                    RETURNING id
+                """, (
+                    str(uuid.uuid4()),
+                    user_id,
+                    final_title,
+                    final_prompt,
+                    provider,
+                    image_upstream_id,
+                    "ready",
+                    AWS_BUCKET_MODELS,
+                    image_url,
+                    thumbnail_url,
+                    image_s3_key,
+                    thumb_s3_key,
+                    image_content_hash,
+                    json.dumps(image_meta),
+                ))
+                image_row = cur.fetchone()
+                if not image_row:
+                    raise RuntimeError("[DB] Failed to upsert image row (no id returned)")
+                image_id = image_row["id"]
+
             cur.execute(f"""
                 INSERT INTO {APP_SCHEMA}.history_items (
                     id, identity_id, item_type, status, stage,
                     title, prompt, root_prompt,
                     thumbnail_url, glb_url, image_url,
-                    model_id,
+                    model_id, image_id,
                     payload
                 ) VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s,
                     %s, %s, %s,
-                    %s,
+                    %s, %s,
                     %s
                 )
                 ON CONFLICT (id) DO UPDATE
@@ -1814,10 +1917,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
                     root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
                     identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                    thumbnail_url = EXCLUDED.thumbnail_url,
-                    glb_url = EXCLUDED.glb_url,
+                    thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                    glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
                     image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
                     model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
+                    image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                     payload = EXCLUDED.payload,
                     updated_at = NOW()
                 RETURNING id
@@ -1830,12 +1934,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 final_title,
                 final_prompt,
                 root_prompt,
-                thumbnail_url,
-                primary_glb_url,
-                None,
-                model_id,
-                json.dumps(payload),
-            ))
+                    thumbnail_url,
+                    primary_glb_url,
+                    image_url if item_type == "image" else None,
+                    model_id,
+                    image_id,
+                    json.dumps(payload),
+                ))
             history_row = cur.fetchone()
             if not history_row:
                 raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
