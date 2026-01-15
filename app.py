@@ -727,7 +727,7 @@ def ensure_history_table():
         print("[DB] Could not connect to database for table verification")
         return
     try:
-        with conn, conn.cursor(row_factory=dict_row) as cur:
+        with conn, conn.cursor() as cur:
             # Just verify tables exist, don't try to create them
             cur.execute("""
                 SELECT EXISTS (
@@ -758,7 +758,7 @@ def ensure_active_jobs_table():
     if not conn:
         return
     try:
-        with conn, conn.cursor() as cur:
+        with conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables
@@ -1078,7 +1078,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 """, (image_id,))
             existing = cur.fetchone()
             if existing:
-                existing_history_id = str(existing["id"])
+                existing_history_id = str(existing[0])
 
             title = (prompt[:50] if prompt else "Generated Image")
             s3_slug = sanitize_filename(title or prompt or "image") or "image"
@@ -1099,6 +1099,9 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     return_hash=True,
                 )
                 image_url, image_content_hash = _unpack_upload_result(upload_result)
+                if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
+                    print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
+                    image_url = None
             if image_urls:
                 image_urls = [
                     safe_upload_to_s3(
@@ -1156,7 +1159,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 """, ("openai", image_content_hash))
                 row = cur.fetchone()
                 if row:
-                    existing_by_hash_id = row["id"]
+                    existing_by_hash_id = row[0]
 
             s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             if existing_by_hash_id:
@@ -1339,7 +1342,8 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             image_row = cur.fetchone()
             if not image_row:
                 raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
-            returned_image_id = image_row["id"]
+            returned_image_id = image_row[0]
+            print(f"[DB] image persisted: image_id={returned_image_id} image_url={image_url} thumb={image_url}")
 
             if existing_history_id:
                 cur.execute(f"""
@@ -1419,6 +1423,8 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
+        if image_url and is_s3_url(image_url):
+            print(f"[DB] ERROR: S3 upload succeeded but DB save failed image_id={image_id} image_url={image_url}")
         import traceback
         traceback.print_exc()
         try:
@@ -1484,6 +1490,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             final_prompt = job_meta.get("prompt")
             root_prompt = job_meta.get("root_prompt") or final_prompt
             provider = _map_provider(job_type)
+            s3_bucket = AWS_BUCKET_MODELS or None
             image_job_types = ("image", "image-studio", "openai-image", "image-gen", "openai_image")
             is_image_output = (
                 (job_type or "").lower() in image_job_types
@@ -1597,6 +1604,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             # Prefer textured output as the canonical model when available
             if not primary_model_source:
                 primary_glb_url = None
+            s3_glb_url = primary_glb_url
+            s3_thumbnail_url = thumbnail_url
+            if AWS_BUCKET_MODELS and s3_glb_url and not is_s3_url(s3_glb_url):
+                print(f"[WARN] canonical url is not S3: glb_url={s3_glb_url[:80]}")
+                s3_glb_url = None
+            if AWS_BUCKET_MODELS and s3_thumbnail_url and not is_s3_url(s3_thumbnail_url):
+                print(f"[WARN] canonical url is not S3: thumbnail_url={s3_thumbnail_url[:80]}")
+                s3_thumbnail_url = None
 
             # Upload texture images to S3
             texture_s3_urls = {}
@@ -1619,16 +1634,16 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
-            if primary_glb_url:
+            if s3_glb_url:
                 primary_ext = "obj" if primary_content_type == "model/obj" else "glb"
-                model_urls_uploaded[primary_ext] = primary_glb_url
+                model_urls_uploaded[primary_ext] = s3_glb_url
                 if textured_glb_url and primary_ext == "glb":
-                    textured_model_urls_uploaded["glb"] = primary_glb_url
+                    textured_model_urls_uploaded["glb"] = s3_glb_url
 
             model_urls = model_urls_uploaded
             textured_model_urls = textured_model_urls_uploaded
 
-            canonical_raw = primary_glb_url if asset_type == "model" else (image_url or thumbnail_url)
+            canonical_raw = s3_glb_url if asset_type == "model" else (image_url or s3_thumbnail_url)
             canonical_url = build_canonical_url(canonical_raw)
 
             try:
@@ -1705,24 +1720,26 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "model_urls": model_urls,
                 "textured_model_urls": textured_model_urls,
             }
+            if s3_glb_url:
+                payload["glb_url"] = s3_glb_url
             if image_url:
                 payload["image_url"] = image_url
-            if thumbnail_url:
-                payload["thumbnail_url"] = thumbnail_url
+            if s3_thumbnail_url:
+                payload["thumbnail_url"] = s3_thumbnail_url
 
             # Log final URLs after S3 upload
             final_title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else DEFAULT_MODEL_TITLE)
-            glb_s3_key = get_s3_key_from_url(primary_glb_url)
-            thumbnail_s3_key = get_s3_key_from_url(thumbnail_url)
+            glb_s3_key = get_s3_key_from_url(s3_glb_url)
+            thumbnail_s3_key = get_s3_key_from_url(s3_thumbnail_url)
             print(f"[DB] Final URLs after S3 upload:")
-            print(f"[DB]   glb_url: {primary_glb_url[:80] if primary_glb_url else 'None'}...")
-            print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
+            print(f"[DB]   glb_url: {s3_glb_url[:80] if s3_glb_url else 'None'}...")
+            print(f"[DB]   thumbnail_url: {s3_thumbnail_url[:80] if s3_thumbnail_url else 'None'}...")
             print(f"[DB]   title: {final_title}")
             print(f"[DB] Inserting history_items with id={history_uuid}")
 
             model_id = None
             image_id = None
-            if primary_glb_url or model_urls or textured_model_urls or rigged_glb_url:
+            if s3_glb_url or model_urls or textured_model_urls or rigged_glb_url:
                 model_meta = {
                     "textured_glb_url": textured_glb_url,
                     "rigged_character_glb_url": rigged_glb_url,
@@ -1773,8 +1790,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         root_prompt,
                         job_id,
                         s3_bucket,
-                        primary_glb_url,
-                        thumbnail_url,
+                        s3_glb_url,
+                        s3_thumbnail_url,
                         glb_s3_key,
                         thumbnail_s3_key,
                         model_content_hash,
@@ -1833,8 +1850,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         job_id,
                         "ready",
                         s3_bucket,
-                        primary_glb_url,
-                        thumbnail_url,
+                        s3_glb_url,
+                        s3_thumbnail_url,
                         glb_s3_key,
                         thumbnail_s3_key,
                         model_content_hash,
@@ -1845,6 +1862,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not model_row:
                     raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
                 model_id = model_row["id"]
+                print(f"[DB] model persisted: model_id={model_id} glb_url={s3_glb_url} thumb={s3_thumbnail_url}")
 
             if item_type == "image" and image_url:
                 image_meta = {
@@ -1878,6 +1896,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         user_id=user_id,
                         key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
                     )
+                if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
+                    print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
+                    image_url = None
+                if AWS_BUCKET_MODELS and thumbnail_url and not is_s3_url(thumbnail_url):
+                    print(f"[WARN] canonical url is not S3: thumbnail_url={thumbnail_url[:80]}")
+                    thumbnail_url = None
                 image_s3_key = get_s3_key_from_url(image_url)
                 thumb_s3_key = get_s3_key_from_url(thumbnail_url)
                 cur.execute(f"""
@@ -1936,6 +1960,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not image_row:
                     raise RuntimeError("[DB] Failed to upsert image row (no id returned)")
                 image_id = image_row["id"]
+                print(f"[DB] image persisted: image_id={image_id} image_url={image_url} thumb={thumbnail_url}")
 
             cur.execute(f"""
                 INSERT INTO {APP_SCHEMA}.history_items (
@@ -1960,7 +1985,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
                     thumbnail_url = EXCLUDED.thumbnail_url,
                     glb_url = EXCLUDED.glb_url,
-                    image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                    image_url = EXCLUDED.image_url,
                     model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
                     image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                     payload = EXCLUDED.payload,
@@ -1975,8 +2000,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 final_title,
                 final_prompt,
                 root_prompt,
-                    thumbnail_url,
-                    primary_glb_url,
+                    s3_thumbnail_url,
+                    s3_glb_url,
                     image_url if item_type == "image" else None,
                     model_id,
                     image_id,
@@ -1995,8 +2020,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             "success": True,
             "db_ok": len(db_errors) == 0,
             "db_errors": db_errors or None,
-            "glb_url": primary_glb_url,
-            "thumbnail_url": thumbnail_url,
+            "glb_url": s3_glb_url,
+            "thumbnail_url": s3_thumbnail_url,
             "textured_glb_url": textured_glb_url,
             "rigged_character_glb_url": rigged_glb_url,
             "rigged_character_fbx_url": rigged_fbx_url,
@@ -2007,6 +2032,15 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         }
     except Exception as e:
         print(f"[DB] Failed to save finished job {job_id}: {e}")
+        s3_glb_url = locals().get("s3_glb_url")
+        s3_thumbnail_url = locals().get("s3_thumbnail_url")
+        image_url = locals().get("image_url")
+        if s3_glb_url and is_s3_url(s3_glb_url):
+            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} glb_url={s3_glb_url}")
+        if s3_thumbnail_url and is_s3_url(s3_thumbnail_url):
+            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} thumbnail_url={s3_thumbnail_url}")
+        if image_url and is_s3_url(image_url):
+            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} image_url={image_url}")
         import traceback
         traceback.print_exc()
         try:
