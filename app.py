@@ -493,6 +493,16 @@ def upload_base64_to_s3(data_url: str, prefix: str = "images", name: str = None,
 MESHY_API_KEY  = os.getenv("MESHY_API_KEY", "").strip()
 MESHY_API_BASE = os.getenv("MESHY_API_BASE", "https://api.meshy.ai").rstrip("/")
 
+# Log presence of maintenance scripts shipped with the build (no imports, no execution).
+try:
+    scripts_dir = os.path.join(os.path.dirname(__file__), "scripts")
+    backfill_path = os.path.join(scripts_dir, "backfill_s3.py")
+    dedupe_path = os.path.join(scripts_dir, "dedupe_db.py")
+    print(f"[Scripts] backfill_s3.py present={os.path.exists(backfill_path)} path={backfill_path}")
+    print(f"[Scripts] dedupe_db.py present={os.path.exists(dedupe_path)} path={dedupe_path}")
+except Exception as e:
+    print(f"[Scripts] presence check failed: {e}")
+
 # OpenAI images (DALL·E / GPT-Image)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 ALLOWED_IMAGE_HOSTS = {
@@ -875,6 +885,7 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
 
             action_code = _map_action_code(job_type)
             provider = _map_provider(job_type)
+            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             cur.execute(f"""
                 SELECT id FROM {APP_SCHEMA}.active_jobs
                 WHERE upstream_job_id = %s
@@ -1124,6 +1135,8 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 "size": size,
                 "image_urls": image_urls or [image_url],
                 "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
+                "image_url": image_url,
+                "thumbnail_url": image_url,
             }
 
             image_meta = json.dumps({
@@ -1692,12 +1705,15 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "model_urls": model_urls,
                 "textured_model_urls": textured_model_urls,
             }
+            if image_url:
+                payload["image_url"] = image_url
+            if thumbnail_url:
+                payload["thumbnail_url"] = thumbnail_url
 
             # Log final URLs after S3 upload
             final_title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else DEFAULT_MODEL_TITLE)
             glb_s3_key = get_s3_key_from_url(primary_glb_url)
             thumbnail_s3_key = get_s3_key_from_url(thumbnail_url)
-            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             print(f"[DB] Final URLs after S3 upload:")
             print(f"[DB]   glb_url: {primary_glb_url[:80] if primary_glb_url else 'None'}...")
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
@@ -1740,8 +1756,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             upstream_id = COALESCE(upstream_id, %s),
                             status = 'ready',
                             s3_bucket = COALESCE(%s, s3_bucket),
-                            glb_url = COALESCE(%s, glb_url),
-                            thumbnail_url = COALESCE(%s, thumbnail_url),
+                            glb_url = %s,
+                            thumbnail_url = %s,
                             glb_s3_key = COALESCE(%s, glb_s3_key),
                             thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
                             content_hash = COALESCE(%s, content_hash),
@@ -1798,8 +1814,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.models.root_prompt),
                             status = 'ready',
                             s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.models.s3_bucket),
-                            glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.models.glb_url),
-                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.models.thumbnail_url),
+                            glb_url = EXCLUDED.glb_url,
+                            thumbnail_url = EXCLUDED.thumbnail_url,
                             glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {APP_SCHEMA}.models.glb_s3_key),
                             thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.models.thumbnail_s3_key),
                             content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.models.content_hash),
@@ -1942,8 +1958,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
                     root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
                     identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                    thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
-                    glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
+                    thumbnail_url = EXCLUDED.thumbnail_url,
+                    glb_url = EXCLUDED.glb_url,
                     image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
                     model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
                     image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
