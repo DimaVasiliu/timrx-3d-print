@@ -150,13 +150,32 @@ def get_content_type_from_url(url: str) -> str:
 def compute_sha256(data_bytes: bytes) -> str:
     return hashlib.sha256(data_bytes).hexdigest()
 
-def _wrap_upload_result(value: str, content_hash: str, return_hash: bool):
-    return (value, content_hash) if return_hash else value
+def _wrap_upload_result(value: str, content_hash: str, return_hash: bool, s3_key: str = None, reused: bool = False):
+    if not return_hash:
+        return value
+    return {"url": value, "hash": content_hash, "key": s3_key, "reused": reused}
 
 def _unpack_upload_result(result):
-    if isinstance(result, tuple) and len(result) == 2:
-        return result[0], result[1]
-    return result, None
+    if isinstance(result, dict):
+        return result.get("url"), result.get("hash"), result.get("key"), result.get("reused")
+    if isinstance(result, tuple):
+        if len(result) == 2:
+            return result[0], result[1], None, None
+        if len(result) == 3:
+            return result[0], result[1], result[2], None
+        if len(result) >= 4:
+            return result[0], result[1], result[2], result[3]
+    return result, None, None, None
+
+def build_hash_s3_key(prefix: str, provider: str, content_hash: str, content_type: str) -> str:
+    safe_provider = sanitize_filename(provider or "unknown") or "unknown"
+    if prefix == "models":
+        ext = ".glb"
+    else:
+        ext = get_extension_for_content_type(content_type)
+        if not ext and prefix in ("images", "thumbnails", "textures", "source_images"):
+            ext = ".png"
+    return f"{prefix}/{safe_provider}/{content_hash}{ext}"
 
 def ensure_s3_key_ext(key: str, content_type: str) -> str:
     if not key:
@@ -283,7 +302,7 @@ MESHY_STATUS_MAP = {
     "TIMEOUT": "failed",
 }
 
-def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: str = None, name: str = None) -> str:
+def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: str = None, name: str = None, provider: str = None) -> str:
     if not isinstance(url, str) or not url.startswith("data:"):
         return url
     try:
@@ -294,6 +313,7 @@ def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: st
             name or prefix,
             user_id=user_id,
             key_base=key_base,
+            provider=provider,
         )
     except Exception as e:
         print(f"[S3] ERROR: Failed to upload data URI for {prefix}: {e}")
@@ -340,7 +360,7 @@ def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet
     if s3_key_exists(key):
         s3_url = build_s3_url(key)
         print(f"[S3] SKIP: Key exists -> {s3_url}")
-        return _wrap_upload_result(s3_url, content_hash, return_hash)
+        return _wrap_upload_result(s3_url, content_hash, return_hash, s3_key=key, reused=True)
 
     print(f"[S3] Uploading {len(data_bytes)} bytes to bucket={AWS_BUCKET_MODELS}, key={key}, content_type={content_type}")
     try:
@@ -353,7 +373,7 @@ def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet
         )
         s3_url = build_s3_url(key)
         print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
-        return _wrap_upload_result(s3_url, content_hash, return_hash)
+        return _wrap_upload_result(s3_url, content_hash, return_hash, s3_key=key, reused=False)
     except Exception as e:
         print(f"[S3] ERROR: put_object failed for {key}: {e}")
         print(f"[S3] HINT: If you see AccessControlListNotSupported, disable 'Block public access' in S3 bucket settings")
@@ -378,28 +398,26 @@ def upload_url_to_s3(url: str, content_type: str = None, prefix: str = "models",
         if s3_key_exists(key):
             s3_url = build_s3_url(key)
             print(f"[S3] SKIP: Key exists -> {s3_url}")
-            return _wrap_upload_result(s3_url, None, return_hash)
+            return _wrap_upload_result(s3_url, None, return_hash, s3_key=key, reused=True)
 
     print(f"[S3] Downloading from URL: {url[:100]}...")
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
     ct = content_type or resp.headers.get("Content-Type", "application/octet-stream")
     print(f"[S3] Downloaded {len(resp.content)} bytes, content-type={ct}")
-    content_hash = compute_sha256(resp.content) if return_hash else None
-    s3_url = upload_bytes_to_s3(resp.content, ct, prefix, name, user_id, key=key)
-    return _wrap_upload_result(s3_url, content_hash, return_hash)
+    return upload_bytes_to_s3(resp.content, ct, prefix, name, user_id, key=key, return_hash=return_hash)
 
-def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None, key: str = None, key_base: str = None, infer_content_type: bool = True, return_hash: bool = False, upstream_id: str = None, stage: str = None) -> str:
+def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None, key: str = None, key_base: str = None, infer_content_type: bool = True, return_hash: bool = False, upstream_id: str = None, stage: str = None, provider: str = None) -> str:
     """
-    Safely upload URL to S3, returning original URL if S3 upload fails or user_id missing.
-    Also handles base64 data URLs.
+    Safely upload URL to S3 using a deterministic hash-based key.
+    Always downloads/decodes to bytes to compute the content hash.
 
     Args:
         url: URL to upload (or base64 data URL)
         content_type: MIME type
         prefix: folder prefix
-        name: optional human-readable name to include in the S3 key
-        user_id: user UUID for namespacing (uses a public namespace if missing)
+        name: optional human-readable name (unused for deterministic keys)
+        provider: asset provider namespace for hash-based keys
     """
     original_url = url
     if isinstance(url, dict):
@@ -414,7 +432,7 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
             inferred_type = get_content_type_from_url(url)
             if inferred_type != "application/octet-stream":
                 content_type = inferred_type
-    print(f"[S3] safe_upload_to_s3 called: prefix={prefix}, user_id={user_id}, name={name}, url={url_preview}...")
+    print(f"[S3] safe_upload_to_s3 called: prefix={prefix}, provider={provider}, url={url_preview}...")
     if not url:
         print(f"[S3] SKIP: No URL provided for {prefix}")
         return _wrap_upload_result(url, None, return_hash)
@@ -426,34 +444,52 @@ def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None
         return _wrap_upload_result(url, None, return_hash)
     if REQUIRE_AWS_UPLOADS and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY):
         raise RuntimeError("[S3] AWS credentials not configured")
-    # Allow uploads when user_id is missing (Meshy URLs expire)
-    # Only apply a public namespace if we need to build a key automatically.
-    if not user_id and not key and not key_base:
-        user_id = "public"
-        print(f"[S3] INFO: No user_id provided, using 'public' namespace for {prefix}")
-    if not key and not key_base and upstream_id:
-        safe_upstream = sanitize_filename(str(upstream_id)) or "asset"
-        safe_name = sanitize_filename(str(name)) if name else ""
-        if prefix in ("models", "thumbnails"):
-            safe_stage = sanitize_filename(str(stage)) or "asset"
-            filename = safe_name or "asset"
-            key_base = f"{prefix}/{user_id}/{safe_upstream}/{safe_stage}/{filename}"
-        elif prefix == "images":
-            key_base = f"{prefix}/{user_id}/{safe_upstream}"
-    if key_base and not key:
-        key = ensure_s3_key_ext(key_base, content_type)
+    if is_s3_url(url):
+        s3_key = get_s3_key_from_url(url)
+        return _wrap_upload_result(url, None, return_hash, s3_key=s3_key, reused=True)
+
+    resolved_type = content_type or "application/octet-stream"
+    data_bytes = None
     try:
-        # Handle base64 data URLs
         if url.startswith("data:"):
-            s3_url = upload_base64_to_s3(url, prefix, name, user_id, key=key, key_base=key_base, return_hash=return_hash)
-            print(f"[S3] SUCCESS: Uploaded base64 {prefix} -> {s3_url}")
-            return s3_url
-        # Handle regular URLs
-        s3_url = upload_url_to_s3(url, content_type, prefix, name, user_id, key=key, return_hash=return_hash)
-        print(f"[S3] SUCCESS: Uploaded {prefix}: {url[:60]}... -> {s3_url}")
-        return s3_url
+            header, b64data = url.split(",", 1)
+            if ":" in header and ";" in header:
+                resolved_type = header.split(":")[1].split(";")[0] or resolved_type
+            data_bytes = base64.b64decode(b64data)
+        else:
+            print(f"[S3] Downloading from URL: {url[:100]}...")
+            resp = requests.get(url, timeout=120)
+            resp.raise_for_status()
+            if infer_content_type:
+                header_type = resp.headers.get("Content-Type")
+                if header_type:
+                    resolved_type = header_type
+            data_bytes = resp.content
+            print(f"[S3] Downloaded {len(data_bytes)} bytes, content-type={resolved_type}")
     except Exception as e:
-        # With AWS configured, treat upload failures as fatal to avoid silent Meshy fallbacks
+        print(f"[S3] ERROR: Failed to fetch bytes for {prefix}: {e}")
+        raise
+
+    content_hash = compute_sha256(data_bytes)
+    s3_key = build_hash_s3_key(prefix, provider, content_hash, resolved_type)
+    if s3_key_exists(s3_key):
+        s3_url = build_s3_url(s3_key)
+        print(f"[S3] SKIP: Key exists -> {s3_url}")
+        return _wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=True)
+
+    print(f"[S3] Uploading {len(data_bytes)} bytes to bucket={AWS_BUCKET_MODELS}, key={s3_key}, content_type={resolved_type}")
+    try:
+        s3.put_object(
+            Bucket=AWS_BUCKET_MODELS,
+            Key=s3_key,
+            Body=data_bytes,
+            ContentType=resolved_type,
+            ACL='public-read',
+        )
+        s3_url = build_s3_url(s3_key)
+        print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
+        return _wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=False)
+    except Exception as e:
         print(f"[S3] ERROR: Failed to upload {prefix}: {e}")
         import traceback
         traceback.print_exc()
@@ -483,9 +519,7 @@ def upload_base64_to_s3(data_url: str, prefix: str = "images", name: str = None,
         # Upload to S3
         if key_base and not key:
             key = ensure_s3_key_ext(key_base, mime)
-        content_hash = compute_sha256(image_bytes) if return_hash else None
-        s3_url = upload_bytes_to_s3(image_bytes, mime, prefix, name, user_id, key=key)
-        return _wrap_upload_result(s3_url, content_hash, return_hash)
+        return upload_bytes_to_s3(image_bytes, mime, prefix, name, user_id, key=key, return_hash=return_hash)
     except Exception as e:
         print(f"[S3] Failed to parse/upload base64: {e}")
         raise
@@ -727,6 +761,7 @@ def ensure_history_table():
         print("[DB] Could not connect to database for table verification")
         return
     try:
+        image_log_info = None
         with conn, conn.cursor() as cur:
             # Just verify tables exist, don't try to create them
             cur.execute("""
@@ -758,6 +793,8 @@ def ensure_active_jobs_table():
     if not conn:
         return
     try:
+        model_log_info = None
+        image_log_info = None
         with conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
                 SELECT EXISTS (
@@ -834,12 +871,13 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         image_url = job_meta.get("image_url")
 
         s3_user_id = user_id or "public"
+        provider = _map_provider(job_type)
         thumb_key_base = f"thumbnails/{s3_user_id}/{job_id}"
         image_key_base = f"images/{s3_user_id}/{job_id}"
         if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
-            thumbnail_url = ensure_s3_url_for_data_uri(thumbnail_url, "thumbnails", thumb_key_base, user_id=user_id, name="thumbnail")
+            thumbnail_url = ensure_s3_url_for_data_uri(thumbnail_url, "thumbnails", thumb_key_base, user_id=user_id, name="thumbnail", provider=provider)
         if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
-            image_url = ensure_s3_url_for_data_uri(image_url, "images", image_key_base, user_id=user_id, name="image")
+            image_url = ensure_s3_url_for_data_uri(image_url, "images", image_key_base, user_id=user_id, name="image", provider=provider)
         payload["thumbnail_url"] = thumbnail_url
         payload["image_url"] = image_url
 
@@ -1088,6 +1126,10 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
             image_key_base = f"images/{s3_user_id}/{job_key}/{s3_slug}"
             # Upload images to S3 for permanent storage (OpenAI URLs expire, base64 needs storage)
             image_content_hash = None
+            image_s3_key_from_upload = None
+            image_reused = None
+            original_image_url = image_url
+            uploaded_url_cache = {}
             if image_url:
                 upload_result = safe_upload_to_s3(
                     image_url,
@@ -1097,25 +1139,45 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     user_id=user_id,
                     key_base=image_key_base,
                     return_hash=True,
+                    provider="openai",
                 )
-                image_url, image_content_hash = _unpack_upload_result(upload_result)
+                image_url, image_content_hash, image_s3_key_from_upload, image_reused = _unpack_upload_result(upload_result)
                 if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
                     print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
                     image_url = None
+                if original_image_url:
+                    uploaded_url_cache[original_image_url] = image_url
+                if image_url:
+                    uploaded_url_cache[image_url] = image_url
             if image_urls:
-                image_urls = [
-                    safe_upload_to_s3(
+                normalized_urls = []
+                for i, url in enumerate(image_urls):
+                    if not url:
+                        normalized_urls.append(url)
+                        continue
+                    if url in uploaded_url_cache:
+                        normalized_urls.append(uploaded_url_cache[url])
+                        continue
+                    s3_url = safe_upload_to_s3(
                         url,
                         "image/png",
                         "images",
                         f"{image_id}_{i}",
                         user_id=user_id,
                         key_base=f"{image_key_base}_{i}",
-                    ) if url else url
-                    for i, url in enumerate(image_urls)
-                ]
-            image_s3_key = get_s3_key_from_url(image_url)
+                        provider="openai",
+                    )
+                    uploaded_url_cache[url] = s3_url
+                    normalized_urls.append(s3_url)
+                image_urls = normalized_urls
+            image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
             thumbnail_s3_key = get_s3_key_from_url(image_url)
+            if image_s3_key:
+                image_log_info = {
+                    "key": image_s3_key,
+                    "hash": image_content_hash,
+                    "reused": bool(image_reused),
+                }
 
             # Parse size for width/height
             width, height = 1024, 1024
@@ -1419,6 +1481,8 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                 ))
 
         conn.close()
+        if image_log_info:
+            print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
         print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_image_id
     except Exception as e:
@@ -1558,10 +1622,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   thumbnail_url: {thumbnail_url[:80] if thumbnail_url else 'None'}...")
             print(f"[DB]   textured_glb_url: {textured_glb_url[:80] if textured_glb_url else 'None'}...")
             print(f"[DB] job_meta: title={job_meta.get('title')}, prompt={job_meta.get('prompt', '')[:50]}...")
-            print(f"[DB] S3 model key will use: models/{job_key}/{s3_name_safe}.glb")
+            print(f"[DB] S3 model key will use: models/{provider}/<content_hash>.glb")
 
             # Upload ALL URLs to S3 for permanent storage (Meshy URLs expire)
             model_content_hash = None
+            model_s3_key_from_upload = None
+            model_reused = None
             glb_candidate = textured_glb_url or glb_url or textured_model_urls.get("glb") or model_urls.get("glb")
             obj_candidate = textured_model_urls.get("obj") or model_urls.get("obj") or status_data.get("obj_url")
             primary_model_source = glb_candidate or obj_candidate or rigged_glb_url
@@ -1569,17 +1635,16 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             if primary_content_type == "application/octet-stream":
                 primary_content_type = "model/gltf-binary"
             if primary_model_source:
-                model_key_base = f"models/{job_key}/{s3_name_safe}"
                 upload_result = safe_upload_to_s3(
                     primary_model_source,
                     primary_content_type,
                     "models",
                     s3_name_safe,
                     user_id=user_id,
-                    key_base=model_key_base,
                     return_hash=True,
+                    provider=provider,
                 )
-                primary_glb_url, model_content_hash = _unpack_upload_result(upload_result)
+                primary_glb_url, model_content_hash, model_s3_key_from_upload, model_reused = _unpack_upload_result(upload_result)
                 glb_url = primary_glb_url
                 if primary_content_type.startswith("model/gltf"):
                     if textured_glb_url:
@@ -1596,8 +1661,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     "thumbnails",
                     s3_name_safe,
                     user_id=user_id,
-                    key_base=f"thumbnails/{job_key}/{s3_name_safe}",
                     infer_content_type=False,
+                    provider=provider,
                 )
             rigged_fbx_url = None
 
@@ -1627,6 +1692,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     user_id=user_id,
                     key_base=texture_key_base,
                     infer_content_type=False,
+                    provider=provider,
                 )
                 texture_s3_urls[safe_map_type] = uploaded_url
                 if uploaded_url:
@@ -1729,7 +1795,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             # Log final URLs after S3 upload
             final_title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else DEFAULT_MODEL_TITLE)
-            glb_s3_key = get_s3_key_from_url(s3_glb_url)
+            glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(s3_glb_url)
             thumbnail_s3_key = get_s3_key_from_url(s3_thumbnail_url)
             print(f"[DB] Final URLs after S3 upload:")
             print(f"[DB]   glb_url: {s3_glb_url[:80] if s3_glb_url else 'None'}...")
@@ -1862,6 +1928,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not model_row:
                     raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
                 model_id = model_row["id"]
+                if glb_s3_key:
+                    model_log_info = {
+                        "key": glb_s3_key,
+                        "hash": model_content_hash,
+                        "reused": bool(model_reused),
+                    }
                 print(f"[DB] model persisted: model_id={model_id} glb_url={s3_glb_url} thumb={s3_thumbnail_url}")
 
             if item_type == "image" and image_url:
@@ -1876,6 +1948,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 image_user = str(user_id) if user_id else "public"
                 image_job_key = sanitize_filename(str(job_id)) or "job"
                 image_content_hash = None
+                image_s3_key_from_upload = None
+                image_reused = None
+                original_image_url = image_url
                 if image_url and not is_s3_url(image_url):
                     upload_result = safe_upload_to_s3(
                         image_url,
@@ -1885,9 +1960,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         user_id=user_id,
                         key_base=f"images/{image_user}/{image_job_key}/{image_slug}",
                         return_hash=True,
+                        provider=provider,
                     )
-                    image_url, image_content_hash = _unpack_upload_result(upload_result)
-                if thumbnail_url and not is_s3_url(thumbnail_url):
+                    image_url, image_content_hash, image_s3_key_from_upload, image_reused = _unpack_upload_result(upload_result)
+                if thumbnail_url and (thumbnail_url == original_image_url or thumbnail_url == image_url):
+                    thumbnail_url = image_url
+                elif thumbnail_url and not is_s3_url(thumbnail_url):
                     thumbnail_url = safe_upload_to_s3(
                         thumbnail_url,
                         "image/png",
@@ -1895,6 +1973,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         image_slug,
                         user_id=user_id,
                         key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
+                        provider=provider,
                     )
                 if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
                     print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
@@ -1902,7 +1981,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if AWS_BUCKET_MODELS and thumbnail_url and not is_s3_url(thumbnail_url):
                     print(f"[WARN] canonical url is not S3: thumbnail_url={thumbnail_url[:80]}")
                     thumbnail_url = None
-                image_s3_key = get_s3_key_from_url(image_url)
+                image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
                 thumb_s3_key = get_s3_key_from_url(thumbnail_url)
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.images (
@@ -1960,6 +2039,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not image_row:
                     raise RuntimeError("[DB] Failed to upsert image row (no id returned)")
                 image_id = image_row["id"]
+                if image_s3_key:
+                    image_log_info = {
+                        "key": image_s3_key,
+                        "hash": image_content_hash,
+                        "reused": bool(image_reused),
+                    }
                 print(f"[DB] image persisted: image_id={image_id} image_url={image_url} thumb={thumbnail_url}")
 
             cur.execute(f"""
@@ -2014,6 +2099,10 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB] Upserted history_items with id={returned_id}")
 
         conn.close()
+        if model_log_info:
+            print(f"[S3] model stored: key={model_log_info['key']} hash={model_log_info['hash']} reused={model_log_info['reused']}")
+        if image_log_info:
+            print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
         print(f"[DB] Saved finished job {job_id} -> {history_uuid} to normalized tables")
         # Return the S3 URLs so the calling endpoint can use them in the API response
         return {
@@ -3435,6 +3524,7 @@ def api_image_to_3d_start():
                     s3_name,
                     user_id=user_id,
                     key_base=f"source_images/{s3_user_id}/{job_id}",
+                    provider="user",
                 )
                 print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
             except Exception as e:
@@ -3798,6 +3888,7 @@ def api_history():
                                         use_id = str(uuid.uuid4())
                                         item["original_id"] = item_id
 
+                                provider = "openai" if item_type == "image" else "meshy"
                                 s3_user_id = user_id or "public"
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
@@ -3806,6 +3897,7 @@ def api_history():
                                         f"thumbnails/{s3_user_id}/{use_id}",
                                         user_id=user_id,
                                         name="thumbnail",
+                                        provider=provider,
                                     )
                                 if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
                                     image_url = ensure_s3_url_for_data_uri(
@@ -3814,6 +3906,7 @@ def api_history():
                                         f"images/{s3_user_id}/{use_id}",
                                         user_id=user_id,
                                         name="image",
+                                        provider=provider,
                                     )
                                 item["thumbnail_url"] = thumbnail_url
                                 item["image_url"] = image_url
@@ -3956,6 +4049,7 @@ def api_history_item_add():
                                     use_id = str(uuid.uuid4())
                                     item["original_id"] = item_id
 
+                            provider = "openai" if item_type == "image" else "meshy"
                             s3_user_id = user_id or "public"
                             if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                 thumbnail_url = ensure_s3_url_for_data_uri(
@@ -3964,6 +4058,7 @@ def api_history_item_add():
                                     f"thumbnails/{s3_user_id}/{use_id}",
                                     user_id=user_id,
                                     name="thumbnail",
+                                    provider=provider,
                                 )
                             if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
                                 image_url = ensure_s3_url_for_data_uri(
@@ -3972,6 +4067,7 @@ def api_history_item_add():
                                     f"images/{s3_user_id}/{use_id}",
                                     user_id=user_id,
                                     name="image",
+                                    provider=provider,
                                 )
                             item["thumbnail_url"] = thumbnail_url
                             item["image_url"] = image_url
@@ -4196,6 +4292,7 @@ def api_history_item_update(item_id):
                                 glb_url = updates.get("glb_url")
                                 image_url = updates.get("image_url")
 
+                                provider = "openai" if item_type == "image" else "meshy"
                                 s3_user_id = user_id or "public"
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
@@ -4204,6 +4301,7 @@ def api_history_item_update(item_id):
                                         f"thumbnails/{s3_user_id}/{actual_id}",
                                         user_id=user_id,
                                         name="thumbnail",
+                                        provider=provider,
                                     )
                                     updates["thumbnail_url"] = thumbnail_url
                                 if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
@@ -4213,6 +4311,7 @@ def api_history_item_update(item_id):
                                         f"images/{s3_user_id}/{actual_id}",
                                         user_id=user_id,
                                         name="image",
+                                        provider=provider,
                                     )
                                     updates["image_url"] = image_url
                                 existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url"}})
