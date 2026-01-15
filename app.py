@@ -1504,6 +1504,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
     Uses the user's schema with UUID primary keys and correct column names.
     user_id is extracted from job_meta if not provided.
     """
+    model_log_info = None
+    image_log_info = None
     # Get user_id from job_meta if not provided
     if not user_id:
         user_id = job_meta.get("user_id")
@@ -1628,6 +1630,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             model_content_hash = None
             model_s3_key_from_upload = None
             model_reused = None
+            thumbnail_content_hash = None
+            thumbnail_s3_key_from_upload = None
+            thumbnail_reused = None
             glb_candidate = textured_glb_url or glb_url or textured_model_urls.get("glb") or model_urls.get("glb")
             obj_candidate = textured_model_urls.get("obj") or model_urls.get("obj") or status_data.get("obj_url")
             primary_model_source = glb_candidate or obj_candidate or rigged_glb_url
@@ -1655,7 +1660,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     textured_glb_url = None
                     rigged_glb_url = None
             if thumbnail_url:
-                thumbnail_url = safe_upload_to_s3(
+                upload_result = safe_upload_to_s3(
                     thumbnail_url,
                     "image/png",
                     "thumbnails",
@@ -1663,7 +1668,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     user_id=user_id,
                     infer_content_type=False,
                     provider=provider,
+                    return_hash=True,
                 )
+                thumbnail_url, thumbnail_content_hash, thumbnail_s3_key_from_upload, thumbnail_reused = _unpack_upload_result(upload_result)
             rigged_fbx_url = None
 
             # Prefer textured output as the canonical model when available
@@ -1677,6 +1684,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             if AWS_BUCKET_MODELS and s3_thumbnail_url and not is_s3_url(s3_thumbnail_url):
                 print(f"[WARN] canonical url is not S3: thumbnail_url={s3_thumbnail_url[:80]}")
                 s3_thumbnail_url = None
+            final_glb_url = s3_glb_url
+            final_thumbnail_url = s3_thumbnail_url
 
             # Upload texture images to S3
             texture_s3_urls = {}
@@ -1700,16 +1709,16 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
-            if s3_glb_url:
+            if final_glb_url:
                 primary_ext = "obj" if primary_content_type == "model/obj" else "glb"
-                model_urls_uploaded[primary_ext] = s3_glb_url
+                model_urls_uploaded[primary_ext] = final_glb_url
                 if textured_glb_url and primary_ext == "glb":
-                    textured_model_urls_uploaded["glb"] = s3_glb_url
+                    textured_model_urls_uploaded["glb"] = final_glb_url
 
             model_urls = model_urls_uploaded
             textured_model_urls = textured_model_urls_uploaded
 
-            canonical_raw = s3_glb_url if asset_type == "model" else (image_url or s3_thumbnail_url)
+            canonical_raw = final_glb_url if asset_type == "model" else (image_url or final_thumbnail_url)
             canonical_url = build_canonical_url(canonical_raw)
 
             try:
@@ -1786,124 +1795,243 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "model_urls": model_urls,
                 "textured_model_urls": textured_model_urls,
             }
-            if s3_glb_url:
-                payload["glb_url"] = s3_glb_url
+            if final_glb_url:
+                payload["glb_url"] = final_glb_url
             if image_url:
                 payload["image_url"] = image_url
-            if s3_thumbnail_url:
-                payload["thumbnail_url"] = s3_thumbnail_url
+            if final_thumbnail_url:
+                payload["thumbnail_url"] = final_thumbnail_url
 
             # Log final URLs after S3 upload
             final_title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else DEFAULT_MODEL_TITLE)
-            glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(s3_glb_url)
-            thumbnail_s3_key = get_s3_key_from_url(s3_thumbnail_url)
+            glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
+            thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
+            image_s3_key = None
+            thumb_s3_key = None
+            image_reused = None
             print(f"[DB] Final URLs after S3 upload:")
-            print(f"[DB]   glb_url: {s3_glb_url[:80] if s3_glb_url else 'None'}...")
-            print(f"[DB]   thumbnail_url: {s3_thumbnail_url[:80] if s3_thumbnail_url else 'None'}...")
+            print(f"[DB]   glb_url: {final_glb_url[:80] if final_glb_url else 'None'}...")
+            print(f"[DB]   thumbnail_url: {final_thumbnail_url[:80] if final_thumbnail_url else 'None'}...")
             print(f"[DB]   title: {final_title}")
             print(f"[DB] Inserting history_items with id={history_uuid}")
 
+            db_save_ok = True
+            history_item_id = None
             model_id = None
             image_id = None
-            if s3_glb_url or model_urls or textured_model_urls or rigged_glb_url:
-                model_meta = {
-                    "textured_glb_url": textured_glb_url,
-                    "rigged_character_glb_url": rigged_glb_url,
-                    "rigged_fbx_url": rigged_fbx_url,
-                    "texture_urls": texture_urls,
-                    "texture_s3_urls": texture_s3_urls,
-                    "model_urls": model_urls,
-                    "textured_model_urls": textured_model_urls,
-                    "stage": final_stage,
-                    "s3_bucket": s3_bucket,
-                }
+            try:
+                cur.execute("SAVEPOINT normalized_save")
+                if final_glb_url or model_urls or textured_model_urls or rigged_glb_url:
+                    model_meta = {
+                        "textured_glb_url": textured_glb_url,
+                        "rigged_character_glb_url": rigged_glb_url,
+                        "rigged_fbx_url": rigged_fbx_url,
+                        "texture_urls": texture_urls,
+                        "texture_s3_urls": texture_s3_urls,
+                        "model_urls": model_urls,
+                        "textured_model_urls": textured_model_urls,
+                        "stage": final_stage,
+                        "s3_bucket": s3_bucket,
+                    }
 
-                existing_by_hash_id = None
-                if model_content_hash:
-                    cur.execute(f"""
-                        SELECT id FROM {APP_SCHEMA}.models
-                        WHERE provider = %s AND content_hash = %s
-                        LIMIT 1
-                    """, (provider, model_content_hash))
-                    row = cur.fetchone()
-                    if row:
-                        existing_by_hash_id = row["id"]
+                    existing_by_hash_id = None
+                    if model_content_hash:
+                        cur.execute(f"""
+                            SELECT id FROM {APP_SCHEMA}.models
+                            WHERE provider = %s AND content_hash = %s
+                            LIMIT 1
+                        """, (provider, model_content_hash))
+                        row = cur.fetchone()
+                        if row:
+                            existing_by_hash_id = row["id"]
 
-                if existing_by_hash_id:
+                    if existing_by_hash_id:
+                        cur.execute(f"""
+                            UPDATE {APP_SCHEMA}.models
+                            SET identity_id = COALESCE(%s, identity_id),
+                                title = COALESCE(%s, title),
+                                prompt = COALESCE(%s, prompt),
+                                root_prompt = COALESCE(%s, root_prompt),
+                                upstream_id = COALESCE(upstream_id, %s),
+                                status = 'ready',
+                                s3_bucket = COALESCE(%s, s3_bucket),
+                                glb_url = %s,
+                                thumbnail_url = %s,
+                                glb_s3_key = COALESCE(%s, glb_s3_key),
+                                thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
+                                content_hash = COALESCE(%s, content_hash),
+                                stage = COALESCE(%s, stage),
+                                meta = COALESCE(%s, meta),
+                                updated_at = NOW()
+                            WHERE id = %s
+                            RETURNING id
+                        """, (
+                            user_id,
+                            final_title,
+                            final_prompt,
+                            root_prompt,
+                            job_id,
+                            s3_bucket,
+                            final_glb_url,
+                            final_thumbnail_url,
+                            glb_s3_key,
+                            thumbnail_s3_key,
+                            model_content_hash,
+                            final_stage,
+                            json.dumps(model_meta),
+                            existing_by_hash_id,
+                        ))
+                    else:
+                        cur.execute(f"""
+                            INSERT INTO {APP_SCHEMA}.models (
+                                id, identity_id,
+                                title, prompt, root_prompt,
+                                provider, upstream_id,
+                                status,
+                                s3_bucket,
+                                glb_url, thumbnail_url,
+                                glb_s3_key, thumbnail_s3_key,
+                                content_hash,
+                                stage,
+                                meta
+                            ) VALUES (
+                                %s, %s,
+                                %s, %s, %s,
+                                %s, %s,
+                                %s,
+                                %s,
+                                %s, %s,
+                                %s, %s,
+                                %s,
+                                %s,
+                                %s
+                            )
+                            ON CONFLICT (provider, upstream_id) DO UPDATE
+                            SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.models.identity_id),
+                                title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.models.title),
+                                prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.models.prompt),
+                                root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.models.root_prompt),
+                                status = 'ready',
+                                s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.models.s3_bucket),
+                                glb_url = EXCLUDED.glb_url,
+                                thumbnail_url = EXCLUDED.thumbnail_url,
+                                glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {APP_SCHEMA}.models.glb_s3_key),
+                                thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.models.thumbnail_s3_key),
+                                content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.models.content_hash),
+                                stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.models.stage),
+                                meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.models.meta),
+                                updated_at = NOW()
+                            RETURNING id
+                        """, (
+                            str(uuid.uuid4()),
+                            user_id,
+                            final_title,
+                            final_prompt,
+                            root_prompt,
+                            provider,
+                            job_id,
+                            "ready",
+                            s3_bucket,
+                            final_glb_url,
+                            final_thumbnail_url,
+                            glb_s3_key,
+                            thumbnail_s3_key,
+                            model_content_hash,
+                            final_stage,
+                            json.dumps(model_meta),
+                        ))
+                    model_row = cur.fetchone()
+                    if not model_row:
+                        raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
+                    model_id = model_row["id"]
+                    if glb_s3_key:
+                        model_log_info = {
+                            "key": glb_s3_key,
+                            "hash": model_content_hash,
+                            "reused": bool(model_reused),
+                        }
+
+                if item_type == "image" and image_url:
+                    image_meta = {
+                        "stage": final_stage,
+                        "job_type": job_type,
+                        "s3_bucket": s3_bucket,
+                    }
+                    image_upstream_id = job_meta.get("image_id") or status_data.get("image_id") or str(job_id)
+                    image_slug = sanitize_filename(final_title or final_prompt or "image") or "image"
+                    image_slug = image_slug[:60]
+                    image_user = str(user_id) if user_id else "public"
+                    image_job_key = sanitize_filename(str(job_id)) or "job"
+                    image_content_hash = None
+                    image_s3_key_from_upload = None
+                    image_reused = None
+                    original_image_url = image_url
+                    if image_url and not is_s3_url(image_url):
+                        upload_result = safe_upload_to_s3(
+                            image_url,
+                            "image/png",
+                            "images",
+                            image_slug,
+                            user_id=user_id,
+                            key_base=f"images/{image_user}/{image_job_key}/{image_slug}",
+                            return_hash=True,
+                            provider=provider,
+                        )
+                        image_url, image_content_hash, image_s3_key_from_upload, image_reused = _unpack_upload_result(upload_result)
+                    if thumbnail_url and (thumbnail_url == original_image_url or thumbnail_url == image_url):
+                        thumbnail_url = image_url
+                    elif thumbnail_url and not is_s3_url(thumbnail_url):
+                        thumbnail_url = safe_upload_to_s3(
+                            thumbnail_url,
+                            "image/png",
+                            "thumbnails",
+                            image_slug,
+                            user_id=user_id,
+                            key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
+                            provider=provider,
+                        )
+                    if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
+                        print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
+                        image_url = None
+                    if AWS_BUCKET_MODELS and thumbnail_url and not is_s3_url(thumbnail_url):
+                        print(f"[WARN] canonical url is not S3: thumbnail_url={thumbnail_url[:80]}")
+                        thumbnail_url = None
+                    image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
+                    thumb_s3_key = get_s3_key_from_url(thumbnail_url)
                     cur.execute(f"""
-                        UPDATE {APP_SCHEMA}.models
-                        SET identity_id = COALESCE(%s, identity_id),
-                            title = COALESCE(%s, title),
-                            prompt = COALESCE(%s, prompt),
-                            root_prompt = COALESCE(%s, root_prompt),
-                            upstream_id = COALESCE(upstream_id, %s),
-                            status = 'ready',
-                            s3_bucket = COALESCE(%s, s3_bucket),
-                            glb_url = %s,
-                            thumbnail_url = %s,
-                            glb_s3_key = COALESCE(%s, glb_s3_key),
-                            thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
-                            content_hash = COALESCE(%s, content_hash),
-                            stage = COALESCE(%s, stage),
-                            meta = COALESCE(%s, meta),
-                            updated_at = NOW()
-                        WHERE id = %s
-                        RETURNING id
-                    """, (
-                        user_id,
-                        final_title,
-                        final_prompt,
-                        root_prompt,
-                        job_id,
-                        s3_bucket,
-                        s3_glb_url,
-                        s3_thumbnail_url,
-                        glb_s3_key,
-                        thumbnail_s3_key,
-                        model_content_hash,
-                        final_stage,
-                        json.dumps(model_meta),
-                        existing_by_hash_id,
-                    ))
-                else:
-                    cur.execute(f"""
-                        INSERT INTO {APP_SCHEMA}.models (
+                        INSERT INTO {APP_SCHEMA}.images (
                             id, identity_id,
-                            title, prompt, root_prompt,
+                            title, prompt,
                             provider, upstream_id,
                             status,
                             s3_bucket,
-                            glb_url, thumbnail_url,
-                            glb_s3_key, thumbnail_s3_key,
+                            image_url, thumbnail_url,
+                            image_s3_key, thumbnail_s3_key,
                             content_hash,
-                            stage,
                             meta
                         ) VALUES (
                             %s, %s,
-                            %s, %s, %s,
-                            %s, %s,
-                            %s,
-                            %s,
                             %s, %s,
                             %s, %s,
                             %s,
+                            %s,
+                            %s, %s,
+                            %s, %s,
                             %s,
                             %s
                         )
                         ON CONFLICT (provider, upstream_id) DO UPDATE
-                        SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.models.identity_id),
-                            title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.models.title),
-                            prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.models.prompt),
-                            root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.models.root_prompt),
+                        SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.images.identity_id),
+                            title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.images.title),
+                            prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.images.prompt),
                             status = 'ready',
-                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.models.s3_bucket),
-                            glb_url = EXCLUDED.glb_url,
-                            thumbnail_url = EXCLUDED.thumbnail_url,
-                            glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {APP_SCHEMA}.models.glb_s3_key),
-                            thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.models.thumbnail_s3_key),
-                            content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.models.content_hash),
-                            stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.models.stage),
-                            meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.models.meta),
+                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.images.s3_bucket),
+                            image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.images.image_url),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.images.thumbnail_url),
+                            image_s3_key = COALESCE(EXCLUDED.image_s3_key, {APP_SCHEMA}.images.image_s3_key),
+                            thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.images.thumbnail_s3_key),
+                            content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.images.content_hash),
+                            meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.images.meta),
                             updated_at = NOW()
                         RETURNING id
                     """, (
@@ -1911,206 +2039,126 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         user_id,
                         final_title,
                         final_prompt,
-                        root_prompt,
                         provider,
-                        job_id,
+                        image_upstream_id,
                         "ready",
-                        s3_bucket,
-                        s3_glb_url,
-                        s3_thumbnail_url,
-                        glb_s3_key,
-                        thumbnail_s3_key,
-                        model_content_hash,
-                        final_stage,
-                        json.dumps(model_meta),
-                    ))
-                model_row = cur.fetchone()
-                if not model_row:
-                    raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
-                model_id = model_row["id"]
-                if glb_s3_key:
-                    model_log_info = {
-                        "key": glb_s3_key,
-                        "hash": model_content_hash,
-                        "reused": bool(model_reused),
-                    }
-                print(f"[DB] model persisted: model_id={model_id} glb_url={s3_glb_url} thumb={s3_thumbnail_url}")
-
-            if item_type == "image" and image_url:
-                image_meta = {
-                    "stage": final_stage,
-                    "job_type": job_type,
-                    "s3_bucket": s3_bucket,
-                }
-                image_upstream_id = job_meta.get("image_id") or status_data.get("image_id") or str(job_id)
-                image_slug = sanitize_filename(final_title or final_prompt or "image") or "image"
-                image_slug = image_slug[:60]
-                image_user = str(user_id) if user_id else "public"
-                image_job_key = sanitize_filename(str(job_id)) or "job"
-                image_content_hash = None
-                image_s3_key_from_upload = None
-                image_reused = None
-                original_image_url = image_url
-                if image_url and not is_s3_url(image_url):
-                    upload_result = safe_upload_to_s3(
+                        AWS_BUCKET_MODELS,
                         image_url,
-                        "image/png",
-                        "images",
-                        image_slug,
-                        user_id=user_id,
-                        key_base=f"images/{image_user}/{image_job_key}/{image_slug}",
-                        return_hash=True,
-                        provider=provider,
-                    )
-                    image_url, image_content_hash, image_s3_key_from_upload, image_reused = _unpack_upload_result(upload_result)
-                if thumbnail_url and (thumbnail_url == original_image_url or thumbnail_url == image_url):
-                    thumbnail_url = image_url
-                elif thumbnail_url and not is_s3_url(thumbnail_url):
-                    thumbnail_url = safe_upload_to_s3(
                         thumbnail_url,
-                        "image/png",
-                        "thumbnails",
-                        image_slug,
-                        user_id=user_id,
-                        key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
-                        provider=provider,
-                    )
-                if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
-                    print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
-                    image_url = None
-                if AWS_BUCKET_MODELS and thumbnail_url and not is_s3_url(thumbnail_url):
-                    print(f"[WARN] canonical url is not S3: thumbnail_url={thumbnail_url[:80]}")
-                    thumbnail_url = None
-                image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
-                thumb_s3_key = get_s3_key_from_url(thumbnail_url)
+                        image_s3_key,
+                        thumb_s3_key,
+                        image_content_hash,
+                        json.dumps(image_meta),
+                    ))
+                    image_row = cur.fetchone()
+                    if not image_row:
+                        raise RuntimeError("[DB] Failed to upsert image row (no id returned)")
+                    image_id = image_row["id"]
+                    if image_s3_key:
+                        image_log_info = {
+                            "key": image_s3_key,
+                            "hash": image_content_hash,
+                            "reused": bool(image_reused),
+                        }
                 cur.execute(f"""
-                    INSERT INTO {APP_SCHEMA}.images (
-                        id, identity_id,
-                        title, prompt,
-                        provider, upstream_id,
-                        status,
-                        s3_bucket,
-                        image_url, thumbnail_url,
-                        image_s3_key, thumbnail_s3_key,
-                        content_hash,
-                        meta
+                    INSERT INTO {APP_SCHEMA}.history_items (
+                        id, identity_id, item_type, status, stage,
+                        title, prompt, root_prompt,
+                        thumbnail_url, glb_url, image_url,
+                        model_id, image_id,
+                        payload
                     ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
                         %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        %s,
-                        %s,
-                        %s, %s,
-                        %s, %s,
-                        %s,
                         %s
                     )
-                    ON CONFLICT (provider, upstream_id) DO UPDATE
-                    SET identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.images.identity_id),
-                        title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.images.title),
-                        prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.images.prompt),
-                        status = 'ready',
-                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {APP_SCHEMA}.images.s3_bucket),
-                        image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.images.image_url),
-                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.images.thumbnail_url),
-                        image_s3_key = COALESCE(EXCLUDED.image_s3_key, {APP_SCHEMA}.images.image_s3_key),
-                        thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {APP_SCHEMA}.images.thumbnail_s3_key),
-                        content_hash = COALESCE(EXCLUDED.content_hash, {APP_SCHEMA}.images.content_hash),
-                        meta = COALESCE(EXCLUDED.meta, {APP_SCHEMA}.images.meta),
+                    ON CONFLICT (id) DO UPDATE
+                    SET status = 'finished',
+                        stage = EXCLUDED.stage,
+                        title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                        prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                        root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                        identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                        thumbnail_url = EXCLUDED.thumbnail_url,
+                        glb_url = EXCLUDED.glb_url,
+                        image_url = EXCLUDED.image_url,
+                        model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
+                        image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
+                        payload = EXCLUDED.payload,
                         updated_at = NOW()
                     RETURNING id
                 """, (
-                    str(uuid.uuid4()),
+                    history_uuid,
                     user_id,
+                    item_type,
+                    "finished",
+                    final_stage,
                     final_title,
                     final_prompt,
-                    provider,
-                    image_upstream_id,
-                    "ready",
-                    AWS_BUCKET_MODELS,
-                    image_url,
-                    thumbnail_url,
-                    image_s3_key,
-                    thumb_s3_key,
-                    image_content_hash,
-                    json.dumps(image_meta),
-                ))
-                image_row = cur.fetchone()
-                if not image_row:
-                    raise RuntimeError("[DB] Failed to upsert image row (no id returned)")
-                image_id = image_row["id"]
-                if image_s3_key:
-                    image_log_info = {
-                        "key": image_s3_key,
-                        "hash": image_content_hash,
-                        "reused": bool(image_reused),
-                    }
-                print(f"[DB] image persisted: image_id={image_id} image_url={image_url} thumb={thumbnail_url}")
-
-            cur.execute(f"""
-                INSERT INTO {APP_SCHEMA}.history_items (
-                    id, identity_id, item_type, status, stage,
-                    title, prompt, root_prompt,
-                    thumbnail_url, glb_url, image_url,
-                    model_id, image_id,
-                    payload
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s,
-                    %s
-                )
-                ON CONFLICT (id) DO UPDATE
-                SET status = 'finished',
-                    stage = EXCLUDED.stage,
-                    title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
-                    prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
-                    root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
-                    identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                    thumbnail_url = EXCLUDED.thumbnail_url,
-                    glb_url = EXCLUDED.glb_url,
-                    image_url = EXCLUDED.image_url,
-                    model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
-                    image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
-                    payload = EXCLUDED.payload,
-                    updated_at = NOW()
-                RETURNING id
-            """, (
-                history_uuid,
-                user_id,
-                item_type,
-                "finished",
-                final_stage,
-                final_title,
-                final_prompt,
-                root_prompt,
-                    s3_thumbnail_url,
-                    s3_glb_url,
+                    root_prompt,
+                    final_thumbnail_url,
+                    final_glb_url,
                     image_url if item_type == "image" else None,
                     model_id,
                     image_id,
                     json.dumps(payload),
                 ))
-            history_row = cur.fetchone()
-            if not history_row:
-                raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
-            returned_id = history_row["id"]
-            print(f"[DB] Upserted history_items with id={returned_id}")
+                history_row = cur.fetchone()
+                if not history_row:
+                    raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
+                history_item_id = history_row["id"]
+                cur.execute("RELEASE SAVEPOINT normalized_save")
+            except Exception as e:
+                db_save_ok = False
+                db_errors.append({"op": "normalized_save", "error": str(e)})
+                log_db_continue("normalized_save", e)
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT normalized_save")
+                    cur.execute("RELEASE SAVEPOINT normalized_save")
+                except Exception as rollback_err:
+                    log_db_continue("normalized_save_rollback", rollback_err)
+                cleanup_keys = []
+                if model_reused is False and glb_s3_key:
+                    cleanup_keys.append(glb_s3_key)
+                if thumbnail_reused is False and thumbnail_s3_key:
+                    cleanup_keys.append(thumbnail_s3_key)
+                if image_reused is False and image_s3_key:
+                    cleanup_keys.append(image_s3_key)
+                if cleanup_keys:
+                    try:
+                        s3.delete_objects(
+                            Bucket=AWS_BUCKET_MODELS,
+                            Delete={"Objects": [{"Key": key} for key in cleanup_keys]},
+                        )
+                        print(f"[S3] cleanup: deleted {len(cleanup_keys)} objects after DB failure")
+                    except Exception as cleanup_err:
+                        print(f"[S3] cleanup failed: {cleanup_err}; keys={cleanup_keys}")
+                else:
+                    print(f"[S3] cleanup skipped; keys={cleanup_keys}")
 
         conn.close()
-        if model_log_info:
+        if db_save_ok and history_item_id:
+            if model_id:
+                print(f"[DB] model persisted: model_id={model_id} glb_url={final_glb_url} history_item_id={history_item_id}")
+            if image_id:
+                print(f"[DB] image persisted: image_id={image_id} image_url={image_url} history_item_id={history_item_id}")
+        if db_save_ok and model_log_info is not None:
             print(f"[S3] model stored: key={model_log_info['key']} hash={model_log_info['hash']} reused={model_log_info['reused']}")
-        if image_log_info:
+        if db_save_ok and image_log_info is not None:
             print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
-        print(f"[DB] Saved finished job {job_id} -> {history_uuid} to normalized tables")
+        if db_save_ok:
+            print(f"[DB] Saved finished job {job_id} -> {history_uuid} to normalized tables")
+        else:
+            print(f"[DB] save_finished_job completed with db_ok=False job_id={job_id}")
         # Return the S3 URLs so the calling endpoint can use them in the API response
         return {
             "success": True,
-            "db_ok": len(db_errors) == 0,
+            "db_ok": db_save_ok and len(db_errors) == 0,
             "db_errors": db_errors or None,
-            "glb_url": s3_glb_url,
-            "thumbnail_url": s3_thumbnail_url,
+            "glb_url": final_glb_url,
+            "thumbnail_url": final_thumbnail_url,
             "textured_glb_url": textured_glb_url,
             "rigged_character_glb_url": rigged_glb_url,
             "rigged_character_fbx_url": rigged_fbx_url,
@@ -2121,13 +2169,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         }
     except Exception as e:
         print(f"[DB] Failed to save finished job {job_id}: {e}")
-        s3_glb_url = locals().get("s3_glb_url")
-        s3_thumbnail_url = locals().get("s3_thumbnail_url")
+        final_glb_url = locals().get("final_glb_url")
+        final_thumbnail_url = locals().get("final_thumbnail_url")
         image_url = locals().get("image_url")
-        if s3_glb_url and is_s3_url(s3_glb_url):
-            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} glb_url={s3_glb_url}")
-        if s3_thumbnail_url and is_s3_url(s3_thumbnail_url):
-            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} thumbnail_url={s3_thumbnail_url}")
+        if final_glb_url and is_s3_url(final_glb_url):
+            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} glb_url={final_glb_url}")
+        if final_thumbnail_url and is_s3_url(final_thumbnail_url):
+            print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} thumbnail_url={final_thumbnail_url}")
         if image_url and is_s3_url(image_url):
             print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} image_url={image_url}")
         import traceback
