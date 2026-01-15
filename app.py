@@ -1834,11 +1834,36 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 image_meta = {
                     "stage": final_stage,
                     "job_type": job_type,
+                    "s3_bucket": s3_bucket,
                 }
                 image_upstream_id = job_meta.get("image_id") or status_data.get("image_id") or str(job_id)
+                image_slug = sanitize_filename(final_title or final_prompt or "image") or "image"
+                image_slug = image_slug[:60]
+                image_user = str(user_id) if user_id else "public"
+                image_job_key = sanitize_filename(str(job_id)) or "job"
+                image_content_hash = None
+                if image_url and not is_s3_url(image_url):
+                    upload_result = safe_upload_to_s3(
+                        image_url,
+                        "image/png",
+                        "images",
+                        image_slug,
+                        user_id=user_id,
+                        key_base=f"images/{image_user}/{image_job_key}/{image_slug}",
+                        return_hash=True,
+                    )
+                    image_url, image_content_hash = _unpack_upload_result(upload_result)
+                if thumbnail_url and not is_s3_url(thumbnail_url):
+                    thumbnail_url = safe_upload_to_s3(
+                        thumbnail_url,
+                        "image/png",
+                        "thumbnails",
+                        image_slug,
+                        user_id=user_id,
+                        key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
+                    )
                 image_s3_key = get_s3_key_from_url(image_url)
                 thumb_s3_key = get_s3_key_from_url(thumbnail_url)
-                image_content_hash = None
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.images (
                         id, identity_id,
