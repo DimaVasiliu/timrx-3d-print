@@ -88,6 +88,18 @@ def main() -> int:
     if not db_url:
         print("[dedupe_db] ERROR: DATABASE_URL not set")
         return 1
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(db_url)
+        safe_netloc = parsed.hostname or parsed.netloc
+        safe_db = (parsed.path or "").lstrip("/")
+    except Exception:
+        safe_netloc = "unknown"
+        safe_db = "unknown"
+    app_schema = os.getenv("APP_SCHEMA", "timrx_app")
+    bucket = os.getenv("AWS_BUCKET_MODELS", "").strip() or "unset"
+    print(f"[dedupe_db] Target DB: host={safe_netloc} db={safe_db} schema={app_schema}")
+    print(f"[dedupe_db] S3 bucket={bucket} apply=always limit=n/a")
 
     print("[dedupe_db] Using SQL queries:")
     print(GROUP_BY_UPSTREAM_SQL)
