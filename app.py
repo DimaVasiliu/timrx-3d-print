@@ -19,7 +19,7 @@ except Exception as e:
     print(f"[DB] Failed to import psycopg3: {e}")
     psycopg = None
     PSYCOPG_VERSION = 0
-from flask import Flask, request, jsonify, Response, abort, g
+from flask import Flask, request, jsonify, Response, abort, g, send_from_directory
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
@@ -663,6 +663,71 @@ for name, bp, prefix in _loaded_blueprints:
     app.register_blueprint(bp, url_prefix=prefix)
 if _loaded_blueprints:
     print(f"[APP] Blueprints registered: {', '.join(name for name, _, _ in _loaded_blueprints)}")
+
+# ─────────────────────────────────────────────────────────────
+# Frontend Serving (same-origin for cookies)
+# ─────────────────────────────────────────────────────────────
+# Find frontend directory - check multiple locations
+FRONTEND_DIR = None
+_possible_frontend_paths = [
+    APP_DIR / "frontend",                    # Deployed: frontend/ in same dir as app.py
+    APP_DIR / ".." / ".." / "Frontend",      # Local dev: TimrX/Backend/meshy -> TimrX/Frontend
+    APP_DIR.parent.parent / "Frontend",      # Alternative path
+]
+for _fp in _possible_frontend_paths:
+    if _fp.exists() and _fp.is_dir():
+        FRONTEND_DIR = _fp.resolve()
+        break
+
+if FRONTEND_DIR:
+    print(f"[FRONTEND] Serving from: {FRONTEND_DIR}")
+else:
+    print("[FRONTEND] WARNING: Frontend directory not found. HTML routes will return 404.")
+
+@app.route("/")
+def serve_hub():
+    """Serve hub.html at root."""
+    if not FRONTEND_DIR:
+        return jsonify({"error": "Frontend not configured"}), 404
+    return send_from_directory(FRONTEND_DIR, "hub.html")
+
+@app.route("/3dprint")
+@app.route("/3dprint.html")
+def serve_3dprint():
+    """Serve 3dprint.html."""
+    if not FRONTEND_DIR:
+        return jsonify({"error": "Frontend not configured"}), 404
+    return send_from_directory(FRONTEND_DIR, "3dprint.html")
+
+@app.route("/hub.html")
+def serve_hub_html():
+    """Serve hub.html explicitly."""
+    if not FRONTEND_DIR:
+        return jsonify({"error": "Frontend not configured"}), 404
+    return send_from_directory(FRONTEND_DIR, "hub.html")
+
+@app.route("/index.html")
+def serve_index_html():
+    """Serve index.html."""
+    if not FRONTEND_DIR:
+        return jsonify({"error": "Frontend not configured"}), 404
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+# Serve static assets (CSS, JS, etc.)
+@app.route("/<path:filename>")
+def serve_static_file(filename):
+    """Serve static files from frontend directory."""
+    if not FRONTEND_DIR:
+        abort(404)
+    # Security: only allow certain extensions
+    allowed_extensions = {'.css', '.js', '.html', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot'}
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in allowed_extensions:
+        abort(404)
+    try:
+        return send_from_directory(FRONTEND_DIR, filename)
+    except Exception:
+        abort(404)
 
 # ─────────────────────────────────────────────────────────────
 # JSON Error Handlers
