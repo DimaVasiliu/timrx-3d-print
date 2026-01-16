@@ -22,8 +22,8 @@ Usage:
 from functools import wraps
 from flask import request, g, jsonify, make_response
 
-from .services.identity_service import IdentityService
-from .db import DatabaseError
+from identity_service import IdentityService
+from db import DatabaseError
 
 
 def with_session(f):
@@ -214,7 +214,7 @@ def require_admin(f):
         - g.admin_email: The admin email (if email-based auth)
         - g.identity: The identity (if email-based auth)
     """
-    from .config import config
+    from config import config
 
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -302,7 +302,7 @@ def require_admin_key(f):
 
     Note: Never logs the actual key value for security.
     """
-    from .config import config
+    from config import config
 
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -338,7 +338,7 @@ def check_admin_key() -> bool:
     Returns True if valid, False otherwise.
     Use this for optional admin bypass checks (e.g., skip credit checks).
     """
-    from .config import config
+    from config import config
 
     if not config.ADMIN_KEY:
         return False
