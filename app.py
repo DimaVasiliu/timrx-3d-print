@@ -24,17 +24,12 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
 # ─────────────────────────────────────────────────────────────
-# Backend Module Imports (new credits system)
+# Backend Module Imports (credits system)
 # ─────────────────────────────────────────────────────────────
-try:
-    from backend.config import config as backend_config
-    from backend.routes import register_blueprints
-    from backend.db import DatabaseError
-    BACKEND_MODULE_AVAILABLE = True
-    print("[BACKEND] Backend module loaded successfully")
-except ImportError as e:
-    BACKEND_MODULE_AVAILABLE = False
-    print(f"[BACKEND] Backend module not available: {e}")
+from backend.config import config as backend_config
+from backend.routes import register_blueprints
+from backend.db import DatabaseError
+print("[BACKEND] Backend module loaded successfully")
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -618,11 +613,9 @@ def _set_anonymous_user():
     g.user_id = None
 
 # ─────────────────────────────────────────────────────────────
-# Register Backend Blueprints (new credits system)
+# Register Backend Blueprints (credits system)
 # ─────────────────────────────────────────────────────────────
-if BACKEND_MODULE_AVAILABLE:
-    register_blueprints(app)
-    print("[BACKEND] Blueprints registered: /api/me, /api/billing, /api/auth, /api/admin")
+register_blueprints(app)
 
 # ─────────────────────────────────────────────────────────────
 # JSON Error Handlers
@@ -701,17 +694,16 @@ def handle_internal_error(e):
 
 
 # Handle DatabaseError from backend module
-if BACKEND_MODULE_AVAILABLE:
-    @app.errorhandler(DatabaseError)
-    def handle_database_error(e):
-        """Handle database errors from backend module."""
-        print(f"[ERROR] Database error: {e}")
-        return make_error_response(
-            "DATABASE_ERROR",
-            "A database error occurred",
-            500,
-            details={"type": type(e).__name__} if IS_DEV else None
-        )
+@app.errorhandler(DatabaseError)
+def handle_database_error(e):
+    """Handle database errors from backend module."""
+    print(f"[ERROR] Database error: {e}")
+    return make_error_response(
+        "DATABASE_ERROR",
+        "A database error occurred",
+        500,
+        details={"type": type(e).__name__} if IS_DEV else None
+    )
 
 
 # ─────────────────────────────────────────────────────────────
