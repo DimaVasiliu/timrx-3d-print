@@ -1,7 +1,7 @@
 """
 /api/admin routes - Admin-only endpoints.
 
-All endpoints require admin authentication via:
+Most endpoints require admin authentication via:
   1. X-Admin-Token header (for scripts/automation)
   2. Session with email in ADMIN_EMAILS list (for browser)
 
@@ -13,6 +13,7 @@ Endpoints:
 - GET  /api/admin/purchases          - List purchases
 - POST /api/admin/credits/grant      - Grant/deduct credits
 - POST /api/admin/wallet/adjust      - Adjust wallet (alias for credits/grant)
+- POST /api/admin/wallet/grant       - Simple credit grant (X-Admin-Key auth)
 - GET  /api/admin/reservations       - List credit reservations
 - POST /api/admin/reservations/<id>/release - Release a reservation
 - GET  /api/admin/jobs               - List jobs
@@ -20,12 +21,16 @@ Endpoints:
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth
   ADMIN_EMAILS=admin@example.com     # Comma-separated list for email-based auth
+  ADMIN_KEY=your-secret-key          # For simple /wallet/grant endpoint
 """
 
 from flask import Blueprint, request, jsonify, g
 
 from ..middleware import require_admin
 from ..services.admin_service import AdminService
+from ..services.identity_service import IdentityService
+from ..services.wallet_service import WalletService, LedgerEntryType
+from ..config import config
 from ..db import DatabaseError
 
 admin_bp = Blueprint("admin", __name__)
@@ -297,3 +302,99 @@ def admin_health():
         "auth_method": getattr(g, "admin_auth_method", None),
         "admin_email": getattr(g, "admin_email", None),
     })
+
+
+@admin_bp.route("/wallet/grant", methods=["POST"])
+def simple_grant_credits():
+    """
+    Simple admin credit grant endpoint for testing without Stripe.
+
+    Auth: X-Admin-Key header must match ADMIN_KEY env variable.
+
+    Body:
+        - identity_id: Target user UUID (optional - uses current session if not provided)
+        - credits: Number of credits to grant (required, must be 1-5000)
+        - reason: Reason for the grant (optional)
+
+    Returns:
+        - ok: true
+        - identity_id: The identity that received credits
+        - balance: New wallet balance
+        - ledger_entry_id: ID of the created ledger entry
+    """
+    # Simple X-Admin-Key authentication
+    admin_key = request.headers.get("X-Admin-Key")
+
+    if not config.ADMIN_KEY:
+        return jsonify({
+            "ok": False,
+            "error": "ADMIN_KEY not configured on server"
+        }), 503
+
+    if not admin_key or admin_key != config.ADMIN_KEY:
+        return jsonify({
+            "ok": False,
+            "error": "Invalid or missing X-Admin-Key header"
+        }), 403
+
+    try:
+        data = request.get_json() or {}
+
+        identity_id = data.get("identity_id")
+        credit_amount = data.get("credits")
+        reason = data.get("reason", "admin_grant").strip() or "admin_grant"
+
+        # If no identity_id provided, try to use current session
+        if not identity_id:
+            identity = IdentityService.get_current_identity(request)
+            if identity:
+                identity_id = str(identity["id"])
+            else:
+                return jsonify({
+                    "ok": False,
+                    "error": "identity_id required (no active session found)"
+                }), 400
+
+        # Validate credits
+        if credit_amount is None:
+            return jsonify({"ok": False, "error": "credits is required"}), 400
+
+        if not isinstance(credit_amount, int):
+            return jsonify({"ok": False, "error": "credits must be an integer"}), 400
+
+        if credit_amount <= 0:
+            return jsonify({"ok": False, "error": "credits must be greater than 0"}), 400
+
+        if credit_amount > 5000:
+            return jsonify({"ok": False, "error": "credits cannot exceed 5000"}), 400
+
+        # Ensure wallet exists
+        wallet = WalletService.get_or_create_wallet(identity_id)
+        if not wallet:
+            return jsonify({"ok": False, "error": "Failed to get or create wallet"}), 500
+
+        # Add ledger entry with admin_grant type
+        ledger_entry = WalletService.add_credits(
+            identity_id=identity_id,
+            amount=credit_amount,
+            entry_type=LedgerEntryType.ADMIN_GRANT,
+            meta={"reason": reason}
+        )
+
+        # Get updated balance
+        new_balance = WalletService.get_balance(identity_id)
+
+        print(f"[ADMIN] Simple grant: {credit_amount} credits to {identity_id} - {reason}")
+
+        return jsonify({
+            "ok": True,
+            "identity_id": identity_id,
+            "balance": new_balance,
+            "ledger_entry_id": str(ledger_entry["id"]) if ledger_entry else None
+        })
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except DatabaseError as e:
+        print(f"[ADMIN] Simple grant error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
