@@ -24,12 +24,16 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
 # ─────────────────────────────────────────────────────────────
-# Backend Module Imports (credits system)
+# Credits System Imports (flat module structure)
 # ─────────────────────────────────────────────────────────────
-from backend.config import config as backend_config
-from backend.routes import register_blueprints
-from backend.db import DatabaseError
-print("[BACKEND] Backend module loaded successfully")
+from config import config as backend_config
+from db import DatabaseError
+from me import me_bp
+from billing import billing_bp
+from auth import auth_bp
+from admin import admin_bp
+from jobs import jobs_bp
+print("[APP] Credits system modules loaded")
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -613,9 +617,14 @@ def _set_anonymous_user():
     g.user_id = None
 
 # ─────────────────────────────────────────────────────────────
-# Register Backend Blueprints (credits system)
+# Register Blueprints (credits system)
 # ─────────────────────────────────────────────────────────────
-register_blueprints(app)
+app.register_blueprint(me_bp, url_prefix="/api/me")
+app.register_blueprint(billing_bp, url_prefix="/api/billing")
+app.register_blueprint(auth_bp, url_prefix="/api/auth")
+app.register_blueprint(admin_bp, url_prefix="/api/admin")
+app.register_blueprint(jobs_bp, url_prefix="/api/jobs")
+print("[APP] Blueprints registered: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs")
 
 # ─────────────────────────────────────────────────────────────
 # JSON Error Handlers
@@ -693,10 +702,10 @@ def handle_internal_error(e):
     return make_error_response("INTERNAL_ERROR", "An internal error occurred", 500)
 
 
-# Handle DatabaseError from backend module
+# Handle DatabaseError from db module
 @app.errorhandler(DatabaseError)
 def handle_database_error(e):
-    """Handle database errors from backend module."""
+    """Handle database errors."""
     print(f"[ERROR] Database error: {e}")
     return make_error_response(
         "DATABASE_ERROR",
