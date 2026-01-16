@@ -11,12 +11,12 @@ Note: Logout is handled by /api/me/logout for consistency with other /me endpoin
 
 from flask import Blueprint, request, jsonify, g
 
-from ..middleware import with_session
-from ..services.magic_code_service import MagicCodeService
-from ..services.identity_service import IdentityService
-from ..services.wallet_service import WalletService
+from middleware import with_session
+from magic_code_service import MagicCodeService
+from identity_service import IdentityService
+from wallet_service import WalletService
 
-auth_bp = Blueprint("auth", __name__)
+bp = Blueprint("auth", __name__)
 
 
 def _get_redeem_error_response(message: str):
@@ -51,7 +51,7 @@ def _get_client_ip() -> str:
     return request.remote_addr or ""
 
 
-@auth_bp.route("/restore/request", methods=["POST"])
+@bp.route("/restore/request", methods=["POST"])
 def request_restore():
     """
     Request a magic code to restore account access.
@@ -122,7 +122,7 @@ def request_restore():
     })
 
 
-@auth_bp.route("/restore/redeem", methods=["POST"])
+@bp.route("/restore/redeem", methods=["POST"])
 @with_session
 def redeem_restore():
     """
@@ -241,7 +241,7 @@ def redeem_restore():
     })
 
 
-@auth_bp.route("/status", methods=["GET"])
+@bp.route("/status", methods=["GET"])
 @with_session
 def auth_status():
     """
