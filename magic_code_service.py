@@ -20,7 +20,7 @@ import hashlib
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
-from ..db import (
+from db import (
     transaction,
     fetch_one,
     fetch_all,
@@ -30,8 +30,8 @@ from ..db import (
     Tables,
     hash_string,
 )
-from ..config import config
-from ..emailer import send_magic_code, notify_restore_request
+from config import config
+from emailer import send_magic_code, notify_restore_request
 
 
 class MagicCodeService:
