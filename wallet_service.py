@@ -19,7 +19,7 @@ Ledger entry types:
 from typing import Optional, Dict, Any, List
 import json
 
-from ..db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
+from db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
 
 
 class LedgerEntryType:
