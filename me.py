@@ -29,10 +29,12 @@ def get_me():
     """
     identity = g.identity
 
-    # Get wallet balance
+    # Fetch wallet balance from wallets table (not from identity join)
     balance = 0
-    if identity:
-        balance = identity.get("balance_credits", 0) or 0
+    reserved = 0
+    if g.identity_id:
+        balance = WalletService.get_balance(g.identity_id)
+        reserved = WalletService.get_reserved_credits(g.identity_id)
 
     return jsonify({
         "ok": True,
@@ -40,6 +42,8 @@ def get_me():
         "email": identity.get("email") if identity else None,
         "email_verified": identity.get("email_verified", False) if identity else False,
         "balance_credits": balance,
+        "reserved_credits": reserved,
+        "available_credits": max(0, balance - reserved),
         "created_at": identity.get("created_at").isoformat() if identity and identity.get("created_at") else None,
     })
 
