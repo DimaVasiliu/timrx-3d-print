@@ -11,15 +11,15 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from ..middleware import with_session, require_session
-from ..services.identity_service import IdentityService
-from ..services.wallet_service import WalletService
-from ..db import DatabaseIntegrityError
+from middleware import with_session, require_session
+from identity_service import IdentityService
+from wallet_service import WalletService
+from db import DatabaseIntegrityError
 
-me_bp = Blueprint("me", __name__)
+bp = Blueprint("me", __name__)
 
 
-@me_bp.route("", methods=["GET"])
+@bp.route("", methods=["GET"])
 @with_session
 def get_me():
     """
@@ -44,7 +44,7 @@ def get_me():
     })
 
 
-@me_bp.route("/email", methods=["POST"])
+@bp.route("/email", methods=["POST"])
 @require_session
 def attach_email():
     """
@@ -87,7 +87,7 @@ def attach_email():
         }), 409
 
 
-@me_bp.route("/wallet", methods=["GET"])
+@bp.route("/wallet", methods=["GET"])
 @require_session
 def get_wallet():
     """
@@ -126,7 +126,7 @@ def get_wallet():
         })
 
 
-@me_bp.route("/ledger", methods=["GET"])
+@bp.route("/ledger", methods=["GET"])
 @require_session
 def get_ledger():
     """
@@ -155,7 +155,7 @@ def get_ledger():
         })
 
 
-@me_bp.route("/logout", methods=["POST"])
+@bp.route("/logout", methods=["POST"])
 def logout():
     """
     End the current session.
