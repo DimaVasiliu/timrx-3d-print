@@ -45,21 +45,21 @@ Example curl commands:
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
 
-from ..middleware import require_admin, require_admin_key
-from ..services.admin_service import AdminService
-from ..services.identity_service import IdentityService
-from ..services.wallet_service import WalletService, LedgerEntryType
-from ..config import config
-from ..db import DatabaseError, query_one, transaction, fetch_one, Tables
+from middleware import require_admin, require_admin_key
+from admin_service import AdminService
+from identity_service import IdentityService
+from wallet_service import WalletService, LedgerEntryType
+from config import config
+from db import DatabaseError, query_one, transaction, fetch_one, Tables
 
-admin_bp = Blueprint("admin", __name__)
+bp = Blueprint("admin", __name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKDOOR ENDPOINTS (X-Admin-Key auth) - for emergency/testing
 # ─────────────────────────────────────────────────────────────────────────────
 
-@admin_bp.route("/ping", methods=["GET"])
+@bp.route("/ping", methods=["GET"])
 @require_admin_key
 def admin_ping():
     """
@@ -72,7 +72,7 @@ def admin_ping():
     })
 
 
-@admin_bp.route("/bootstrap", methods=["POST"])
+@bp.route("/bootstrap", methods=["POST"])
 @require_admin_key
 def admin_bootstrap():
     """
@@ -163,7 +163,7 @@ def admin_bootstrap():
         }), 500
 
 
-@admin_bp.route("/wallet/grant", methods=["POST"])
+@bp.route("/wallet/grant", methods=["POST"])
 @require_admin_key
 def admin_wallet_grant():
     """
@@ -261,8 +261,8 @@ def admin_wallet_grant():
 # STANDARD ADMIN ENDPOINTS (X-Admin-Token or email-based auth)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@admin_bp.route("/overview", methods=["GET"])
-@admin_bp.route("/stats", methods=["GET"])
+@bp.route("/overview", methods=["GET"])
+@bp.route("/stats", methods=["GET"])
 @require_admin
 def get_stats():
     """
@@ -288,7 +288,7 @@ def get_stats():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/identities", methods=["GET"])
+@bp.route("/identities", methods=["GET"])
 @require_admin
 def list_identities():
     """
@@ -324,7 +324,7 @@ def list_identities():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/identities/<identity_id>", methods=["GET"])
+@bp.route("/identities/<identity_id>", methods=["GET"])
 @require_admin
 def get_identity_detail(identity_id):
     """
@@ -342,7 +342,7 @@ def get_identity_detail(identity_id):
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/purchases", methods=["GET"])
+@bp.route("/purchases", methods=["GET"])
 @require_admin
 def list_purchases():
     """
@@ -372,8 +372,8 @@ def list_purchases():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/wallet/adjust", methods=["POST"])
-@admin_bp.route("/credits/grant", methods=["POST"])
+@bp.route("/wallet/adjust", methods=["POST"])
+@bp.route("/credits/grant", methods=["POST"])
 @require_admin
 def grant_credits():
     """
@@ -429,7 +429,7 @@ def grant_credits():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/reservations", methods=["GET"])
+@bp.route("/reservations", methods=["GET"])
 @require_admin
 def list_reservations():
     """
@@ -456,7 +456,7 @@ def list_reservations():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/reservations/<reservation_id>/release", methods=["POST"])
+@bp.route("/reservations/<reservation_id>/release", methods=["POST"])
 @require_admin
 def release_reservation(reservation_id):
     """
@@ -486,7 +486,7 @@ def release_reservation(reservation_id):
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/jobs", methods=["GET"])
+@bp.route("/jobs", methods=["GET"])
 @require_admin
 def list_jobs():
     """
@@ -516,7 +516,7 @@ def list_jobs():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
-@admin_bp.route("/health", methods=["GET"])
+@bp.route("/health", methods=["GET"])
 @require_admin
 def admin_health():
     """
