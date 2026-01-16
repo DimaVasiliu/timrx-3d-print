@@ -34,7 +34,7 @@ except ImportError:
     dict_row = None
     PSYCOPG_AVAILABLE = False
 
-from .config import config
+from config import config
 
 
 # ─────────────────────────────────────────────────────────────
