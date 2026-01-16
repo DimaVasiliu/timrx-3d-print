@@ -17,8 +17,8 @@ Usage:
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
-from ..db import query_one, query_all, execute_returning, transaction, Tables
-from .wallet_service import WalletService
+from db import query_one, query_all, execute_returning, transaction, Tables
+from wallet_service import WalletService
 
 
 class AdminService:
@@ -541,7 +541,7 @@ class AdminService:
         """
         Manually release a held reservation (returns credits to user).
         """
-        from .reservation_service import ReservationService
+        from reservation_service import ReservationService
         return ReservationService.release_reservation(reservation_id)
 
     # ─────────────────────────────────────────────────────────────
