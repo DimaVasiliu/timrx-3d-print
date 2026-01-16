@@ -1,0 +1,292 @@
+"""
+Middleware for TimrX Backend routes.
+
+Provides decorators and helpers for session/identity management in routes.
+
+Usage:
+    from backend.middleware import with_session, require_session
+
+    @app.route("/api/me")
+    @with_session
+    def get_me():
+        # g.identity and g.session_id are available
+        return jsonify({"identity_id": str(g.identity["id"])})
+
+    @app.route("/api/billing/checkout", methods=["POST"])
+    @require_session
+    def checkout():
+        # Requires valid session, returns 401 if not authenticated
+        return jsonify({"ok": True})
+"""
+
+from functools import wraps
+from flask import request, g, jsonify, make_response
+
+from .services.identity_service import IdentityService
+from .db import DatabaseError
+
+
+def with_session(f):
+    """
+    Decorator that ensures a session exists.
+    Creates anonymous identity + session if none exists.
+
+    Sets on g:
+        - g.session_id: The session ID
+        - g.identity_id: The identity ID (string)
+        - g.identity: The full identity dict (with wallet balance)
+
+    The session cookie is automatically set on new sessions.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Create response wrapper to set cookies
+        try:
+            # Check for existing valid session first
+            identity = IdentityService.get_current_identity(request)
+
+            if identity:
+                # Existing valid session
+                g.session_id = IdentityService.get_session_id_from_request(request)
+                g.identity_id = str(identity["id"])
+                g.identity = identity
+                return f(*args, **kwargs)
+
+            # No valid session - need to create one
+            # We need to wrap the response to set the cookie
+            response = make_response()
+
+            session_id, identity_id = IdentityService.get_or_create_session(request, response)
+
+            g.session_id = session_id
+            g.identity_id = identity_id
+            g.identity = IdentityService.get_identity_with_wallet(identity_id)
+
+            # Call the actual route function
+            result = f(*args, **kwargs)
+
+            # If result is a Response, copy cookies to it
+            if hasattr(result, 'headers'):
+                # Copy the session cookie from our temp response
+                for cookie in response.headers.getlist('Set-Cookie'):
+                    result.headers.add('Set-Cookie', cookie)
+                return result
+            else:
+                # Result is not a response (e.g., tuple or dict)
+                # Convert to response and add cookies
+                if isinstance(result, tuple):
+                    actual_response = make_response(result[0], result[1] if len(result) > 1 else 200)
+                else:
+                    actual_response = make_response(result)
+
+                for cookie in response.headers.getlist('Set-Cookie'):
+                    actual_response.headers.add('Set-Cookie', cookie)
+                return actual_response
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in with_session: {e}")
+            return jsonify({
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "Database error occurred"
+                }
+            }), 500
+
+    return decorated
+
+
+def require_session(f):
+    """
+    Decorator that requires a valid session.
+    Returns 401 if no valid session exists.
+    Does NOT create anonymous sessions.
+
+    Sets on g:
+        - g.session_id: The session ID
+        - g.identity_id: The identity ID (string)
+        - g.identity: The full identity dict
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        try:
+            identity = IdentityService.get_current_identity(request)
+
+            if not identity:
+                return jsonify({
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Valid session required"
+                    }
+                }), 401
+
+            g.session_id = IdentityService.get_session_id_from_request(request)
+            g.identity_id = str(identity["id"])
+            g.identity = identity
+
+            return f(*args, **kwargs)
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in require_session: {e}")
+            return jsonify({
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "Database error occurred"
+                }
+            }), 500
+
+    return decorated
+
+
+def require_email(f):
+    """
+    Decorator that requires a valid session with an attached email.
+    Returns 401 if no session, 403 if no email attached.
+
+    Use for endpoints that require email (e.g., purchases).
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        try:
+            identity = IdentityService.get_current_identity(request)
+
+            if not identity:
+                return jsonify({
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Valid session required"
+                    }
+                }), 401
+
+            if not identity.get("email"):
+                return jsonify({
+                    "error": {
+                        "code": "EMAIL_REQUIRED",
+                        "message": "Email address required for this action"
+                    }
+                }), 403
+
+            g.session_id = IdentityService.get_session_id_from_request(request)
+            g.identity_id = str(identity["id"])
+            g.identity = identity
+
+            return f(*args, **kwargs)
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in require_email: {e}")
+            return jsonify({
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "Database error occurred"
+                }
+            }), 500
+
+    return decorated
+
+
+def get_identity_from_request():
+    """
+    Helper function to get identity from current request.
+    Returns None if no valid session.
+    Use this when you don't want a decorator.
+    """
+    return IdentityService.get_current_identity(request)
+
+
+def get_session_id_from_request():
+    """
+    Helper function to get session ID from current request.
+    Returns None if no session cookie.
+    """
+    return IdentityService.get_session_id_from_request(request)
+
+
+def require_admin(f):
+    """
+    Decorator that requires admin authentication.
+    Supports two authentication methods:
+      1. Token-based: X-Admin-Token header (for scripts/automation)
+      2. Email-based: Session with email in ADMIN_EMAILS list (for browser)
+
+    Returns 401 if not authenticated, 403 if not an admin.
+
+    Sets on g:
+        - g.admin_auth_method: 'token' or 'email'
+        - g.admin_email: The admin email (if email-based auth)
+        - g.identity: The identity (if email-based auth)
+    """
+    from .config import config
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Check if admin auth is configured at all
+        if not config.ADMIN_AUTH_CONFIGURED:
+            return jsonify({
+                "error": {
+                    "code": "ADMIN_NOT_CONFIGURED",
+                    "message": "Admin authentication is not configured"
+                }
+            }), 503
+
+        # Method 1: Token-based authentication (X-Admin-Token header)
+        admin_token = request.headers.get("X-Admin-Token")
+        if admin_token:
+            if config.ADMIN_TOKEN and admin_token == config.ADMIN_TOKEN:
+                g.admin_auth_method = "token"
+                g.admin_email = None
+                g.identity = None
+                return f(*args, **kwargs)
+            else:
+                return jsonify({
+                    "error": {
+                        "code": "INVALID_ADMIN_TOKEN",
+                        "message": "Invalid admin token"
+                    }
+                }), 403
+
+        # Method 2: Email-based authentication (session with admin email)
+        try:
+            identity = IdentityService.get_current_identity(request)
+
+            if not identity:
+                return jsonify({
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Authentication required"
+                    }
+                }), 401
+
+            email = identity.get("email")
+            if not email:
+                return jsonify({
+                    "error": {
+                        "code": "EMAIL_REQUIRED",
+                        "message": "Admin access requires verified email"
+                    }
+                }), 403
+
+            if not config.is_admin_email(email):
+                return jsonify({
+                    "error": {
+                        "code": "NOT_ADMIN",
+                        "message": "You do not have admin privileges"
+                    }
+                }), 403
+
+            g.admin_auth_method = "email"
+            g.admin_email = email
+            g.session_id = IdentityService.get_session_id_from_request(request)
+            g.identity_id = str(identity["id"])
+            g.identity = identity
+
+            return f(*args, **kwargs)
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in require_admin: {e}")
+            return jsonify({
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "Database error occurred"
+                }
+            }), 500
+
+    return decorated

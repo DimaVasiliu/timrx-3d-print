@@ -14,11 +14,17 @@ CREATE SCHEMA IF NOT EXISTS timrx_app;
 
 CREATE TABLE IF NOT EXISTS timrx_billing.identities (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email            TEXT NOT NULL UNIQUE,
+  email            TEXT,
   email_verified   BOOLEAN NOT NULL DEFAULT FALSE,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen_at     TIMESTAMPTZ
+  last_seen_at     TIMESTAMPTZ,
+  CONSTRAINT ck_identities_email_lowercase
+    CHECK (email IS NULL OR email = lower(email))
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_identities_email_lower
+ON timrx_billing.identities (lower(email))
+WHERE email IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS timrx_billing.magic_codes (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -53,7 +59,9 @@ CREATE TABLE IF NOT EXISTS timrx_billing.plans (
   price_gbp        NUMERIC(10,2) NOT NULL,
   currency         TEXT NOT NULL DEFAULT 'GBP',
   credit_grant     INT NOT NULL,
+  includes_priority BOOLEAN NOT NULL DEFAULT FALSE,
   is_active        BOOLEAN NOT NULL DEFAULT TRUE,
+  meta             JSONB,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -147,6 +155,12 @@ ON timrx_billing.jobs(identity_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_upstream
 ON timrx_billing.jobs(provider, upstream_job_id);
 
+ALTER TABLE timrx_billing.credit_reservations
+  ADD CONSTRAINT fk_reservations_ref_job
+  FOREIGN KEY (ref_job_id) REFERENCES timrx_billing.jobs(id)
+  ON DELETE SET NULL
+  NOT VALID;
+
 CREATE OR REPLACE FUNCTION timrx_billing.touch_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -172,9 +186,9 @@ CREATE TABLE IF NOT EXISTS timrx_billing.daily_limits (
 
 INSERT INTO timrx_billing.plans(code, name, description, price_gbp, credit_grant, is_active)
 VALUES
- ('starter_120',  'Starter',  'Try the tools. Great for a few generations.',  4.99,  120, TRUE),
- ('creator_400',  'Creator',  'Regular use. Better value bundle.',           12.99,  400, TRUE),
- ('studio_1000',  'Studio',   'Heavy use. Best value.',                     24.99, 1000, TRUE)
+ ('starter_80',  'Starter',  'Try the tools. Great for a few generations.',  7.99,  80, TRUE),
+ ('creator_300',  'Creator',  'Regular use. Better value bundle.',           19.99,  300, TRUE),
+ ('studio_600',  'Studio',   'Heavy use. Best value.',                     34.99, 600, TRUE)
 ON CONFLICT (code) DO NOTHING;
 
 -- ============================================================
@@ -199,6 +213,7 @@ CREATE TABLE IF NOT EXISTS timrx_app.models (
   thumbnail_s3_key  TEXT,
   glb_url           TEXT,
   thumbnail_url     TEXT,
+  content_hash      TEXT,
 
   meta              JSONB,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -206,11 +221,29 @@ CREATE TABLE IF NOT EXISTS timrx_app.models (
   deleted_at        TIMESTAMPTZ
 );
 
+ALTER TABLE timrx_app.models
+ADD COLUMN IF NOT EXISTS content_hash TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_models_identity_created
 ON timrx_app.models(identity_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_models_upstream
 ON timrx_app.models(provider, upstream_job_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_models_provider_upstream_job
+ON timrx_app.models(provider, upstream_job_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_models_provider_content_hash
+ON timrx_app.models(provider, content_hash)
+WHERE content_hash IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_models_glb_s3_key
+ON timrx_app.models(s3_bucket, glb_s3_key)
+WHERE s3_bucket IS NOT NULL AND glb_s3_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_models_thumb_s3_key
+ON timrx_app.models(s3_bucket, thumbnail_s3_key)
+WHERE s3_bucket IS NOT NULL AND thumbnail_s3_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS timrx_app.images (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -231,6 +264,7 @@ CREATE TABLE IF NOT EXISTS timrx_app.images (
 
   image_url         TEXT,
   thumbnail_url     TEXT,
+  content_hash      TEXT,
 
   width             INT,
   height            INT,
@@ -240,11 +274,40 @@ CREATE TABLE IF NOT EXISTS timrx_app.images (
   deleted_at        TIMESTAMPTZ
 );
 
+ALTER TABLE timrx_app.images
+ADD COLUMN IF NOT EXISTS content_hash TEXT;
+
+ALTER TABLE timrx_app.images
+ADD CONSTRAINT IF NOT EXISTS images_provider_upstream_id_uniq UNIQUE (provider, upstream_id);
+
 CREATE INDEX IF NOT EXISTS idx_images_identity_created
 ON timrx_app.images(identity_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_images_upstream
 ON timrx_app.images(provider, upstream_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_images_provider_upstream_id
+ON timrx_app.images(provider, upstream_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_images_provider_image_url_no_upstream
+ON timrx_app.images(provider, image_url)
+WHERE upstream_id IS NULL AND image_url IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_images_provider_content_hash
+ON timrx_app.images(provider, content_hash)
+WHERE content_hash IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_images_image_s3_key
+ON timrx_app.images(s3_bucket, image_s3_key)
+WHERE s3_bucket IS NOT NULL AND image_s3_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_images_thumb_s3_key
+ON timrx_app.images(s3_bucket, thumbnail_s3_key)
+WHERE s3_bucket IS NOT NULL AND thumbnail_s3_key IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_images_source_s3_key
+ON timrx_app.images(s3_bucket, source_s3_key)
+WHERE s3_bucket IS NOT NULL AND source_s3_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS timrx_app.history_items (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -270,8 +333,37 @@ CREATE TABLE IF NOT EXISTS timrx_app.history_items (
 
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  deleted_at        TIMESTAMPTZ
+  deleted_at        TIMESTAMPTZ,
+  CONSTRAINT ck_history_items_exactly_one_asset
+    CHECK (((model_id IS NOT NULL)::int + (image_id IS NOT NULL)::int) = 1)
 );
+
+CREATE TABLE IF NOT EXISTS timrx_app.asset_saves (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  provider      TEXT NOT NULL,
+  asset_type    TEXT NOT NULL DEFAULT 'model',
+  upstream_id   TEXT,
+  canonical_url TEXT,
+  stage         TEXT NOT NULL,
+  saved_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE timrx_app.asset_saves
+  ADD COLUMN IF NOT EXISTS asset_type TEXT NOT NULL DEFAULT 'model';
+ALTER TABLE timrx_app.asset_saves
+  ADD COLUMN IF NOT EXISTS canonical_url TEXT;
+ALTER TABLE timrx_app.asset_saves
+  ALTER COLUMN upstream_id DROP NOT NULL;
+ALTER TABLE timrx_app.asset_saves
+  DROP CONSTRAINT IF EXISTS asset_saves_provider_upstream_id_stage_key;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_asset_saves_provider_asset_upstream
+ON timrx_app.asset_saves(provider, asset_type, upstream_id)
+WHERE upstream_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_asset_saves_provider_asset_canonical
+ON timrx_app.asset_saves(provider, asset_type, canonical_url)
+WHERE canonical_url IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_history_identity_created
 ON timrx_app.history_items(identity_id, created_at DESC);
