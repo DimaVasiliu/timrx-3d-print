@@ -14,13 +14,13 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from ..middleware import require_session, require_email
-from ..services.pricing_service import PricingService
-from ..services.wallet_service import WalletService
-from ..services.reservation_service import ReservationService
-from ..services.purchase_service import PurchaseService
+from middleware import require_session, require_email
+from pricing_service import PricingService
+from wallet_service import WalletService
+from reservation_service import ReservationService
+from purchase_service import PurchaseService
 
-billing_bp = Blueprint("billing", __name__)
+bp = Blueprint("billing", __name__)
 
 # Cache TTL for pricing data (5 minutes)
 CACHE_TTL_SECONDS = 300
@@ -32,7 +32,7 @@ def _add_cache_headers(response, max_age: int = CACHE_TTL_SECONDS):
     return response
 
 
-@billing_bp.route("/plans", methods=["GET"])
+@bp.route("/plans", methods=["GET"])
 def get_plans():
     """
     List available credit plans for purchase.
@@ -72,7 +72,7 @@ def get_plans():
         })
 
 
-@billing_bp.route("/action-costs", methods=["GET"])
+@bp.route("/action-costs", methods=["GET"])
 def get_action_costs():
     """
     Get action costs in credits.
@@ -117,13 +117,13 @@ def get_action_costs():
 
 
 # Keep /costs as alias for backward compatibility
-@billing_bp.route("/costs", methods=["GET"])
+@bp.route("/costs", methods=["GET"])
 def get_costs():
     """Alias for /action-costs (backward compatibility)."""
     return get_action_costs()
 
 
-@billing_bp.route("/ledger", methods=["GET"])
+@bp.route("/ledger", methods=["GET"])
 @require_session
 def get_ledger():
     """
@@ -179,7 +179,7 @@ def get_ledger():
         })
 
 
-@billing_bp.route("/reserve", methods=["POST"])
+@bp.route("/reserve", methods=["POST"])
 @require_session
 def reserve_credits():
     """
@@ -315,7 +315,7 @@ def reserve_credits():
         }), 500
 
 
-@billing_bp.route("/checkout/start", methods=["POST"])
+@bp.route("/checkout/start", methods=["POST"])
 @require_session
 def create_checkout():
     """
@@ -431,7 +431,7 @@ def create_checkout():
         }), 500
 
 
-@billing_bp.route("/webhook", methods=["POST"])
+@bp.route("/webhook", methods=["POST"])
 def stripe_webhook():
     """
     Handle Stripe webhook events.
@@ -465,7 +465,7 @@ def stripe_webhook():
         })
 
 
-@billing_bp.route("/purchase/<purchase_id>", methods=["GET"])
+@bp.route("/purchase/<purchase_id>", methods=["GET"])
 @require_session
 def get_purchase(purchase_id):
     """
@@ -522,7 +522,7 @@ def get_purchase(purchase_id):
         }), 500
 
 
-@billing_bp.route("/purchases", methods=["GET"])
+@bp.route("/purchases", methods=["GET"])
 @require_session
 def get_purchases():
     """
