@@ -210,14 +210,14 @@ class Config:
     ADMIN_EMAIL: str = field(default_factory=lambda: _get_env("ADMIN_EMAIL"))
 
     # Admin authentication (for /api/admin/* endpoints)
-    # Option 1: Token-based (X-Admin-Token header)
+    # Option 1: Token-based (X-Admin-Token header) - for existing admin dashboard
     ADMIN_TOKEN: str = field(default_factory=lambda: _get_env("ADMIN_TOKEN"))
-
-    # Simple admin key for testing endpoints (X-Admin-Key header)
-    ADMIN_KEY: str = field(default_factory=lambda: _get_env("ADMIN_KEY"))
 
     # Option 2: Email-based (comma-separated list of allowed admin emails)
     ADMIN_EMAILS: List[str] = field(default_factory=lambda: _get_env_list("ADMIN_EMAILS"))
+
+    # Admin key for backdoor endpoints (X-Admin-Key header) - for emergency/testing
+    ADMIN_KEY: str = field(default_factory=lambda: _get_env("ADMIN_KEY"))
 
     @property
     def ADMIN_AUTH_CONFIGURED(self) -> bool:
@@ -408,8 +408,8 @@ EMAIL_FROM_ADDRESS = config.EMAIL_FROM_ADDRESS
 EMAIL_FROM_NAME = config.EMAIL_FROM_NAME
 ADMIN_EMAIL = config.ADMIN_EMAIL
 ADMIN_TOKEN = config.ADMIN_TOKEN
-ADMIN_KEY = config.ADMIN_KEY
 ADMIN_EMAILS = config.ADMIN_EMAILS
+ADMIN_KEY = config.ADMIN_KEY
 NOTIFY_ON_NEW_IDENTITY = config.NOTIFY_ON_NEW_IDENTITY
 NOTIFY_ON_PURCHASE = config.NOTIFY_ON_PURCHASE
 NOTIFY_ON_RESTORE_REQUEST = config.NOTIFY_ON_RESTORE_REQUEST
