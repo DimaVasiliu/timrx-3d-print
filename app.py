@@ -26,14 +26,13 @@ from werkzeug.exceptions import HTTPException
 # ─────────────────────────────────────────────────────────────
 # Credits System Imports (flat module structure)
 # ─────────────────────────────────────────────────────────────
-from config import config as backend_config
+import config
 from db import DatabaseError
-from me import me_bp
-from billing import billing_bp
-from auth import auth_bp
-from admin import admin_bp
-from jobs import jobs_bp
-print("[APP] Credits system modules loaded")
+from me import bp as me_bp
+from billing import bp as billing_bp
+from auth import bp as auth_bp
+from admin import bp as admin_bp
+from jobs import bp as jobs_bp
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -624,7 +623,7 @@ app.register_blueprint(billing_bp, url_prefix="/api/billing")
 app.register_blueprint(auth_bp, url_prefix="/api/auth")
 app.register_blueprint(admin_bp, url_prefix="/api/admin")
 app.register_blueprint(jobs_bp, url_prefix="/api/jobs")
-print("[APP] Blueprints registered: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs")
+print("[APP] Blueprints registered: me, billing, auth, admin, jobs")
 
 # ─────────────────────────────────────────────────────────────
 # JSON Error Handlers
