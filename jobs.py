@@ -12,14 +12,14 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g
 
-from ..middleware import require_session, check_admin_key
-from ..services.job_service import JobService, JobStatus, JobProvider
-from ..services.wallet_service import WalletService
+from middleware import require_session, check_admin_key
+from job_service import JobService, JobStatus, JobProvider
+from wallet_service import WalletService
 
-jobs_bp = Blueprint("jobs", __name__)
+bp = Blueprint("jobs", __name__)
 
 
-@jobs_bp.route("/create", methods=["POST"])
+@bp.route("/create", methods=["POST"])
 @require_session
 def create_job():
     """
@@ -181,7 +181,7 @@ def create_job():
         }), 500
 
 
-@jobs_bp.route("/<job_id>", methods=["GET"])
+@bp.route("/<job_id>", methods=["GET"])
 @require_session
 def get_job(job_id):
     """
@@ -240,7 +240,7 @@ def get_job(job_id):
         }), 500
 
 
-@jobs_bp.route("", methods=["GET"])
+@bp.route("", methods=["GET"])
 @require_session
 def list_jobs():
     """
@@ -288,7 +288,7 @@ def list_jobs():
         })
 
 
-@jobs_bp.route("/<job_id>/complete", methods=["POST"])
+@bp.route("/<job_id>/complete", methods=["POST"])
 @require_session
 def complete_job(job_id):
     """
@@ -393,7 +393,7 @@ def complete_job(job_id):
         }), 500
 
 
-@jobs_bp.route("/<job_id>/cancel", methods=["POST"])
+@bp.route("/<job_id>/cancel", methods=["POST"])
 @require_session
 def cancel_job(job_id):
     """
@@ -529,7 +529,7 @@ def cancel_job(job_id):
         }), 500
 
 
-@jobs_bp.route("/callback", methods=["POST"])
+@bp.route("/callback", methods=["POST"])
 def job_callback():
     """
     Internal callback for existing pipeline to complete jobs by upstream_job_id.
