@@ -24,17 +24,56 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
 # ─────────────────────────────────────────────────────────────
-# Backend Module Imports (new credits system)
+# Credits System - Flat Module Imports
 # ─────────────────────────────────────────────────────────────
+# Import blueprints individually so one failure doesn't break all
+_loaded_blueprints = []
+
+# Required: me blueprint
 try:
-    from backend.config import config as backend_config
-    from backend.routes import register_blueprints
-    from backend.db import DatabaseError
-    BACKEND_MODULE_AVAILABLE = True
-    print("[BACKEND] Backend module loaded successfully")
+    from me import bp as me_bp
+    _loaded_blueprints.append(("me", me_bp, "/api/me"))
 except ImportError as e:
-    BACKEND_MODULE_AVAILABLE = False
-    print(f"[BACKEND] Backend module not available: {e}")
+    print(f"[WARN] me blueprint not loaded: {e}")
+    me_bp = None
+
+# Required: admin blueprint
+try:
+    from admin import bp as admin_bp
+    _loaded_blueprints.append(("admin", admin_bp, "/api/admin"))
+except ImportError as e:
+    print(f"[WARN] admin blueprint not loaded: {e}")
+    admin_bp = None
+
+# Optional: billing blueprint
+try:
+    from billing import bp as billing_bp
+    _loaded_blueprints.append(("billing", billing_bp, "/api/billing"))
+except ImportError as e:
+    print(f"[WARN] billing blueprint not loaded: {e}")
+    billing_bp = None
+
+# Optional: auth blueprint
+try:
+    from auth import bp as auth_bp
+    _loaded_blueprints.append(("auth", auth_bp, "/api/auth"))
+except ImportError as e:
+    print(f"[WARN] auth blueprint not loaded: {e}")
+    auth_bp = None
+
+# Optional: jobs blueprint
+try:
+    from jobs import bp as jobs_bp
+    _loaded_blueprints.append(("jobs", jobs_bp, "/api/jobs"))
+except ImportError as e:
+    print(f"[WARN] jobs blueprint not loaded: {e}")
+    jobs_bp = None
+
+# Import DatabaseError for error handler
+try:
+    from db import DatabaseError
+except ImportError:
+    DatabaseError = None
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -618,11 +657,12 @@ def _set_anonymous_user():
     g.user_id = None
 
 # ─────────────────────────────────────────────────────────────
-# Register Backend Blueprints (new credits system)
+# Register Blueprints (credits system)
 # ─────────────────────────────────────────────────────────────
-if BACKEND_MODULE_AVAILABLE:
-    register_blueprints(app)
-    print("[BACKEND] Blueprints registered: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs")
+for name, bp, prefix in _loaded_blueprints:
+    app.register_blueprint(bp, url_prefix=prefix)
+if _loaded_blueprints:
+    print(f"[APP] Blueprints registered: {', '.join(name for name, _, _ in _loaded_blueprints)}")
 
 # ─────────────────────────────────────────────────────────────
 # JSON Error Handlers
@@ -700,11 +740,11 @@ def handle_internal_error(e):
     return make_error_response("INTERNAL_ERROR", "An internal error occurred", 500)
 
 
-# Handle DatabaseError from backend module
-if BACKEND_MODULE_AVAILABLE:
+# Handle DatabaseError from db module
+if DatabaseError is not None:
     @app.errorhandler(DatabaseError)
     def handle_database_error(e):
-        """Handle database errors from backend module."""
+        """Handle database errors."""
         print(f"[ERROR] Database error: {e}")
         return make_error_response(
             "DATABASE_ERROR",
