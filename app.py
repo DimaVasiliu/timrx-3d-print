@@ -21,6 +21,20 @@ except Exception as e:
     PSYCOPG_VERSION = 0
 from flask import Flask, request, jsonify, Response, abort, g
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
+
+# ─────────────────────────────────────────────────────────────
+# Backend Module Imports (new credits system)
+# ─────────────────────────────────────────────────────────────
+try:
+    from backend.config import config as backend_config
+    from backend.routes import register_blueprints
+    from backend.db import DatabaseError
+    BACKEND_MODULE_AVAILABLE = True
+    print("[BACKEND] Backend module loaded successfully")
+except ImportError as e:
+    BACKEND_MODULE_AVAILABLE = False
+    print(f"[BACKEND] Backend module not available: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -602,6 +616,104 @@ CORS(
 def _set_anonymous_user():
     # Auth removed; keep request user_id consistently set to None.
     g.user_id = None
+
+# ─────────────────────────────────────────────────────────────
+# Register Backend Blueprints (new credits system)
+# ─────────────────────────────────────────────────────────────
+if BACKEND_MODULE_AVAILABLE:
+    register_blueprints(app)
+    print("[BACKEND] Blueprints registered: /api/me, /api/billing, /api/auth, /api/admin")
+
+# ─────────────────────────────────────────────────────────────
+# JSON Error Handlers
+# Returns consistent error format: {error: {code, message, details?}}
+# ─────────────────────────────────────────────────────────────
+def make_error_response(code: str, message: str, status: int, details: dict = None):
+    """Create a consistent error response."""
+    error_body = {
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    }
+    if details:
+        error_body["error"]["details"] = details
+    return jsonify(error_body), status
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    """Handle all HTTP exceptions with JSON response."""
+    code = e.name.upper().replace(" ", "_")
+    return make_error_response(code, e.description or str(e), e.code)
+
+
+@app.errorhandler(400)
+def handle_bad_request(e):
+    """Handle 400 Bad Request."""
+    message = e.description if hasattr(e, 'description') else "Bad request"
+    return make_error_response("BAD_REQUEST", message, 400)
+
+
+@app.errorhandler(401)
+def handle_unauthorized(e):
+    """Handle 401 Unauthorized."""
+    return make_error_response("UNAUTHORIZED", "Authentication required", 401)
+
+
+@app.errorhandler(403)
+def handle_forbidden(e):
+    """Handle 403 Forbidden."""
+    return make_error_response("FORBIDDEN", "Access denied", 403)
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    """Handle 404 Not Found."""
+    return make_error_response("NOT_FOUND", "Resource not found", 404)
+
+
+@app.errorhandler(405)
+def handle_method_not_allowed(e):
+    """Handle 405 Method Not Allowed."""
+    return make_error_response("METHOD_NOT_ALLOWED", "Method not allowed", 405)
+
+
+@app.errorhandler(422)
+def handle_unprocessable_entity(e):
+    """Handle 422 Unprocessable Entity."""
+    message = e.description if hasattr(e, 'description') else "Unprocessable entity"
+    return make_error_response("UNPROCESSABLE_ENTITY", message, 422)
+
+
+@app.errorhandler(429)
+def handle_rate_limit(e):
+    """Handle 429 Too Many Requests."""
+    return make_error_response("RATE_LIMITED", "Too many requests, please slow down", 429)
+
+
+@app.errorhandler(500)
+def handle_internal_error(e):
+    """Handle 500 Internal Server Error."""
+    # Log the actual error for debugging
+    print(f"[ERROR] Internal server error: {e}")
+    return make_error_response("INTERNAL_ERROR", "An internal error occurred", 500)
+
+
+# Handle DatabaseError from backend module
+if BACKEND_MODULE_AVAILABLE:
+    @app.errorhandler(DatabaseError)
+    def handle_database_error(e):
+        """Handle database errors from backend module."""
+        print(f"[ERROR] Database error: {e}")
+        return make_error_response(
+            "DATABASE_ERROR",
+            "A database error occurred",
+            500,
+            details={"type": type(e).__name__} if IS_DEV else None
+        )
+
+
 # ─────────────────────────────────────────────────────────────
 # DEV ONLY: Local JSON file storage for job metadata
 # In production (USE_DB=True), this is used as in-memory cache only
@@ -842,6 +954,158 @@ def _map_provider(job_type: str) -> str:
     job = (job_type or "").lower()
     return "openai" if "image" in job else "meshy"
 
+
+def _validate_history_item_asset_ids(model_id, image_id, context: str = ""):
+    """
+    Validate that exactly one of model_id or image_id is set (XOR constraint).
+    Returns True if valid, False otherwise. Logs a warning if invalid.
+    """
+    has_model = model_id is not None
+    has_image = image_id is not None
+    if has_model == has_image:  # Both set or both NULL = invalid
+        print(f"[WARN] history_items XOR violation ({context}): model_id={model_id}, image_id={image_id}")
+        return False
+    return True
+
+
+def _parse_s3_bucket_and_key(url: str):
+    """
+    Extract S3 bucket and key from an S3 URL.
+    Returns (bucket, key) tuple, or (None, None) if not an S3 URL.
+
+    Supports formats:
+    - https://bucket.s3.region.amazonaws.com/key
+    - https://s3.region.amazonaws.com/bucket/key
+    """
+    if not is_s3_url(url):
+        return None, None
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        path = parsed.path.lstrip("/")
+
+        # Format: bucket.s3.region.amazonaws.com/key
+        if host.endswith(".amazonaws.com") and ".s3." in host:
+            bucket = host.split(".s3.")[0]
+            key = path
+            return bucket, key if key else None
+
+        # Format: s3.region.amazonaws.com/bucket/key
+        if host.startswith("s3.") and host.endswith(".amazonaws.com"):
+            parts = path.split("/", 1)
+            if len(parts) >= 1:
+                bucket = parts[0]
+                key = parts[1] if len(parts) > 1 else None
+                return bucket, key
+
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _lookup_asset_id_for_history(cur, item_type: str, job_id: str, glb_url: str = None, image_url: str = None, user_id: str = None, provider: str = None):
+    """
+    Try to find an existing model_id or image_id for a history item.
+    Returns (model_id, image_id, reason) tuple:
+    - If found: (model_id or None, image_id or None, None)
+    - If ambiguous match: (None, None, "ambiguous_asset_match")
+    - If not found: (None, None, "missing_asset_reference")
+
+    Strict priority order (never uses weak matching):
+    1. provider + upstream_id (strongest key)
+    2. s3_bucket + s3_key (exact match on unique index)
+    3. Never falls back to raw URL matching without S3 key extraction
+
+    If multiple matches found, returns (None, None, "ambiguous_asset_match") and logs warning.
+    """
+    model_id = None
+    image_id = None
+
+    if item_type == "image":
+        # Priority 1: Look up by provider + upstream_id (strongest key)
+        if job_id:
+            prov = provider or "openai"
+            cur.execute(f"""
+                SELECT id FROM {APP_SCHEMA}.images
+                WHERE provider = %s AND upstream_id = %s
+            """, (prov, str(job_id)))
+            rows = cur.fetchall()
+            if len(rows) == 1:
+                image_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
+            elif len(rows) > 1:
+                ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
+                print(f"[WARN] _lookup_asset_id_for_history: multiple images for provider={prov}, upstream_id={job_id}: {ids}")
+                return None, None, "ambiguous_asset_match"
+
+        # Priority 2: Look up by s3_bucket + image_s3_key (unique index)
+        if not image_id and image_url:
+            bucket, key = _parse_s3_bucket_and_key(image_url)
+            if bucket and key:
+                cur.execute(f"""
+                    SELECT id FROM {APP_SCHEMA}.images
+                    WHERE s3_bucket = %s AND image_s3_key = %s
+                """, (bucket, key))
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    image_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
+                elif len(rows) > 1:
+                    ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
+                    print(f"[WARN] _lookup_asset_id_for_history: multiple images for s3_bucket={bucket}, key={key}: {ids}")
+                    return None, None, "ambiguous_asset_match"
+
+        # Priority 3: Look up by s3_bucket + thumbnail_s3_key (unique index)
+        if not image_id and image_url:
+            bucket, key = _parse_s3_bucket_and_key(image_url)
+            if bucket and key:
+                cur.execute(f"""
+                    SELECT id FROM {APP_SCHEMA}.images
+                    WHERE s3_bucket = %s AND thumbnail_s3_key = %s
+                """, (bucket, key))
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    image_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
+                elif len(rows) > 1:
+                    ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
+                    print(f"[WARN] _lookup_asset_id_for_history: multiple images for s3_bucket={bucket}, thumb_key={key}: {ids}")
+                    return None, None, "ambiguous_asset_match"
+    else:
+        # Priority 1: Look up by provider + upstream_job_id (strongest key)
+        if job_id:
+            prov = provider or "meshy"
+            cur.execute(f"""
+                SELECT id FROM {APP_SCHEMA}.models
+                WHERE provider = %s AND upstream_job_id = %s
+            """, (prov, str(job_id)))
+            rows = cur.fetchall()
+            if len(rows) == 1:
+                model_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
+            elif len(rows) > 1:
+                ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
+                print(f"[WARN] _lookup_asset_id_for_history: multiple models for provider={prov}, upstream_job_id={job_id}: {ids}")
+                return None, None, "ambiguous_asset_match"
+
+        # Priority 2: Look up by s3_bucket + glb_s3_key (unique index)
+        if not model_id and glb_url:
+            bucket, key = _parse_s3_bucket_and_key(glb_url)
+            if bucket and key:
+                cur.execute(f"""
+                    SELECT id FROM {APP_SCHEMA}.models
+                    WHERE s3_bucket = %s AND glb_s3_key = %s
+                """, (bucket, key))
+                rows = cur.fetchall()
+                if len(rows) == 1:
+                    model_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
+                elif len(rows) > 1:
+                    ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
+                    print(f"[WARN] _lookup_asset_id_for_history: multiple models for s3_bucket={bucket}, key={key}: {ids}")
+                    return None, None, "ambiguous_asset_match"
+
+    # Return result with reason if not found
+    if model_id or image_id:
+        return model_id, image_id, None
+    return None, None, "missing_asset_reference"
+
+
 def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadata: dict = None, user_id: str = None):
     """Save active job to database for recovery"""
     if not USE_DB:
@@ -882,48 +1146,13 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         payload["image_url"] = image_url
 
         with conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(f"""
-                INSERT INTO {APP_SCHEMA}.history_items (
-                    id, identity_id, item_type, status, stage,
-                    title, prompt, root_prompt,
-                    thumbnail_url, glb_url, image_url,
-                    payload
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s, %s,
-                    %s
-                )
-                ON CONFLICT (id) DO UPDATE
-                SET status = EXCLUDED.status,
-                    stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
-                    title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
-                    prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
-                    root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
-                    identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                    thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
-                    glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
-                    image_url = EXCLUDED.image_url,
-                    payload = EXCLUDED.payload,
-                    updated_at = NOW()
-            """, (
-                history_id,
-                user_id,
-                item_type,
-                "processing",
-                stage,
-                title,
-                prompt,
-                root_prompt,
-                thumbnail_url,
-                glb_url,
-                image_url,
-                json.dumps(payload),
-            ))
+            # NOTE: We no longer create history_items placeholders here.
+            # The history_item will be created by the job completion webhook
+            # after the model/image asset exists (required by XOR constraint).
+            # Use active_jobs table for tracking in-progress jobs.
 
             action_code = _map_action_code(job_type)
             provider = _map_provider(job_type)
-            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             cur.execute(f"""
                 SELECT id FROM {APP_SCHEMA}.active_jobs
                 WHERE upstream_job_id = %s
@@ -939,20 +1168,19 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
                         action_code = %s,
                         status = 'running',
                         progress = %s,
-                        related_history_id = COALESCE(%s, related_history_id),
                         updated_at = NOW()
                     WHERE id = %s
-                """, (user_id, provider, action_code, progress, history_id, existing["id"]))
+                """, (user_id, provider, action_code, progress, existing["id"]))
             else:
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.active_jobs (
                         id, identity_id, provider, action_code, upstream_job_id,
-                        status, progress, related_history_id
+                        status, progress
                     ) VALUES (
                         %s, %s, %s, %s, %s,
-                        'running', %s, %s
+                        'running', %s
                     )
-                """, (str(uuid.uuid4()), user_id, provider, action_code, job_id, progress, history_id))
+                """, (str(uuid.uuid4()), user_id, provider, action_code, job_id, progress))
         conn.close()
         return True
     except Exception as e:
@@ -1437,6 +1665,7 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     json.dumps(payload),
                     history_uuid,
                 ))
+                print(f"[history] updated item: history_id={history_uuid}, model_id=None, image_id={returned_image_id}, job_id={image_id}")
             else:
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.history_items (
@@ -1479,11 +1708,11 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     returned_image_id,
                     json.dumps(payload),
                 ))
+                print(f"[history] inserted item: history_id={history_uuid}, model_id=None, image_id={returned_image_id}, job_id={image_id}")
 
         conn.close()
         if image_log_info:
             print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
-        print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
@@ -1813,7 +2042,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   glb_url: {final_glb_url[:80] if final_glb_url else 'None'}...")
             print(f"[DB]   thumbnail_url: {final_thumbnail_url[:80] if final_thumbnail_url else 'None'}...")
             print(f"[DB]   title: {final_title}")
-            print(f"[DB] Inserting history_items with id={history_uuid}")
 
             db_save_ok = True
             history_item_id = None
@@ -2060,6 +2288,24 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             "hash": image_content_hash,
                             "reused": bool(image_reused),
                         }
+
+                # XOR validation: exactly one of model_id or image_id must be set
+                has_model = model_id is not None
+                has_image = image_id is not None
+                if has_model == has_image:  # Both set or both NULL = invalid
+                    if not has_model and not has_image:
+                        print(f"[WARN] history_items XOR violation: both model_id and image_id are NULL (job_id={job_id})")
+                        # Skip history_items insert - no asset was created
+                        raise RuntimeError(f"Cannot create history_items: no model or image asset created for job {job_id}")
+                    else:
+                        print(f"[WARN] history_items XOR violation: both model_id={model_id} and image_id={image_id} are set (job_id={job_id})")
+                        # Prefer the asset matching item_type
+                        if item_type == "image":
+                            model_id = None
+                        else:
+                            image_id = None
+                        print(f"[WARN] Resolved: keeping {item_type}_id, cleared the other")
+
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.history_items (
                         id, identity_id, item_type, status, stage,
@@ -2084,8 +2330,17 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         thumbnail_url = EXCLUDED.thumbnail_url,
                         glb_url = EXCLUDED.glb_url,
                         image_url = EXCLUDED.image_url,
-                        model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
-                        image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
+                        -- XOR enforcement: use EXCLUDED values directly, clearing the other if one is set
+                        model_id = CASE
+                            WHEN EXCLUDED.model_id IS NOT NULL THEN EXCLUDED.model_id
+                            WHEN EXCLUDED.image_id IS NOT NULL THEN NULL
+                            ELSE {APP_SCHEMA}.history_items.model_id
+                        END,
+                        image_id = CASE
+                            WHEN EXCLUDED.image_id IS NOT NULL THEN EXCLUDED.image_id
+                            WHEN EXCLUDED.model_id IS NOT NULL THEN NULL
+                            ELSE {APP_SCHEMA}.history_items.image_id
+                        END,
                         payload = EXCLUDED.payload,
                         updated_at = NOW()
                     RETURNING id
@@ -2109,6 +2364,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not history_row:
                     raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
                 history_item_id = history_row["id"]
+                print(f"[history] inserted item: history_id={history_item_id}, model_id={model_id}, image_id={image_id}, job_id={job_id}")
                 cur.execute("RELEASE SAVEPOINT normalized_save")
             except Exception as e:
                 db_save_ok = False
@@ -3881,13 +4137,17 @@ def api_history():
 
         db_ok = None
         db_errors = []
+        # Track results for frontend retry logic
+        updated_ids = []
+        inserted_ids = []
+        skipped_items = []  # [{client_id, reason}]
+
         if USE_DB:
             conn = get_db_conn()
             if conn:
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            saved = 0
                             for item in payload:
                                 item_id = item.get("id") or item.get("job_id")
                                 if not item_id:
@@ -3965,6 +4225,7 @@ def api_history():
                                 item["id"] = use_id
 
                                 if existing_id:
+                                    # UPDATE existing row (model_id/image_id should already be set)
                                     cur.execute(
                                         f"""UPDATE {APP_SCHEMA}.history_items
                                            SET item_type = %s,
@@ -3983,12 +4244,35 @@ def api_history():
                                         (item_type, status, stage, title, prompt, root_prompt, user_id,
                                          thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
                                     )
+                                    updated_ids.append(use_id)
                                 else:
+                                    # NEW INSERT: Must have model_id or image_id (XOR constraint)
+                                    # Try to look up from item or DB
+                                    model_id = item.get("model_id")
+                                    image_id = item.get("image_id")
+                                    lookup_reason = None
+                                    if not model_id and not image_id:
+                                        # Try to find the asset in DB
+                                        model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
+                                            cur, item_type, item_id, glb_url, image_url, user_id, provider
+                                        )
+                                    # Validate XOR constraint
+                                    if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
+                                        # Determine skip reason
+                                        if lookup_reason:
+                                            skip_reason = lookup_reason
+                                        elif model_id and image_id:
+                                            skip_reason = "xor_violation"
+                                        else:
+                                            skip_reason = "missing_asset_reference"
+                                        print(f"[History] Skipping item {item_id} - reason: {skip_reason}")
+                                        skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
+                                        continue
                                     cur.execute(
                                         f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                               root_prompt, thumbnail_url, glb_url, image_url, payload)
+                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
                                            VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s)
+                                               %s, %s, %s, %s, %s, %s, %s)
                                            ON CONFLICT (id) DO UPDATE
                                            SET item_type = EXCLUDED.item_type,
                                                status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
@@ -4000,14 +4284,16 @@ def api_history():
                                                thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
                                                glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
                                                image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                                               model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
+                                               image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                                                payload = EXCLUDED.payload,
                                                updated_at = NOW();""",
                                         (use_id, user_id, item_type, status, stage, title, prompt,
-                                         root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
+                                         root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
                                     )
-                                saved += 1
+                                    inserted_ids.append(use_id)
                     conn.close()
-                    print(f"[History] Saved {saved} items to DB")
+                    print(f"[History] Bulk sync: updated={len(updated_ids)}, inserted={len(inserted_ids)}, skipped={len(skipped_items)}")
                     db_ok = True
                 except Exception as e:
                     log_db_continue("history_bulk_write", e)
@@ -4025,7 +4311,15 @@ def api_history():
 
         # DEV ONLY: sync to local JSON (no-op in production)
         save_history_store(payload)
-        return jsonify({"ok": True, "count": len(payload), "db": db_ok, "db_errors": db_errors or None})
+        return jsonify({
+            "ok": True,
+            "count": len(payload),
+            "updated": updated_ids,
+            "inserted": inserted_ids,
+            "skipped": skipped_items if skipped_items else None,
+            "db": db_ok,
+            "db_errors": db_errors or None,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4126,6 +4420,7 @@ def api_history_item_add():
                             item["id"] = use_id
 
                             if existing_id:
+                                # UPDATE existing row (model_id/image_id should already be set)
                                 cur.execute(
                                     f"""UPDATE {APP_SCHEMA}.history_items
                                        SET item_type = %s,
@@ -4144,30 +4439,60 @@ def api_history_item_add():
                                     (item_type, status, stage, title, prompt, root_prompt, user_id,
                                      thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
                                 )
+                                db_ok = True
+                                item_id = use_id
                             else:
-                                cur.execute(
-                                    f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                           root_prompt, thumbnail_url, glb_url, image_url, payload)
-                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s)
-                                       ON CONFLICT (id) DO UPDATE
-                                       SET item_type = EXCLUDED.item_type,
-                                           status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
-                                           stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
-                                           title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
-                                           prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
-                                           root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
-                                           identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                                           thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
-                                           glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
-                                           image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
-                                           payload = EXCLUDED.payload,
-                                           updated_at = NOW();""",
-                                    (use_id, user_id, item_type, status, stage, title, prompt,
-                                     root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
-                                )
-                            db_ok = True
-                            item_id = use_id  # Return the actual UUID used
+                                # NEW INSERT: Must have model_id or image_id (XOR constraint)
+                                # Try to look up from item or DB
+                                model_id = item.get("model_id")
+                                image_id = item.get("image_id")
+                                lookup_reason = None
+                                if not model_id and not image_id:
+                                    # Try to find the asset in DB
+                                    model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
+                                        cur, item_type, item_id, glb_url, image_url, user_id, provider
+                                    )
+                                # Validate XOR constraint
+                                if not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
+                                    # Determine skip reason for frontend
+                                    if lookup_reason:
+                                        skip_reason = lookup_reason
+                                    elif model_id and image_id:
+                                        skip_reason = "xor_violation"
+                                    else:
+                                        skip_reason = "missing_asset_reference"
+                                    print(f"[History] Skipping item {item_id} - reason: {skip_reason}")
+                                    db_errors.append({
+                                        "op": "history_item_add",
+                                        "error": f"Skipped: {skip_reason}",
+                                        "skip_reason": skip_reason,
+                                    })
+                                else:
+                                    cur.execute(
+                                        f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
+                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                           VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                               %s, %s, %s, %s, %s, %s, %s)
+                                           ON CONFLICT (id) DO UPDATE
+                                           SET item_type = EXCLUDED.item_type,
+                                               status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
+                                               stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
+                                               title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                                               prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                                               root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                                               identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                                               thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                                               glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
+                                               image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                                               model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
+                                               image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
+                                               payload = EXCLUDED.payload,
+                                               updated_at = NOW();""",
+                                        (use_id, user_id, item_type, status, stage, title, prompt,
+                                         root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
+                                    )
+                                    db_ok = True
+                                    item_id = use_id  # Return the actual UUID used
                     conn.close()
                 except Exception as e:
                     log_db_continue("history_item_add", e)
@@ -4177,8 +4502,22 @@ def api_history_item_add():
             else:
                 db_errors.append({"op": "history_item_add_connect", "error": "db_unavailable"})
 
+        # Check if item was skipped (for frontend retry logic)
+        skipped = None
+        for err in db_errors:
+            if err.get("skip_reason"):
+                skipped = {"client_id": str(item_id), "reason": err["skip_reason"]}
+                break
+
         local_ok = upsert_history_local(item, merge=False)
-        return jsonify({"ok": True, "id": item_id, "db": db_ok, "db_errors": db_errors or None, "local": local_ok})
+        return jsonify({
+            "ok": db_ok or False,
+            "id": item_id,
+            "skipped": skipped,
+            "db": db_ok,
+            "db_errors": db_errors or None,
+            "local": local_ok,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
