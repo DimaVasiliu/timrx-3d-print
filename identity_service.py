@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 import uuid
 import hashlib
 
-from ..db import (
+from db import (
     transaction,
     fetch_one,
     fetch_all,
@@ -31,8 +31,8 @@ from ..db import (
     DatabaseError,
     DatabaseIntegrityError,
 )
-from ..config import config
-from ..emailer import notify_new_identity
+from config import config
+from emailer import notify_new_identity
 
 
 class IdentityService:
