@@ -29,7 +29,7 @@ class LedgerEntryType:
     RESERVATION_FINALIZE = "reservation_finalize"
     RESERVATION_RELEASE = "reservation_release"
     ADMIN_ADJUST = "admin_adjust"
-    ADMIN_GRANT = "admin_grant"  # Simple admin credit grant (for testing)
+    ADMIN_GRANT = "admin_grant"  # Admin backdoor credit grant
     REFUND = "refund"
     SIGNUP_GRANT = "signup_grant"
 
