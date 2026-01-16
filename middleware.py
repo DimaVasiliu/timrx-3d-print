@@ -290,3 +290,58 @@ def require_admin(f):
             }), 500
 
     return decorated
+
+
+def require_admin_key(f):
+    """
+    Decorator that requires X-Admin-Key header authentication.
+    This is a simple key-based auth for backdoor/emergency admin endpoints.
+
+    Validates X-Admin-Key header against ADMIN_KEY env variable.
+    Returns 401 if missing/invalid.
+
+    Note: Never logs the actual key value for security.
+    """
+    from .config import config
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Check if ADMIN_KEY is configured
+        if not config.ADMIN_KEY:
+            return jsonify({
+                "error": {
+                    "code": "ADMIN_KEY_NOT_CONFIGURED",
+                    "message": "Admin key not configured on server"
+                }
+            }), 503
+
+        # Validate X-Admin-Key header
+        provided_key = request.headers.get("X-Admin-Key")
+        if not provided_key or provided_key != config.ADMIN_KEY:
+            # Log attempt without revealing key
+            print("[MIDDLEWARE] Invalid or missing X-Admin-Key")
+            return jsonify({
+                "error": {
+                    "code": "UNAUTHORIZED",
+                    "message": "Invalid or missing X-Admin-Key header"
+                }
+            }), 401
+
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+def check_admin_key() -> bool:
+    """
+    Check if the current request has a valid X-Admin-Key header.
+    Returns True if valid, False otherwise.
+    Use this for optional admin bypass checks (e.g., skip credit checks).
+    """
+    from .config import config
+
+    if not config.ADMIN_KEY:
+        return False
+
+    provided_key = request.headers.get("X-Admin-Key")
+    return provided_key and provided_key == config.ADMIN_KEY
