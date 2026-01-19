@@ -6,14 +6,11 @@
 // ============================================================================
 // API ENDPOINTS
 // ============================================================================
-// Use relative paths when on deployed domain for same-origin cookie handling
-const DEPLOYED_DOMAINS = ['3d.timrx.live', 'timrx-3d-print-1.onrender.com'];
-const isDeployedDomain = DEPLOYED_DOMAINS.some(d => window.location.hostname.includes(d));
-
-export const BACKEND = isDeployedDomain ? '' : (window.TIMRX_3D_API_BASE || 'https://timrx-3d-print-1.onrender.com');
+// Always use the custom domain for proper cookie handling
+export const BACKEND = window.TIMRX_3D_API_BASE || 'https://3d.timrx.live';
 export const CHAT_API = window.TIMRX_API_BASE || 'https://timrx-chat-1.onrender.com';
 
-console.log('[Config] BACKEND:', BACKEND || '(same-origin)', 'hostname:', window.location.hostname);
+console.log('[Config] BACKEND:', BACKEND, 'hostname:', window.location.hostname);
 
 // ============================================================================
 // STORAGE KEYS
