@@ -658,8 +658,14 @@ def _parse_cors_origins() -> list:
     Parse ALLOWED_ORIGINS env var into a clean list of URLs.
     Handles common misconfiguration issues.
     """
-    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
-    print(f"[CORS] Raw ALLOWED_ORIGINS env var: {raw!r}")
+    # Step 1: Get raw env var exactly as-is
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    print(f"[CORS] ────────────────────────────────────────────────────────")
+    print(f"[CORS] Raw os.getenv('ALLOWED_ORIGINS'): {raw!r}")
+    print(f"[CORS] Length: {len(raw)} chars")
+
+    # Step 2: Strip whitespace
+    raw = raw.strip()
 
     if not raw:
         if IS_DEV:
@@ -674,32 +680,33 @@ def _parse_cors_origins() -> list:
         print("[CORS] Wildcard '*' requested - using prod + dev origins for credentials support")
         return PROD_ORIGINS + DEV_ORIGINS
 
-    # Parse comma-separated list
-    origins = []
-    for part in raw.split(","):
-        origin = part.strip()
+    # Step 3: SANITIZE - Strip accidental "ALLOWED_ORIGINS=" prefix from the ENTIRE string
+    # This happens when env var is misconfigured as: ALLOWED_ORIGINS=ALLOWED_ORIGINS=https://...
+    # Check case-insensitive but preserve the actual URL casing
+    if raw.upper().startswith("ALLOWED_ORIGINS="):
+        old_raw = raw
+        raw = raw[len("ALLOWED_ORIGINS="):]
+        print(f"[CORS] WARNING: Stripped 'ALLOWED_ORIGINS=' prefix from value")
+        print(f"[CORS] Before: {old_raw!r}")
+        print(f"[CORS] After:  {raw!r}")
 
-        # Skip empty parts
-        if not origin:
-            continue
+    # Step 4: Parse comma-separated list
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    print(f"[CORS] After split: {origins}")
 
-        # SANITIZE: Strip accidental "ALLOWED_ORIGINS=" prefix from value
-        # This happens when env var is misconfigured as: ALLOWED_ORIGINS=ALLOWED_ORIGINS=https://...
-        if origin.upper().startswith("ALLOWED_ORIGINS="):
-            origin = origin[len("ALLOWED_ORIGINS="):]
-            print(f"[CORS] WARNING: Stripped accidental 'ALLOWED_ORIGINS=' prefix from value")
-
-        # Validate it looks like a URL
+    # Step 5: Validate each origin is a valid URL
+    valid_origins = []
+    for origin in origins:
         if origin.startswith("http://") or origin.startswith("https://"):
-            origins.append(origin)
+            valid_origins.append(origin)
         else:
             print(f"[CORS] WARNING: Skipping invalid origin (not http/https): {origin!r}")
 
-    if not origins:
+    if not valid_origins:
         print("[CORS] WARNING: No valid origins parsed, falling back to production defaults")
         return PROD_ORIGINS
 
-    return origins
+    return valid_origins
 
 
 # Parse and validate CORS origins at startup
@@ -731,15 +738,29 @@ def _ensure_cors_headers(response):
     """
     Ensure CORS headers are present on all responses, including errors.
     Flask-CORS handles most cases, but this ensures preflight responses work.
+
+    Headers set:
+    - Access-Control-Allow-Origin: <origin> (NOT wildcard when using credentials)
+    - Access-Control-Allow-Credentials: true
+    - Vary: Origin (required for caching with dynamic origin)
+    - Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With
+    - Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
     """
     origin = request.headers.get("Origin")
+
+    # Always set Vary: Origin for proper caching when CORS varies by origin
+    response.headers["Vary"] = "Origin"
+
     if origin and origin in ALLOWED_ORIGINS:
         # Explicitly set headers (Flask-CORS may miss some edge cases)
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
+
+        # For preflight (OPTIONS) requests, include method and header info
         if request.method == "OPTIONS":
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+
     return response
 
 @app.before_request
@@ -754,6 +775,15 @@ for name, bp, prefix in _loaded_blueprints:
     app.register_blueprint(bp, url_prefix=prefix)
 if _loaded_blueprints:
     print(f"[APP] Blueprints registered: {', '.join(name for name, _, _ in _loaded_blueprints)}")
+
+# ─────────────────────────────────────────────────────────────
+# Seed Default Plans (ensures plans exist in DB)
+# ─────────────────────────────────────────────────────────────
+if CREDITS_AVAILABLE and PricingService:
+    try:
+        PricingService.seed_plans()
+    except Exception as e:
+        print(f"[APP] Warning: Failed to seed plans: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # Frontend Serving (same-origin for cookies)
