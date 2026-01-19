@@ -33,10 +33,16 @@ CREATE TABLE IF NOT EXISTS timrx_billing.magic_codes (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at   TIMESTAMPTZ NOT NULL,
   attempts     INT NOT NULL DEFAULT 0,
-  consumed_at  TIMESTAMPTZ
+  consumed     BOOLEAN NOT NULL DEFAULT FALSE,
+  consumed_at  TIMESTAMPTZ,
+  ip_hash      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_magic_codes_email_created
 ON timrx_billing.magic_codes(email, created_at DESC);
+
+-- Migration for existing magic_codes table (run if table already exists without these columns)
+ALTER TABLE timrx_billing.magic_codes ADD COLUMN IF NOT EXISTS consumed BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE timrx_billing.magic_codes ADD COLUMN IF NOT EXISTS ip_hash TEXT;
 
 CREATE TABLE IF NOT EXISTS timrx_billing.sessions (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -84,6 +90,7 @@ ON CONFLICT (action_code) DO NOTHING;
 CREATE TABLE IF NOT EXISTS timrx_billing.wallets (
   identity_id      UUID PRIMARY KEY REFERENCES timrx_billing.identities(id) ON DELETE CASCADE,
   balance_credits  INT NOT NULL DEFAULT 0,
+  reserved_credits INT NOT NULL DEFAULT 0,
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
