@@ -181,28 +181,48 @@ class Config:
     # ─────────────────────────────────────────────────────────────
     # Email Configuration
     # ─────────────────────────────────────────────────────────────
-    # SendGrid API (preferred)
+    # Master switch - if false, emails are logged only
+    EMAIL_ENABLED: bool = field(default_factory=lambda: _get_env_bool("EMAIL_ENABLED", True))
+
+    # Provider: "neo", "ses", "sendgrid" (default: neo for Neo SMTP)
+    EMAIL_PROVIDER: str = field(default_factory=lambda: _get_env("EMAIL_PROVIDER", "neo").lower())
+
+    # SendGrid API (legacy support)
     SENDGRID_API_KEY: str = field(default_factory=lambda: _get_env("SENDGRID_API_KEY"))
 
-    # SMTP fallback (or alternative provider)
-    SMTP_HOST: str = field(default_factory=lambda: _get_env("SMTP_HOST", "smtp.sendgrid.net"))
+    # SMTP configuration
+    SMTP_HOST: str = field(default_factory=lambda: _get_env("SMTP_HOST"))
     SMTP_PORT: int = field(default_factory=lambda: _get_env_int("SMTP_PORT", 587))
-    SMTP_USER: str = field(default_factory=lambda: _get_env("SMTP_USER", "apikey"))
+    SMTP_USER: str = field(default_factory=lambda: _get_env("SMTP_USER"))
+    SMTP_PASSWORD: str = field(default_factory=lambda: _get_env("SMTP_PASSWORD"))
     SMTP_USE_TLS: bool = field(default_factory=lambda: _get_env_bool("SMTP_USE_TLS", True))
+    SMTP_TIMEOUT: int = field(default_factory=lambda: _get_env_int("SMTP_TIMEOUT", 10))
 
-    @property
-    def SMTP_PASSWORD(self) -> str:
-        """SMTP password (falls back to SendGrid API key if not set)."""
-        return _get_env("SMTP_PASSWORD") or self.SENDGRID_API_KEY
-
-    # From address
+    # From address (can be "Name <email>" format via SMTP_FROM, or separate)
+    _SMTP_FROM_RAW: str = field(default_factory=lambda: _get_env("SMTP_FROM"))
     EMAIL_FROM_ADDRESS: str = field(default_factory=lambda: _get_env("EMAIL_FROM_ADDRESS", "noreply@timrx.app"))
     EMAIL_FROM_NAME: str = field(default_factory=lambda: _get_env("EMAIL_FROM_NAME", "TimrX"))
 
     @property
+    def SMTP_FROM_PARSED(self) -> tuple:
+        """Parse SMTP_FROM into (name, address) tuple."""
+        raw = self._SMTP_FROM_RAW
+        if raw and "<" in raw and ">" in raw:
+            # Format: "Name <email@domain.com>"
+            import re
+            match = re.match(r"^(.+?)\s*<(.+?)>$", raw.strip())
+            if match:
+                return (match.group(1).strip(), match.group(2).strip())
+        if raw and "@" in raw:
+            return (self.EMAIL_FROM_NAME, raw.strip())
+        return (self.EMAIL_FROM_NAME, self.EMAIL_FROM_ADDRESS)
+
+    @property
     def EMAIL_CONFIGURED(self) -> bool:
-        """True if email sending is configured."""
-        return bool(self.SENDGRID_API_KEY or (self.SMTP_HOST and self.SMTP_PASSWORD))
+        """True if email sending is properly configured."""
+        if not self.EMAIL_ENABLED:
+            return False
+        return bool(self.SMTP_HOST and self.SMTP_USER and self.SMTP_PASSWORD)
 
     # ─────────────────────────────────────────────────────────────
     # Admin
