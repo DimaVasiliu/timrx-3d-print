@@ -18,7 +18,7 @@ Security:
 import secrets
 import hashlib
 from typing import Optional, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from db import (
     transaction,
@@ -148,7 +148,7 @@ class MagicCodeService:
         last_code_time = MagicCodeService.get_last_code_time(email)
         if last_code_time:
             cooldown_seconds = MagicCodeService.COOLDOWN_SECONDS
-            elapsed = (datetime.utcnow() - last_code_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - last_code_time).total_seconds()
             if elapsed < cooldown_seconds:
                 remaining = int(cooldown_seconds - elapsed)
                 return (False, f"Please wait {remaining} seconds before requesting another code")
