@@ -7,15 +7,16 @@ Handles:
 - GET /api/billing/ledger - Get ledger entries for current identity
 - POST /api/billing/reserve - Reserve credits for a job
 - POST /api/billing/checkout - Create Mollie payment (primary)
-- POST /api/billing/checkout/start - Create Stripe checkout session (legacy)
+- POST /api/billing/checkout/start - Create Stripe checkout session (disabled when PAYMENTS_PROVIDER != 'stripe')
 - POST /api/billing/webhook/mollie - Mollie webhook handler
-- POST /api/billing/webhook - Stripe webhook handler (legacy)
+- POST /api/billing/webhook - Stripe webhook handler (disabled when PAYMENTS_PROVIDER != 'stripe')
 - GET /api/billing/purchase/:id - Get purchase details
 - GET /api/billing/purchases - Get purchase history
 """
 
 from flask import Blueprint, request, jsonify, g, make_response
 
+from config import config
 from middleware import require_session, require_email
 from pricing_service import PricingService
 from wallet_service import WalletService
@@ -402,16 +403,18 @@ def create_mollie_checkout():
     except ValueError as e:
         error_msg = str(e)
 
-        if "not found" in error_msg.lower():
+        if "not found" in error_msg.lower() or "inactive" in error_msg.lower():
             return jsonify({
+                "ok": False,
                 "error": {
-                    "code": "INVALID_PLAN",
-                    "message": error_msg,
+                    "code": "PLAN_NOT_FOUND",
+                    "message": f"Plan '{plan_code}' not found or inactive",
                 }
             }), 400
 
         if "not configured" in error_msg.lower():
             return jsonify({
+                "ok": False,
                 "error": {
                     "code": "SERVICE_UNAVAILABLE",
                     "message": "Payment service is not available",
@@ -419,6 +422,7 @@ def create_mollie_checkout():
             }), 503
 
         return jsonify({
+            "ok": False,
             "error": {
                 "code": "CHECKOUT_ERROR",
                 "message": error_msg,
@@ -428,6 +432,7 @@ def create_mollie_checkout():
     except Exception as e:
         print(f"[BILLING] Error creating Mollie checkout: {e}")
         return jsonify({
+            "ok": False,
             "error": {
                 "code": "INTERNAL_ERROR",
                 "message": "Failed to create checkout session",
@@ -436,7 +441,7 @@ def create_mollie_checkout():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRIPE CHECKOUT (Legacy - kept for backward compatibility)
+# STRIPE CHECKOUT (Disabled when PAYMENTS_PROVIDER != 'stripe' or 'both')
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/checkout/start", methods=["POST"])
@@ -445,6 +450,9 @@ def create_checkout():
     """
     Create a Stripe checkout session.
     Email is captured during checkout and attached to identity.
+
+    NOTE: This endpoint is disabled when PAYMENTS_PROVIDER is 'mollie' (default).
+    Use /checkout for Mollie payments instead.
 
     Request body:
     {
@@ -460,6 +468,15 @@ def create_checkout():
         "checkout_url": "https://checkout.stripe.com/..."
     }
     """
+    # Check if Stripe is enabled via PAYMENTS_PROVIDER
+    if not config.USE_STRIPE:
+        return jsonify({
+            "error": {
+                "code": "SERVICE_DISABLED",
+                "message": "Stripe is disabled. Use /checkout for Mollie payments.",
+            }
+        }), 503
+
     # Check if Stripe is configured
     if not PurchaseService.is_available():
         return jsonify({
@@ -561,12 +578,21 @@ def stripe_webhook():
     Handle Stripe webhook events.
     Processes checkout.session.completed to grant credits.
 
+    NOTE: This endpoint is disabled when PAYMENTS_PROVIDER is 'mollie' (default).
+
     This endpoint receives raw POST body with Stripe-Signature header.
     No authentication required (verified via webhook signature).
 
     Returns 200 OK to acknowledge receipt (even on processing errors,
     to prevent Stripe from retrying indefinitely).
     """
+    # Check if Stripe is enabled via PAYMENTS_PROVIDER
+    if not config.USE_STRIPE:
+        return jsonify({
+            "ok": False,
+            "error": "Stripe is disabled",
+        }), 503
+
     # Get raw body (required for signature verification)
     payload = request.get_data()
     signature = request.headers.get("Stripe-Signature", "")
