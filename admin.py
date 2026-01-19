@@ -5,260 +5,35 @@ Standard admin endpoints require authentication via:
   1. X-Admin-Token header (for scripts/automation)
   2. Session with email in ADMIN_EMAILS list (for browser)
 
-Backdoor admin endpoints (X-Admin-Key) - for emergency/testing:
-- GET  /api/admin/ping               - Health check (requires X-Admin-Key)
-- POST /api/admin/bootstrap          - Bootstrap admin identity with credits
-- POST /api/admin/wallet/grant       - Grant credits to any identity
-
-Standard admin endpoints:
+Endpoints:
 - GET  /api/admin/overview           - System overview (alias for stats)
 - GET  /api/admin/stats              - System statistics
 - GET  /api/admin/identities         - List identities
 - GET  /api/admin/identities/<id>    - Get identity detail
 - GET  /api/admin/purchases          - List purchases
-- POST /api/admin/credits/grant      - Grant/deduct credits
+- POST /api/admin/credits/grant      - Grant/deduct credits (requires reason, audit trail)
 - POST /api/admin/wallet/adjust      - Adjust wallet (alias for credits/grant)
 - GET  /api/admin/reservations       - List credit reservations
 - POST /api/admin/reservations/<id>/release - Release a reservation
 - GET  /api/admin/jobs               - List jobs
+- GET  /api/admin/health             - Admin health check
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
   ADMIN_EMAILS=admin@example.com     # Comma-separated list for email-based auth
-  ADMIN_KEY=your-secret-key          # For backdoor endpoints (X-Admin-Key)
-  ADMIN_EMAIL=admin@example.com      # Email for bootstrap identity
-
-Example curl commands:
-  # Ping (health check)
-  curl -H "X-Admin-Key: YOUR_KEY" https://api.example.com/api/admin/ping
-
-  # Bootstrap admin identity with 100 credits
-  curl -X POST -H "X-Admin-Key: YOUR_KEY" -H "Content-Type: application/json" \\
-       -d '{"credits":100}' https://api.example.com/api/admin/bootstrap
-
-  # Grant 100 credits to specific identity
-  curl -X POST -H "X-Admin-Key: YOUR_KEY" -H "Content-Type: application/json" \\
-       -d '{"identity_id":"UUID","credits":100,"reason":"test"}' \\
-       https://api.example.com/api/admin/wallet/grant
 """
 
-from datetime import datetime
 from flask import Blueprint, request, jsonify, g
 
-from middleware import require_admin, require_admin_key
+from middleware import require_admin
 from admin_service import AdminService
-from identity_service import IdentityService
-from wallet_service import WalletService, LedgerEntryType
-from config import config
-from db import DatabaseError, query_one, transaction, fetch_one, Tables
+from db import DatabaseError
 
 bp = Blueprint("admin", __name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACKDOOR ENDPOINTS (X-Admin-Key auth) - for emergency/testing
-# ─────────────────────────────────────────────────────────────────────────────
-
-@bp.route("/ping", methods=["GET"])
-@require_admin_key
-def admin_ping():
-    """
-    Simple health check that verifies X-Admin-Key is working.
-    Returns current server time.
-    """
-    return jsonify({
-        "ok": True,
-        "now": datetime.utcnow().isoformat() + "Z"
-    })
-
-
-@bp.route("/bootstrap", methods=["POST"])
-@require_admin_key
-def admin_bootstrap():
-    """
-    Bootstrap a dedicated admin identity and grant credits.
-    No cookies/session required - creates identity from ADMIN_EMAIL env var.
-
-    Body:
-        - credits: Number of credits to grant (default: 100)
-
-    Returns:
-        - identity_id: The admin identity UUID
-        - wallet: {balance, reserved, available}
-        - granted_credits: How many credits were added
-    """
-    try:
-        data = request.get_json() or {}
-        credits_to_grant = data.get("credits", 100)
-
-        if not isinstance(credits_to_grant, int) or credits_to_grant < 0:
-            return jsonify({
-                "error": {"code": "INVALID_CREDITS", "message": "credits must be a non-negative integer"}
-            }), 400
-
-        # Use ADMIN_EMAIL or default
-        admin_email = (config.ADMIN_EMAIL or "admin@timrx.local").lower().strip()
-
-        # Find or create admin identity
-        identity = query_one(
-            f"SELECT id, email FROM {Tables.IDENTITIES} WHERE LOWER(email) = %s",
-            (admin_email,)
-        )
-
-        if identity:
-            identity_id = str(identity["id"])
-            print(f"[ADMIN] Bootstrap: found existing identity {identity_id} for {admin_email}")
-        else:
-            # Create new identity with email
-            with transaction() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.IDENTITIES} (email, created_at)
-                    VALUES (%s, NOW())
-                    RETURNING id
-                    """,
-                    (admin_email,)
-                )
-                new_identity = fetch_one(cur)
-                identity_id = str(new_identity["id"])
-            print(f"[ADMIN] Bootstrap: created new identity {identity_id} for {admin_email}")
-
-        # Ensure wallet exists
-        wallet = WalletService.get_or_create_wallet(identity_id)
-        if not wallet:
-            return jsonify({
-                "error": {"code": "WALLET_ERROR", "message": "Failed to create wallet"}
-            }), 500
-
-        # Grant credits if requested
-        if credits_to_grant > 0:
-            WalletService.add_credits(
-                identity_id=identity_id,
-                amount=credits_to_grant,
-                entry_type=LedgerEntryType.ADMIN_GRANT,
-                meta={"reason": "admin_bootstrap", "admin_email": admin_email}
-            )
-            print(f"[ADMIN] Bootstrap: granted {credits_to_grant} credits to {identity_id}")
-
-        # Get updated wallet state
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-
-        return jsonify({
-            "ok": True,
-            "identity_id": identity_id,
-            "email": admin_email,
-            "wallet": {
-                "balance": balance,
-                "reserved": reserved,
-                "available": balance - reserved
-            },
-            "granted_credits": credits_to_grant
-        })
-
-    except DatabaseError as e:
-        print(f"[ADMIN] Bootstrap error: {e}")
-        return jsonify({
-            "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
-        }), 500
-
-
-@bp.route("/wallet/grant", methods=["POST"])
-@require_admin_key
-def admin_wallet_grant():
-    """
-    Grant credits to any identity (by ID or current session).
-    Uses X-Admin-Key auth, works without cookies if identity_id provided.
-
-    Body:
-        - credits: Number of credits to grant (required, must be positive)
-        - identity_id: Target identity UUID (optional - uses session if not provided)
-        - reason: Reason for grant (optional, default: "admin_grant")
-
-    Returns:
-        - identity_id: The identity that received credits
-        - wallet: {balance, reserved, available}
-    """
-    try:
-        data = request.get_json() or {}
-        credits_to_grant = data.get("credits")
-        identity_id = data.get("identity_id")
-        reason = data.get("reason", "admin_grant").strip() or "admin_grant"
-
-        # Validate credits
-        if credits_to_grant is None:
-            return jsonify({
-                "error": {"code": "MISSING_CREDITS", "message": "credits is required"}
-            }), 400
-
-        if not isinstance(credits_to_grant, int) or credits_to_grant <= 0:
-            return jsonify({
-                "error": {"code": "INVALID_CREDITS", "message": "credits must be a positive integer"}
-            }), 400
-
-        # Get identity_id from param or session
-        if not identity_id:
-            # Try to get from current session cookie
-            identity = IdentityService.get_current_identity(request)
-            if identity:
-                identity_id = str(identity["id"])
-            else:
-                return jsonify({
-                    "error": {
-                        "code": "MISSING_IDENTITY",
-                        "message": "identity_id required (no valid session found)"
-                    }
-                }), 400
-
-        # Verify identity exists
-        existing = query_one(
-            f"SELECT id FROM {Tables.IDENTITIES} WHERE id = %s",
-            (identity_id,)
-        )
-        if not existing:
-            return jsonify({
-                "error": {"code": "IDENTITY_NOT_FOUND", "message": "Identity not found"}
-            }), 404
-
-        # Ensure wallet exists
-        wallet = WalletService.get_or_create_wallet(identity_id)
-        if not wallet:
-            return jsonify({
-                "error": {"code": "WALLET_ERROR", "message": "Failed to get or create wallet"}
-            }), 500
-
-        # Grant credits
-        WalletService.add_credits(
-            identity_id=identity_id,
-            amount=credits_to_grant,
-            entry_type=LedgerEntryType.ADMIN_GRANT,
-            meta={"reason": reason}
-        )
-        print(f"[ADMIN] Granted {credits_to_grant} credits to {identity_id} - {reason}")
-
-        # Get updated wallet state
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-
-        return jsonify({
-            "ok": True,
-            "identity_id": identity_id,
-            "wallet": {
-                "balance": balance,
-                "reserved": reserved,
-                "available": balance - reserved
-            }
-        })
-
-    except DatabaseError as e:
-        print(f"[ADMIN] Wallet grant error: {e}")
-        return jsonify({
-            "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
-        }), 500
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STANDARD ADMIN ENDPOINTS (X-Admin-Token or email-based auth)
+# ADMIN ENDPOINTS (X-Admin-Token or email-based auth)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/overview", methods=["GET"])
