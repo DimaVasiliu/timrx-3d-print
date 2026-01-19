@@ -12,7 +12,7 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g
 
-from middleware import require_session, check_admin_key
+from middleware import require_session
 from job_service import JobService, JobStatus, JobProvider
 from wallet_service import WalletService
 
@@ -62,10 +62,6 @@ def create_job():
     action_key = data.get("action_key")
     payload = data.get("payload") or {}
 
-    # Check for admin bypass (X-Admin-Key header)
-    # If valid admin key, skip credit checks and reservations
-    admin_bypass = check_admin_key()
-
     # Validation
     if not action_key:
         return jsonify({
@@ -88,10 +84,9 @@ def create_job():
             identity_id=g.identity_id,
             action_key=action_key,
             payload=payload,
-            admin_bypass=admin_bypass,
         )
 
-        response = {
+        return jsonify({
             "ok": True,
             "job_id": result["job_id"],
             "reservation_id": result["reservation_id"],
@@ -100,10 +95,7 @@ def create_job():
             "provider": result["provider"],
             "action_code": result["action_code"],
             "cost_credits": result["cost_credits"],
-        }
-        if admin_bypass:
-            response["admin_bypass"] = True
-        return jsonify(response)
+        })
 
     except ValueError as e:
         error_msg = str(e)
