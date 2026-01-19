@@ -628,52 +628,119 @@ ALLOWED_IMAGE_HOSTS = {
 # DEV: Allow localhost origins for local development
 # PROD: Restrict to specific domains via ALLOWED_ORIGINS env var
 #
-# Example .env for production:
-#   ALLOWED_ORIGINS=https://hub.yourdomain.com,https://3d.yourdomain.com,https://yourdomain.com
+# Example env var (comma-separated URLs only, no variable name prefix):
+#   ALLOWED_ORIGINS=https://timrx.live,https://www.timrx.live,http://localhost:5503
 #
 DEV_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3001",
-    "http://localhost:5173",      # Vite default
+    "http://localhost:5173",
+    "http://localhost:5500",
+    "http://localhost:5501",
+    "http://localhost:5502",
+    "http://localhost:5503",
     "http://localhost:8080",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
+    "http://127.0.0.1:5500",
+    "http://127.0.0.1:5503",
 ]
 
-# Parse ALLOWED_ORIGINS from env (comma-separated)
-_env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
-ALLOW_ALL_ORIGINS = False  # Flag for wildcard mode
+# Production origins for TimrX frontend
+PROD_ORIGINS = [
+    "https://timrx.live",
+    "https://www.timrx.live",
+]
 
-if _env_origins == "*":
-    # Wildcard mode: allow all origins dynamically
-    # NOTE: With credentials=True, we can't use literal "*" - must echo the requesting origin
-    ALLOW_ALL_ORIGINS = True
-    ALLOWED_ORIGINS = [
-        # Match any origin - we'll echo it back
-        re.compile(r".*"),
-    ]
-    print("[CORS] Wildcard mode enabled - allowing all origins")
-elif _env_origins:
-    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
-elif IS_DEV:
-    # Dev mode with no explicit origins: allow localhost
-    ALLOWED_ORIGINS = DEV_ORIGINS
-else:
-    # Production with no explicit origins: block by default for safety
-    ALLOWED_ORIGINS = []
-    print("[CORS] ERROR: ALLOWED_ORIGINS not set in production; requests will be blocked until configured.")
 
-print(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
+def _parse_cors_origins() -> list:
+    """
+    Parse ALLOWED_ORIGINS env var into a clean list of URLs.
+    Handles common misconfiguration issues.
+    """
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    print(f"[CORS] Raw ALLOWED_ORIGINS env var: {raw!r}")
+
+    if not raw:
+        if IS_DEV:
+            print("[CORS] No ALLOWED_ORIGINS set, using dev + prod defaults")
+            return DEV_ORIGINS + PROD_ORIGINS
+        else:
+            print("[CORS] No ALLOWED_ORIGINS set, using production defaults")
+            return PROD_ORIGINS
+
+    if raw == "*":
+        # Wildcard mode: can't use literal * with credentials, use explicit list
+        print("[CORS] Wildcard '*' requested - using prod + dev origins for credentials support")
+        return PROD_ORIGINS + DEV_ORIGINS
+
+    # Parse comma-separated list
+    origins = []
+    for part in raw.split(","):
+        origin = part.strip()
+
+        # Skip empty parts
+        if not origin:
+            continue
+
+        # SANITIZE: Strip accidental "ALLOWED_ORIGINS=" prefix from value
+        # This happens when env var is misconfigured as: ALLOWED_ORIGINS=ALLOWED_ORIGINS=https://...
+        if origin.upper().startswith("ALLOWED_ORIGINS="):
+            origin = origin[len("ALLOWED_ORIGINS="):]
+            print(f"[CORS] WARNING: Stripped accidental 'ALLOWED_ORIGINS=' prefix from value")
+
+        # Validate it looks like a URL
+        if origin.startswith("http://") or origin.startswith("https://"):
+            origins.append(origin)
+        else:
+            print(f"[CORS] WARNING: Skipping invalid origin (not http/https): {origin!r}")
+
+    if not origins:
+        print("[CORS] WARNING: No valid origins parsed, falling back to production defaults")
+        return PROD_ORIGINS
+
+    return origins
+
+
+# Parse and validate CORS origins at startup
+ALLOWED_ORIGINS = _parse_cors_origins()
+
+# Log the final parsed list clearly
+print(f"[CORS] ════════════════════════════════════════════════════════")
+print(f"[CORS] Final allowed origins ({len(ALLOWED_ORIGINS)} total):")
+for i, origin in enumerate(ALLOWED_ORIGINS, 1):
+    print(f"[CORS]   {i}. {origin}")
+print(f"[CORS] ════════════════════════════════════════════════════════")
 
 app = Flask(__name__)
+
+# Configure CORS with explicit origin list (required for credentials)
+# NO wildcards - explicit origins only for cookie/credential support
 CORS(
     app,
     resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
     supports_credentials=True,  # Required for httpOnly cookies
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
     expose_headers=["Content-Type"],
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
+
+
+@app.after_request
+def _ensure_cors_headers(response):
+    """
+    Ensure CORS headers are present on all responses, including errors.
+    Flask-CORS handles most cases, but this ensures preflight responses work.
+    """
+    origin = request.headers.get("Origin")
+    if origin and origin in ALLOWED_ORIGINS:
+        # Explicitly set headers (Flask-CORS may miss some edge cases)
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        if request.method == "OPTIONS":
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    return response
 
 @app.before_request
 def _set_anonymous_user():
