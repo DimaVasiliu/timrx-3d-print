@@ -272,6 +272,28 @@ class Config:
         return "test"
 
     # ─────────────────────────────────────────────────────────────
+    # Mollie
+    # ─────────────────────────────────────────────────────────────
+    MOLLIE_API_KEY: str = field(default_factory=lambda: _get_env("MOLLIE_API_KEY"))
+    MOLLIE_PROFILE_ID: str = field(default_factory=lambda: _get_env("MOLLIE_PROFILE_ID"))
+    MOLLIE_ENV: str = field(default_factory=lambda: _get_env("MOLLIE_ENV", "test").lower())
+    PUBLIC_BASE_URL: str = field(default_factory=lambda: _get_env("PUBLIC_BASE_URL"))
+
+    @property
+    def MOLLIE_CONFIGURED(self) -> bool:
+        """True if Mollie is configured."""
+        return bool(self.MOLLIE_API_KEY)
+
+    @property
+    def MOLLIE_MODE(self) -> str:
+        """Returns 'live' or 'test' based on MOLLIE_ENV or key prefix."""
+        if self.MOLLIE_ENV == "live":
+            return "live"
+        if self.MOLLIE_API_KEY.startswith("live_"):
+            return "live"
+        return "test"
+
+    # ─────────────────────────────────────────────────────────────
     # Credits System
     # ─────────────────────────────────────────────────────────────
     RESERVATION_EXPIRY_MINUTES: int = field(default_factory=lambda: _get_env_int("RESERVATION_EXPIRY_MINUTES", 20))
@@ -350,6 +372,7 @@ class Config:
         print(f"  Database configured: {self.HAS_DATABASE}")
         print(f"  Email configured: {self.EMAIL_CONFIGURED}")
         print(f"  Stripe configured: {self.STRIPE_CONFIGURED} ({self.STRIPE_MODE if self.STRIPE_CONFIGURED else 'N/A'})")
+        print(f"  Mollie configured: {self.MOLLIE_CONFIGURED} ({self.MOLLIE_MODE if self.MOLLIE_CONFIGURED else 'N/A'})")
         print(f"  AWS S3 configured: {self.AWS_CONFIGURED}")
         print("-" * 60)
         print(f"  Admin email: {self.ADMIN_EMAIL or '(not set)'}")
@@ -369,8 +392,8 @@ class Config:
                 warnings.append("DATABASE_URL not set - running without persistence!")
             if not self.EMAIL_CONFIGURED:
                 warnings.append("Email not configured - magic codes and receipts won't send")
-            if not self.STRIPE_CONFIGURED:
-                warnings.append("Stripe not configured - purchases disabled")
+            if not self.STRIPE_CONFIGURED and not self.MOLLIE_CONFIGURED:
+                warnings.append("No payment provider configured (Stripe/Mollie) - purchases disabled")
             if not self.ALLOWED_ORIGINS:
                 warnings.append("ALLOWED_ORIGINS not set - CORS will block requests")
             if self.ALLOW_ALL_ORIGINS:
@@ -389,6 +412,8 @@ class Config:
             "email_configured": self.EMAIL_CONFIGURED,
             "stripe_configured": self.STRIPE_CONFIGURED,
             "stripe_mode": self.STRIPE_MODE if self.STRIPE_CONFIGURED else None,
+            "mollie_configured": self.MOLLIE_CONFIGURED,
+            "mollie_mode": self.MOLLIE_MODE if self.MOLLIE_CONFIGURED else None,
             "aws_configured": self.AWS_CONFIGURED,
             "free_credits_on_signup": self.FREE_CREDITS_ON_SIGNUP,
         }
@@ -432,6 +457,10 @@ NOTIFY_ON_RESTORE_REQUEST = config.NOTIFY_ON_RESTORE_REQUEST
 STRIPE_SECRET_KEY = config.STRIPE_SECRET_KEY
 STRIPE_PUBLISHABLE_KEY = config.STRIPE_PUBLISHABLE_KEY
 STRIPE_WEBHOOK_SECRET = config.STRIPE_WEBHOOK_SECRET
+MOLLIE_API_KEY = config.MOLLIE_API_KEY
+MOLLIE_PROFILE_ID = config.MOLLIE_PROFILE_ID
+MOLLIE_ENV = config.MOLLIE_ENV
+PUBLIC_BASE_URL = config.PUBLIC_BASE_URL
 RESERVATION_EXPIRY_MINUTES = config.RESERVATION_EXPIRY_MINUTES
 FREE_CREDITS_ON_SIGNUP = config.FREE_CREDITS_ON_SIGNUP
 AWS_REGION = config.AWS_REGION
