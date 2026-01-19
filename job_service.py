@@ -118,7 +118,6 @@ class JobService:
         identity_id: str,
         action_key: str,
         payload: Dict[str, Any],
-        admin_bypass: bool = False,
     ) -> Dict[str, Any]:
         """
         Create a job and dispatch to the appropriate provider.
@@ -127,19 +126,17 @@ class JobService:
             identity_id: The user's identity
             action_key: Frontend action key (e.g., 'text_to_3d_generate')
             payload: Action-specific payload (differs per tool)
-            admin_bypass: If True, skip credit checks/reservations (admin testing)
 
         Returns:
             Dict with job details:
             {
                 "job_id": "uuid",
-                "reservation_id": "uuid",  # None if admin_bypass=True
+                "reservation_id": "uuid",
                 "upstream_job_id": "provider-id",
                 "status": "pending",
                 "provider": "meshy",
                 "action_code": "MESHY_TEXT_TO_3D",
-                "cost_credits": 20,
-                "admin_bypass": false
+                "cost_credits": 20
             }
 
         Raises:
@@ -163,11 +160,8 @@ class JobService:
         # Extract prompt for storage (if available)
         prompt = payload.get("prompt", "")
 
-        # Build job meta (include admin_bypass flag if applicable)
+        # Build job meta
         job_meta = {"payload": payload}
-        if admin_bypass:
-            job_meta["admin_bypass"] = True
-            print(f"[JOB] Admin bypass: skipping credit reservation for {action_key}")
 
         # Create job and reserve credits in a single transaction
         with transaction() as cur:
@@ -192,30 +186,29 @@ class JobService:
             job_row = fetch_one(cur)
             job_id = str(job_row["id"])
 
-        # 2. Reserve credits (skip if admin bypass)
+        # 2. Reserve credits
         reservation_id = None
-        if not admin_bypass:
-            try:
-                reservation_result = ReservationService.reserve_credits(
-                    identity_id=identity_id,
-                    action_key=action_key,
-                    job_id=job_id,
-                    meta={"action_key": action_key, "provider": provider},
-                )
-                reservation_id = reservation_result["reservation"]["id"]
-            except ValueError as e:
-                # Clean up job if reservation fails
-                execute(
-                    f"UPDATE {Tables.JOBS} SET status = %s, error_message = %s WHERE id = %s",
-                    (JobStatus.FAILED, str(e), job_id),
-                )
-                raise
-
-            # 3. Update job with reservation_id
-            execute(
-                f"UPDATE {Tables.JOBS} SET reservation_id = %s WHERE id = %s",
-                (reservation_id, job_id),
+        try:
+            reservation_result = ReservationService.reserve_credits(
+                identity_id=identity_id,
+                action_key=action_key,
+                job_id=job_id,
+                meta={"action_key": action_key, "provider": provider},
             )
+            reservation_id = reservation_result["reservation"]["id"]
+        except ValueError as e:
+            # Clean up job if reservation fails
+            execute(
+                f"UPDATE {Tables.JOBS} SET status = %s, error_message = %s WHERE id = %s",
+                (JobStatus.FAILED, str(e), job_id),
+            )
+            raise
+
+        # 3. Update job with reservation_id
+        execute(
+            f"UPDATE {Tables.JOBS} SET reservation_id = %s WHERE id = %s",
+            (reservation_id, job_id),
+        )
 
         # 4. Dispatch to provider
         try:
@@ -247,10 +240,9 @@ class JobService:
             (upstream_job_id, JobStatus.PENDING, job_id),
         )
 
-        bypass_tag = " (admin_bypass)" if admin_bypass else ""
         print(
             f"[JOB] Created job={job_id}, upstream={upstream_job_id}, "
-            f"provider={provider}, action={action_code}, credits={cost_credits}{bypass_tag}"
+            f"provider={provider}, action={action_code}, credits={cost_credits}"
         )
 
         return {
@@ -261,7 +253,6 @@ class JobService:
             "provider": provider,
             "action_code": action_code,
             "cost_credits": cost_credits,
-            "admin_bypass": admin_bypass,
         }
 
     # ─────────────────────────────────────────────────────────────
