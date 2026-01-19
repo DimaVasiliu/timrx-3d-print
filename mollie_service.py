@@ -1,0 +1,508 @@
+"""
+Mollie Payment Service - Handles credit purchases via Mollie.
+
+Flow:
+1. create_checkout(identity_id, plan_code, email) -> checkout_url
+2. User completes payment on Mollie
+3. handle_webhook() processes payment.paid:
+   - Creates purchases row
+   - Adds ledger entry purchase_credit (+credits)
+   - Updates wallet balance
+   - Attaches email to identity (if not already)
+   - Sends receipt email to user
+   - Sends admin notification email
+
+Idempotency:
+- Purchases are keyed by provider_payment_id (Mollie payment ID)
+- Repeated webhooks for same payment are safely ignored
+
+Environment variables:
+- MOLLIE_API_KEY: Your Mollie API key (test_xxx or live_xxx)
+- MOLLIE_PROFILE_ID: Optional Mollie profile ID
+- MOLLIE_ENV: 'test' or 'live' (default: test)
+- PUBLIC_BASE_URL: Base URL for webhooks (e.g., https://api.timrx.com)
+"""
+
+import json
+import requests
+from typing import Optional, Dict, Any
+from datetime import datetime
+
+from config import config
+from pricing_service import PricingService
+
+# Check if Mollie is configured
+MOLLIE_AVAILABLE = config.MOLLIE_CONFIGURED
+
+if MOLLIE_AVAILABLE:
+    print(f"[MOLLIE] Mollie configured and ready (mode: {config.MOLLIE_MODE})")
+else:
+    print("[MOLLIE] Mollie not configured - Mollie payments disabled")
+
+
+class MollieService:
+    """Service for handling credit purchases via Mollie."""
+
+    MOLLIE_API_BASE = "https://api.mollie.com/v2"
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if Mollie functionality is available."""
+        return MOLLIE_AVAILABLE
+
+    @staticmethod
+    def _get_headers() -> Dict[str, str]:
+        """Get headers for Mollie API requests."""
+        return {
+            "Authorization": f"Bearer {config.MOLLIE_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # Checkout Flow
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def create_checkout(
+        identity_id: str,
+        plan_code: str,
+        email: str,
+        success_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a Mollie payment for purchasing credits.
+
+        Args:
+            identity_id: The user's identity ID
+            plan_code: The plan code to purchase (e.g., 'starter_80')
+            email: User's email (stored in metadata)
+            success_url: URL to redirect on success (optional)
+            cancel_url: URL to redirect on cancel (optional, same as success_url)
+
+        Returns:
+            {
+                "checkout_url": "https://www.mollie.com/checkout/...",
+                "payment_id": "tr_..."
+            }
+
+        Raises:
+            ValueError: If Mollie not configured, plan not found, or API error
+        """
+        if not MOLLIE_AVAILABLE:
+            raise ValueError("Mollie is not configured")
+
+        # Validate plan exists
+        plan = PricingService.get_plan_by_code(plan_code)
+        if not plan:
+            raise ValueError(f"Plan '{plan_code}' not found or inactive")
+
+        # Get plan details
+        plan_id = plan["id"]
+        plan_name = plan["name"]
+        price_gbp = plan["price"]
+        credits = plan["credits"]
+
+        # Build redirect URL
+        base_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        if not success_url:
+            success_url = f"{base_url}/checkout/success"
+        if not cancel_url:
+            cancel_url = success_url  # Mollie uses same URL for cancel
+
+        # Build webhook URL
+        webhook_url = f"{base_url}/api/billing/webhook/mollie"
+
+        # Build metadata (stored with payment, returned in webhook)
+        metadata = {
+            "identity_id": identity_id,
+            "plan_code": plan_code,
+            "plan_id": str(plan_id),
+            "credits": str(credits),
+            "email": email,
+        }
+
+        # Create Mollie payment
+        payment_data = {
+            "amount": {
+                "currency": "GBP",
+                "value": f"{price_gbp:.2f}",
+            },
+            "description": f"{plan_name} - {credits} Credits",
+            "redirectUrl": success_url,
+            "webhookUrl": webhook_url,
+            "metadata": metadata,
+        }
+
+        # Add profile ID if configured
+        if config.MOLLIE_PROFILE_ID:
+            payment_data["profileId"] = config.MOLLIE_PROFILE_ID
+
+        try:
+            response = requests.post(
+                f"{MollieService.MOLLIE_API_BASE}/payments",
+                headers=MollieService._get_headers(),
+                json=payment_data,
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 201):
+                error_data = response.json() if response.content else {}
+                error_msg = error_data.get("detail", response.text)
+                print(f"[MOLLIE] API error creating payment: {response.status_code} - {error_msg}")
+                raise ValueError(f"Mollie API error: {error_msg}")
+
+            payment = response.json()
+            payment_id = payment["id"]
+            checkout_url = payment["_links"]["checkout"]["href"]
+
+            print(
+                f"[MOLLIE] Payment created: payment_id={payment_id}, "
+                f"identity={identity_id}, plan={plan_code}, credits={credits}"
+            )
+
+            return {
+                "checkout_url": checkout_url,
+                "payment_id": payment_id,
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Request error creating payment: {e}")
+            raise ValueError(f"Payment service error: {str(e)}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Webhook Processing
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def handle_webhook(payment_id: str) -> Dict[str, Any]:
+        """
+        Handle a Mollie webhook notification.
+
+        Mollie webhooks only send the payment ID - we fetch full details.
+
+        Args:
+            payment_id: The Mollie payment ID (tr_xxx)
+
+        Returns:
+            {
+                "ok": True/False,
+                "status": "paid" / "failed" / etc,
+                "message": "...",
+                "purchase_id": "..." (if applicable)
+            }
+        """
+        if not MOLLIE_AVAILABLE:
+            return {"ok": False, "error": "Mollie not configured"}
+
+        # Fetch payment details from Mollie
+        try:
+            response = requests.get(
+                f"{MollieService.MOLLIE_API_BASE}/payments/{payment_id}",
+                headers=MollieService._get_headers(),
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                print(f"[MOLLIE] Failed to fetch payment {payment_id}: {response.status_code}")
+                return {"ok": False, "error": f"Failed to fetch payment: {response.status_code}"}
+
+            payment = response.json()
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Request error fetching payment: {e}")
+            return {"ok": False, "error": f"Request error: {str(e)}"}
+
+        status = payment.get("status")
+        print(f"[MOLLIE] Webhook received: payment_id={payment_id}, status={status}")
+
+        # Only process paid payments
+        if status != "paid":
+            return {
+                "ok": True,
+                "status": status,
+                "message": f"Payment status is '{status}', no action needed",
+            }
+
+        # Process the paid payment
+        result = MollieService._handle_payment_paid(payment)
+
+        if result:
+            return {
+                "ok": True,
+                "status": "paid",
+                "message": "Purchase completed successfully",
+                "purchase_id": result.get("purchase_id"),
+            }
+        else:
+            return {
+                "ok": False,
+                "status": "paid",
+                "error": "Failed to process paid payment",
+            }
+
+    @staticmethod
+    def _handle_payment_paid(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle a paid payment - create purchase and grant credits.
+
+        Args:
+            payment: Full Mollie payment object
+
+        Returns:
+            Dict with purchase info, or None on failure
+        """
+        # Import here to avoid circular import
+        from purchase_service import PurchaseService
+
+        payment_id = payment.get("id")
+        metadata = payment.get("metadata", {})
+
+        # Extract metadata
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        plan_id = metadata.get("plan_id")
+        credits_str = metadata.get("credits")
+        customer_email = metadata.get("email")
+
+        if not identity_id or not plan_code or not credits_str:
+            print(f"[MOLLIE] Missing metadata in payment {payment_id}: {metadata}")
+            return None
+
+        credits = int(credits_str)
+
+        # Get amount from payment
+        amount_data = payment.get("amount", {})
+        amount_gbp = float(amount_data.get("value", 0))
+
+        # Get plan name
+        plan = PricingService.get_plan_by_code(plan_code)
+        plan_name = plan["name"] if plan else plan_code
+
+        # Idempotency check: see if purchase already exists for this payment
+        existing = PurchaseService.get_purchase_by_provider_id(payment_id)
+        if existing:
+            print(f"[MOLLIE] Already processed payment {payment_id}, purchase_id={existing['id']}")
+            return {
+                "purchase_id": existing["id"],
+                "was_existing": True,
+            }
+
+        # Record the purchase (this handles credits, wallet, email attachment)
+        try:
+            result = MollieService._record_mollie_purchase(
+                identity_id=identity_id,
+                plan_id=plan_id,
+                plan_code=plan_code,
+                provider_payment_id=payment_id,
+                amount_gbp=amount_gbp,
+                credits_granted=credits,
+                customer_email=customer_email,
+            )
+
+            if result:
+                purchase_id = result["purchase"]["id"]
+
+                # Send receipt email
+                if customer_email:
+                    from emailer import send_purchase_receipt, notify_purchase
+                    send_purchase_receipt(
+                        to_email=customer_email,
+                        plan_name=plan_name,
+                        credits=credits,
+                        amount_gbp=amount_gbp,
+                    )
+
+                    # Send admin notification
+                    notify_purchase(
+                        identity_id=identity_id,
+                        email=customer_email,
+                        plan_name=plan_name,
+                        credits=credits,
+                        amount_gbp=amount_gbp,
+                    )
+
+                return {
+                    "purchase_id": purchase_id,
+                    "was_existing": False,
+                }
+
+        except Exception as e:
+            print(f"[MOLLIE] Error processing paid payment: {e}")
+            return None
+
+        return None
+
+    @staticmethod
+    def _record_mollie_purchase(
+        identity_id: str,
+        plan_id: str,
+        plan_code: str,
+        provider_payment_id: str,
+        amount_gbp: float,
+        credits_granted: int,
+        customer_email: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Record a completed Mollie purchase and grant credits.
+
+        This is similar to PurchaseService.record_purchase but uses 'mollie' as provider.
+        """
+        from db import fetch_one, transaction, Tables
+        from wallet_service import LedgerEntryType
+        from purchase_service import PurchaseStatus, PurchaseService
+
+        with transaction() as cur:
+            # 1. Create purchase record
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.PURCHASES}
+                (identity_id, plan_id, provider, provider_payment_id,
+                 amount, currency, credits_granted, status, purchased_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                RETURNING *
+                """,
+                (
+                    identity_id,
+                    plan_id,
+                    "mollie",  # Different provider
+                    provider_payment_id,
+                    amount_gbp,
+                    "GBP",
+                    credits_granted,
+                    PurchaseStatus.COMPLETED,
+                ),
+            )
+            purchase = fetch_one(cur)
+            purchase_id = str(purchase["id"])
+
+            # 2. Lock wallet for update
+            cur.execute(
+                f"""
+                SELECT identity_id, balance_credits
+                FROM {Tables.WALLETS}
+                WHERE identity_id = %s
+                FOR UPDATE
+                """,
+                (identity_id,),
+            )
+            wallet = fetch_one(cur)
+
+            if not wallet:
+                # Create wallet if doesn't exist
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
+                    VALUES (%s, 0, NOW())
+                    ON CONFLICT (identity_id) DO NOTHING
+                    RETURNING *
+                    """,
+                    (identity_id,),
+                )
+                wallet = fetch_one(cur)
+                if not wallet:
+                    # Conflict means it was created, fetch it
+                    cur.execute(
+                        f"SELECT * FROM {Tables.WALLETS} WHERE identity_id = %s FOR UPDATE",
+                        (identity_id,),
+                    )
+                    wallet = fetch_one(cur)
+
+            current_balance = wallet.get("balance_credits", 0) or 0
+            new_balance = current_balance + credits_granted
+
+            # 3. Insert ledger entry
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.LEDGER_ENTRIES}
+                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                RETURNING *
+                """,
+                (
+                    identity_id,
+                    LedgerEntryType.PURCHASE_CREDIT,
+                    credits_granted,  # Positive amount
+                    "purchases",
+                    purchase_id,
+                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "provider": "mollie"}),
+                ),
+            )
+            ledger_entry = fetch_one(cur)
+
+            # 4. Update wallet balance
+            cur.execute(
+                f"""
+                UPDATE {Tables.WALLETS}
+                SET balance_credits = %s, updated_at = NOW()
+                WHERE identity_id = %s
+                """,
+                (new_balance, identity_id),
+            )
+
+            # 5. Attach email to identity if provided
+            email_attached = False
+            if customer_email:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.IDENTITIES}
+                    SET email = %s, updated_at = NOW()
+                    WHERE id = %s AND email IS NULL
+                    """,
+                    (customer_email.lower().strip(), identity_id),
+                )
+                email_attached = cur.rowcount > 0
+
+            print(
+                f"[MOLLIE] Purchase recorded: purchase_id={purchase_id}, identity={identity_id}, "
+                f"credits={credits_granted}, balance: {current_balance} -> {new_balance}, "
+                f"email_attached={email_attached}"
+            )
+
+            return {
+                "purchase": PurchaseService._format_purchase(purchase),
+                "ledger_entry_id": str(ledger_entry["id"]),
+                "balance": new_balance,
+                "email_attached": email_attached,
+            }
+
+    # ─────────────────────────────────────────────────────────────
+    # Payment Status Check
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_payment_status(payment_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the status of a Mollie payment.
+
+        Args:
+            payment_id: The Mollie payment ID (tr_xxx)
+
+        Returns:
+            Dict with payment status info, or None on error
+        """
+        if not MOLLIE_AVAILABLE:
+            return None
+
+        try:
+            response = requests.get(
+                f"{MollieService.MOLLIE_API_BASE}/payments/{payment_id}",
+                headers=MollieService._get_headers(),
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                return None
+
+            payment = response.json()
+            return {
+                "id": payment.get("id"),
+                "status": payment.get("status"),
+                "amount": payment.get("amount"),
+                "description": payment.get("description"),
+                "created_at": payment.get("createdAt"),
+                "paid_at": payment.get("paidAt"),
+            }
+
+        except requests.RequestException:
+            return None
