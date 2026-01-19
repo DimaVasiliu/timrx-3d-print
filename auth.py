@@ -330,26 +330,19 @@ def attach_email():
 
     ip_address = _get_client_ip()
 
-    # Check if email belongs to another verified identity
-    existing = IdentityService.get_identity_by_email(email)
-    if existing and str(existing["id"]) != identity_id:
-        # Email belongs to another identity
-        if existing.get("email_verified"):
-            # Already verified by someone else - user should use restore flow
-            # Return generic success to prevent enumeration
-            print(f"[AUTH] Email attach blocked: {email} already verified by identity {existing['id']}")
-            return jsonify({
-                "ok": True,
-                "message": "If valid, a verification code has been sent",
-                "requires_restore": True,  # Hint for frontend
-            })
-
     # Attach email to current identity (unverified)
+    # This method is anti-enumeration safe - it returns ok even if email belongs
+    # to another identity (user must use restore flow, but we don't tell them explicitly)
     try:
-        IdentityService.attach_email(identity_id, email)
-    except Exception as e:
+        _, _, reason = IdentityService.attach_email(identity_id, email)
+        # Log the reason internally but NEVER expose to users
+        if reason == IdentityService.ATTACH_REASON_BELONGS_TO_OTHER:
+            # Email belongs to another identity - silently skip attachment
+            # User must use restore/redeem flow to take over that account
+            pass  # Already logged in attach_email
+    except ValueError as e:
         print(f"[AUTH] Failed to attach email: {e}")
-        # Continue anyway - might be a duplicate key issue if email already attached
+        # Continue anyway to prevent enumeration
 
     # Check rate limits and send verification code
     rate_ok, rate_msg = MagicCodeService._check_rate_limits(email)
