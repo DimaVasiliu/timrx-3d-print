@@ -14,7 +14,6 @@ from flask import Blueprint, request, jsonify, g, make_response
 from middleware import with_session, require_session
 from identity_service import IdentityService
 from wallet_service import WalletService
-from db import DatabaseIntegrityError
 
 bp = Blueprint("me", __name__)
 
@@ -68,11 +67,16 @@ def attach_email():
         }), 400
 
     try:
-        updated, was_changed = IdentityService.attach_email(g.identity_id, email)
+        # attach_email is anti-enumeration safe - it returns ok even if email
+        # belongs to another identity (reason is logged internally only)
+        updated, was_changed, _ = IdentityService.attach_email(g.identity_id, email)
+
+        # ANTI-ENUMERATION: Always return ok=true, never reveal if email belongs to another
+        # The reason is for internal logging only
         return jsonify({
             "ok": True,
             "identity_id": g.identity_id,
-            "email": updated.get("email"),
+            "email": updated.get("email"),  # Returns current email (may be unchanged)
             "was_changed": was_changed,
         })
     except ValueError as e:
@@ -82,13 +86,6 @@ def attach_email():
                 "message": str(e),
             }
         }), 400
-    except DatabaseIntegrityError:
-        return jsonify({
-            "error": {
-                "code": "EMAIL_IN_USE",
-                "message": "This email is already associated with another account",
-            }
-        }), 409
 
 
 @bp.route("/wallet", methods=["GET"])
