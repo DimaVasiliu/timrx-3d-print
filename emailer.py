@@ -27,9 +27,15 @@ from config import (
 EMAIL_CONFIGURED = bool(SENDGRID_API_KEY or (SMTP_HOST and SMTP_USER and SMTP_PASSWORD))
 
 if EMAIL_CONFIGURED:
-    print(f"[EMAIL] Email configured via {'SendGrid' if SENDGRID_API_KEY else 'SMTP'}")
+    if SENDGRID_API_KEY:
+        print("[EMAIL] Email configured via SendGrid API")
+    else:
+        _masked_user = SMTP_USER[:3] + "***" if SMTP_USER and len(SMTP_USER) > 3 else "(set)"
+        _masked_pass = "***" + SMTP_PASSWORD[-4:] if SMTP_PASSWORD and len(SMTP_PASSWORD) > 4 else "(set)"
+        print(f"[EMAIL] Email configured via SMTP: {SMTP_HOST}:{SMTP_PORT} user={_masked_user} pass={_masked_pass}")
 else:
     print("[EMAIL] WARNING: Email not configured - emails will be logged only")
+    print(f"[EMAIL] DEBUG: SMTP_HOST={SMTP_HOST or '(empty)'}, SMTP_USER={SMTP_USER or '(empty)'}, SMTP_PASSWORD={'(set)' if SMTP_PASSWORD else '(empty)'}, SENDGRID_API_KEY={'(set)' if SENDGRID_API_KEY else '(empty)'}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -70,6 +76,7 @@ def send_email(
         msg.attach(MIMEText(html_body, "html"))
 
         # Send via SMTP
+        print(f"[EMAIL] Connecting to SMTP host={SMTP_HOST} port={SMTP_PORT}")
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASSWORD)
