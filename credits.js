@@ -547,6 +547,34 @@
   const changeVerifiedEmailBtn = document.getElementById('changeVerifiedEmailBtn');
   const showRestoreBtn = document.getElementById('showRestoreBtn');
 
+  // Toggle button and collapsible card
+  const secureToggleBtn = document.getElementById('secureToggleBtn');
+  const secureCreditsCard = document.getElementById('secureCreditsCard');
+
+  /**
+   * Toggle the secure credits card visibility
+   */
+  function toggleSecureCredits() {
+    if (!secureToggleBtn || !secureCreditsCard) return;
+
+    const isExpanded = secureCreditsCard.classList.contains('expanded');
+
+    if (isExpanded) {
+      // Collapse
+      secureCreditsCard.classList.remove('expanded');
+      secureCreditsCard.classList.add('collapsed');
+      secureToggleBtn.classList.remove('expanded');
+    } else {
+      // Expand
+      secureCreditsCard.classList.remove('collapsed');
+      secureCreditsCard.classList.add('expanded');
+      secureToggleBtn.classList.add('expanded');
+    }
+  }
+
+  // Toggle button event listener
+  secureToggleBtn?.addEventListener('click', toggleSecureCredits);
+
   // Email state
   let pendingEmail = '';
   let emailVerified = false;
