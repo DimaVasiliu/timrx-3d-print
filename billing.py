@@ -6,8 +6,10 @@ Handles:
 - GET /api/billing/action-costs - Get action costs
 - GET /api/billing/ledger - Get ledger entries for current identity
 - POST /api/billing/reserve - Reserve credits for a job
-- POST /api/billing/checkout/start - Create Stripe checkout session
-- POST /api/billing/webhook - Stripe webhook handler
+- POST /api/billing/checkout - Create Mollie payment (primary)
+- POST /api/billing/checkout/start - Create Stripe checkout session (legacy)
+- POST /api/billing/webhook/mollie - Mollie webhook handler
+- POST /api/billing/webhook - Stripe webhook handler (legacy)
 - GET /api/billing/purchase/:id - Get purchase details
 - GET /api/billing/purchases - Get purchase history
 """
@@ -19,6 +21,7 @@ from pricing_service import PricingService
 from wallet_service import WalletService
 from reservation_service import ReservationService
 from purchase_service import PurchaseService
+from mollie_service import MollieService
 
 bp = Blueprint("billing", __name__)
 
@@ -315,6 +318,127 @@ def reserve_credits():
         }), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MOLLIE CHECKOUT (Primary payment provider)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/checkout", methods=["POST"])
+@require_session
+def create_mollie_checkout():
+    """
+    Create a Mollie payment for purchasing credits.
+
+    Request body:
+    {
+        "plan_code": "starter_80",
+        "email": "user@example.com"
+    }
+
+    Response (success - 200):
+    {
+        "ok": true,
+        "checkout_url": "https://www.mollie.com/checkout/..."
+    }
+
+    Response (error - 400/503):
+    {
+        "error": {
+            "code": "...",
+            "message": "..."
+        }
+    }
+    """
+    # Check if Mollie is configured
+    if not MollieService.is_available():
+        return jsonify({
+            "error": {
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Payment service is not configured",
+            }
+        }), 503
+
+    data = request.get_json() or {}
+    plan_code = data.get("plan_code")
+    email = data.get("email", "").strip()
+
+    # Validation
+    if not plan_code:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "plan_code is required",
+            }
+        }), 400
+
+    if not email:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "email is required",
+            }
+        }), 400
+
+    # Basic email validation
+    if "@" not in email or "." not in email:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Invalid email format",
+            }
+        }), 400
+
+    try:
+        result = MollieService.create_checkout(
+            identity_id=g.identity_id,
+            plan_code=plan_code,
+            email=email,
+        )
+
+        return jsonify({
+            "ok": True,
+            "checkout_url": result["checkout_url"],
+        })
+
+    except ValueError as e:
+        error_msg = str(e)
+
+        if "not found" in error_msg.lower():
+            return jsonify({
+                "error": {
+                    "code": "INVALID_PLAN",
+                    "message": error_msg,
+                }
+            }), 400
+
+        if "not configured" in error_msg.lower():
+            return jsonify({
+                "error": {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": "Payment service is not available",
+                }
+            }), 503
+
+        return jsonify({
+            "error": {
+                "code": "CHECKOUT_ERROR",
+                "message": error_msg,
+            }
+        }), 400
+
+    except Exception as e:
+        print(f"[BILLING] Error creating Mollie checkout: {e}")
+        return jsonify({
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Failed to create checkout session",
+            }
+        }), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRIPE CHECKOUT (Legacy - kept for backward compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @bp.route("/checkout/start", methods=["POST"])
 @require_session
 def create_checkout():
@@ -464,6 +588,59 @@ def stripe_webhook():
             "error": result.get("error"),
         })
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOLLIE WEBHOOK
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/webhook/mollie", methods=["POST"])
+def mollie_webhook():
+    """
+    Handle Mollie webhook notifications.
+
+    Mollie sends a POST with form data containing `id` (payment ID).
+    We fetch the payment details and process if paid.
+
+    No authentication required - Mollie verifies by us fetching payment details.
+
+    Returns 200 OK to acknowledge receipt (even on processing errors,
+    to prevent Mollie from retrying indefinitely).
+    """
+    # Mollie sends payment ID as form data
+    payment_id = request.form.get("id")
+
+    if not payment_id:
+        # Try JSON body as fallback
+        data = request.get_json(silent=True) or {}
+        payment_id = data.get("id")
+
+    if not payment_id:
+        print("[BILLING] Mollie webhook received without payment ID")
+        return jsonify({"ok": False, "error": "Missing payment ID"}), 400
+
+    print(f"[BILLING] Mollie webhook received: payment_id={payment_id}")
+
+    # Process the webhook
+    result = MollieService.handle_webhook(payment_id)
+
+    if result.get("ok"):
+        return jsonify({
+            "ok": True,
+            "status": result.get("status"),
+            "message": result.get("message"),
+        })
+    else:
+        # Log error but still return 200 to prevent retries
+        print(f"[BILLING] Mollie webhook error: {result.get('error')}")
+        return jsonify({
+            "ok": False,
+            "error": result.get("error"),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PURCHASE QUERIES
+# ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/purchase/<purchase_id>", methods=["GET"])
 @require_session
