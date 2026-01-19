@@ -334,7 +334,7 @@
       }
 
       if (data.checkout_url) {
-        // Redirect to Stripe checkout
+        // Redirect to Mollie checkout
         window.location.href = data.checkout_url;
       } else {
         throw new Error('No checkout URL returned');
