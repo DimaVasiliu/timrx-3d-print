@@ -93,6 +93,7 @@ export async function fetchWallet() {
 
 /**
  * Fetch action costs from /api/billing/action-costs
+ * Response format: { ok: true, action_costs: [{ action_key: "...", credits: N }, ...] }
  */
 export async function fetchActionCosts() {
   try {
@@ -104,17 +105,29 @@ export async function fetchActionCosts() {
 
     if (!res.ok) {
       log('[Credits] Action costs fetch failed:', res.status);
-      // Use default costs if API fails
       creditsState.actionCosts = getDefaultActionCosts();
       return creditsState.actionCosts;
     }
 
     const data = await res.json();
-    if (data.ok && data.costs) {
-      creditsState.actionCosts = data.costs;
+
+    // Handle array format from backend: { action_costs: [{ action_key, credits }, ...] }
+    if (data.ok && Array.isArray(data.action_costs)) {
+      const costsMap = {};
+      data.action_costs.forEach(item => {
+        if (item.action_key && typeof item.credits === 'number') {
+          costsMap[item.action_key] = item.credits;
+        }
+      });
+      // Add legacy aliases for backward compatibility
+      if (costsMap['text_to_3d_generate']) costsMap['text-to-3d'] = costsMap['text_to_3d_generate'];
+      if (costsMap['image_to_3d_generate']) costsMap['image-to-3d'] = costsMap['image_to_3d_generate'];
+      if (costsMap['image_studio_generate']) costsMap['text-to-image'] = costsMap['image_studio_generate'];
+
+      creditsState.actionCosts = costsMap;
       log('[Credits] Action costs loaded:', creditsState.actionCosts);
     } else if (data.costs) {
-      // Handle case where response is just { costs: {...} }
+      // Handle old object format (backward compatibility)
       creditsState.actionCosts = data.costs;
     } else {
       creditsState.actionCosts = getDefaultActionCosts();
@@ -131,16 +144,22 @@ export async function fetchActionCosts() {
 
 /**
  * Default action costs (fallback if API unavailable)
+ * Keys match backend action_key format with legacy aliases
  */
 function getDefaultActionCosts() {
   return {
+    // Backend action keys
+    'text_to_3d_generate': 20,
+    'image_to_3d_generate': 30,
+    'image_studio_generate': 12,
+    'refine': 10,
+    'texture': 10,
+    'remesh': 10,
+    'rig': 10,
+    // Legacy aliases for backward compatibility
     'text-to-3d': 20,
     'image-to-3d': 30,
     'text-to-image': 12,
-    'refine': 10,
-    'texture': 10,
-    'remesh': 5,
-    'rig': 10,
   };
 }
 
@@ -314,7 +333,7 @@ function updateGenerateButtonCosts() {
 }
 
 /**
- * Show insufficient credits message
+ * Show insufficient credits modal
  */
 export function showInsufficientCreditsMessage(action) {
   const cost = getActionCost(action);
@@ -330,11 +349,78 @@ export function showInsufficientCreditsMessage(action) {
     return;
   }
 
-  // Simple confirm dialog
-  const msg = `Insufficient credits.\n\nYou need ${cost} credits for this action but only have ${available} available.\nYou need ${needed} more credits.`;
-  if (confirm(msg + '\n\nWould you like to buy more credits?')) {
-    window.location.href = 'hub.html#pricing';
+  // Use the insufficient credits modal in 3dprint.html
+  const modal = document.getElementById('insufficientCreditsModal');
+  if (!modal) {
+    // Fallback if modal doesn't exist
+    log('[Credits] Modal not found, using fallback');
+    const msg = `Insufficient credits.\n\nYou need ${cost} credits for this action but only have ${available} available.\nYou need ${needed} more credits.`;
+    if (confirm(msg + '\n\nWould you like to buy more credits?')) {
+      window.location.href = 'hub.html#pricing';
+    }
+    return;
   }
+
+  // Populate modal values
+  const messageEl = document.getElementById('creditsModalMessage');
+  const requiredEl = document.getElementById('creditsModalRequired');
+  const availableEl = document.getElementById('creditsModalAvailable');
+  const neededEl = document.getElementById('creditsModalNeeded');
+  const buyBtn = document.getElementById('creditsModalBuy');
+  const cancelBtn = document.getElementById('creditsModalCancel');
+
+  if (messageEl) {
+    messageEl.textContent = `You need more credits to perform this action.`;
+  }
+  if (requiredEl) requiredEl.textContent = cost.toLocaleString();
+  if (availableEl) availableEl.textContent = available.toLocaleString();
+  if (neededEl) neededEl.textContent = needed.toLocaleString();
+
+  // Show modal
+  modal.setAttribute('aria-hidden', 'false');
+  modal.classList.add('visible');
+
+  // Handle buy button
+  const handleBuy = () => {
+    closeCreditsModal();
+    window.location.href = 'hub.html#pricing';
+  };
+
+  // Handle cancel button
+  const handleCancel = () => {
+    closeCreditsModal();
+  };
+
+  // Handle backdrop click
+  const handleBackdrop = (e) => {
+    if (e.target === modal) {
+      closeCreditsModal();
+    }
+  };
+
+  // Handle escape key
+  const handleEscape = (e) => {
+    if (e.key === 'Escape') {
+      closeCreditsModal();
+    }
+  };
+
+  // Close modal helper
+  const closeCreditsModal = () => {
+    modal.setAttribute('aria-hidden', 'true');
+    modal.classList.remove('visible');
+    // Clean up event listeners
+    if (buyBtn) buyBtn.removeEventListener('click', handleBuy);
+    if (cancelBtn) cancelBtn.removeEventListener('click', handleCancel);
+    modal.removeEventListener('click', handleBackdrop);
+    document.removeEventListener('keydown', handleEscape);
+  };
+
+  // Attach event listeners
+  if (buyBtn) buyBtn.addEventListener('click', handleBuy);
+  if (cancelBtn) cancelBtn.addEventListener('click', handleCancel);
+  modal.addEventListener('click', handleBackdrop);
+  document.addEventListener('keydown', handleEscape);
 }
 
 // ============================================================================
