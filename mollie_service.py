@@ -68,7 +68,6 @@ class MollieService:
         plan_code: str,
         email: str,
         success_url: Optional[str] = None,
-        cancel_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Create a Mollie payment for purchasing credits.
@@ -77,8 +76,7 @@ class MollieService:
             identity_id: The user's identity ID
             plan_code: The plan code to purchase (e.g., 'starter_80')
             email: User's email (stored in metadata)
-            success_url: URL to redirect on success (optional)
-            cancel_url: URL to redirect on cancel (optional, same as success_url)
+            success_url: URL to redirect after payment (optional, defaults to hub.html?checkout=success)
 
         Returns:
             {
@@ -103,12 +101,11 @@ class MollieService:
         price_gbp = plan["price"]
         credits = plan["credits"]
 
-        # Build redirect URL
+        # Build redirect URL - Mollie redirects here after payment (success or cancel)
         base_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
         if not success_url:
-            success_url = f"{base_url}/checkout/success"
-        if not cancel_url:
-            cancel_url = success_url  # Mollie uses same URL for cancel
+            # Redirect to hub.html with checkout=success query param for frontend detection
+            success_url = f"{base_url}/hub.html?checkout=success"
 
         # Build webhook URL
         webhook_url = f"{base_url}/api/billing/webhook/mollie"
