@@ -1,41 +1,32 @@
 """
 Email utilities for TimrX Backend.
-Handles sending transactional emails via SendGrid or SMTP.
+Handles sending transactional emails via the EmailService.
+
+This module provides high-level email functions (send_magic_code, send_purchase_receipt, etc.)
+while delegating actual sending to EmailService in email_service.py.
 """
 
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from typing import Optional, Dict, Any
 
-from config import (
-    SENDGRID_API_KEY,
-    SMTP_HOST,
-    SMTP_PORT,
-    SMTP_USER,
-    SMTP_PASSWORD,
-    EMAIL_FROM_ADDRESS,
-    EMAIL_FROM_NAME,
-    ADMIN_EMAIL,
-    NOTIFY_ON_NEW_IDENTITY,
-    NOTIFY_ON_PURCHASE,
-    NOTIFY_ON_RESTORE_REQUEST,
-    IS_DEV,
-)
+from config import config
 
-# Check if email is configured
-EMAIL_CONFIGURED = bool(SENDGRID_API_KEY or (SMTP_HOST and SMTP_USER and SMTP_PASSWORD))
+# Import send_email from EmailService for actual sending
+# Try multiple import paths for flexibility (app.py adds services/ to sys.path)
+EMAIL_SERVICE_AVAILABLE = False
+_send_email = None
 
-if EMAIL_CONFIGURED:
-    if SENDGRID_API_KEY:
-        print("[EMAIL] Email configured via SendGrid API")
-    else:
-        _masked_user = SMTP_USER[:3] + "***" if SMTP_USER and len(SMTP_USER) > 3 else "(set)"
-        _masked_pass = "***" + SMTP_PASSWORD[-4:] if SMTP_PASSWORD and len(SMTP_PASSWORD) > 4 else "(set)"
-        print(f"[EMAIL] Email configured via SMTP: {SMTP_HOST}:{SMTP_PORT} user={_masked_user} pass={_masked_pass}")
-else:
-    print("[EMAIL] WARNING: Email not configured - emails will be logged only")
-    print(f"[EMAIL] DEBUG: SMTP_HOST={SMTP_HOST or '(empty)'}, SMTP_USER={SMTP_USER or '(empty)'}, SMTP_PASSWORD={'(set)' if SMTP_PASSWORD else '(empty)'}, SENDGRID_API_KEY={'(set)' if SENDGRID_API_KEY else '(empty)'}")
+try:
+    from services.email_service import send_email as _send_email
+    EMAIL_SERVICE_AVAILABLE = True
+except ImportError:
+    try:
+        from email_service import send_email as _send_email
+        EMAIL_SERVICE_AVAILABLE = True
+    except ImportError:
+        pass
+
+if not EMAIL_SERVICE_AVAILABLE:
+    print("[EMAIL] WARNING: email_service not available, using fallback")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -50,44 +41,23 @@ def send_email(
     from_name: Optional[str] = None,
 ) -> bool:
     """
-    Send an email via SMTP (SendGrid-compatible).
+    Send an email via EmailService.
     Returns True on success, False on failure.
+    Never throws - safe to call from any endpoint.
     """
-    if not EMAIL_CONFIGURED:
-        print(f"[EMAIL] Would send to {to_email}: {subject}")
-        if IS_DEV:
-            print(f"[EMAIL] Body: {text_body or html_body[:200]}...")
-        return True  # Pretend success in dev when not configured
+    if EMAIL_SERVICE_AVAILABLE and _send_email is not None:
+        return _send_email(
+            to_email=to_email,
+            subject=subject,
+            html_body=html_body,
+            text_body=text_body,
+            from_email=from_email,
+            from_name=from_name,
+        )
 
-    from_addr = from_email or EMAIL_FROM_ADDRESS
-    sender_name = from_name or EMAIL_FROM_NAME
-
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{sender_name} <{from_addr}>"
-        msg["To"] = to_email
-
-        # Attach text version if provided
-        if text_body:
-            msg.attach(MIMEText(text_body, "plain"))
-
-        # Attach HTML version
-        msg.attach(MIMEText(html_body, "html"))
-
-        # Send via SMTP
-        print(f"[EMAIL] Connecting to SMTP host={SMTP_HOST} port={SMTP_PORT}")
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(from_addr, to_email, msg.as_string())
-
-        print(f"[EMAIL] Sent to {to_email}: {subject}")
-        return True
-
-    except Exception as e:
-        print(f"[EMAIL] Failed to send to {to_email}: {e}")
-        return False
+    # Fallback if email_service not available
+    print(f"[EMAIL] Would send to {to_email}: {subject}")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -185,8 +155,9 @@ Your credits are now available in your account.
 # ─────────────────────────────────────────────────────────────
 def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None) -> bool:
     """Send a notification to the admin email."""
-    if not ADMIN_EMAIL:
-        print(f"[EMAIL] Admin notification (no email configured): {subject}")
+    admin_email = config.ADMIN_EMAIL
+    if not admin_email:
+        print(f"[EMAIL] Admin notification (no ADMIN_EMAIL configured): {subject}")
         return False
 
     data_html = ""
@@ -207,12 +178,12 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
     </div>
     """
 
-    return send_email(ADMIN_EMAIL, f"[TimrX Admin] {subject}", html_body)
+    return send_email(admin_email, f"[TimrX Admin] {subject}", html_body)
 
 
 def notify_new_identity(identity_id: str, email: Optional[str] = None) -> bool:
     """Notify admin when a new identity is created (with email)."""
-    if not NOTIFY_ON_NEW_IDENTITY:
+    if not config.NOTIFY_ON_NEW_IDENTITY:
         return False
     if not email:  # Only notify when email is attached
         return False
@@ -232,7 +203,7 @@ def notify_purchase(
     amount_gbp: float,
 ) -> bool:
     """Notify admin when a purchase is completed."""
-    if not NOTIFY_ON_PURCHASE:
+    if not config.NOTIFY_ON_PURCHASE:
         return False
 
     return notify_admin(
@@ -250,7 +221,7 @@ def notify_purchase(
 
 def notify_restore_request(email: str) -> bool:
     """Notify admin when a restore code is requested."""
-    if not NOTIFY_ON_RESTORE_REQUEST:
+    if not config.NOTIFY_ON_RESTORE_REQUEST:
         return False
 
     return notify_admin(
