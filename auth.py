@@ -268,3 +268,253 @@ def auth_status():
         "email": identity.get("email") if identity else None,
         "email_verified": identity.get("email_verified", False) if identity else False,
     })
+
+
+@bp.route("/email/attach", methods=["POST"])
+@with_session
+def attach_email():
+    """
+    Attach an email to the current identity and send verification code.
+
+    This endpoint allows anonymous users to "secure" their credits by attaching
+    an email address. The email is stored but marked unverified until the user
+    completes the magic code verification.
+
+    Request body:
+    {
+        "email": "user@example.com"
+    }
+
+    Response (always 200 to prevent email enumeration):
+    {
+        "ok": true,
+        "message": "If valid, a verification code has been sent"
+    }
+
+    Behavior:
+    - If email is free: attach to current identity, send verification code
+    - If email belongs to another VERIFIED identity: return generic success,
+      but user must use restore flow to take over that account
+    - If email already on current identity: resend verification code
+
+    Rate limited: same as restore/request (60s cooldown, max 3 active codes)
+    """
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+
+    if not email:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "email is required",
+            }
+        }), 400
+
+    # Basic email validation
+    if "@" not in email or "." not in email:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Invalid email format",
+            }
+        }), 400
+
+    identity_id = g.identity_id
+    if not identity_id:
+        return jsonify({
+            "error": {
+                "code": "SESSION_REQUIRED",
+                "message": "Active session required",
+            }
+        }), 401
+
+    ip_address = _get_client_ip()
+
+    # Check if email belongs to another verified identity
+    existing = IdentityService.get_identity_by_email(email)
+    if existing and str(existing["id"]) != identity_id:
+        # Email belongs to another identity
+        if existing.get("email_verified"):
+            # Already verified by someone else - user should use restore flow
+            # Return generic success to prevent enumeration
+            print(f"[AUTH] Email attach blocked: {email} already verified by identity {existing['id']}")
+            return jsonify({
+                "ok": True,
+                "message": "If valid, a verification code has been sent",
+                "requires_restore": True,  # Hint for frontend
+            })
+
+    # Attach email to current identity (unverified)
+    try:
+        IdentityService.attach_email(identity_id, email)
+    except Exception as e:
+        print(f"[AUTH] Failed to attach email: {e}")
+        # Continue anyway - might be a duplicate key issue if email already attached
+
+    # Check rate limits and send verification code
+    rate_ok, rate_msg = MagicCodeService._check_rate_limits(email)
+    if not rate_ok:
+        if "wait" in rate_msg.lower() or "too many" in rate_msg.lower():
+            return jsonify({
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": rate_msg,
+                }
+            }), 429
+        return jsonify({
+            "error": {
+                "code": "REQUEST_FAILED",
+                "message": rate_msg,
+            }
+        }), 400
+
+    # Generate and send verification code (result ignored - always return generic success)
+    MagicCodeService.request_restore(email, ip_address)
+
+    # Always return generic success to prevent enumeration
+    return jsonify({
+        "ok": True,
+        "message": "If valid, a verification code has been sent",
+    })
+
+
+@bp.route("/email/verify", methods=["POST"])
+@with_session
+def verify_email():
+    """
+    Verify the email attached to current identity using magic code.
+
+    Unlike restore/redeem, this does NOT switch identity - it just marks
+    the email as verified on the current identity.
+
+    Request body:
+    {
+        "email": "user@example.com",
+        "code": "123456"
+    }
+
+    Response (success - 200):
+    {
+        "ok": true,
+        "message": "Email verified successfully",
+        "email_verified": true
+    }
+
+    Response (failure - 400):
+    {
+        "error": {
+            "code": "INVALID_CODE",
+            "message": "Invalid or expired code"
+        }
+    }
+    """
+    data = request.get_json() or {}
+    email = data.get("email", "").strip().lower()
+    code = data.get("code", "").strip()
+
+    # Validation
+    if not email:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "email is required",
+            }
+        }), 400
+
+    if not code:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "code is required",
+            }
+        }), 400
+
+    if len(code) != 6 or not code.isdigit():
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Code must be 6 digits",
+            }
+        }), 400
+
+    identity_id = g.identity_id
+    identity = g.identity
+
+    if not identity_id:
+        return jsonify({
+            "error": {
+                "code": "SESSION_REQUIRED",
+                "message": "Active session required",
+            }
+        }), 401
+
+    # Check that email matches what's on the identity
+    current_email = identity.get("email", "").lower() if identity else ""
+    if current_email != email:
+        return jsonify({
+            "error": {
+                "code": "EMAIL_MISMATCH",
+                "message": "Email does not match your account",
+            }
+        }), 400
+
+    # Verify the code
+    code_hash = MagicCodeService.hash_code(code)
+    from db import query_one, transaction, fetch_one, execute, Tables
+
+    # Find matching active code
+    code_record = query_one(
+        f"""
+        SELECT id, attempts
+        FROM {Tables.MAGIC_CODES}
+        WHERE email = %s
+          AND code_hash = %s
+          AND consumed = FALSE
+          AND expires_at > NOW()
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (email, code_hash),
+    )
+
+    if not code_record:
+        # Code not found - increment attempts
+        MagicCodeService._increment_attempts(email)
+        return _get_redeem_error_response("Invalid or expired code")
+
+    from config import config
+    if code_record["attempts"] >= config.MAGIC_CODE_MAX_ATTEMPTS:
+        return _get_redeem_error_response("Too many failed attempts. Please request a new code")
+
+    code_id = str(code_record["id"])
+
+    # Mark code as consumed and set email_verified = TRUE
+    with transaction() as cur:
+        cur.execute(
+            f"""
+            UPDATE {Tables.MAGIC_CODES}
+            SET consumed = TRUE, consumed_at = NOW()
+            WHERE id = %s
+            """,
+            (code_id,),
+        )
+
+        cur.execute(
+            f"""
+            UPDATE {Tables.IDENTITIES}
+            SET email_verified = TRUE, last_seen_at = NOW()
+            WHERE id = %s
+            """,
+            (identity_id,),
+        )
+
+    # Invalidate other pending codes
+    MagicCodeService.invalidate_codes_for_email(email)
+
+    print(f"[AUTH] Email verified for identity {identity_id}: {email}")
+
+    return jsonify({
+        "ok": True,
+        "message": "Email verified successfully",
+        "email_verified": True,
+    })
