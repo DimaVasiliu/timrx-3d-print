@@ -145,16 +145,45 @@ class Config:
     # Session & Auth
     # ─────────────────────────────────────────────────────────────
     SESSION_COOKIE_NAME: str = "timrx_sid"
-    SESSION_COOKIE_SAMESITE: str = "Lax"
     SESSION_COOKIE_HTTPONLY: bool = True
     SESSION_COOKIE_PATH: str = "/"
+
+    # Cookie domain for cross-subdomain sharing (e.g., ".timrx.live")
+    # Set via SESSION_COOKIE_DOMAIN env var in production
+    # Leading dot allows subdomains (timrx.live + 3d.timrx.live + www.timrx.live)
+    _SESSION_COOKIE_DOMAIN_RAW: str = field(default_factory=lambda: _get_env("SESSION_COOKIE_DOMAIN"))
+
+    @property
+    def SESSION_COOKIE_DOMAIN(self) -> Optional[str]:
+        """
+        Cookie domain for cross-subdomain sharing.
+        Returns None in dev (localhost doesn't support domain cookies).
+        In production, should be ".timrx.live" to share across subdomains.
+        """
+        if self._SESSION_COOKIE_DOMAIN_RAW:
+            return self._SESSION_COOKIE_DOMAIN_RAW
+        # In production without explicit domain, default to .timrx.live
+        if self.IS_PROD:
+            return ".timrx.live"
+        # In dev, return None (let browser default to current host)
+        return None
+
+    @property
+    def SESSION_COOKIE_SAMESITE(self) -> str:
+        """
+        SameSite policy for session cookie.
+        - "Lax": Default, works for same-site navigation (recommended)
+        - "None": Required for cross-site requests (requires Secure=True)
+        """
+        # Lax is fine for same-site subdomains (timrx.live <-> 3d.timrx.live)
+        return "Lax"
 
     # Single TTL for both DB session expiry AND cookie max-age (must match!)
     SESSION_TTL_DAYS: int = field(default_factory=lambda: _get_env_int("SESSION_TTL_DAYS", 30))
 
     @property
     def SESSION_COOKIE_SECURE(self) -> bool:
-        """Secure cookie: True in production, False in dev."""
+        """Secure cookie: True in production (HTTPS), False in dev (HTTP)."""
         return self.IS_PROD
 
     @property
@@ -319,22 +348,47 @@ class Config:
 
     @property
     def ALLOWED_ORIGINS(self) -> List[str]:
-        """List of allowed CORS origins."""
-        if self._ALLOWED_ORIGINS_RAW == "*":
+        """
+        List of allowed CORS origins.
+        Parses comma-separated URLs, sanitizes common misconfigurations.
+        """
+        raw = self._ALLOWED_ORIGINS_RAW
+
+        if not raw:
+            # Dev defaults
+            if self.IS_DEV:
+                return [
+                    "http://localhost:3000",
+                    "http://localhost:3001",
+                    "http://localhost:5173",
+                    "http://localhost:5500",
+                    "http://localhost:5503",
+                    "http://localhost:8080",
+                    "http://127.0.0.1:3000",
+                    "http://127.0.0.1:5173",
+                    "http://127.0.0.1:5503",
+                ]
+            return []
+
+        if raw == "*":
             return ["*"]
-        if self._ALLOWED_ORIGINS_RAW:
-            return [o.strip() for o in self._ALLOWED_ORIGINS_RAW.split(",") if o.strip()]
-        # Dev defaults
-        if self.IS_DEV:
-            return [
-                "http://localhost:3000",
-                "http://localhost:3001",
-                "http://localhost:5173",
-                "http://localhost:8080",
-                "http://127.0.0.1:3000",
-                "http://127.0.0.1:5173",
-            ]
-        return []
+
+        # Parse comma-separated list with sanitization
+        origins = []
+        for part in raw.split(","):
+            origin = part.strip()
+            if not origin:
+                continue
+
+            # Strip accidental "ALLOWED_ORIGINS=" prefix (common misconfiguration)
+            if origin.upper().startswith("ALLOWED_ORIGINS="):
+                origin = origin[len("ALLOWED_ORIGINS="):]
+
+            # Only accept valid http/https URLs
+            if origin.startswith("http://") or origin.startswith("https://"):
+                origins.append(origin)
+
+        return origins
 
     @property
     def ALLOW_ALL_ORIGINS(self) -> bool:
@@ -374,6 +428,14 @@ class Config:
         print(f"  Stripe configured: {self.STRIPE_CONFIGURED} ({self.STRIPE_MODE if self.STRIPE_CONFIGURED else 'N/A'})")
         print(f"  Mollie configured: {self.MOLLIE_CONFIGURED} ({self.MOLLIE_MODE if self.MOLLIE_CONFIGURED else 'N/A'})")
         print(f"  AWS S3 configured: {self.AWS_CONFIGURED}")
+        print("-" * 60)
+        print("[CONFIG] Session Cookie Settings:")
+        print(f"  Cookie name: {self.SESSION_COOKIE_NAME}")
+        print(f"  Cookie domain: {self.SESSION_COOKIE_DOMAIN!r}")
+        print(f"  Cookie secure: {self.SESSION_COOKIE_SECURE}")
+        print(f"  Cookie samesite: {self.SESSION_COOKIE_SAMESITE}")
+        print(f"  Cookie httponly: {self.SESSION_COOKIE_HTTPONLY}")
+        print(f"  Session TTL: {self.SESSION_TTL_DAYS} days")
         print("-" * 60)
         print(f"  Admin email: {self.ADMIN_EMAIL or '(not set)'}")
         print(f"  Notify on purchase: {self.NOTIFY_ON_PURCHASE}")
@@ -436,6 +498,11 @@ DATABASE_URL = config.DATABASE_URL
 BILLING_SCHEMA = config.BILLING_SCHEMA
 APP_SCHEMA = config.APP_SCHEMA
 SESSION_COOKIE_NAME = config.SESSION_COOKIE_NAME
+SESSION_COOKIE_DOMAIN = config.SESSION_COOKIE_DOMAIN
+SESSION_COOKIE_SECURE = config.SESSION_COOKIE_SECURE
+SESSION_COOKIE_SAMESITE = config.SESSION_COOKIE_SAMESITE
+SESSION_COOKIE_HTTPONLY = config.SESSION_COOKIE_HTTPONLY
+SESSION_COOKIE_PATH = config.SESSION_COOKIE_PATH
 SESSION_TTL_DAYS = config.SESSION_TTL_DAYS
 SESSION_TTL_SECONDS = config.SESSION_TTL_SECONDS
 SESSION_MAX_AGE_DAYS = config.SESSION_MAX_AGE_DAYS  # Deprecated alias
