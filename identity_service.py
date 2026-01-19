@@ -52,24 +52,46 @@ class IdentityService:
         """
         Set the session cookie on the response.
         Uses SESSION_TTL_SECONDS for max_age (must match DB session expiry).
+
+        Cookie settings:
+        - domain: ".timrx.live" in prod (allows timrx.live + 3d.timrx.live)
+        - secure: True in prod (HTTPS only)
+        - samesite: "Lax" (works for same-site subdomains)
+        - httponly: True (not accessible via JavaScript)
         """
-        response.set_cookie(
-            config.SESSION_COOKIE_NAME,
-            session_id,
-            max_age=config.SESSION_TTL_SECONDS,  # Must match DB session expiry
-            httponly=config.SESSION_COOKIE_HTTPONLY,
-            secure=config.SESSION_COOKIE_SECURE,  # True in prod, False in dev
-            samesite=config.SESSION_COOKIE_SAMESITE,
-            path=config.SESSION_COOKIE_PATH,
+        # Build cookie kwargs - only include domain if set (None omits it)
+        cookie_kwargs = {
+            "max_age": config.SESSION_TTL_SECONDS,
+            "httponly": config.SESSION_COOKIE_HTTPONLY,
+            "secure": config.SESSION_COOKIE_SECURE,
+            "samesite": config.SESSION_COOKIE_SAMESITE,
+            "path": config.SESSION_COOKIE_PATH,
+        }
+
+        # Add domain for cross-subdomain sharing (e.g., ".timrx.live")
+        domain = config.SESSION_COOKIE_DOMAIN
+        if domain:
+            cookie_kwargs["domain"] = domain
+
+        response.set_cookie(config.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
+
+        print(
+            f"[SESSION] Cookie set: name={config.SESSION_COOKIE_NAME}, "
+            f"domain={domain!r}, secure={config.SESSION_COOKIE_SECURE}, "
+            f"samesite={config.SESSION_COOKIE_SAMESITE}"
         )
 
     @staticmethod
     def clear_session_cookie(response) -> None:
         """Clear the session cookie from the response."""
-        response.delete_cookie(
-            config.SESSION_COOKIE_NAME,
-            path=config.SESSION_COOKIE_PATH,
-        )
+        # Must include domain to properly clear cross-subdomain cookie
+        delete_kwargs = {"path": config.SESSION_COOKIE_PATH}
+
+        domain = config.SESSION_COOKIE_DOMAIN
+        if domain:
+            delete_kwargs["domain"] = domain
+
+        response.delete_cookie(config.SESSION_COOKIE_NAME, **delete_kwargs)
 
     # ─────────────────────────────────────────────────────────────
     # Identity CRUD
@@ -172,25 +194,35 @@ class IdentityService:
             (identity_id,),
         )
 
+    # Reasons for email attachment failure (internal use only - never expose to users)
+    ATTACH_REASON_SUCCESS = "success"
+    ATTACH_REASON_ALREADY_ATTACHED = "already_attached"
+    ATTACH_REASON_BELONGS_TO_OTHER = "belongs_to_other"  # Anti-enumeration: logged only
+
     @staticmethod
-    def attach_email(identity_id: str, email: str) -> Tuple[Dict[str, Any], bool]:
+    def attach_email(identity_id: str, email: str) -> Tuple[Dict[str, Any], bool, str]:
         """
-        Attach email to an identity. Idempotent: if same email already set, returns OK.
+        Attach email to an identity. Non-enumeration safe.
 
         Rules:
         - Normalizes email to lower/trim
-        - If email belongs to a DIFFERENT identity: raises DatabaseIntegrityError
+        - If email belongs to a DIFFERENT identity: returns OK without attaching
+          (user must use restore flow - but we don't tell them that explicitly)
         - If same identity already has that email: returns (identity, False) - no change
         - Otherwise attaches email and returns (identity, True) - changed
+
+        IMPORTANT: This method NEVER raises errors for email conflicts to prevent
+        user enumeration. The reason is returned but should only be logged internally,
+        never exposed to users.
 
         Does NOT verify email. Verification is handled via magic codes separately.
 
         Returns:
-            Tuple of (identity_dict, was_changed)
+            Tuple of (identity_dict, was_changed, reason)
+            - reason is for internal logging only, never expose to users
 
         Raises:
             ValueError: If identity not found or email empty
-            DatabaseIntegrityError: If email already used by another identity
         """
         normalized_email = email.strip().lower()
 
@@ -205,15 +237,20 @@ class IdentityService:
         # If same email already attached, return idempotently (no change)
         if current.get("email") == normalized_email:
             print(f"[IDENTITY] Email already attached to identity {identity_id}: {normalized_email}")
-            return current, False
+            return current, False, IdentityService.ATTACH_REASON_ALREADY_ATTACHED
 
         # Check if this email is already used by another identity
         existing = IdentityService.get_identity_by_email(normalized_email)
         if existing and str(existing["id"]) != identity_id:
-            raise DatabaseIntegrityError(
-                f"Email {normalized_email} is already associated with another account",
-                constraint="uq_identities_email",
+            # ANTI-ENUMERATION: Do NOT raise an error or reveal this to the user.
+            # Just log internally and return as if successful.
+            # User must use restore/redeem flow to take over the account.
+            print(
+                f"[IDENTITY] Email attach silently blocked (anti-enumeration): "
+                f"{normalized_email} belongs to identity {existing['id']}, "
+                f"requested by identity {identity_id}"
             )
+            return current, False, IdentityService.ATTACH_REASON_BELONGS_TO_OTHER
 
         result = execute_returning(
             f"""
@@ -232,7 +269,7 @@ class IdentityService:
         notify_new_identity(identity_id, normalized_email)
 
         print(f"[IDENTITY] Attached email to identity {identity_id}: {normalized_email}")
-        return result, True
+        return result, True, IdentityService.ATTACH_REASON_SUCCESS
 
     @staticmethod
     def touch_identity(identity_id: str) -> bool:
