@@ -28,19 +28,23 @@ from pricing_service import PricingService
 from wallet_service import WalletService, LedgerEntryType
 from identity_service import IdentityService
 
-# Stripe import (optional, graceful degradation)
-try:
-    import stripe
-    stripe.api_key = config.STRIPE_SECRET_KEY
-    STRIPE_AVAILABLE = config.STRIPE_CONFIGURED
-except ImportError:
-    stripe = None
-    STRIPE_AVAILABLE = False
+# Stripe import (only if enabled via PAYMENTS_PROVIDER)
+stripe = None
+STRIPE_AVAILABLE = False
 
-if STRIPE_AVAILABLE:
-    print(f"[STRIPE] Stripe configured and ready (mode: {config.STRIPE_MODE})")
-else:
-    print("[STRIPE] Stripe not configured - purchases disabled")
+if config.USE_STRIPE:
+    try:
+        import stripe as stripe_module
+        stripe = stripe_module
+        stripe.api_key = config.STRIPE_SECRET_KEY
+        STRIPE_AVAILABLE = config.STRIPE_CONFIGURED
+        if STRIPE_AVAILABLE:
+            print(f"[STRIPE] Stripe configured and ready (mode: {config.STRIPE_MODE})")
+        else:
+            print("[STRIPE] Stripe enabled but not configured (missing STRIPE_SECRET_KEY)")
+    except ImportError:
+        print("[STRIPE] Stripe package not installed")
+# If PAYMENTS_PROVIDER is not 'stripe' or 'both', Stripe is silently disabled (no warnings)
 
 
 class PurchaseStatus:
