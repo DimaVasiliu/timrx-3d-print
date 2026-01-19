@@ -315,6 +315,13 @@
     clearCheckoutError();
 
     try {
+      // Build return URLs - go back to hub.html with checkout status
+      const origin = window.location.origin;
+      const basePath = window.location.pathname.replace(/\/[^\/]*$/, ''); // e.g. "" or "/subpath"
+      const hubPath = basePath ? `${basePath}/hub.html` : '/hub.html';
+      const successUrl = `${origin}${hubPath}?checkout=success`;
+      const cancelUrl = `${origin}${hubPath}?checkout=cancelled`;
+
       // Call POST /api/billing/checkout/start
       const res = await fetch(`${API_BASE}/api/billing/checkout/start`, {
         method: 'POST',
@@ -324,10 +331,10 @@
           'Accept': 'application/json'
         },
         body: JSON.stringify({
-          plan_id: selectedPlan.id,
+          plan_code: selectedPlan.id,  // plan_code matches DB: starter_80, creator_300, studio_600
           email: email,
-          credits: selectedPlan.credits,
-          amount_pence: Math.round(selectedPlan.price * 100)
+          success_url: successUrl,
+          cancel_url: cancelUrl
         })
       });
 
@@ -484,15 +491,489 @@
     // Clean URL immediately
     window.history.replaceState({}, '', window.location.pathname);
 
-    // Fetch wallet and show success modal with new balance
+    // Poll for wallet update - webhook may be delayed
+    // Try up to 6 times, every 2 seconds (12 seconds max)
     (async function handleCheckoutSuccess() {
-      const wallet = await fetchWallet();
-      openSuccessModal(wallet ? wallet.available : 0);
+      const initialBalance = walletAvailable;
+      let attempts = 0;
+      const maxAttempts = 6;
+      const pollInterval = 2000; // 2 seconds
+
+      console.log('[Credits] Checkout success - polling for balance update, initial:', initialBalance);
+
+      async function pollBalance() {
+        attempts++;
+        const wallet = await fetchWallet();
+        const newBalance = wallet ? wallet.available : 0;
+
+        console.log(`[Credits] Poll ${attempts}/${maxAttempts}: balance=${newBalance} (was ${initialBalance})`);
+
+        // If balance increased or we've reached max attempts, show the modal
+        if (newBalance > initialBalance || attempts >= maxAttempts) {
+          if (newBalance > initialBalance) {
+            console.log('[Credits] Balance updated! Showing success modal');
+          } else {
+            console.log('[Credits] Max attempts reached, showing current balance');
+          }
+          openSuccessModal(newBalance);
+          return;
+        }
+
+        // Otherwise, schedule next poll
+        setTimeout(pollBalance, pollInterval);
+      }
+
+      // Start polling after a short delay (give webhook a head start)
+      setTimeout(pollBalance, 1000);
     })();
   } else if (urlParams.get('checkout') === 'cancelled') {
     // Clean URL silently
     window.history.replaceState({}, '', window.location.pathname);
   }
+
+  // ─────────────────────────────────────────────────────────────
+  // EMAIL ATTACH / VERIFY / RESTORE
+  // ─────────────────────────────────────────────────────────────
+
+  // Secure credits section DOM elements
+  const secureState1 = document.getElementById('secureState1');
+  const secureState2 = document.getElementById('secureState2');
+  const secureState3 = document.getElementById('secureState3');
+  const restorePanel = document.getElementById('restorePanel');
+
+  const secureEmailInput = document.getElementById('secureEmail');
+  const sendCodeBtn = document.getElementById('sendCodeBtn');
+  const secureError = document.getElementById('secureError');
+  const secureMessage = document.getElementById('secureMessage');
+
+  const sentToEmail = document.getElementById('sentToEmail');
+  const verifyCodeInput = document.getElementById('verifyCode');
+  const verifyCodeBtn = document.getElementById('verifyCodeBtn');
+  const verifyError = document.getElementById('verifyError');
+  const verifyMessage = document.getElementById('verifyMessage');
+  const resendCodeBtn = document.getElementById('resendCodeBtn');
+  const changeEmailBtn = document.getElementById('changeEmailBtn');
+
+  const verifiedEmailEl = document.getElementById('verifiedEmail');
+  const changeVerifiedEmailBtn = document.getElementById('changeVerifiedEmailBtn');
+  const showRestoreBtn = document.getElementById('showRestoreBtn');
+
+  // Email state
+  let pendingEmail = '';
+  let emailVerified = false;
+  let resendCooldown = 0;
+  let resendTimer = null;
+  let isRestoreMode = false;
+
+  /**
+   * Show secure credits section state
+   * @param {1|2|3} stateNum - Which state to show
+   */
+  function showSecureState(stateNum) {
+    if (secureState1) secureState1.style.display = stateNum === 1 ? 'block' : 'none';
+    if (secureState2) secureState2.style.display = stateNum === 2 ? 'block' : 'none';
+    if (secureState3) secureState3.style.display = stateNum === 3 ? 'block' : 'none';
+
+    // Show restore panel only in state 1 (anonymous)
+    if (restorePanel) {
+      restorePanel.style.display = stateNum === 1 ? 'block' : 'none';
+    }
+
+    // Clear error/message when switching states
+    clearSecureMessages();
+  }
+
+  function clearSecureMessages() {
+    if (secureError) secureError.textContent = '';
+    if (secureMessage) secureMessage.textContent = '';
+    if (verifyError) verifyError.textContent = '';
+    if (verifyMessage) verifyMessage.textContent = '';
+  }
+
+  function setSecureError(msg) {
+    if (secureError) secureError.textContent = msg;
+    if (secureMessage) secureMessage.textContent = '';
+  }
+
+  function setSecureMessage(msg) {
+    if (secureMessage) secureMessage.textContent = msg;
+    if (secureError) secureError.textContent = '';
+  }
+
+  function setVerifyError(msg) {
+    if (verifyError) verifyError.textContent = msg;
+    if (verifyMessage) verifyMessage.textContent = '';
+  }
+
+  function setVerifyMessage(msg) {
+    if (verifyMessage) verifyMessage.textContent = msg;
+    if (verifyError) verifyError.textContent = '';
+  }
+
+  /**
+   * Update secure credits UI based on current email state
+   */
+  function updateSecureCreditsUI() {
+    if (!secureState1) return; // Not on hub.html
+
+    if (emailVerified && userEmail) {
+      // State 3: Verified
+      if (verifiedEmailEl) verifiedEmailEl.textContent = userEmail;
+      showSecureState(3);
+    } else if (userEmail && !emailVerified) {
+      // State 2: Email attached but unverified (code sent)
+      pendingEmail = userEmail;
+      if (sentToEmail) sentToEmail.textContent = userEmail;
+      showSecureState(2);
+    } else {
+      // State 1: No email
+      showSecureState(1);
+    }
+  }
+
+  /**
+   * Send verification code to email
+   */
+  async function sendCode() {
+    const email = secureEmailInput?.value?.trim().toLowerCase();
+
+    if (!email) {
+      setSecureError('Please enter an email address');
+      return;
+    }
+
+    if (!email.includes('@') || !email.includes('.')) {
+      setSecureError('Please enter a valid email address');
+      return;
+    }
+
+    sendCodeBtn?.classList.add('loading');
+    clearSecureMessages();
+
+    try {
+      const endpoint = isRestoreMode
+        ? `${API_BASE}/api/auth/restore/request`
+        : `${API_BASE}/api/auth/email/attach`;
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ email })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        if (data.error?.code === 'RATE_LIMITED') {
+          setSecureError(data.error.message || 'Please wait before requesting another code');
+        } else {
+          setSecureError(data.error?.message || 'Failed to send code');
+        }
+        return;
+      }
+
+      // Success - move to state 2
+      pendingEmail = email;
+      if (sentToEmail) sentToEmail.textContent = email;
+      showSecureState(2);
+      setVerifyMessage('Code sent! Check your email.');
+
+      // Start resend cooldown
+      startResendCooldown();
+
+      // Focus code input
+      verifyCodeInput?.focus();
+
+    } catch (err) {
+      console.error('[Credits] sendCode error:', err);
+      setSecureError('Failed to send code. Please try again.');
+    } finally {
+      sendCodeBtn?.classList.remove('loading');
+    }
+  }
+
+  /**
+   * Verify the entered code
+   */
+  async function verifyCode() {
+    const code = verifyCodeInput?.value?.trim();
+
+    if (!code) {
+      setVerifyError('Please enter the code');
+      return;
+    }
+
+    if (code.length !== 6 || !/^\d+$/.test(code)) {
+      setVerifyError('Code must be 6 digits');
+      return;
+    }
+
+    verifyCodeBtn?.classList.add('loading');
+    clearSecureMessages();
+
+    try {
+      const endpoint = isRestoreMode
+        ? `${API_BASE}/api/auth/restore/redeem`
+        : `${API_BASE}/api/auth/email/verify`;
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ email: pendingEmail, code })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        if (data.error?.code === 'INVALID_CODE') {
+          setVerifyError('Invalid or expired code');
+        } else if (data.error?.code === 'TOO_MANY_ATTEMPTS') {
+          setVerifyError('Too many attempts. Please request a new code.');
+        } else if (data.error?.code === 'CODE_EXPIRED') {
+          setVerifyError('Code has expired. Please request a new one.');
+        } else {
+          setVerifyError(data.error?.message || 'Verification failed');
+        }
+        return;
+      }
+
+      // Success!
+      console.log('[Credits] Email verified successfully');
+      userEmail = pendingEmail;
+      emailVerified = true;
+      isRestoreMode = false;
+
+      // Refresh wallet to get updated state (especially for restore)
+      await fetchWallet();
+
+      // Show verified state
+      if (verifiedEmailEl) verifiedEmailEl.textContent = userEmail;
+      showSecureState(3);
+
+    } catch (err) {
+      console.error('[Credits] verifyCode error:', err);
+      setVerifyError('Verification failed. Please try again.');
+    } finally {
+      verifyCodeBtn?.classList.remove('loading');
+    }
+  }
+
+  /**
+   * Start resend cooldown timer (60 seconds)
+   */
+  function startResendCooldown() {
+    resendCooldown = 60;
+    updateResendButton();
+
+    if (resendTimer) clearInterval(resendTimer);
+
+    resendTimer = setInterval(() => {
+      resendCooldown--;
+      updateResendButton();
+
+      if (resendCooldown <= 0) {
+        clearInterval(resendTimer);
+        resendTimer = null;
+      }
+    }, 1000);
+  }
+
+  function updateResendButton() {
+    if (!resendCodeBtn) return;
+
+    if (resendCooldown > 0) {
+      resendCodeBtn.disabled = true;
+      resendCodeBtn.textContent = `Resend (${resendCooldown}s)`;
+    } else {
+      resendCodeBtn.disabled = false;
+      resendCodeBtn.textContent = 'Resend Code';
+    }
+  }
+
+  /**
+   * Resend verification code
+   */
+  async function resendCode() {
+    if (resendCooldown > 0) return;
+
+    resendCodeBtn?.classList.add('loading');
+    clearSecureMessages();
+
+    try {
+      const endpoint = isRestoreMode
+        ? `${API_BASE}/api/auth/restore/request`
+        : `${API_BASE}/api/auth/email/attach`;
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ email: pendingEmail })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        setVerifyError(data.error?.message || 'Failed to resend code');
+        return;
+      }
+
+      setVerifyMessage('New code sent!');
+      startResendCooldown();
+
+      // Clear code input
+      if (verifyCodeInput) verifyCodeInput.value = '';
+
+    } catch (err) {
+      console.error('[Credits] resendCode error:', err);
+      setVerifyError('Failed to resend code. Please try again.');
+    } finally {
+      resendCodeBtn?.classList.remove('loading');
+    }
+  }
+
+  /**
+   * Go back to change email
+   */
+  function changeEmail() {
+    isRestoreMode = false;
+    showSecureState(1);
+    if (secureEmailInput) {
+      secureEmailInput.value = pendingEmail || '';
+      secureEmailInput.focus();
+    }
+  }
+
+  /**
+   * Switch to restore mode for existing account
+   */
+  function showRestoreMode() {
+    isRestoreMode = true;
+    // Update UI to indicate restore mode
+    if (secureState1) {
+      const h3 = secureState1.querySelector('h3');
+      const subtitle = secureState1.querySelector('.secure-subtitle');
+      if (h3) h3.textContent = 'Restore Your Account';
+      if (subtitle) subtitle.textContent = 'Enter the email linked to your existing credits.';
+    }
+    secureEmailInput?.focus();
+  }
+
+  /**
+   * Reset to attach mode (from restore mode)
+   */
+  function resetToAttachMode() {
+    isRestoreMode = false;
+    if (secureState1) {
+      const h3 = secureState1.querySelector('h3');
+      const subtitle = secureState1.querySelector('.secure-subtitle');
+      if (h3) h3.textContent = 'Secure Your Credits';
+      if (subtitle) subtitle.textContent = 'Add an email to restore your credits on any device.';
+    }
+  }
+
+  // Event listeners for secure credits section
+  sendCodeBtn?.addEventListener('click', sendCode);
+  verifyCodeBtn?.addEventListener('click', verifyCode);
+  resendCodeBtn?.addEventListener('click', resendCode);
+  changeEmailBtn?.addEventListener('click', changeEmail);
+  changeVerifiedEmailBtn?.addEventListener('click', () => {
+    emailVerified = false;
+    userEmail = '';
+    changeEmail();
+  });
+  showRestoreBtn?.addEventListener('click', showRestoreMode);
+
+  // Enter key handlers
+  secureEmailInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendCode();
+    }
+  });
+
+  verifyCodeInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      verifyCode();
+    }
+  });
+
+  // Auto-format code input (numbers only)
+  verifyCodeInput?.addEventListener('input', () => {
+    if (verifyCodeInput) {
+      verifyCodeInput.value = verifyCodeInput.value.replace(/\D/g, '').slice(0, 6);
+    }
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // UPDATED INIT: Also update secure credits UI
+  // ─────────────────────────────────────────────────────────────
+
+  // Modify fetchWallet to also update email state
+  const originalFetchWallet = fetchWallet;
+
+  // Wrap fetchWallet to update secure credits UI
+  async function fetchWalletAndUpdateUI() {
+    const result = await originalFetchWallet();
+
+    // Update email state from latest /api/me response
+    // (userEmail is already set in originalFetchWallet)
+    // We need to track email_verified separately
+    try {
+      const meRes = await fetch(`${API_BASE}/api/me`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 'Accept': 'application/json' }
+      });
+      if (meRes.ok) {
+        const meData = await meRes.json();
+        if (meData.ok) {
+          userEmail = meData.email || '';
+          emailVerified = meData.email_verified || false;
+          updateSecureCreditsUI();
+        }
+      }
+    } catch (err) {
+      console.warn('[Credits] Failed to update email state:', err);
+    }
+
+    return result;
+  }
+
+  // Initial secure credits UI update
+  // This happens after the first fetchWallet call
+  setTimeout(async () => {
+    try {
+      const meRes = await fetch(`${API_BASE}/api/me`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 'Accept': 'application/json' }
+      });
+      if (meRes.ok) {
+        const meData = await meRes.json();
+        if (meData.ok) {
+          userEmail = meData.email || '';
+          emailVerified = meData.email_verified || false;
+          updateSecureCreditsUI();
+        }
+      }
+    } catch (err) {
+      console.warn('[Credits] Failed to get email state:', err);
+      updateSecureCreditsUI(); // Still update to show state 1
+    }
+  }, 500);
 
   // Expose for external use
   window.TimrXCredits = {
@@ -504,7 +985,9 @@
     getBalance: () => walletBalance,
     getReserved: () => walletReserved,
     getAvailable: () => walletAvailable,
-    getIdentityId: () => identityId
+    getIdentityId: () => identityId,
+    getEmail: () => userEmail,
+    isEmailVerified: () => emailVerified
   };
 
 })();
