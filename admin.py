@@ -302,3 +302,88 @@ def admin_health():
         "auth_method": getattr(g, "admin_auth_method", None),
         "admin_email": getattr(g, "admin_email", None),
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL DIAGNOSTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/email/health", methods=["GET"])
+@require_admin
+def email_health():
+    """
+    Check email service health.
+
+    Performs:
+    - DNS resolution of SMTP_HOST
+    - TCP connection test to SMTP_HOST:SMTP_PORT
+
+    Returns detailed status for debugging.
+    """
+    try:
+        from email_service import EmailService
+        result = EmailService.healthcheck()
+        return jsonify({"ok": result.get("status") == "healthy", **result})
+    except ImportError:
+        return jsonify({
+            "ok": False,
+            "error": "email_service not available",
+            "message": "EmailService module not found"
+        }), 500
+    except Exception as e:
+        print(f"[ADMIN] Email health check error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/email/test", methods=["POST"])
+@require_admin
+def email_test():
+    """
+    Send a test email to verify SMTP configuration.
+
+    Body:
+        - to: Recipient email address (required)
+
+    Returns send result with success/failure details.
+    """
+    try:
+        data = request.get_json() or {}
+        to_email = data.get("to", "").strip()
+
+        if not to_email:
+            return jsonify({
+                "ok": False,
+                "error": "VALIDATION_ERROR",
+                "message": "'to' email address is required"
+            }), 400
+
+        if "@" not in to_email or "." not in to_email:
+            return jsonify({
+                "ok": False,
+                "error": "VALIDATION_ERROR",
+                "message": "Invalid email format"
+            }), 400
+
+        from email_service import EmailService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Sending test email to {to_email} (requested by {admin_email or 'token'})")
+
+        result = EmailService.send_test(to_email)
+
+        return jsonify({
+            "ok": result.success,
+            "message": result.message,
+            "error": result.error,
+            "to": to_email,
+        })
+
+    except ImportError:
+        return jsonify({
+            "ok": False,
+            "error": "email_service not available",
+            "message": "EmailService module not found"
+        }), 500
+    except Exception as e:
+        print(f"[ADMIN] Email test error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
