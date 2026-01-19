@@ -365,6 +365,7 @@ export function watchJob(job_id) {
 
       if (st.status === 'failed') {
         State.removeActiveJob(job_id);
+        refreshWalletAfterJob(); // Refresh to show released credits
         prog.fail(st.message || 'Job failed');
         alert(st.message || 'Job failed');
         return;
@@ -516,6 +517,7 @@ export function watchMeshyTask(job_id, kind = 'remesh') {
 
       if (st.status === 'failed') {
         State.removeActiveJob(job_id);
+        refreshWalletAfterJob(); // Refresh to show released credits
         prog.fail(st.message || `${stageLabel} failed`);
         alert(st.message || `${stageLabel} failed`);
         return;
