@@ -6,11 +6,8 @@
 (function() {
   'use strict';
 
-  // API endpoint - prefer same-origin for cookie handling
-  // Use relative path if on deployed domain, otherwise use explicit backend URL
-  const DEPLOYED_DOMAINS = ['3d.timrx.live', 'timrx-3d-print-1.onrender.com'];
-  const isDeployedDomain = DEPLOYED_DOMAINS.some(d => window.location.hostname.includes(d));
-  const API_BASE = isDeployedDomain ? '' : (window.TIMRX_3D_API_BASE || 'https://timrx-3d-print-1.onrender.com');
+  // API endpoint - always use the custom domain for proper cookie handling
+  const API_BASE = window.TIMRX_3D_API_BASE || 'https://3d.timrx.live';
 
   console.log('[Credits] Init - API_BASE:', API_BASE || '(same-origin)', 'hostname:', window.location.hostname);
 
@@ -315,15 +312,9 @@
     clearCheckoutError();
 
     try {
-      // Build return URLs - go back to hub.html with checkout status
-      const origin = window.location.origin;
-      const basePath = window.location.pathname.replace(/\/[^\/]*$/, ''); // e.g. "" or "/subpath"
-      const hubPath = basePath ? `${basePath}/hub.html` : '/hub.html';
-      const successUrl = `${origin}${hubPath}?checkout=success`;
-      const cancelUrl = `${origin}${hubPath}?checkout=cancelled`;
-
-      // Call POST /api/billing/checkout/start
-      const res = await fetch(`${API_BASE}/api/billing/checkout/start`, {
+      // Call POST /api/billing/checkout (Mollie)
+      // Redirect URL is configured server-side via PUBLIC_BASE_URL
+      const res = await fetch(`${API_BASE}/api/billing/checkout`, {
         method: 'POST',
         credentials: 'include',
         headers: {
@@ -332,9 +323,7 @@
         },
         body: JSON.stringify({
           plan_code: selectedPlan.id,  // plan_code matches DB: starter_80, creator_300, studio_600
-          email: email,
-          success_url: successUrl,
-          cancel_url: cancelUrl
+          email: email
         })
       });
 
