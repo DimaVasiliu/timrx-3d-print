@@ -18,7 +18,36 @@ Stable frontend keys:
 
 from typing import Optional, Dict, Any, List
 
-from db import query_one, query_all, Tables
+from db import query_one, query_all, execute, Tables
+
+
+# Default plans to seed into the database
+DEFAULT_PLANS = [
+    {
+        "code": "starter_80",
+        "name": "Starter",
+        "description": "Try the tools. Great for a few generations.",
+        "price_gbp": 7.99,
+        "credit_grant": 80,
+        "includes_priority": False,
+    },
+    {
+        "code": "creator_300",
+        "name": "Creator",
+        "description": "Regular use. Better value bundle.",
+        "price_gbp": 19.99,
+        "credit_grant": 300,
+        "includes_priority": False,
+    },
+    {
+        "code": "studio_600",
+        "name": "Studio",
+        "description": "Heavy use. Best value. Priority queue access.",
+        "price_gbp": 34.99,
+        "credit_grant": 600,
+        "includes_priority": True,
+    },
+]
 
 
 class PricingService:
@@ -330,3 +359,52 @@ class PricingService:
             "image-studio": "OPENAI_IMAGE",
         }
         return mapping.get(job, "MESHY_TEXT_TO_3D")  # Default to text-to-3d cost
+
+    @staticmethod
+    def seed_plans() -> int:
+        """
+        Seed the default plans into the database.
+        Uses INSERT ... ON CONFLICT DO UPDATE to ensure plans exist and are active.
+
+        Returns:
+            Number of plans seeded/updated
+        """
+        from db import is_available
+
+        if not is_available():
+            print("[PRICING] Database not available, skipping plan seed")
+            return 0
+
+        seeded = 0
+        for plan in DEFAULT_PLANS:
+            try:
+                execute(
+                    f"""
+                    INSERT INTO {Tables.PLANS}
+                        (code, name, description, price_gbp, currency, credit_grant, includes_priority, is_active, created_at)
+                    VALUES
+                        (%s, %s, %s, %s, 'GBP', %s, %s, TRUE, NOW())
+                    ON CONFLICT (code) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        price_gbp = EXCLUDED.price_gbp,
+                        credit_grant = EXCLUDED.credit_grant,
+                        includes_priority = EXCLUDED.includes_priority,
+                        is_active = TRUE
+                    """,
+                    (
+                        plan["code"],
+                        plan["name"],
+                        plan["description"],
+                        plan["price_gbp"],
+                        plan["credit_grant"],
+                        plan["includes_priority"],
+                    ),
+                )
+                seeded += 1
+                print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ £{plan['price_gbp']})")
+            except Exception as e:
+                print(f"[PRICING] Error seeding plan {plan['code']}: {e}")
+
+        print(f"[PRICING] Plans seeded: {seeded}/{len(DEFAULT_PLANS)}")
+        return seeded
