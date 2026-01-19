@@ -71,9 +71,18 @@ class EmailService:
         from_name, from_addr = config.SMTP_FROM_PARSED
 
         print(f"[EMAIL] Email ENABLED via {config.EMAIL_PROVIDER.upper()}")
-        print(f"[EMAIL] SMTP: {config.SMTP_HOST}:{config.SMTP_PORT} (TLS={config.SMTP_USE_TLS})")
+        print(f"[EMAIL] SMTP_HOST={config.SMTP_HOST!r} SMTP_PORT={config.SMTP_PORT} (TLS={config.SMTP_USE_TLS})")
         print(f"[EMAIL] Auth: user={masked_user} pass={masked_pass}")
         print(f"[EMAIL] From: {from_name} <{from_addr}>")
+
+        # Pre-check DNS resolution at startup
+        try:
+            addr_info = socket.getaddrinfo(config.SMTP_HOST, config.SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM)
+            resolved_ips = [info[4][0] for info in addr_info]
+            print(f"[EMAIL] DNS check OK: {config.SMTP_HOST!r} -> {resolved_ips}")
+        except socket.gaierror as e:
+            print(f"[EMAIL] DNS check FAILED: {config.SMTP_HOST!r} -> {e!r}")
+            print("[EMAIL] WARNING: Emails will fail until DNS resolves")
 
     @classmethod
     def send(
@@ -130,11 +139,26 @@ class EmailService:
             # Attach HTML version
             msg.attach(MIMEText(html, "html"))
 
-            # Log connection attempt
-            print(f"[EMAIL] Connecting: {config.SMTP_HOST}:{config.SMTP_PORT} (provider={config.EMAIL_PROVIDER})")
+            # Log connection attempt with debug info
+            smtp_host = config.SMTP_HOST
+            smtp_port = config.SMTP_PORT
+            print(f"[EMAIL] Connecting: host={smtp_host!r} port={smtp_port} (provider={config.EMAIL_PROVIDER})")
+
+            # Pre-resolve DNS to catch issues early and log IPs
+            try:
+                addr_info = socket.getaddrinfo(smtp_host, smtp_port, socket.AF_INET, socket.SOCK_STREAM)
+                resolved_ips = [info[4][0] for info in addr_info]
+                print(f"[EMAIL] DNS resolved {smtp_host!r} -> {resolved_ips}")
+            except socket.gaierror as dns_err:
+                print(f"[EMAIL] DNS FAILED for {smtp_host!r}: {dns_err!r}")
+                return EmailResult(
+                    success=False,
+                    message=f"DNS resolution failed for {smtp_host!r}",
+                    error=f"{type(dns_err).__name__}: {dns_err}"
+                )
 
             # Send via SMTP with timeout
-            with smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=config.SMTP_TIMEOUT) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=config.SMTP_TIMEOUT) as server:
                 if config.SMTP_USE_TLS:
                     server.starttls()
                 server.login(config.SMTP_USER, config.SMTP_PASSWORD)
@@ -144,30 +168,25 @@ class EmailService:
             return EmailResult(success=True, message="Email sent successfully")
 
         except socket.gaierror as e:
-            # DNS resolution failed
-            error_msg = f"DNS resolution failed for {config.SMTP_HOST}: {e}"
-            print(f"[EMAIL] FAILED - {error_msg}")
-            return EmailResult(success=False, message="DNS resolution failed", error=str(e))
+            # DNS resolution failed (fallback - should be caught by pre-resolve above)
+            print(f"[EMAIL] FAILED - DNS error for {smtp_host!r}: {e!r}")
+            return EmailResult(success=False, message=f"DNS resolution failed for {smtp_host!r}", error=f"{type(e).__name__}: {e}")
 
         except socket.timeout as e:
-            error_msg = f"Connection timeout to {config.SMTP_HOST}:{config.SMTP_PORT}"
-            print(f"[EMAIL] FAILED - {error_msg}")
-            return EmailResult(success=False, message="Connection timeout", error=str(e))
+            print(f"[EMAIL] FAILED - Connection timeout to {smtp_host!r}:{smtp_port}: {e!r}")
+            return EmailResult(success=False, message="Connection timeout", error=f"{type(e).__name__}: {e}")
 
         except smtplib.SMTPAuthenticationError as e:
-            error_msg = f"SMTP authentication failed: {e}"
-            print(f"[EMAIL] FAILED - {error_msg}")
-            return EmailResult(success=False, message="Authentication failed", error=str(e))
+            print(f"[EMAIL] FAILED - SMTP auth error: {e!r}")
+            return EmailResult(success=False, message="Authentication failed", error=f"{type(e).__name__}: {e}")
 
         except smtplib.SMTPException as e:
-            error_msg = f"SMTP error: {e}"
-            print(f"[EMAIL] FAILED - {error_msg}")
-            return EmailResult(success=False, message="SMTP error", error=str(e))
+            print(f"[EMAIL] FAILED - SMTP error: {e!r}")
+            return EmailResult(success=False, message="SMTP error", error=f"{type(e).__name__}: {e}")
 
         except Exception as e:
-            error_msg = f"Unexpected error: {e}"
-            print(f"[EMAIL] FAILED - {error_msg}")
-            return EmailResult(success=False, message="Unexpected error", error=str(e))
+            print(f"[EMAIL] FAILED - Unexpected error: {e!r}")
+            return EmailResult(success=False, message="Unexpected error", error=f"{type(e).__name__}: {e}")
 
     @classmethod
     def healthcheck(cls) -> Dict[str, Any]:
@@ -180,12 +199,16 @@ class EmailService:
         """
         cls._log_config()
 
+        smtp_host = config.SMTP_HOST
+        smtp_port = config.SMTP_PORT
+
         result = {
             "enabled": config.EMAIL_ENABLED,
             "configured": config.EMAIL_CONFIGURED,
             "provider": config.EMAIL_PROVIDER,
-            "smtp_host": config.SMTP_HOST,
-            "smtp_port": config.SMTP_PORT,
+            "smtp_host": smtp_host,
+            "smtp_host_repr": repr(smtp_host),  # Debug: show exact value with quotes
+            "smtp_port": smtp_port,
             "dns_ok": False,
             "tcp_ok": False,
             "error": None,
@@ -202,44 +225,44 @@ class EmailService:
             return result
 
         # Step 1: DNS resolution
-        print(f"[EMAIL] Healthcheck: Resolving DNS for {config.SMTP_HOST}...")
+        print(f"[EMAIL] Healthcheck: Resolving DNS for {smtp_host!r}...")
         try:
-            ip_addresses = socket.gethostbyname_ex(config.SMTP_HOST)
+            ip_addresses = socket.gethostbyname_ex(smtp_host)
             result["dns_ok"] = True
             result["dns_ips"] = ip_addresses[2]
-            print(f"[EMAIL] Healthcheck: DNS OK - {config.SMTP_HOST} -> {ip_addresses[2]}")
+            print(f"[EMAIL] Healthcheck: DNS OK - {smtp_host!r} -> {ip_addresses[2]}")
         except socket.gaierror as e:
-            result["error"] = f"DNS resolution failed: {e}"
+            result["error"] = f"DNS resolution failed for {smtp_host!r}: {e!r}"
             result["status"] = "dns_failed"
-            result["message"] = f"Cannot resolve {config.SMTP_HOST}"
-            print(f"[EMAIL] Healthcheck: DNS FAILED - {e}")
+            result["message"] = f"Cannot resolve {smtp_host!r}"
+            print(f"[EMAIL] Healthcheck: DNS FAILED for {smtp_host!r}: {e!r}")
             return result
 
         # Step 2: TCP connection
-        print(f"[EMAIL] Healthcheck: TCP connect to {config.SMTP_HOST}:{config.SMTP_PORT}...")
+        print(f"[EMAIL] Healthcheck: TCP connect to {smtp_host!r}:{smtp_port}...")
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(5)
-            sock.connect((config.SMTP_HOST, config.SMTP_PORT))
+            sock.connect((smtp_host, smtp_port))
             sock.close()
             result["tcp_ok"] = True
-            print(f"[EMAIL] Healthcheck: TCP OK - connected to {config.SMTP_HOST}:{config.SMTP_PORT}")
+            print(f"[EMAIL] Healthcheck: TCP OK - connected to {smtp_host!r}:{smtp_port}")
         except socket.timeout:
-            result["error"] = "TCP connection timeout (5s)"
+            result["error"] = f"TCP connection timeout (5s) to {smtp_host!r}:{smtp_port}"
             result["status"] = "tcp_timeout"
-            result["message"] = f"Connection to {config.SMTP_HOST}:{config.SMTP_PORT} timed out"
-            print(f"[EMAIL] Healthcheck: TCP TIMEOUT")
+            result["message"] = f"Connection to {smtp_host!r}:{smtp_port} timed out"
+            print(f"[EMAIL] Healthcheck: TCP TIMEOUT to {smtp_host!r}:{smtp_port}")
             return result
         except socket.error as e:
-            result["error"] = f"TCP connection failed: {e}"
+            result["error"] = f"TCP connection failed to {smtp_host!r}:{smtp_port}: {e!r}"
             result["status"] = "tcp_failed"
-            result["message"] = f"Cannot connect to {config.SMTP_HOST}:{config.SMTP_PORT}"
-            print(f"[EMAIL] Healthcheck: TCP FAILED - {e}")
+            result["message"] = f"Cannot connect to {smtp_host!r}:{smtp_port}"
+            print(f"[EMAIL] Healthcheck: TCP FAILED to {smtp_host!r}:{smtp_port}: {e!r}")
             return result
 
         result["status"] = "healthy"
         result["message"] = "Email service is healthy"
-        print(f"[EMAIL] Healthcheck: HEALTHY")
+        print("[EMAIL] Healthcheck: HEALTHY")
         return result
 
     @classmethod
