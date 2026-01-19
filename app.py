@@ -9,6 +9,16 @@ from botocore.exceptions import ClientError
 
 load_dotenv()
 
+# Add backend directories to Python path for module imports
+import sys
+_app_dir = Path(__file__).resolve().parent
+_backend_dir = _app_dir / "backend"
+_routes_dir = _backend_dir / "routes"
+_services_dir = _backend_dir / "services"
+for _dir in [_backend_dir, _routes_dir, _services_dir]:
+    if str(_dir) not in sys.path:
+        sys.path.insert(0, str(_dir))
+
 import requests
 try:
     import psycopg
@@ -74,6 +84,20 @@ try:
     from db import DatabaseError
 except ImportError:
     DatabaseError = None
+
+# Import credit services for enforcement
+try:
+    from reservation_service import ReservationService, ReservationStatus
+    from wallet_service import WalletService
+    from pricing_service import PricingService
+    CREDITS_AVAILABLE = True
+    print("[CREDITS] Credit enforcement services loaded")
+except ImportError as e:
+    print(f"[CREDITS] Credit services not available: {e}")
+    CREDITS_AVAILABLE = False
+    ReservationService = None
+    WalletService = None
+    PricingService = None
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -3109,6 +3133,152 @@ def build_source_payload(body: dict):
         return {"model_url": model_url}, None
 
 # ─────────────────────────────────────────────────────────────
+# Credit Enforcement Helpers
+# ─────────────────────────────────────────────────────────────
+def check_and_reserve_credits(identity_id: str, action_key: str, job_id: str):
+    """
+    Check if user has enough credits and reserve them for the job.
+
+    Args:
+        identity_id: User's identity ID (from g.identity_id or g.user_id)
+        action_key: Action key for pricing (e.g., 'text_to_3d_generate')
+        job_id: Job ID to associate with the reservation
+
+    Returns:
+        (reservation_id, None) on success
+        (None, error_response) on failure (can return directly from endpoint)
+    """
+    if not CREDITS_AVAILABLE:
+        # Credits system not loaded - allow request (graceful degradation)
+        print(f"[CREDITS] System not available, allowing {action_key} without credit check")
+        return None, None
+
+    if not identity_id:
+        # No identity - allow anonymous (legacy behavior)
+        print(f"[CREDITS] No identity for {action_key}, allowing without credit check")
+        return None, None
+
+    try:
+        # Get cost for this action
+        cost = PricingService.get_action_cost(action_key)
+        if cost == 0:
+            print(f"[CREDITS] No cost defined for {action_key}, allowing")
+            return None, None
+
+        # Check available balance
+        balance = WalletService.get_balance(identity_id)
+        reserved = WalletService.get_reserved_credits(identity_id)
+        available = max(0, balance - reserved)
+
+        print(f"[CREDITS] {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}")
+
+        if available < cost:
+            # Insufficient credits
+            return None, jsonify({
+                "ok": False,
+                "error": {
+                    "code": "INSUFFICIENT_CREDITS",
+                    "message": f"Insufficient credits. Need {cost}, have {available}.",
+                    "required": cost,
+                    "available": available,
+                    "balance": balance,
+                    "reserved": reserved,
+                }
+            }), 402
+
+        # Reserve credits
+        result = ReservationService.reserve_credits(
+            identity_id=identity_id,
+            action_key=action_key,
+            job_id=job_id,
+            meta={"action_key": action_key, "source": "legacy_endpoint"},
+        )
+
+        reservation_id = result["reservation"]["id"]
+        print(f"[CREDITS] Reserved {cost} credits for {action_key}, reservation_id={reservation_id}")
+        return reservation_id, None
+
+    except ValueError as e:
+        # Insufficient credits error from ReservationService
+        error_msg = str(e)
+        print(f"[CREDITS] Reservation failed: {error_msg}")
+
+        if "INSUFFICIENT_CREDITS" in error_msg:
+            # Parse the error to get details
+            parts = error_msg.split(":")
+            required = available = 0
+            for part in parts:
+                if "required=" in part:
+                    try:
+                        required = int(part.split("=")[1].strip())
+                    except:
+                        pass
+                elif "available=" in part:
+                    try:
+                        available = int(part.split("=")[1].strip())
+                    except:
+                        pass
+
+            return None, jsonify({
+                "ok": False,
+                "error": {
+                    "code": "INSUFFICIENT_CREDITS",
+                    "message": error_msg,
+                    "required": required,
+                    "available": available,
+                }
+            }), 402
+
+        return None, jsonify({
+            "ok": False,
+            "error": {
+                "code": "CREDIT_ERROR",
+                "message": str(e),
+            }
+        }), 400
+
+    except Exception as e:
+        print(f"[CREDITS] Unexpected error: {e}")
+        # Don't block on credit system errors - allow request
+        return None, None
+
+
+def finalize_reservation(reservation_id: str):
+    """Finalize (capture) a credit reservation after successful job start."""
+    if not CREDITS_AVAILABLE or not reservation_id:
+        return
+
+    try:
+        ReservationService.finalize_reservation(reservation_id)
+        print(f"[CREDITS] Finalized reservation {reservation_id}")
+    except Exception as e:
+        print(f"[CREDITS] Failed to finalize reservation {reservation_id}: {e}")
+
+
+def release_reservation(reservation_id: str, reason: str = "job_failed"):
+    """Release a credit reservation after job failure."""
+    if not CREDITS_AVAILABLE or not reservation_id:
+        return
+
+    try:
+        ReservationService.release_reservation(reservation_id, reason)
+        print(f"[CREDITS] Released reservation {reservation_id} ({reason})")
+    except Exception as e:
+        print(f"[CREDITS] Failed to release reservation {reservation_id}: {e}")
+
+
+# Action key mapping for legacy endpoints
+LEGACY_ACTION_KEYS = {
+    "text-to-3d-preview": "text_to_3d_generate",
+    "text-to-3d-refine": "refine",
+    "image-to-3d": "image_to_3d_generate",
+    "remesh": "remesh",
+    "texture": "texture",
+    "rig": "rig",
+    "image-studio": "image_studio_generate",
+}
+
+# ─────────────────────────────────────────────────────────────
 # API
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/health", methods=["GET"])
@@ -3143,6 +3313,7 @@ def api_text_to_3d_start():
         return ("", 204)
 
     user_id = g.user_id  # May be None for anonymous users
+    identity_id = getattr(g, 'identity_id', None) or user_id  # Use billing identity if available
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/start:incoming", body)
@@ -3151,6 +3322,15 @@ def api_text_to_3d_start():
         return jsonify({"error": "prompt required"}), 400
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    # Generate a temporary job ID for credit reservation (before Meshy call)
+    temp_job_id = f"text3d-{uuid.uuid4().hex[:12]}"
+
+    # Check and reserve credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["text-to-3d-preview"]
+    reservation_id, credit_error = check_and_reserve_credits(identity_id, action_key, temp_job_id)
+    if credit_error:
+        return credit_error
 
     payload = {
         "mode": "preview",
@@ -3180,9 +3360,16 @@ def api_text_to_3d_start():
         log_event("text-to-3d/start:meshy-resp", resp)
         job_id = resp.get("result")
         if not job_id:
+            # Release reservation on failure
+            release_reservation(reservation_id, "meshy_no_job_id")
             return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
+        # Release reservation on failure
+        release_reservation(reservation_id, "meshy_api_error")
         return jsonify({"error": str(e)}), 502
+
+    # Finalize reservation - job started successfully
+    finalize_reservation(reservation_id)
 
     store = load_store()
     store[job_id] = {
@@ -3199,6 +3386,7 @@ def api_text_to_3d_start():
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
         "user_id": user_id,  # Track user who started the job
+        "reservation_id": reservation_id,  # Track credit reservation
     }
     save_store(store)
 
@@ -3214,6 +3402,7 @@ def api_text_to_3d_refine():
         return ("", 204)
 
     user_id = g.user_id  # May be None for anonymous users
+    identity_id = getattr(g, 'identity_id', None) or user_id
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/refine:incoming", body)
@@ -3222,6 +3411,15 @@ def api_text_to_3d_refine():
         return jsonify({"error": "preview_task_id required"}), 400
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    # Generate a temporary job ID for credit reservation
+    temp_job_id = f"refine-{uuid.uuid4().hex[:12]}"
+
+    # Check and reserve credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["text-to-3d-refine"]
+    reservation_id, credit_error = check_and_reserve_credits(identity_id, action_key, temp_job_id)
+    if credit_error:
+        return credit_error
 
     # Resolve to original Meshy job ID if this is our database UUID
     preview_task_id = resolve_meshy_job_id(preview_task_id_input)
@@ -3241,9 +3439,14 @@ def api_text_to_3d_refine():
         log_event("text-to-3d/refine:meshy-resp", resp)
         job_id = resp.get("result")
         if not job_id:
+            release_reservation(reservation_id, "meshy_no_job_id")
             return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
+        release_reservation(reservation_id, "meshy_api_error")
         return jsonify({"error": str(e)}), 502
+
+    # Finalize reservation - job started successfully
+    finalize_reservation(reservation_id)
 
     store = load_store()
     # Copy metadata from preview job (try both input ID and resolved ID)
@@ -3263,6 +3466,7 @@ def api_text_to_3d_refine():
         "art_style": preview_meta.get("art_style"),
         "texture_prompt": texture_prompt,
         "user_id": user_id,
+        "reservation_id": reservation_id,
     }
     save_store(store)
 
