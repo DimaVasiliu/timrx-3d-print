@@ -304,23 +304,27 @@ class PurchaseService:
             if result:
                 purchase_id = result["purchase"]["id"]
 
-                # Send receipt email
+                # Send emails (non-blocking - failures are logged as warnings only)
                 if customer_email:
-                    send_purchase_receipt(
-                        to_email=customer_email,
-                        plan_name=plan_name,
-                        credits=credits,
-                        amount_gbp=amount_gbp,
-                    )
+                    try:
+                        send_purchase_receipt(
+                            to_email=customer_email,
+                            plan_name=plan_name,
+                            credits=credits,
+                            amount_gbp=amount_gbp,
+                        )
 
-                    # Send admin notification
-                    notify_purchase(
-                        identity_id=identity_id,
-                        email=customer_email,
-                        plan_name=plan_name,
-                        credits=credits,
-                        amount_gbp=amount_gbp,
-                    )
+                        # Send admin notification
+                        notify_purchase(
+                            identity_id=identity_id,
+                            email=customer_email,
+                            plan_name=plan_name,
+                            credits=credits,
+                            amount_gbp=amount_gbp,
+                        )
+                    except Exception as email_err:
+                        # Never fail purchase due to email errors
+                        print(f"[PURCHASE] WARNING: Email failed for purchase {purchase_id}: {email_err} (credits already granted)")
 
                 return {
                     "purchase_id": purchase_id,
