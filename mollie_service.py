@@ -622,18 +622,31 @@ class MollieService:
                 (new_balance, identity_id),
             )
 
-            # 5. Attach email to identity if provided
+            # 5. Attach email to identity if provided (safe + idempotent)
+            # Only attach if: identity has no email AND email not used by another identity
             email_attached = False
             if customer_email:
+                normalized_email = customer_email.lower().strip()
                 cur.execute(
                     f"""
                     UPDATE {Tables.IDENTITIES}
-                    SET email = %s, last_seen_at = NOW()
-                    WHERE id = %s AND email IS NULL
+                    SET email = %s,
+                        last_seen_at = NOW()
+                    WHERE id = %s
+                      AND email IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {Tables.IDENTITIES} i2
+                          WHERE lower(i2.email) = lower(%s)
+                      )
                     """,
-                    (customer_email.lower().strip(), identity_id),
+                    (normalized_email, identity_id, normalized_email),
                 )
                 email_attached = cur.rowcount > 0
+                print(
+                    f"[MOLLIE] Email attach attempted for identity={identity_id} "
+                    f"email={normalized_email} (rows={cur.rowcount})"
+                )
 
             print(
                 f"[MOLLIE] Purchase recorded: purchase_id={purchase_id}, identity={identity_id}, "
