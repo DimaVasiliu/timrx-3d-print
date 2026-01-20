@@ -455,9 +455,10 @@ class MollieService:
 
             if result:
                 purchase_id = result["purchase"]["id"]
+                was_existing = result.get("was_existing", False)
 
-                # Send receipt email
-                if customer_email:
+                # Only send emails for NEW purchases (not duplicates)
+                if not was_existing and customer_email:
                     from emailer import send_purchase_receipt, notify_purchase
                     send_purchase_receipt(
                         to_email=customer_email,
@@ -477,7 +478,7 @@ class MollieService:
 
                 return {
                     "purchase_id": purchase_id,
-                    "was_existing": False,
+                    "was_existing": was_existing,
                 }
 
         except Exception as e:
@@ -506,19 +507,21 @@ class MollieService:
         from purchase_service import PurchaseStatus, PurchaseService
 
         with transaction() as cur:
-            # 1. Create purchase record
+            # 1. Create purchase record (idempotent via ON CONFLICT DO NOTHING)
+            # If webhook and confirm endpoint race, only one will succeed
             cur.execute(
                 f"""
                 INSERT INTO {Tables.PURCHASES}
                 (identity_id, plan_id, provider, provider_payment_id,
-                 amount, currency, credits_granted, status, purchased_at)
+                 amount_gbp, currency, credits_granted, status, paid_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (provider, provider_payment_id) DO NOTHING
                 RETURNING *
                 """,
                 (
                     identity_id,
                     plan_id,
-                    "mollie",  # Different provider
+                    "mollie",
                     provider_payment_id,
                     amount_gbp,
                     "GBP",
@@ -527,6 +530,27 @@ class MollieService:
                 ),
             )
             purchase = fetch_one(cur)
+
+            # If no row returned, this was a duplicate (ON CONFLICT fired)
+            # Query for the existing purchase and return it as "was_existing"
+            if not purchase:
+                print(f"[MOLLIE] Purchase already exists (ON CONFLICT): {provider_payment_id}")
+                # Fetch the existing purchase
+                cur.execute(
+                    f"""
+                    SELECT * FROM {Tables.PURCHASES}
+                    WHERE provider = 'mollie' AND provider_payment_id = %s
+                    """,
+                    (provider_payment_id,),
+                )
+                existing = fetch_one(cur)
+                if existing:
+                    return {
+                        "purchase": PurchaseService._format_purchase(existing),
+                        "was_existing": True,
+                    }
+                return None
+
             purchase_id = str(purchase["id"])
 
             # 2. Lock wallet for update
