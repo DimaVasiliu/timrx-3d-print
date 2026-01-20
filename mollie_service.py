@@ -19,7 +19,8 @@ Idempotency:
 Environment variables:
 - MOLLIE_API_KEY: Your Mollie API key (test_xxx or live_xxx)
 - MOLLIE_ENV: 'test' or 'live' (default: test)
-- PUBLIC_BASE_URL: Base URL for webhooks and redirects (e.g., https://timrx.live)
+- PUBLIC_BASE_URL: Backend API URL for webhooks (e.g., https://3d.timrx.live)
+- FRONTEND_BASE_URL: Frontend site URL for redirects (e.g., https://timrx.live)
 """
 
 import json
@@ -108,14 +109,21 @@ class MollieService:
         price_gbp = plan["price"]
         credits = plan["credits"]
 
-        # Build redirect URL - Mollie redirects here after payment (success or cancel)
-        base_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        # Build redirect URL - Mollie redirects user HERE after payment
+        # MUST use FRONTEND_BASE_URL (timrx.live), NOT backend URL (3d.timrx.live)
+        frontend_url = config.FRONTEND_BASE_URL.rstrip("/") if config.FRONTEND_BASE_URL else ""
+        if not frontend_url:
+            # Fallback to PUBLIC_BASE_URL for backward compatibility (not recommended)
+            frontend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+            print("[MOLLIE] WARNING: FRONTEND_BASE_URL not set, using PUBLIC_BASE_URL for redirects")
+
         if not success_url:
             # Redirect to hub.html with checkout=success query param for frontend detection
-            success_url = f"{base_url}/hub.html?checkout=success"
+            success_url = f"{frontend_url}/hub.html?checkout=success"
 
-        # Build webhook URL
-        webhook_url = f"{base_url}/api/billing/webhook/mollie"
+        # Build webhook URL - MUST use backend API URL (3d.timrx.live)
+        backend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        webhook_url = f"{backend_url}/api/billing/webhook/mollie"
 
         # Build metadata (stored with payment, returned in webhook)
         metadata = {
@@ -539,3 +547,4 @@ class MollieService:
 
         except requests.RequestException:
             return None
+t
