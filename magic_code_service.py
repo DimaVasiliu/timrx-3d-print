@@ -132,8 +132,11 @@ class MagicCodeService:
             # Still return success to not reveal email issues
             return (True, "If this email is registered, a code has been sent")
 
-        # Notify admin (optional)
-        notify_restore_request(email)
+        # Notify admin (optional, non-blocking)
+        try:
+            notify_restore_request(email)
+        except Exception as email_err:
+            print(f"[MAGIC_CODE] WARNING: Admin notification failed: {email_err}")
 
         print(f"[MAGIC_CODE] Code sent to {email}, expires in {expiry_minutes} minutes")
         return (True, "Code sent to your email")
