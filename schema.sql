@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS timrx_billing.purchases (
   plan_id              UUID REFERENCES timrx_billing.plans(id) ON DELETE SET NULL,
   provider             TEXT NOT NULL DEFAULT 'stripe',
   provider_payment_id  TEXT NOT NULL,
+  payment_id           TEXT,
   amount_gbp           NUMERIC(10,2) NOT NULL,
   currency             TEXT NOT NULL DEFAULT 'GBP',
   credits_granted      INT NOT NULL,
@@ -122,6 +123,14 @@ CREATE TABLE IF NOT EXISTS timrx_billing.purchases (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_provider_payment
 ON timrx_billing.purchases(provider, provider_payment_id);
+CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
+ON timrx_billing.purchases (provider, payment_id)
+WHERE payment_id IS NOT NULL;
+
+ALTER TABLE timrx_billing.purchases
+  ADD COLUMN IF NOT EXISTS payment_id TEXT;
+ALTER TABLE timrx_billing.purchases
+  ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'::jsonb;
 
 CREATE TABLE IF NOT EXISTS timrx_billing.credit_reservations (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -191,12 +200,22 @@ CREATE TABLE IF NOT EXISTS timrx_billing.daily_limits (
   UNIQUE(identity_id, day_utc)
 );
 
-INSERT INTO timrx_billing.plans(code, name, description, price_gbp, credit_grant, is_active)
+INSERT INTO timrx_billing.plans
+  (code, name, description, price_gbp, currency, credit_grant, is_active, includes_priority, meta)
 VALUES
- ('starter_80',  'Starter',  'Try the tools. Great for a few generations.',  7.99,  80, TRUE),
- ('creator_300',  'Creator',  'Regular use. Better value bundle.',           19.99,  300, TRUE),
- ('studio_600',  'Studio',   'Heavy use. Best value.',                     34.99, 600, TRUE)
-ON CONFLICT (code) DO NOTHING;
+  ('starter_80',  'Starter', 'Entry pack',  7.99, 'GBP',  80,  TRUE, FALSE, '{}'::jsonb),
+  ('creator_300', 'Creator', 'Most popular', 19.99, 'GBP', 300, TRUE, FALSE, '{}'::jsonb),
+  ('studio_600',  'Studio',  'Best value', 34.99, 'GBP', 600, TRUE, FALSE, '{}'::jsonb)
+ON CONFLICT (code) DO UPDATE
+SET
+  name = EXCLUDED.name,
+  description = EXCLUDED.description,
+  price_gbp = EXCLUDED.price_gbp,
+  currency = EXCLUDED.currency,
+  credit_grant = EXCLUDED.credit_grant,
+  is_active = EXCLUDED.is_active,
+  includes_priority = EXCLUDED.includes_priority,
+  meta = EXCLUDED.meta;
 
 -- ============================================================
 -- APP TABLES (MODELS / IMAGES / HISTORY)
