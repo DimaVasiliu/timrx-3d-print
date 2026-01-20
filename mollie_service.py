@@ -18,9 +18,8 @@ Idempotency:
 
 Environment variables:
 - MOLLIE_API_KEY: Your Mollie API key (test_xxx or live_xxx)
-- MOLLIE_PROFILE_ID: Optional Mollie profile ID
 - MOLLIE_ENV: 'test' or 'live' (default: test)
-- PUBLIC_BASE_URL: Base URL for webhooks (e.g., https://api.timrx.com)
+- PUBLIC_BASE_URL: Base URL for webhooks and redirects (e.g., https://timrx.live)
 """
 
 import json
@@ -30,6 +29,14 @@ from datetime import datetime
 
 from config import config
 from pricing_service import PricingService
+
+
+class MollieCreateError(Exception):
+    """Raised when Mollie payment creation fails."""
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
+
 
 # Check if Mollie is configured
 MOLLIE_AVAILABLE = config.MOLLIE_CONFIGURED
@@ -120,6 +127,7 @@ class MollieService:
         }
 
         # Create Mollie payment
+        # Note: profileId is NOT a valid field - profile is determined by API key
         payment_data = {
             "amount": {
                 "currency": "GBP",
@@ -129,11 +137,8 @@ class MollieService:
             "redirectUrl": success_url,
             "webhookUrl": webhook_url,
             "metadata": metadata,
+            "locale": "en_GB",
         }
-
-        # Add profile ID if configured
-        if config.MOLLIE_PROFILE_ID:
-            payment_data["profileId"] = config.MOLLIE_PROFILE_ID
 
         try:
             response = requests.post(
@@ -145,9 +150,9 @@ class MollieService:
 
             if response.status_code not in (200, 201):
                 error_data = response.json() if response.content else {}
-                error_msg = error_data.get("detail", response.text)
-                print(f"[MOLLIE] API error creating payment: {response.status_code} - {error_msg}")
-                raise ValueError(f"Mollie API error: {error_msg}")
+                error_detail = error_data.get("detail", response.text)
+                print(f"[MOLLIE] API error creating payment: {response.status_code} - {error_detail}")
+                raise MollieCreateError(error_detail)
 
             payment = response.json()
             payment_id = payment["id"]
