@@ -216,32 +216,63 @@ class MollieService:
             return {"ok": False, "error": f"Request error: {str(e)}"}
 
         status = payment.get("status")
-        print(f"[MOLLIE] Webhook received: payment_id={payment_id}, status={status}")
+        metadata = payment.get("metadata", {})
+        identity_id = metadata.get("identity_id", "unknown")
+        plan_code = metadata.get("plan_code", "unknown")
+        credits = metadata.get("credits", "0")
 
-        # Only process paid payments
-        if status != "paid":
-            return {
-                "ok": True,
-                "status": status,
-                "message": f"Payment status is '{status}', no action needed",
-            }
+        print(
+            f"[MOLLIE] Webhook received: payment_id={payment_id}, status={status}, "
+            f"identity_id={identity_id}, plan_code={plan_code}, credits={credits}"
+        )
 
-        # Process the paid payment
-        result = MollieService._handle_payment_paid(payment)
+        # Handle different payment statuses
+        if status == "paid":
+            # Process the paid payment - grant credits (idempotent by payment_id)
+            result = MollieService._handle_payment_paid(payment)
 
-        if result:
-            return {
-                "ok": True,
-                "status": "paid",
-                "message": "Purchase completed successfully",
-                "purchase_id": result.get("purchase_id"),
-            }
-        else:
-            return {
-                "ok": False,
-                "status": "paid",
-                "error": "Failed to process paid payment",
-            }
+            if result:
+                was_existing = result.get("was_existing", False)
+                if was_existing:
+                    print(
+                        f"[MOLLIE] Duplicate webhook ignored (already processed): "
+                        f"payment_id={payment_id}, identity_id={identity_id}"
+                    )
+                else:
+                    print(
+                        f"[MOLLIE] Credits granted: payment_id={payment_id}, "
+                        f"identity_id={identity_id}, plan_code={plan_code}, credits={credits}"
+                    )
+                return {
+                    "ok": True,
+                    "status": "paid",
+                    "message": "Purchase completed successfully" if not was_existing else "Already processed",
+                    "purchase_id": result.get("purchase_id"),
+                }
+            else:
+                print(
+                    f"[MOLLIE] ERROR: Failed to grant credits: payment_id={payment_id}, "
+                    f"identity_id={identity_id}, plan_code={plan_code}"
+                )
+                return {
+                    "ok": False,
+                    "status": "paid",
+                    "error": "Failed to process paid payment",
+                }
+
+        # Non-paid statuses: failed, canceled, expired, open, pending
+        # No credits granted - just acknowledge the webhook
+        if status in ("failed", "canceled", "expired"):
+            print(
+                f"[MOLLIE] Payment {status} - no credits granted: payment_id={payment_id}, "
+                f"identity_id={identity_id}, plan_code={plan_code}"
+            )
+
+        return {
+            "ok": True,
+            "status": status,
+            "message": f"Payment status is '{status}', no credits granted",
+        }
 
     @staticmethod
     def _handle_payment_paid(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
