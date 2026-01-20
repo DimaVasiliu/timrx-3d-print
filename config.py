@@ -334,7 +334,13 @@ class Config:
     MOLLIE_API_KEY: str = field(default_factory=lambda: _get_env("MOLLIE_API_KEY"))
     MOLLIE_PROFILE_ID: str = field(default_factory=lambda: _get_env("MOLLIE_PROFILE_ID"))
     MOLLIE_ENV: str = field(default_factory=lambda: _get_env("MOLLIE_ENV", "test").lower())
+
+    # PUBLIC_BASE_URL: Backend API URL (for webhooks) - e.g., https://3d.timrx.live
     PUBLIC_BASE_URL: str = field(default_factory=lambda: _get_env("PUBLIC_BASE_URL"))
+
+    # FRONTEND_BASE_URL: Frontend site URL (for redirects) - e.g., https://timrx.live
+    # If not set, falls back to PUBLIC_BASE_URL for backward compatibility
+    FRONTEND_BASE_URL: str = field(default_factory=lambda: _get_env("FRONTEND_BASE_URL"))
 
     @property
     def MOLLIE_CONFIGURED(self) -> bool:
@@ -570,6 +576,7 @@ MOLLIE_API_KEY = config.MOLLIE_API_KEY
 MOLLIE_PROFILE_ID = config.MOLLIE_PROFILE_ID
 MOLLIE_ENV = config.MOLLIE_ENV
 PUBLIC_BASE_URL = config.PUBLIC_BASE_URL
+FRONTEND_BASE_URL = config.FRONTEND_BASE_URL
 RESERVATION_EXPIRY_MINUTES = config.RESERVATION_EXPIRY_MINUTES
 FREE_CREDITS_ON_SIGNUP = config.FREE_CREDITS_ON_SIGNUP
 AWS_REGION = config.AWS_REGION
