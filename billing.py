@@ -469,7 +469,8 @@ def create_checkout():
     }
     """
     # Check if Stripe is enabled via PAYMENTS_PROVIDER
-    if not config.USE_STRIPE:
+    _payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie').lower()
+    if _payments_provider not in ('stripe', 'both'):
         return jsonify({
             "error": {
                 "code": "SERVICE_DISABLED",
@@ -587,7 +588,8 @@ def stripe_webhook():
     to prevent Stripe from retrying indefinitely).
     """
     # Check if Stripe is enabled via PAYMENTS_PROVIDER
-    if not config.USE_STRIPE:
+    _payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie').lower()
+    if _payments_provider not in ('stripe', 'both'):
         return jsonify({
             "ok": False,
             "error": "Stripe is disabled",
