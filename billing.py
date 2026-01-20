@@ -331,7 +331,13 @@ def create_mollie_checkout():
 
     Request body:
     {
-        "plan_code": "starter_80",
+        "plan": "creator_300",   // plan code (e.g., starter_80, creator_300, studio_600)
+        "email": "user@example.com"
+    }
+
+    Alternative (backward compat):
+    {
+        "plan_code": "creator_300",
         "email": "user@example.com"
     }
 
@@ -341,51 +347,53 @@ def create_mollie_checkout():
         "checkout_url": "https://www.mollie.com/checkout/..."
     }
 
-    Response (error - 400/503):
+    Response (error - 400):
     {
-        "error": {
-            "code": "...",
-            "message": "..."
-        }
+        "ok": false,
+        "error_code": "PLAN_NOT_FOUND"
     }
     """
     # Check if Mollie is configured
     if not MollieService.is_available():
         return jsonify({
-            "error": {
-                "code": "SERVICE_UNAVAILABLE",
-                "message": "Payment service is not configured",
-            }
+            "ok": False,
+            "error_code": "SERVICE_UNAVAILABLE",
         }), 503
 
     data = request.get_json() or {}
-    plan_code = data.get("plan_code")
+    # Accept both "plan" and "plan_code" for flexibility
+    plan_code = data.get("plan") or data.get("plan_code")
     email = data.get("email", "").strip()
 
     # Validation
     if not plan_code:
         return jsonify({
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "message": "plan_code is required",
-            }
+            "ok": False,
+            "error_code": "VALIDATION_ERROR",
+            "message": "plan is required",
         }), 400
 
     if not email:
         return jsonify({
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "message": "email is required",
-            }
+            "ok": False,
+            "error_code": "VALIDATION_ERROR",
+            "message": "email is required",
         }), 400
 
     # Basic email validation
     if "@" not in email or "." not in email:
         return jsonify({
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "message": "Invalid email format",
-            }
+            "ok": False,
+            "error_code": "VALIDATION_ERROR",
+            "message": "Invalid email format",
+        }), 400
+
+    # Lookup plan by code (uses: SELECT * FROM timrx_billing.plans WHERE code=%s AND is_active=true)
+    plan = PricingService.get_plan_by_code(plan_code)
+    if not plan:
+        return jsonify({
+            "ok": False,
+            "error_code": "PLAN_NOT_FOUND",
         }), 400
 
     try:
@@ -402,41 +410,25 @@ def create_mollie_checkout():
 
     except ValueError as e:
         error_msg = str(e)
-
-        if "not found" in error_msg.lower() or "inactive" in error_msg.lower():
-            return jsonify({
-                "ok": False,
-                "error": {
-                    "code": "PLAN_NOT_FOUND",
-                    "message": f"Plan '{plan_code}' not found or inactive",
-                }
-            }), 400
+        print(f"[BILLING] Mollie checkout error: {error_msg}")
 
         if "not configured" in error_msg.lower():
             return jsonify({
                 "ok": False,
-                "error": {
-                    "code": "SERVICE_UNAVAILABLE",
-                    "message": "Payment service is not available",
-                }
+                "error_code": "SERVICE_UNAVAILABLE",
             }), 503
 
         return jsonify({
             "ok": False,
-            "error": {
-                "code": "CHECKOUT_ERROR",
-                "message": error_msg,
-            }
+            "error_code": "CHECKOUT_ERROR",
+            "message": error_msg,
         }), 400
 
     except Exception as e:
         print(f"[BILLING] Error creating Mollie checkout: {e}")
         return jsonify({
             "ok": False,
-            "error": {
-                "code": "INTERNAL_ERROR",
-                "message": "Failed to create checkout session",
-            }
+            "error_code": "INTERNAL_ERROR",
         }), 500
 
 
