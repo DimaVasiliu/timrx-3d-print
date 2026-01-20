@@ -32,14 +32,19 @@ from identity_service import IdentityService
 stripe = None
 STRIPE_AVAILABLE = False
 
-if config.USE_STRIPE:
+# Check PAYMENTS_PROVIDER directly (avoids property issues on some deployments)
+_payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie').lower()
+_use_stripe = _payments_provider in ('stripe', 'both')
+
+if _use_stripe:
     try:
         import stripe as stripe_module
         stripe = stripe_module
         stripe.api_key = config.STRIPE_SECRET_KEY
-        STRIPE_AVAILABLE = config.STRIPE_CONFIGURED
+        STRIPE_AVAILABLE = bool(config.STRIPE_SECRET_KEY)
         if STRIPE_AVAILABLE:
-            print(f"[STRIPE] Stripe configured and ready (mode: {config.STRIPE_MODE})")
+            stripe_mode = "live" if config.STRIPE_SECRET_KEY.startswith("sk_live_") else "test"
+            print(f"[STRIPE] Stripe configured and ready (mode: {stripe_mode})")
         else:
             print("[STRIPE] Stripe enabled but not configured (missing STRIPE_SECRET_KEY)")
     except ImportError:
