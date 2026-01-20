@@ -53,11 +53,12 @@ class IdentityService:
         Set the session cookie on the response.
         Uses SESSION_TTL_SECONDS for max_age (must match DB session expiry).
 
-        Cookie settings:
-        - domain: ".timrx.live" in prod (allows timrx.live + 3d.timrx.live)
-        - secure: True in prod (HTTPS only)
-        - samesite: "Lax" (works for same-site subdomains)
-        - httponly: True (not accessible via JavaScript)
+        Cookie settings (production):
+        - Domain: .timrx.live (allows timrx.live + 3d.timrx.live + www.timrx.live)
+        - Secure: True (HTTPS only)
+        - SameSite: None (required for cross-subdomain with credentials)
+        - HttpOnly: True (not accessible via JavaScript)
+        - Path: /
         """
         # Build cookie kwargs - only include domain if set (None omits it)
         cookie_kwargs = {
@@ -148,9 +149,12 @@ class IdentityService:
                     (identity_id, "grant", initial_balance, "signup", '{"reason": "welcome_credits"}'),
                 )
 
-        # Send admin notification if email was attached
+        # Send admin notification if email was attached (non-blocking)
         if normalized_email:
-            notify_new_identity(identity_id, normalized_email)
+            try:
+                notify_new_identity(identity_id, normalized_email)
+            except Exception as email_err:
+                print(f"[IDENTITY] WARNING: Admin notification failed: {email_err}")
 
         print(f"[IDENTITY] Created new identity: {identity_id} (email: {normalized_email or 'anonymous'})")
         return identity
@@ -265,8 +269,11 @@ class IdentityService:
         if not result:
             raise ValueError(f"Identity {identity_id} not found")
 
-        # Send admin notification only when email is newly attached
-        notify_new_identity(identity_id, normalized_email)
+        # Send admin notification only when email is newly attached (non-blocking)
+        try:
+            notify_new_identity(identity_id, normalized_email)
+        except Exception as email_err:
+            print(f"[IDENTITY] WARNING: Admin notification failed: {email_err}")
 
         print(f"[IDENTITY] Attached email to identity {identity_id}: {normalized_email}")
         return result, True, IdentityService.ATTACH_REASON_SUCCESS
