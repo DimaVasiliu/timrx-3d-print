@@ -283,6 +283,118 @@ class MollieService:
         }
 
     @staticmethod
+    def confirm_payment(payment_id: str, identity_id: str) -> Dict[str, Any]:
+        """
+        Confirm a payment and grant credits if paid.
+        Called by frontend after redirect to ensure credits are granted
+        (in case webhook is delayed).
+
+        This is idempotent - won't double-grant due to unique constraint
+        on provider_payment_id in purchases table.
+
+        Args:
+            payment_id: The Mollie payment ID (tr_xxx)
+            identity_id: The identity ID to verify ownership
+
+        Returns:
+            {
+                "ok": True/False,
+                "status": "paid" / "open" / "failed" / etc,
+                "credits_granted": True/False,
+                "message": "..."
+            }
+        """
+        if not MOLLIE_AVAILABLE:
+            return {"ok": False, "error": "Mollie not configured"}
+
+        # Fetch payment details from Mollie
+        try:
+            response = requests.get(
+                f"{MollieService.MOLLIE_API_BASE}/payments/{payment_id}",
+                headers=MollieService._get_headers(),
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                print(f"[MOLLIE] Confirm: Failed to fetch payment {payment_id}: {response.status_code}")
+                return {
+                    "ok": False,
+                    "error": f"Failed to fetch payment: {response.status_code}",
+                }
+
+            payment = response.json()
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Confirm: Request error fetching payment: {e}")
+            return {"ok": False, "error": f"Request error: {str(e)}"}
+
+        status = payment.get("status")
+        metadata = payment.get("metadata", {})
+        payment_identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code", "unknown")
+        credits = metadata.get("credits", "0")
+
+        # Verify ownership - the payment must belong to the requesting identity
+        if payment_identity_id != identity_id:
+            print(
+                f"[MOLLIE] Confirm: Identity mismatch for payment {payment_id}: "
+                f"expected {identity_id}, got {payment_identity_id}"
+            )
+            return {
+                "ok": False,
+                "error": "Payment does not belong to this identity",
+            }
+
+        print(
+            f"[MOLLIE] Confirm: payment_id={payment_id}, status={status}, "
+            f"identity_id={identity_id}, plan_code={plan_code}"
+        )
+
+        # Only process paid payments
+        if status != "paid":
+            return {
+                "ok": True,
+                "status": status,
+                "credits_granted": False,
+                "message": f"Payment status is '{status}'",
+            }
+
+        # Process the paid payment - grant credits (idempotent by payment_id)
+        result = MollieService._handle_payment_paid(payment)
+
+        if result:
+            was_existing = result.get("was_existing", False)
+            if was_existing:
+                print(
+                    f"[MOLLIE] Confirm: Already processed (idempotent): "
+                    f"payment_id={payment_id}, identity_id={identity_id}"
+                )
+            else:
+                print(
+                    f"[MOLLIE] Confirm: Credits granted: payment_id={payment_id}, "
+                    f"identity_id={identity_id}, plan_code={plan_code}, credits={credits}"
+                )
+
+            return {
+                "ok": True,
+                "status": "paid",
+                "credits_granted": True,
+                "was_existing": was_existing,
+                "message": "Credits granted" if not was_existing else "Already processed",
+            }
+        else:
+            print(
+                f"[MOLLIE] Confirm: ERROR: Failed to grant credits: payment_id={payment_id}, "
+                f"identity_id={identity_id}"
+            )
+            return {
+                "ok": False,
+                "status": "paid",
+                "credits_granted": False,
+                "error": "Failed to process payment",
+            }
+
+    @staticmethod
     def _handle_payment_paid(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Handle a paid payment - create purchase and grant credits.
