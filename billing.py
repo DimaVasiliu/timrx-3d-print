@@ -441,6 +441,82 @@ def create_mollie_checkout():
         }), 500
 
 
+@bp.route("/confirm", methods=["GET"])
+@require_session
+def confirm_payment():
+    """
+    Confirm a Mollie payment and grant credits if paid.
+    Called by frontend after redirect to ensure credits are granted
+    (in case webhook is delayed).
+
+    Query params:
+    - payment_id: The Mollie payment ID (tr_xxx)
+
+    Response (success - 200):
+    {
+        "ok": true,
+        "status": "paid",
+        "credits_granted": true,
+        "message": "Credits granted"
+    }
+
+    Response (not paid - 200):
+    {
+        "ok": true,
+        "status": "open",
+        "credits_granted": false,
+        "message": "Payment status is 'open'"
+    }
+
+    This endpoint is idempotent - calling it multiple times for the
+    same payment will only grant credits once.
+    """
+    payment_id = request.args.get("payment_id")
+
+    if not payment_id:
+        return jsonify({
+            "ok": False,
+            "error_code": "VALIDATION_ERROR",
+            "message": "payment_id is required",
+        }), 400
+
+    # Basic validation - Mollie payment IDs start with "tr_"
+    if not payment_id.startswith("tr_"):
+        return jsonify({
+            "ok": False,
+            "error_code": "VALIDATION_ERROR",
+            "message": "Invalid payment_id format",
+        }), 400
+
+    try:
+        result = MollieService.confirm_payment(
+            payment_id=payment_id,
+            identity_id=g.identity_id,
+        )
+
+        if result.get("ok"):
+            return jsonify({
+                "ok": True,
+                "status": result.get("status"),
+                "credits_granted": result.get("credits_granted", False),
+                "message": result.get("message"),
+            })
+        else:
+            return jsonify({
+                "ok": False,
+                "error_code": "CONFIRM_FAILED",
+                "detail": result.get("error"),
+            }), 400
+
+    except Exception as e:
+        print(f"[BILLING] Error confirming payment: {e}")
+        return jsonify({
+            "ok": False,
+            "error_code": "INTERNAL_ERROR",
+            "detail": str(e),
+        }), 500
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STRIPE CHECKOUT (Disabled when PAYMENTS_PROVIDER != 'stripe' or 'both')
 # ─────────────────────────────────────────────────────────────────────────────
