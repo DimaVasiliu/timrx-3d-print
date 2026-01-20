@@ -469,12 +469,42 @@ def init_db() -> bool:
     try:
         if verify_connection():
             print("[DB] Database connection verified successfully")
+            # Ensure schema indexes exist for idempotency
+            ensure_schema()
             return True
         else:
             raise DatabaseConnectionError("Connection test query failed")
     except DatabaseError as e:
         print(f"[DB] ERROR: {e}")
         raise
+
+
+def ensure_schema() -> None:
+    """
+    Ensure critical schema elements exist.
+    Creates indexes needed for idempotency if they don't exist.
+    Called at app startup after connection is verified.
+    """
+    try:
+        with transaction() as cur:
+            # Unique index on (provider, provider_payment_id) for webhook idempotency
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_provider_payment
+                ON timrx_billing.purchases(provider, provider_payment_id)
+            """)
+
+            # Unique index on (provider, payment_id) for additional idempotency
+            # Partial index: only applies when payment_id is not null
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
+                ON timrx_billing.purchases (provider, payment_id)
+                WHERE payment_id IS NOT NULL
+            """)
+
+        print("[DB] Schema indexes ensured")
+    except Exception as e:
+        # Log but don't fail startup - indexes may already exist or DB user may lack permissions
+        print(f"[DB] Warning: Could not ensure schema indexes: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
