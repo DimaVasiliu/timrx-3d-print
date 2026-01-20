@@ -657,6 +657,7 @@ DEV_ORIGINS = [
 PROD_ORIGINS = [
     "https://timrx.live",
     "https://www.timrx.live",
+    "https://3d.timrx.live",
 ]
 
 
