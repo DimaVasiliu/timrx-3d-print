@@ -406,6 +406,7 @@ def create_mollie_checkout():
         return jsonify({
             "ok": True,
             "checkout_url": result["checkout_url"],
+            "payment_id": result.get("payment_id"),  # For post-redirect confirmation
         })
 
     except MollieCreateError as e:
