@@ -458,23 +458,28 @@ class MollieService:
                 was_existing = result.get("was_existing", False)
 
                 # Only send emails for NEW purchases (not duplicates)
+                # Emails are non-blocking - failures are logged as warnings only
                 if not was_existing and customer_email:
-                    from emailer import send_purchase_receipt, notify_purchase
-                    send_purchase_receipt(
-                        to_email=customer_email,
-                        plan_name=plan_name,
-                        credits=credits,
-                        amount_gbp=amount_gbp,
-                    )
+                    try:
+                        from emailer import send_purchase_receipt, notify_purchase
+                        send_purchase_receipt(
+                            to_email=customer_email,
+                            plan_name=plan_name,
+                            credits=credits,
+                            amount_gbp=amount_gbp,
+                        )
 
-                    # Send admin notification
-                    notify_purchase(
-                        identity_id=identity_id,
-                        email=customer_email,
-                        plan_name=plan_name,
-                        credits=credits,
-                        amount_gbp=amount_gbp,
-                    )
+                        # Send admin notification
+                        notify_purchase(
+                            identity_id=identity_id,
+                            email=customer_email,
+                            plan_name=plan_name,
+                            credits=credits,
+                            amount_gbp=amount_gbp,
+                        )
+                    except Exception as email_err:
+                        # Never fail payment due to email errors
+                        print(f"[MOLLIE] WARNING: Email failed for payment {payment_id}: {email_err} (credits already granted)")
 
                 return {
                     "purchase_id": purchase_id,
