@@ -172,10 +172,17 @@ class Config:
     def SESSION_COOKIE_SAMESITE(self) -> str:
         """
         SameSite policy for session cookie.
-        - "Lax": Default, works for same-site navigation (recommended)
+        - "Lax": Default, works for same-site navigation
         - "None": Required for cross-site requests (requires Secure=True)
+
+        We use "None" in production for cross-subdomain requests
+        (timrx.live -> 3d.timrx.live) to ensure cookies are sent.
         """
-        # Lax is fine for same-site subdomains (timrx.live <-> 3d.timrx.live)
+        # Use "None" in production for cross-origin subdomain requests
+        # SameSite=None requires Secure=True (HTTPS)
+        if self.IS_PROD:
+            return "None"
+        # In dev, use "Lax" since we're on localhost (no HTTPS)
         return "Lax"
 
     # Single TTL for both DB session expiry AND cookie max-age (must match!)
@@ -282,6 +289,24 @@ class Config:
     NOTIFY_ON_RESTORE_REQUEST: bool = field(default_factory=lambda: _get_env_bool("NOTIFY_ON_RESTORE_REQUEST", False))
 
     # ─────────────────────────────────────────────────────────────
+    # Payment Provider Selection
+    # ─────────────────────────────────────────────────────────────
+    # PAYMENTS_PROVIDER controls which payment provider to use
+    # Options: "mollie" (default), "stripe", "both"
+    # If set to "mollie", Stripe will be completely disabled (no init, no warnings, no endpoints)
+    PAYMENTS_PROVIDER: str = field(default_factory=lambda: _get_env("PAYMENTS_PROVIDER", "mollie").lower())
+
+    @property
+    def USE_STRIPE(self) -> bool:
+        """True if Stripe should be used (provider is 'stripe' or 'both')."""
+        return self.PAYMENTS_PROVIDER in ("stripe", "both")
+
+    @property
+    def USE_MOLLIE(self) -> bool:
+        """True if Mollie should be used (provider is 'mollie' or 'both')."""
+        return self.PAYMENTS_PROVIDER in ("mollie", "both")
+
+    # ─────────────────────────────────────────────────────────────
     # Stripe
     # ─────────────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: str = field(default_factory=lambda: _get_env("STRIPE_SECRET_KEY"))
@@ -290,7 +315,10 @@ class Config:
 
     @property
     def STRIPE_CONFIGURED(self) -> bool:
-        """True if Stripe is configured."""
+        """True if Stripe is configured AND enabled via PAYMENTS_PROVIDER."""
+        # Only consider Stripe configured if the provider flag allows it
+        if not self.USE_STRIPE:
+            return False
         return bool(self.STRIPE_SECRET_KEY)
 
     @property
@@ -425,8 +453,15 @@ class Config:
         print("-" * 60)
         print(f"  Database configured: {self.HAS_DATABASE}")
         print(f"  Email configured: {self.EMAIL_CONFIGURED}")
-        print(f"  Stripe configured: {self.STRIPE_CONFIGURED} ({self.STRIPE_MODE if self.STRIPE_CONFIGURED else 'N/A'})")
-        print(f"  Mollie configured: {self.MOLLIE_CONFIGURED} ({self.MOLLIE_MODE if self.MOLLIE_CONFIGURED else 'N/A'})")
+        print(f"  Payment provider: {self.PAYMENTS_PROVIDER}")
+        if self.USE_STRIPE:
+            print(f"  Stripe configured: {self.STRIPE_CONFIGURED} ({self.STRIPE_MODE if self.STRIPE_CONFIGURED else 'N/A'})")
+        else:
+            print(f"  Stripe: disabled (PAYMENTS_PROVIDER={self.PAYMENTS_PROVIDER})")
+        if self.USE_MOLLIE:
+            print(f"  Mollie configured: {self.MOLLIE_CONFIGURED} ({self.MOLLIE_MODE if self.MOLLIE_CONFIGURED else 'N/A'})")
+        else:
+            print(f"  Mollie: disabled (PAYMENTS_PROVIDER={self.PAYMENTS_PROVIDER})")
         print(f"  AWS S3 configured: {self.AWS_CONFIGURED}")
         print("-" * 60)
         print("[CONFIG] Session Cookie Settings:")
@@ -454,8 +489,11 @@ class Config:
                 warnings.append("DATABASE_URL not set - running without persistence!")
             if not self.EMAIL_CONFIGURED:
                 warnings.append("Email not configured - magic codes and receipts won't send")
-            if not self.STRIPE_CONFIGURED and not self.MOLLIE_CONFIGURED:
-                warnings.append("No payment provider configured (Stripe/Mollie) - purchases disabled")
+            # Check payment provider based on PAYMENTS_PROVIDER setting
+            if self.USE_STRIPE and not self.STRIPE_CONFIGURED:
+                warnings.append("PAYMENTS_PROVIDER includes 'stripe' but Stripe not configured")
+            if self.USE_MOLLIE and not self.MOLLIE_CONFIGURED:
+                warnings.append("PAYMENTS_PROVIDER includes 'mollie' but Mollie not configured")
             if not self.ALLOWED_ORIGINS:
                 warnings.append("ALLOWED_ORIGINS not set - CORS will block requests")
             if self.ALLOW_ALL_ORIGINS:
@@ -472,9 +510,12 @@ class Config:
             "port": self.PORT,
             "has_database": self.HAS_DATABASE,
             "email_configured": self.EMAIL_CONFIGURED,
-            "stripe_configured": self.STRIPE_CONFIGURED,
+            "payments_provider": self.PAYMENTS_PROVIDER,
+            "stripe_enabled": self.USE_STRIPE,
+            "stripe_configured": self.STRIPE_CONFIGURED if self.USE_STRIPE else False,
             "stripe_mode": self.STRIPE_MODE if self.STRIPE_CONFIGURED else None,
-            "mollie_configured": self.MOLLIE_CONFIGURED,
+            "mollie_enabled": self.USE_MOLLIE,
+            "mollie_configured": self.MOLLIE_CONFIGURED if self.USE_MOLLIE else False,
             "mollie_mode": self.MOLLIE_MODE if self.MOLLIE_CONFIGURED else None,
             "aws_configured": self.AWS_CONFIGURED,
             "free_credits_on_signup": self.FREE_CREDITS_ON_SIGNUP,
