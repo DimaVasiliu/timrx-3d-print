@@ -22,7 +22,7 @@ from pricing_service import PricingService
 from wallet_service import WalletService
 from reservation_service import ReservationService
 from purchase_service import PurchaseService
-from mollie_service import MollieService
+from mollie_service import MollieService, MollieCreateError
 
 bp = Blueprint("billing", __name__)
 
@@ -408,6 +408,14 @@ def create_mollie_checkout():
             "checkout_url": result["checkout_url"],
         })
 
+    except MollieCreateError as e:
+        print(f"[BILLING] Mollie create failed: {e.detail}")
+        return jsonify({
+            "ok": False,
+            "error_code": "MOLLIE_CREATE_FAILED",
+            "detail": e.detail,
+        }), 400
+
     except ValueError as e:
         error_msg = str(e)
         print(f"[BILLING] Mollie checkout error: {error_msg}")
@@ -421,7 +429,7 @@ def create_mollie_checkout():
         return jsonify({
             "ok": False,
             "error_code": "CHECKOUT_ERROR",
-            "message": error_msg,
+            "detail": error_msg,
         }), 400
 
     except Exception as e:
@@ -429,6 +437,7 @@ def create_mollie_checkout():
         return jsonify({
             "ok": False,
             "error_code": "INTERNAL_ERROR",
+            "detail": str(e),
         }), 500
 
 
