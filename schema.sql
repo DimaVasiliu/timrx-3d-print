@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS timrx_billing.ledger_entries (
 CREATE INDEX IF NOT EXISTS idx_ledger_identity_created
 ON timrx_billing.ledger_entries(identity_id, created_at DESC);
 
+-- Unique index for charge idempotency: (identity_id, ref_type, ref_id)
+-- Ensures the same (identity, action, job_id/upstream_id) combo can only be charged once
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_charge_idempotency
+ON timrx_billing.ledger_entries(identity_id, ref_type, ref_id)
+WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL AND entry_type = 'charge';
+
 CREATE TABLE IF NOT EXISTS timrx_billing.purchases (
   id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   identity_id          UUID NOT NULL REFERENCES timrx_billing.identities(id) ON DELETE CASCADE,
