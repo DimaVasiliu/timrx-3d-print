@@ -688,4 +688,3 @@ class MollieService:
 
         except requests.RequestException:
             return None
-t
