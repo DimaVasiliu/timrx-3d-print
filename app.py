@@ -86,6 +86,14 @@ except ImportError as e:
     print(f"[WARN] jobs blueprint not loaded: {e}")
     jobs_bp = None
 
+# Optional: credits blueprint (wallet balance + charge)
+try:
+    from credits import bp as credits_bp
+    _loaded_blueprints.append(("credits", credits_bp, "/api/credits"))
+except ImportError as e:
+    print(f"[WARN] credits blueprint not loaded: {e}")
+    credits_bp = None
+
 # Import DatabaseError for error handler
 try:
     from db import DatabaseError
@@ -783,6 +791,65 @@ for name, bp, prefix in _loaded_blueprints:
     app.register_blueprint(bp, url_prefix=prefix)
 if _loaded_blueprints:
     print(f"[APP] Blueprints registered: {', '.join(name for name, _, _ in _loaded_blueprints)}")
+
+# ─────────────────────────────────────────────────────────────
+# GET /api/wallet - Simple wallet balance endpoint
+# ─────────────────────────────────────────────────────────────
+@app.route("/api/wallet", methods=["GET"])
+def api_wallet():
+    """
+    Get current wallet credits for the active identity/session.
+
+    Response (200):
+    {
+        "identity_id": "uuid",
+        "credits_balance": 150
+    }
+
+    Response (401 - no session):
+    {
+        "error": {"code": "UNAUTHORIZED", "message": "No valid session"}
+    }
+    """
+    from identity_service import IdentityService
+
+    # Get session from cookie
+    session_id = IdentityService.get_session_id_from_request(request)
+    if not session_id:
+        return jsonify({
+            "error": {
+                "code": "UNAUTHORIZED",
+                "message": "No valid session",
+            }
+        }), 401
+
+    # Validate session
+    identity = IdentityService.validate_session(session_id)
+    if not identity:
+        return jsonify({
+            "error": {
+                "code": "UNAUTHORIZED",
+                "message": "Invalid or expired session",
+            }
+        }), 401
+
+    identity_id = str(identity["id"])
+
+    # Get balance
+    try:
+        balance = WalletService.get_balance(identity_id) if WalletService else 0
+        return jsonify({
+            "identity_id": identity_id,
+            "credits_balance": balance,
+        })
+    except Exception as e:
+        print(f"[WALLET] Error fetching balance: {e}")
+        return jsonify({
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Failed to fetch wallet balance",
+            }
+        }), 500
 
 # ─────────────────────────────────────────────────────────────
 # Seed Default Plans (ensures plans exist in DB)
@@ -3409,6 +3476,120 @@ LEGACY_ACTION_KEYS = {
     "image-studio": "image_studio_generate",
 }
 
+
+def check_credits_available(identity_id: str, action_key: str):
+    """
+    Check if user has enough credits for an action BEFORE calling upstream API.
+    Does NOT reserve or charge - just a balance check.
+
+    Args:
+        identity_id: User's identity ID
+        action_key: Action key from LEGACY_ACTION_KEYS (e.g., 'text_to_3d_generate')
+
+    Returns:
+        (True, cost, None) if credits available
+        (False, cost, error_response) if insufficient - return error_response from route
+    """
+    if not CREDITS_AVAILABLE:
+        print(f"[CREDITS] System not available, allowing {action_key} without credit check")
+        return True, 0, None
+
+    if not identity_id:
+        print(f"[CREDITS] No identity for {action_key}, allowing without credit check")
+        return True, 0, None
+
+    try:
+        cost = PricingService.get_action_cost(action_key)
+        if cost == 0:
+            print(f"[CREDITS] No cost defined for {action_key}, allowing")
+            return True, 0, None
+
+        balance = WalletService.get_balance(identity_id)
+        reserved = WalletService.get_reserved_credits(identity_id)
+        available = max(0, balance - reserved)
+
+        print(f"[CREDITS] Check {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}")
+
+        if available < cost:
+            return False, cost, (jsonify({
+                "ok": False,
+                "error": "insufficient_credits",
+                "code": "INSUFFICIENT_CREDITS",
+                "message": f"Insufficient credits. Need {cost}, have {available}.",
+                "required": cost,
+                "available": available,
+                "balance": balance,
+            }), 402)
+
+        return True, cost, None
+
+    except Exception as e:
+        print(f"[CREDITS] Check error for {action_key}: {e}")
+        # Don't block on credit system errors
+        return True, 0, None
+
+
+def charge_credits_for_action(identity_id: str, action_key: str, upstream_job_id: str, metadata: dict = None):
+    """
+    Charge credits AFTER successful upstream API call.
+    Uses upstream_job_id as idempotency key to prevent double-charging.
+
+    Args:
+        identity_id: User's identity ID
+        action_key: Action key from LEGACY_ACTION_KEYS
+        upstream_job_id: The job ID returned by Meshy/OpenAI (idempotency key)
+        metadata: Optional metadata to store with the charge
+
+    Returns:
+        (True, new_balance, ledger_entry_id) on success
+        (False, 0, error_message) on failure (should not happen if check passed first)
+    """
+    if not CREDITS_AVAILABLE:
+        return True, 0, None
+
+    if not identity_id:
+        return True, 0, None
+
+    try:
+        cost = PricingService.get_action_cost(action_key)
+        if cost == 0:
+            return True, WalletService.get_balance(identity_id), None
+
+        # Import the charge function from credits module
+        from credits import _charge_credits_idempotent
+
+        result = _charge_credits_idempotent(
+            identity_id=identity_id,
+            action=action_key,
+            ref_type=action_key,
+            ref_id=upstream_job_id,
+            cost_credits=cost,
+            meta={
+                "upstream_job_id": upstream_job_id,
+                "source": "legacy_endpoint",
+                **(metadata or {}),
+            },
+        )
+
+        if result["idempotent"]:
+            print(f"[CREDITS] Idempotent charge for {action_key}, job={upstream_job_id}")
+        else:
+            print(f"[CREDITS] Charged {cost} credits for {action_key}, job={upstream_job_id}, new_balance={result['new_balance']}")
+
+        return True, result["new_balance"], None
+
+    except ValueError as e:
+        error_msg = str(e)
+        print(f"[CREDITS] Charge failed for {action_key}: {error_msg}")
+        # This shouldn't happen if check_credits_available passed, but handle gracefully
+        return False, 0, error_msg
+
+    except Exception as e:
+        print(f"[CREDITS] Unexpected charge error for {action_key}: {e}")
+        # Don't fail the request on credit errors - job already started
+        return True, 0, None
+
+
 # ─────────────────────────────────────────────────────────────
 # API
 # ─────────────────────────────────────────────────────────────
@@ -3612,12 +3793,21 @@ def api_text_to_3d_remesh_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
+    user_id = g.user_id
+    identity_id = getattr(g, 'identity_id', None) or user_id
+
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"error": "prompt required"}), 400
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    # Check credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["remesh"]
+    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
+    if not has_credits:
+        return credit_error
 
     payload = {
         "mode": "preview",
@@ -3649,6 +3839,9 @@ def api_text_to_3d_remesh_start():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
+    # Charge credits AFTER successful Meshy call (idempotent via job_id)
+    charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100]})
+
     store = load_store()
     store[job_id] = {
         "stage": "preview",
@@ -3662,6 +3855,7 @@ def api_text_to_3d_remesh_start():
         "is_a_t_pose": bool(body.get("is_a_t_pose")),
         "batch_count": batch_count,
         "batch_slot": batch_slot,
+        "user_id": user_id,
     }
     save_store(store)
     return jsonify({"job_id": job_id})
@@ -3979,6 +4173,7 @@ def api_mesh_retexture():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
+    identity_id = getattr(g, 'identity_id', None) or user_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/retexture:incoming", body)
@@ -3990,6 +4185,12 @@ def api_mesh_retexture():
     style_img = (body.get("image_style_url") or "").strip()
     if not prompt and not style_img:
         return jsonify({"error": "text_style_prompt or image_style_url required"}), 400
+
+    # Check credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["texture"]
+    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
+    if not has_credits:
+        return credit_error
 
     payload = {
         **source,
@@ -4010,6 +4211,9 @@ def api_mesh_retexture():
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        # Charge credits AFTER successful Meshy call (idempotent via job_id)
+        charge_credits_for_action(identity_id, action_key, job_id, {"texture_prompt": prompt[:100] if prompt else None})
 
         # Save metadata to store (checks local store AND database for source)
         store = load_store()
@@ -4111,12 +4315,19 @@ def api_mesh_rigging():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
+    identity_id = getattr(g, 'identity_id', None) or user_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/rigging:incoming", body)
     source, err = build_source_payload(body)
     if err:
         return jsonify({"error": err}), 400
+
+    # Check credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["rig"]
+    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
+    if not has_credits:
+        return credit_error
 
     payload = {**source}
     try:
@@ -4135,6 +4346,9 @@ def api_mesh_rigging():
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        # Charge credits AFTER successful Meshy call (idempotent via job_id)
+        charge_credits_for_action(identity_id, action_key, job_id)
 
         # Save metadata to store (checks local store AND database for source)
         store = load_store()
@@ -4231,12 +4445,19 @@ def api_image_to_3d_start():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
+    identity_id = getattr(g, 'identity_id', None) or user_id
 
     body = request.get_json(silent=True) or {}
     log_event("image-to-3d/start:incoming", body)
     image_url = (body.get("image_url") or "").strip()
     if not image_url:
         return jsonify({"error": "image_url required"}), 400
+
+    # Check credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["image-to-3d"]
+    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
+    if not has_credits:
+        return credit_error
 
     prompt = (body.get("prompt") or "").strip()
     payload = {
@@ -4252,6 +4473,9 @@ def api_image_to_3d_start():
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        # Charge credits AFTER successful Meshy call (idempotent via job_id)
+        charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100] if prompt else None})
 
         s3_name = prompt if prompt else "image_to_3d_source"
         s3_user_id = user_id or "public"
@@ -4368,6 +4592,7 @@ def api_openai_image():
         return ("", 204)
 
     user_id = g.user_id
+    identity_id = getattr(g, 'identity_id', None) or user_id
 
     if not OPENAI_API_KEY:
         return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
@@ -4395,6 +4620,32 @@ def api_openai_image():
     model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1").strip()
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
+
+    # Check credits BEFORE calling OpenAI
+    # Note: For n > 1, we check for n * cost (charge per image)
+    action_key = LEGACY_ACTION_KEYS["image-studio"]
+    if CREDITS_AVAILABLE and identity_id:
+        try:
+            base_cost = PricingService.get_action_cost(action_key)
+            total_cost = base_cost * n
+            balance = WalletService.get_balance(identity_id)
+            reserved = WalletService.get_reserved_credits(identity_id)
+            available = max(0, balance - reserved)
+
+            print(f"[CREDITS] OpenAI image: n={n}, base_cost={base_cost}, total_cost={total_cost}, available={available}")
+
+            if total_cost > 0 and available < total_cost:
+                return jsonify({
+                    "ok": False,
+                    "error": "insufficient_credits",
+                    "code": "INSUFFICIENT_CREDITS",
+                    "message": f"Insufficient credits. Need {total_cost}, have {available}.",
+                    "required": total_cost,
+                    "available": available,
+                    "balance": balance,
+                }), 402
+        except Exception as e:
+            print(f"[CREDITS] Check error for OpenAI image: {e}")
 
     try:
         resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
@@ -4428,6 +4679,26 @@ def api_openai_image():
             image_urls=urls,
             user_id=user_id
         )
+
+        # Charge credits AFTER successful OpenAI call (idempotent via image_id)
+        # For n > 1, we charge n times the base cost
+        if CREDITS_AVAILABLE and identity_id:
+            try:
+                base_cost = PricingService.get_action_cost(action_key)
+                total_cost = base_cost * n
+                if total_cost > 0:
+                    from credits import _charge_credits_idempotent
+                    _charge_credits_idempotent(
+                        identity_id=identity_id,
+                        action=action_key,
+                        ref_type=action_key,
+                        ref_id=image_id,
+                        cost_credits=total_cost,
+                        meta={"prompt": prompt[:100], "n": n, "model": model, "size": size},
+                    )
+                    print(f"[CREDITS] Charged {total_cost} credits for OpenAI image, image_id={image_id}, n={n}")
+            except Exception as e:
+                print(f"[CREDITS] Failed to charge for OpenAI image: {e}")
 
     return jsonify({
         "image_id": image_id,
