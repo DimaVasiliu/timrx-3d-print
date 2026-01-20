@@ -29,9 +29,16 @@ except Exception as e:
     print(f"[DB] Failed to import psycopg3: {e}")
     psycopg = None
     PSYCOPG_VERSION = 0
-from flask import Flask, request, jsonify, Response, abort, g, send_from_directory
+from flask import Flask, request, jsonify, Response, abort, g, send_from_directory, redirect
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
+
+# Import config for FRONTEND_BASE_URL
+try:
+    from config import config
+except ImportError:
+    config = None
+    print("[APP] Warning: Could not import config module")
 
 # ─────────────────────────────────────────────────────────────
 # Credits System - Flat Module Imports
@@ -800,16 +807,39 @@ for _fp in _possible_frontend_paths:
         FRONTEND_DIR = _fp.resolve()
         break
 
+# Get FRONTEND_BASE_URL for redirects when FRONTEND_DIR is not available
+_FRONTEND_BASE_URL = None
+if config and hasattr(config, 'FRONTEND_BASE_URL'):
+    _FRONTEND_BASE_URL = config.FRONTEND_BASE_URL.rstrip("/") if config.FRONTEND_BASE_URL else None
+
 if FRONTEND_DIR:
     print(f"[FRONTEND] Serving from: {FRONTEND_DIR}")
+elif _FRONTEND_BASE_URL:
+    print(f"[FRONTEND] No local frontend dir. Will redirect HTML routes to: {_FRONTEND_BASE_URL}")
 else:
-    print("[FRONTEND] WARNING: Frontend directory not found. HTML routes will return 404.")
+    print("[FRONTEND] WARNING: No FRONTEND_DIR or FRONTEND_BASE_URL. HTML routes will 404.")
+
+
+def _redirect_to_frontend(path: str):
+    """
+    Redirect to frontend URL, preserving query string.
+    Used when FRONTEND_DIR is not available but FRONTEND_BASE_URL is set.
+    """
+    if not _FRONTEND_BASE_URL:
+        return jsonify({"error": "Frontend not configured. Set FRONTEND_BASE_URL env var."}), 404
+    # Preserve query string (e.g., ?checkout=success)
+    query = request.query_string.decode('utf-8')
+    target_url = f"{_FRONTEND_BASE_URL}/{path.lstrip('/')}"
+    if query:
+        target_url = f"{target_url}?{query}"
+    return redirect(target_url, code=302)
+
 
 @app.route("/")
 def serve_hub():
     """Serve hub.html at root."""
     if not FRONTEND_DIR:
-        return jsonify({"error": "Frontend not configured"}), 404
+        return _redirect_to_frontend("hub.html")
     return send_from_directory(FRONTEND_DIR, "hub.html")
 
 @app.route("/3dprint")
@@ -817,21 +847,21 @@ def serve_hub():
 def serve_3dprint():
     """Serve 3dprint.html."""
     if not FRONTEND_DIR:
-        return jsonify({"error": "Frontend not configured"}), 404
+        return _redirect_to_frontend("3dprint.html")
     return send_from_directory(FRONTEND_DIR, "3dprint.html")
 
 @app.route("/hub.html")
 def serve_hub_html():
     """Serve hub.html explicitly."""
     if not FRONTEND_DIR:
-        return jsonify({"error": "Frontend not configured"}), 404
+        return _redirect_to_frontend("hub.html")
     return send_from_directory(FRONTEND_DIR, "hub.html")
 
 @app.route("/index.html")
 def serve_index_html():
     """Serve index.html."""
     if not FRONTEND_DIR:
-        return jsonify({"error": "Frontend not configured"}), 404
+        return _redirect_to_frontend("index.html")
     return send_from_directory(FRONTEND_DIR, "index.html")
 
 # Serve static assets (CSS, JS, etc.)
@@ -839,6 +869,9 @@ def serve_index_html():
 def serve_static_file(filename):
     """Serve static files from frontend directory."""
     if not FRONTEND_DIR:
+        # For static assets, redirect if FRONTEND_BASE_URL is set
+        if _FRONTEND_BASE_URL and filename.endswith(('.css', '.js', '.html', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot')):
+            return _redirect_to_frontend(filename)
         abort(404)
     # Security: only allow certain extensions
     allowed_extensions = {'.css', '.js', '.html', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot'}
