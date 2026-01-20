@@ -32,6 +32,9 @@ class LedgerEntryType:
     REFUND = "refund"
     SIGNUP_GRANT = "signup_grant"
 
+    # Direct charge (idempotent, used by /api/credits/charge)
+    CHARGE = "charge"
+
     # For backward compatibility with existing code
     GRANT = "grant"
     PURCHASE = "purchase"
