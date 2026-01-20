@@ -467,7 +467,7 @@ class PurchaseService:
                 cur.execute(
                     f"""
                     UPDATE {Tables.IDENTITIES}
-                    SET email = %s, updated_at = NOW()
+                    SET email = %s, last_seen_at = NOW()
                     WHERE id = %s AND email IS NULL
                     """,
                     (customer_email.lower().strip(), identity_id),
