@@ -150,7 +150,7 @@ class EmailService:
                 resolved_ips = [info[4][0] for info in addr_info]
                 print(f"[EMAIL] DNS resolved {smtp_host!r} -> {resolved_ips}")
             except socket.gaierror as dns_err:
-                print(f"[EMAIL] DNS FAILED for {smtp_host!r}: {dns_err!r}")
+                print(f"[EMAIL] WARNING: DNS failed for {smtp_host!r}: {dns_err!r} (email not sent, request continues)")
                 return EmailResult(
                     success=False,
                     message=f"DNS resolution failed for {smtp_host!r}",
@@ -169,23 +169,23 @@ class EmailService:
 
         except socket.gaierror as e:
             # DNS resolution failed (fallback - should be caught by pre-resolve above)
-            print(f"[EMAIL] FAILED - DNS error for {smtp_host!r}: {e!r}")
+            print(f"[EMAIL] WARNING: DNS error for {smtp_host!r}: {e!r} (email not sent, request continues)")
             return EmailResult(success=False, message=f"DNS resolution failed for {smtp_host!r}", error=f"{type(e).__name__}: {e}")
 
         except socket.timeout as e:
-            print(f"[EMAIL] FAILED - Connection timeout to {smtp_host!r}:{smtp_port}: {e!r}")
+            print(f"[EMAIL] WARNING: Connection timeout to {smtp_host!r}:{smtp_port}: {e!r} (email not sent, request continues)")
             return EmailResult(success=False, message="Connection timeout", error=f"{type(e).__name__}: {e}")
 
         except smtplib.SMTPAuthenticationError as e:
-            print(f"[EMAIL] FAILED - SMTP auth error: {e!r}")
+            print(f"[EMAIL] WARNING: SMTP auth error: {e!r} (email not sent, request continues)")
             return EmailResult(success=False, message="Authentication failed", error=f"{type(e).__name__}: {e}")
 
         except smtplib.SMTPException as e:
-            print(f"[EMAIL] FAILED - SMTP error: {e!r}")
+            print(f"[EMAIL] WARNING: SMTP error: {e!r} (email not sent, request continues)")
             return EmailResult(success=False, message="SMTP error", error=f"{type(e).__name__}: {e}")
 
         except Exception as e:
-            print(f"[EMAIL] FAILED - Unexpected error: {e!r}")
+            print(f"[EMAIL] WARNING: Unexpected error: {e!r} (email not sent, request continues)")
             return EmailResult(success=False, message="Unexpected error", error=f"{type(e).__name__}: {e}")
 
     @classmethod
