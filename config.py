@@ -99,8 +99,21 @@ class Config:
 
     @property
     def IS_DEV(self) -> bool:
-        """True if running in development mode."""
-        return self.FLASK_ENV in ("development", "dev", "local")
+        """
+        True if running in development mode.
+        Auto-detects local development when FLASK_ENV is not explicitly set.
+        """
+        # Explicit env var takes precedence
+        if self.FLASK_ENV in ("development", "dev", "local"):
+            return True
+        # If FLASK_ENV is explicitly set to production, respect it
+        if _get_env("FLASK_ENV"):
+            return False
+        # Auto-detect: if FLASK_ENV not set and not on Render, assume dev mode
+        # This allows local testing without setting FLASK_ENV=development
+        if not self.IS_RENDER:
+            return True
+        return False
 
     @property
     def IS_PROD(self) -> bool:
@@ -454,7 +467,8 @@ class Config:
         print("=" * 60)
         print("[CONFIG] TimrX Backend Configuration")
         print("=" * 60)
-        print(f"  Environment: {self.FLASK_ENV} (IS_DEV={self.IS_DEV})")
+        dev_note = " (auto-detected)" if self.IS_DEV and not _get_env("FLASK_ENV") else ""
+        print(f"  Environment: {self.FLASK_ENV} (IS_DEV={self.IS_DEV}{dev_note})")
         print(f"  Running on Render: {self.IS_RENDER}")
         print(f"  Port: {self.PORT}")
         print("-" * 60)
