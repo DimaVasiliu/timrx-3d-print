@@ -534,7 +534,7 @@ class MollieService:
             # If no row returned, this was a duplicate (ON CONFLICT fired)
             # Query for the existing purchase and return it as "was_existing"
             if not purchase:
-                print(f"[MOLLIE] Purchase already exists (ON CONFLICT): {provider_payment_id}")
+                print(f"[PURCHASE] Duplicate payment ignored: provider=mollie payment_id={provider_payment_id}")
                 # Fetch the existing purchase
                 cur.execute(
                     f"""
