@@ -3590,6 +3590,23 @@ def charge_credits_for_action(identity_id: str, action_key: str, upstream_job_id
         return True, 0, None
 
 
+def get_current_balance(identity_id: str):
+    """
+    Get current available balance for an identity.
+    Returns dict with balance/reserved/available, or None if credits not available.
+    """
+    if not CREDITS_AVAILABLE or not identity_id:
+        return None
+    try:
+        balance = WalletService.get_balance(identity_id)
+        reserved = WalletService.get_reserved_credits(identity_id)
+        available = max(0, balance - reserved)
+        return {"balance": balance, "reserved": reserved, "available": available}
+    except Exception as e:
+        print(f"[CREDITS] Failed to get balance: {e}")
+        return None
+
+
 # ─────────────────────────────────────────────────────────────
 # API
 # ─────────────────────────────────────────────────────────────
@@ -3705,7 +3722,11 @@ def api_text_to_3d_start():
     # Save to DB for recovery
     save_active_job_to_db(job_id, "text-to-3d", "preview", store[job_id], user_id)
 
-    return jsonify({"job_id": job_id})
+    # Get updated balance after credit deduction
+    balance_info = get_current_balance(identity_id)
+    new_balance = balance_info["available"] if balance_info else None
+
+    return jsonify({"job_id": job_id, "new_balance": new_balance})
 
 # ---- Refine from preview ----
 @app.route("/api/text-to-3d/refine", methods=["POST", "OPTIONS"])
@@ -3785,7 +3806,11 @@ def api_text_to_3d_refine():
     # Save to DB for recovery
     save_active_job_to_db(job_id, "text-to-3d", "refine", store[job_id], user_id)
 
-    return jsonify({"job_id": job_id})
+    # Get updated balance after credit deduction
+    balance_info = get_current_balance(identity_id)
+    new_balance = balance_info["available"] if balance_info else None
+
+    return jsonify({"job_id": job_id, "new_balance": new_balance})
 
 # ---- (Soft) Remesh start (re-run preview with flags) ----
 @app.route("/api/text-to-3d/remesh-start", methods=["POST", "OPTIONS"])
@@ -3840,7 +3865,7 @@ def api_text_to_3d_remesh_start():
         return jsonify({"error": str(e)}), 502
 
     # Charge credits AFTER successful Meshy call (idempotent via job_id)
-    charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100]})
+    _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100]})
 
     store = load_store()
     store[job_id] = {
@@ -3858,7 +3883,7 @@ def api_text_to_3d_remesh_start():
         "user_id": user_id,
     }
     save_store(store)
-    return jsonify({"job_id": job_id})
+    return jsonify({"job_id": job_id, "new_balance": new_balance or None})
 
 # ---- Status ----
 @app.route("/api/text-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
@@ -4038,12 +4063,19 @@ def api_mesh_remesh():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
+    identity_id = getattr(g, 'identity_id', None) or user_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/remesh:incoming", body)
     source, err = build_source_payload(body)
     if err:
         return jsonify({"error": err}), 400
+
+    # Check credits BEFORE calling Meshy
+    action_key = LEGACY_ACTION_KEYS["remesh"]
+    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
+    if not has_credits:
+        return credit_error
 
     payload = {
         **source,
@@ -4080,6 +4112,9 @@ def api_mesh_remesh():
         if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
 
+        # Charge credits AFTER successful Meshy call (idempotent via job_id)
+        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id)
+
         # Save metadata to store (checks local store AND database for source)
         store = load_store()
         source_task_id = body.get("source_task_id") or body.get("model_task_id")
@@ -4102,7 +4137,7 @@ def api_mesh_remesh():
         # Save to DB for recovery
         save_active_job_to_db(job_id, "remesh", "remesh", store[job_id], user_id)
 
-        return jsonify({"job_id": job_id})
+        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -4213,7 +4248,7 @@ def api_mesh_retexture():
             return jsonify({"error": "No job id in response", "raw": resp}), 502
 
         # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        charge_credits_for_action(identity_id, action_key, job_id, {"texture_prompt": prompt[:100] if prompt else None})
+        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id, {"texture_prompt": prompt[:100] if prompt else None})
 
         # Save metadata to store (checks local store AND database for source)
         store = load_store()
@@ -4237,7 +4272,7 @@ def api_mesh_retexture():
         # Save to DB for recovery
         save_active_job_to_db(job_id, "retexture", "texture", store[job_id], user_id)
 
-        return jsonify({"job_id": job_id})
+        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -4348,7 +4383,7 @@ def api_mesh_rigging():
             return jsonify({"error": "No job id in response", "raw": resp}), 502
 
         # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        charge_credits_for_action(identity_id, action_key, job_id)
+        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id)
 
         # Save metadata to store (checks local store AND database for source)
         store = load_store()
@@ -4370,7 +4405,7 @@ def api_mesh_rigging():
         # Save to DB for recovery
         save_active_job_to_db(job_id, "rigging", "rigging", store[job_id], user_id)
 
-        return jsonify({"job_id": job_id})
+        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -4475,7 +4510,7 @@ def api_image_to_3d_start():
             return jsonify({"error": "No job id in response", "raw": resp}), 502
 
         # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100] if prompt else None})
+        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100] if prompt else None})
 
         s3_name = prompt if prompt else "image_to_3d_source"
         s3_user_id = user_id or "public"
@@ -4516,7 +4551,7 @@ def api_image_to_3d_start():
         # Save to DB for recovery
         save_active_job_to_db(job_id, "image-to-3d", "image3d", store[job_id], user_id)
 
-        return jsonify({"job_id": job_id})
+        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -4682,13 +4717,14 @@ def api_openai_image():
 
         # Charge credits AFTER successful OpenAI call (idempotent via image_id)
         # For n > 1, we charge n times the base cost
+        new_balance = None
         if CREDITS_AVAILABLE and identity_id:
             try:
                 base_cost = PricingService.get_action_cost(action_key)
                 total_cost = base_cost * n
                 if total_cost > 0:
                     from credits import _charge_credits_idempotent
-                    _charge_credits_idempotent(
+                    result = _charge_credits_idempotent(
                         identity_id=identity_id,
                         action=action_key,
                         ref_type=action_key,
@@ -4696,7 +4732,8 @@ def api_openai_image():
                         cost_credits=total_cost,
                         meta={"prompt": prompt[:100], "n": n, "model": model, "size": size},
                     )
-                    print(f"[CREDITS] Charged {total_cost} credits for OpenAI image, image_id={image_id}, n={n}")
+                    new_balance = result.get("new_balance")
+                    print(f"[CREDITS] Charged {total_cost} credits for OpenAI image, image_id={image_id}, n={n}, new_balance={new_balance}")
             except Exception as e:
                 print(f"[CREDITS] Failed to charge for OpenAI image: {e}")
 
@@ -4708,6 +4745,7 @@ def api_openai_image():
         "status": "done",
         "model": model,
         "size": size,
+        "new_balance": new_balance,
         "raw": resp
     })
 
