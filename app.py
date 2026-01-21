@@ -37,9 +37,9 @@ from werkzeug.exceptions import HTTPException
 
 # Import config for FRONTEND_BASE_URL
 try:
-    from config import config
+    import config as cfg
 except ImportError:
-    config = None
+    cfg = None
     print("[APP] Warning: Could not import config module")
 
 # ─────────────────────────────────────────────────────────────
@@ -879,8 +879,8 @@ for _fp in _possible_frontend_paths:
 
 # Get FRONTEND_BASE_URL for redirects when FRONTEND_DIR is not available
 _FRONTEND_BASE_URL = None
-if config and hasattr(config, 'FRONTEND_BASE_URL'):
-    _FRONTEND_BASE_URL = config.FRONTEND_BASE_URL.rstrip("/") if config.FRONTEND_BASE_URL else None
+if cfg and hasattr(cfg.config, 'FRONTEND_BASE_URL'):
+    _FRONTEND_BASE_URL = cfg.config.FRONTEND_BASE_URL.rstrip("/") if cfg.config.FRONTEND_BASE_URL else None
 
 if FRONTEND_DIR:
     print(f"[FRONTEND] Serving from: {FRONTEND_DIR}")
