@@ -246,15 +246,33 @@ class MagicCodeService:
             )
 
             # Update session to point to this identity
-            cur.execute(
-                f"""
-                UPDATE {Tables.SESSIONS}
-                SET identity_id = %s, updated_at = NOW()
-                WHERE id = %s
-                RETURNING id
-                """,
-                (identity_id, session_id),
-            )
+            # NOTE: updated_at column added in migration 009_sessions_updated_at.sql
+            # Use COALESCE pattern to work both before and after migration
+            try:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.SESSIONS}
+                    SET identity_id = %s, updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING id
+                    """,
+                    (identity_id, session_id),
+                )
+            except Exception as e:
+                # Fallback if updated_at column doesn't exist yet (pre-migration)
+                if "updated_at" in str(e):
+                    print(f"[MAGIC_CODE] Warning: updated_at column missing, using fallback query")
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.SESSIONS}
+                        SET identity_id = %s
+                        WHERE id = %s
+                        RETURNING id
+                        """,
+                        (identity_id, session_id),
+                    )
+                else:
+                    raise
             updated_session = fetch_one(cur)
 
             if not updated_session:
