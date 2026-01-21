@@ -28,7 +28,6 @@ from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 
 from db import transaction, fetch_one, query_one, query_all, execute, Tables
-from config import config
 from reservation_service import ReservationService, ReservationStatus
 from pricing_service import PricingService
 
