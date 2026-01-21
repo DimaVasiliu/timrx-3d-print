@@ -14,6 +14,7 @@ Stable frontend keys:
 - texture
 - rig
 - image_studio_generate
+- video
 """
 
 from typing import Optional, Dict, Any, List
@@ -59,19 +60,21 @@ class PricingService:
     _frontend_to_db_map: Dict[str, str] = {}
 
     # Mapping from DB action_code to stable frontend keys
-    # DB codes: MESHY_TEXT_TO_3D, MESHY_IMAGE_TO_3D, MESHY_REFINE, MESHY_RETEXTURE, OPENAI_IMAGE
+    # DB codes: MESHY_TEXT_TO_3D, MESHY_IMAGE_TO_3D, MESHY_REFINE, MESHY_RETEXTURE, MESHY_RIG, OPENAI_IMAGE, VIDEO_GENERATE
     ACTION_CODE_MAP = {
         "MESHY_TEXT_TO_3D": "text_to_3d_generate",
         "MESHY_IMAGE_TO_3D": "image_to_3d_generate",
         "MESHY_REFINE": "refine",
         "MESHY_RETEXTURE": "texture",
+        "MESHY_RIG": "rig",
         "OPENAI_IMAGE": "image_studio_generate",
+        "VIDEO_GENERATE": "video",
     }
 
     # Additional frontend aliases that map to same DB codes
     FRONTEND_ALIASES = {
-        "remesh": "MESHY_REFINE",  # remesh uses same cost as refine
-        "rig": "MESHY_REFINE",     # rig uses same cost as refine
+        "remesh": "MESHY_REFINE",  # remesh uses same cost as refine (10c)
+        "rigging": "MESHY_RIG",    # rigging alias for rig (25c)
     }
 
     @staticmethod
@@ -352,11 +355,13 @@ class PricingService:
             "retexture": "MESHY_RETEXTURE",
             "remesh": "MESHY_REFINE",
             "refine": "MESHY_REFINE",
-            "rigging": "MESHY_REFINE",
-            "rig": "MESHY_REFINE",
+            "rigging": "MESHY_RIG",
+            "rig": "MESHY_RIG",
             "openai-image": "OPENAI_IMAGE",
             "nano-image": "OPENAI_IMAGE",
             "image-studio": "OPENAI_IMAGE",
+            "video": "VIDEO_GENERATE",
+            "video-generate": "VIDEO_GENERATE",
         }
         return mapping.get(job, "MESHY_TEXT_TO_3D")  # Default to text-to-3d cost
 
