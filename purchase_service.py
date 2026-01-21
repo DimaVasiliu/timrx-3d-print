@@ -22,7 +22,7 @@ from datetime import datetime
 import json
 
 from db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
-from config import config
+import config as cfg
 from emailer import send_purchase_receipt, notify_purchase
 from pricing_service import PricingService
 from wallet_service import WalletService, LedgerEntryType
@@ -33,17 +33,17 @@ stripe = None
 STRIPE_AVAILABLE = False
 
 # Check PAYMENTS_PROVIDER directly (avoids property issues on some deployments)
-_payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie').lower()
+_payments_provider = getattr(cfg.config, 'PAYMENTS_PROVIDER', 'mollie').lower()
 _use_stripe = _payments_provider in ('stripe', 'both')
 
 if _use_stripe:
     try:
         import stripe as stripe_module
         stripe = stripe_module
-        stripe.api_key = config.STRIPE_SECRET_KEY
-        STRIPE_AVAILABLE = bool(config.STRIPE_SECRET_KEY)
+        stripe.api_key = cfg.config.STRIPE_SECRET_KEY
+        STRIPE_AVAILABLE = bool(cfg.config.STRIPE_SECRET_KEY)
         if STRIPE_AVAILABLE:
-            stripe_mode = "live" if config.STRIPE_SECRET_KEY.startswith("sk_live_") else "test"
+            stripe_mode = "live" if cfg.config.STRIPE_SECRET_KEY.startswith("sk_live_") else "test"
             print(f"[STRIPE] Stripe configured and ready (mode: {stripe_mode})")
         else:
             print("[STRIPE] Stripe enabled but not configured (missing STRIPE_SECRET_KEY)")
@@ -185,11 +185,11 @@ class PurchaseService:
 
         # Verify webhook signature (REQUIRED in production)
         try:
-            if config.STRIPE_WEBHOOK_SECRET:
+            if cfg.config.STRIPE_WEBHOOK_SECRET:
                 event = stripe.Webhook.construct_event(
-                    payload, signature, config.STRIPE_WEBHOOK_SECRET
+                    payload, signature, cfg.config.STRIPE_WEBHOOK_SECRET
                 )
-            elif config.IS_DEV:
+            elif cfg.config.IS_DEV:
                 # Dev only: allow unverified webhooks for local testing
                 print("[PURCHASE] WARNING: Webhook signature not verified (dev mode, no secret)")
                 event = stripe.Event.construct_from(
