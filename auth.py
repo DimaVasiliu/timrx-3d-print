@@ -4,7 +4,11 @@
 Handles:
 - POST /api/auth/restore/request - Request magic code via email
 - POST /api/auth/restore/redeem - Verify magic code and restore session
+- POST /api/auth/request-code - Alias for restore/request
+- POST /api/auth/verify-code - Alias for restore/redeem
 - GET /api/auth/status - Get current auth status
+- POST /api/auth/email/attach - Attach email to current identity
+- POST /api/auth/email/verify - Verify email on current identity
 
 Note: Logout is handled by /api/me/logout for consistency with other /me endpoints.
 """
@@ -511,3 +515,20 @@ def verify_email():
         "message": "Email verified successfully",
         "email_verified": True,
     })
+
+
+# ─────────────────────────────────────────────────────────────
+# Route Aliases (shorter paths for convenience)
+# ─────────────────────────────────────────────────────────────
+
+@bp.route("/request-code", methods=["POST"])
+def request_code_alias():
+    """Alias for /restore/request - Request a magic code via email."""
+    return request_restore()
+
+
+@bp.route("/verify-code", methods=["POST"])
+@with_session
+def verify_code_alias():
+    """Alias for /restore/redeem - Verify a magic code and restore session."""
+    return redeem_restore()
