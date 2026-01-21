@@ -21,6 +21,7 @@ Usage:
 """
 
 import hashlib
+import os
 from contextlib import contextmanager
 from typing import Optional, Any, Dict, List, Union
 from datetime import datetime, timezone
@@ -34,7 +35,21 @@ except ImportError:
     dict_row = None
     PSYCOPG_AVAILABLE = False
 
-from config import config
+# NOTE: Do NOT import config at module level - causes circular imports!
+# Use _get_config() for lazy access inside functions.
+
+def _get_config():
+    """Lazy import of config to avoid circular imports."""
+    from config import config
+    return config
+
+
+# Module-level constants using os.getenv() directly to avoid circular imports
+_DATABASE_URL = os.getenv("DATABASE_URL", "")
+_HAS_DATABASE = bool(_DATABASE_URL)
+_DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+_APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
+_BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -77,10 +92,10 @@ class DatabaseIntegrityError(DatabaseError):
 # ─────────────────────────────────────────────────────────────
 # Connection State
 # ─────────────────────────────────────────────────────────────
-USE_DB = bool(config.DATABASE_URL and PSYCOPG_AVAILABLE)
+USE_DB = bool(_DATABASE_URL and PSYCOPG_AVAILABLE)
 
 if PSYCOPG_AVAILABLE:
-    print(f"[DB] psycopg3 available, DATABASE_URL configured: {config.HAS_DATABASE}, USE_DB: {USE_DB}")
+    print(f"[DB] psycopg3 available, DATABASE_URL configured: {_HAS_DATABASE}, USE_DB: {USE_DB}")
 else:
     print("[DB] psycopg3 not available - database features disabled")
 
@@ -109,18 +124,18 @@ def _create_connection():
     if not PSYCOPG_AVAILABLE:
         raise DatabaseNotConfiguredError("psycopg3 is not installed")
 
-    if not config.DATABASE_URL:
+    if not _DATABASE_URL:
         raise DatabaseNotConfiguredError("DATABASE_URL is not set")
 
     try:
         conn = psycopg.connect(
-            config.DATABASE_URL,
-            connect_timeout=config.DB_CONNECT_TIMEOUT,
+            _DATABASE_URL,
+            connect_timeout=_DB_CONNECT_TIMEOUT,
             row_factory=dict_row,  # Default to dict rows
         )
         # Set search path for both schemas
         with conn.cursor() as cur:
-            cur.execute(f"SET search_path TO {config.APP_SCHEMA}, {config.BILLING_SCHEMA}, public;")
+            cur.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public;")
         return conn
     except psycopg.OperationalError as e:
         raise DatabaseConnectionError(f"Failed to connect to database: {e}", original_error=e)
@@ -384,24 +399,24 @@ def execute_returning_all(sql: str, params: tuple = None) -> List[Dict[str, Any]
 class Tables:
     """Table name constants with schema prefixes."""
     # Billing schema
-    IDENTITIES = f"{config.BILLING_SCHEMA}.identities"
-    SESSIONS = f"{config.BILLING_SCHEMA}.sessions"
-    MAGIC_CODES = f"{config.BILLING_SCHEMA}.magic_codes"
-    WALLETS = f"{config.BILLING_SCHEMA}.wallets"
-    LEDGER_ENTRIES = f"{config.BILLING_SCHEMA}.ledger_entries"
-    ACTION_COSTS = f"{config.BILLING_SCHEMA}.action_costs"
-    CREDIT_RESERVATIONS = f"{config.BILLING_SCHEMA}.credit_reservations"
-    PURCHASES = f"{config.BILLING_SCHEMA}.purchases"
-    PLANS = f"{config.BILLING_SCHEMA}.plans"
-    JOBS = f"{config.BILLING_SCHEMA}.jobs"
-    DAILY_LIMITS = f"{config.BILLING_SCHEMA}.daily_limits"
+    IDENTITIES = f"{_BILLING_SCHEMA}.identities"
+    SESSIONS = f"{_BILLING_SCHEMA}.sessions"
+    MAGIC_CODES = f"{_BILLING_SCHEMA}.magic_codes"
+    WALLETS = f"{_BILLING_SCHEMA}.wallets"
+    LEDGER_ENTRIES = f"{_BILLING_SCHEMA}.ledger_entries"
+    ACTION_COSTS = f"{_BILLING_SCHEMA}.action_costs"
+    CREDIT_RESERVATIONS = f"{_BILLING_SCHEMA}.credit_reservations"
+    PURCHASES = f"{_BILLING_SCHEMA}.purchases"
+    PLANS = f"{_BILLING_SCHEMA}.plans"
+    JOBS = f"{_BILLING_SCHEMA}.jobs"
+    DAILY_LIMITS = f"{_BILLING_SCHEMA}.daily_limits"
 
     # App schema
-    MODELS = f"{config.APP_SCHEMA}.models"
-    IMAGES = f"{config.APP_SCHEMA}.images"
-    HISTORY_ITEMS = f"{config.APP_SCHEMA}.history_items"
-    ACTIVE_JOBS = f"{config.APP_SCHEMA}.active_jobs"
-    ACTIVITY_LOGS = f"{config.APP_SCHEMA}.activity_logs"
+    MODELS = f"{_APP_SCHEMA}.models"
+    IMAGES = f"{_APP_SCHEMA}.images"
+    HISTORY_ITEMS = f"{_APP_SCHEMA}.history_items"
+    ACTIVE_JOBS = f"{_APP_SCHEMA}.active_jobs"
+    ACTIVITY_LOGS = f"{_APP_SCHEMA}.activity_logs"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -457,7 +472,7 @@ def init_db() -> bool:
     Raises:
         DatabaseConnectionError: If database is configured but connection fails
     """
-    if not config.HAS_DATABASE:
+    if not _HAS_DATABASE:
         print("[DB] DATABASE_URL not set - running without database")
         return False
 
