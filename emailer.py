@@ -8,7 +8,7 @@ while delegating actual sending to EmailService in email_service.py.
 
 from typing import Optional, Dict, Any
 
-from config import config
+import config as cfg
 
 # Import send_email from EmailService for actual sending
 # Try multiple import paths for flexibility (app.py adds services/ to sys.path)
@@ -155,7 +155,7 @@ Your credits are now available in your account.
 # ─────────────────────────────────────────────────────────────
 def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None) -> bool:
     """Send a notification to the admin email."""
-    admin_email = config.ADMIN_EMAIL
+    admin_email = cfg.config.ADMIN_EMAIL
     if not admin_email:
         print(f"[EMAIL] Admin notification (no ADMIN_EMAIL configured): {subject}")
         return False
@@ -183,7 +183,7 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
 
 def notify_new_identity(identity_id: str, email: Optional[str] = None) -> bool:
     """Notify admin when a new identity is created (with email)."""
-    if not config.NOTIFY_ON_NEW_IDENTITY:
+    if not cfg.config.NOTIFY_ON_NEW_IDENTITY:
         return False
     if not email:  # Only notify when email is attached
         return False
@@ -203,7 +203,7 @@ def notify_purchase(
     amount_gbp: float,
 ) -> bool:
     """Notify admin when a purchase is completed."""
-    if not config.NOTIFY_ON_PURCHASE:
+    if not cfg.config.NOTIFY_ON_PURCHASE:
         return False
 
     return notify_admin(
@@ -221,7 +221,7 @@ def notify_purchase(
 
 def notify_restore_request(email: str) -> bool:
     """Notify admin when a restore code is requested."""
-    if not config.NOTIFY_ON_RESTORE_REQUEST:
+    if not cfg.config.NOTIFY_ON_RESTORE_REQUEST:
         return False
 
     return notify_admin(
