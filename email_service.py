@@ -4,7 +4,9 @@ Email Service - Hardened email sending with proper error handling.
 Features:
 - EMAIL_ENABLED toggle (if false, just logs)
 - EMAIL_PROVIDER support (neo, ses, sendgrid)
-- DNS and TCP health checks
+- AWS SES via boto3 (when EMAIL_PROVIDER=ses)
+- SMTP for other providers (neo, sendgrid, etc.)
+- DNS and TCP health checks (for SMTP)
 - Never crashes calling endpoints on failure
 - Detailed logging for debugging
 
@@ -16,6 +18,13 @@ Usage:
 
     # Health check
     result = EmailService.healthcheck()
+
+Environment variables for SES:
+    EMAIL_PROVIDER=ses
+    AWS_REGION=eu-west-2
+    AWS_ACCESS_KEY_ID=xxx
+    AWS_SECRET_ACCESS_KEY=xxx
+    SES_FROM_EMAIL=noreply@timrx.app (or EMAIL_FROM_ADDRESS)
 """
 
 import smtplib
@@ -26,6 +35,15 @@ from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 
 from config import config
+
+# Try to import boto3 for SES
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+    print("[EMAIL] WARNING: boto3 not available - SES sending disabled")
 
 
 @dataclass
@@ -53,6 +71,34 @@ class EmailService:
             print("[EMAIL] Email DISABLED (EMAIL_ENABLED=false) - emails will be logged only")
             return
 
+        provider = config.EMAIL_PROVIDER.lower()
+
+        # SES provider
+        if provider == "ses":
+            if not BOTO3_AVAILABLE:
+                print("[EMAIL] WARNING: EMAIL_PROVIDER=ses but boto3 not installed")
+                print("[EMAIL] Emails will be logged only until boto3 is available")
+                return
+
+            if not config.EMAIL_CONFIGURED:
+                missing = []
+                if not config.AWS_ACCESS_KEY_ID:
+                    missing.append("AWS_ACCESS_KEY_ID")
+                if not config.AWS_SECRET_ACCESS_KEY:
+                    missing.append("AWS_SECRET_ACCESS_KEY")
+                if not (config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS):
+                    missing.append("SES_FROM_EMAIL or EMAIL_FROM_ADDRESS")
+                print(f"[EMAIL] WARNING: SES not configured - missing: {', '.join(missing)}")
+                print("[EMAIL] Emails will be logged only until configured")
+                return
+
+            from_email = config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
+            print("[EMAIL] Email ENABLED via AWS SES")
+            print(f"[EMAIL] Region: {config.AWS_REGION}")
+            print(f"[EMAIL] From: {config.EMAIL_FROM_NAME} <{from_email}>")
+            return
+
+        # SMTP providers (neo, sendgrid, etc.)
         if not config.EMAIL_CONFIGURED:
             missing = []
             if not config.SMTP_HOST:
@@ -120,6 +166,87 @@ class EmailService:
             print(f"[EMAIL] NOT CONFIGURED - Would send to {to}: {subject}")
             return EmailResult(success=True, message="Email not configured - logged only")
 
+        # Route to appropriate provider
+        provider = config.EMAIL_PROVIDER.lower()
+        if provider == "ses":
+            return cls._send_via_ses(to, subject, html, text, from_email, from_name)
+
+        # Default: SMTP providers (neo, sendgrid, etc.)
+        return cls._send_via_smtp(to, subject, html, text, from_email, from_name)
+
+    @classmethod
+    def _send_via_ses(
+        cls,
+        to: str,
+        subject: str,
+        html: str,
+        text: Optional[str] = None,
+        from_email: Optional[str] = None,
+        from_name: Optional[str] = None,
+    ) -> EmailResult:
+        """Send email via AWS SES using boto3."""
+        if not BOTO3_AVAILABLE:
+            print(f"[EMAIL] SES ERROR: boto3 not available - cannot send to {to}")
+            return EmailResult(success=False, message="boto3 not available", error="ImportError")
+
+        # Get from address
+        sender_addr = from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
+        sender_name = from_name or config.EMAIL_FROM_NAME
+        sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
+
+        try:
+            # Create SES client
+            ses_client = boto3.client(
+                "ses",
+                region_name=config.AWS_REGION,
+                aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            )
+
+            # Build email body
+            body = {"Html": {"Charset": "UTF-8", "Data": html}}
+            if text:
+                body["Text"] = {"Charset": "UTF-8", "Data": text}
+
+            # Send email
+            response = ses_client.send_email(
+                Source=sender,
+                Destination={"ToAddresses": [to]},
+                Message={
+                    "Subject": {"Charset": "UTF-8", "Data": subject},
+                    "Body": body,
+                },
+            )
+
+            message_id = response.get("MessageId", "unknown")
+            print(f"[EMAIL] SES SENT to {to}: {subject} (MessageId: {message_id})")
+            return EmailResult(success=True, message=f"Email sent via SES (MessageId: {message_id})")
+
+        except NoCredentialsError as e:
+            print(f"[EMAIL] SES ERROR: No credentials - {e}")
+            return EmailResult(success=False, message="AWS credentials not configured", error=str(e))
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_msg = e.response.get("Error", {}).get("Message", str(e))
+            print(f"[EMAIL] SES ERROR ({error_code}): {error_msg}")
+            return EmailResult(success=False, message=f"SES error: {error_code}", error=error_msg)
+
+        except Exception as e:
+            print(f"[EMAIL] SES ERROR: Unexpected - {e}")
+            return EmailResult(success=False, message="Unexpected SES error", error=str(e))
+
+    @classmethod
+    def _send_via_smtp(
+        cls,
+        to: str,
+        subject: str,
+        html: str,
+        text: Optional[str] = None,
+        from_email: Optional[str] = None,
+        from_name: Optional[str] = None,
+    ) -> EmailResult:
+        """Send email via SMTP."""
         # Get from address
         default_name, default_addr = config.SMTP_FROM_PARSED
         sender_name = from_name or default_name
