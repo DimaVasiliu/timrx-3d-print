@@ -1266,8 +1266,8 @@ def _map_action_code(job_type: str) -> str:
         "texture": "MESHY_RETEXTURE",
         "retexture": "MESHY_RETEXTURE",
         "remesh": "MESHY_REFINE",
-        "rig": "MESHY_REFINE",
-        "rigging": "MESHY_REFINE",
+        "rig": "MESHY_RIG",
+        "rigging": "MESHY_RIG",
         "image": "OPENAI_IMAGE",
         "openai_image": "OPENAI_IMAGE",
     }
