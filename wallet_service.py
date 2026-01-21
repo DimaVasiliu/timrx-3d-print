@@ -30,6 +30,7 @@ class LedgerEntryType:
     RESERVATION_RELEASE = "reservation_release"
     ADMIN_ADJUST = "admin_adjust"
     REFUND = "refund"
+    CHARGEBACK = "chargeback"
     SIGNUP_GRANT = "signup_grant"
 
     # Direct charge (idempotent, used by /api/credits/charge)
@@ -161,7 +162,7 @@ class WalletService:
             identity_id: The identity to modify
             entry_type: Type of entry (see LedgerEntryType)
             delta: Amount to add (positive) or subtract (negative)
-            ref_type: Reference table name (e.g., 'purchases', 'reservations')
+            ref_type: Reference table name (e.g., 'purchase', 'reservations')
             ref_id: Reference row ID
             meta: Additional metadata as JSON
 
