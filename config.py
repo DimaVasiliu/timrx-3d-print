@@ -557,7 +557,12 @@ class Config:
 # ─────────────────────────────────────────────────────────────
 # Singleton instance
 # ─────────────────────────────────────────────────────────────
-config = Config()
+try:
+    config = Config()
+    print(f"[CONFIG] Loaded successfully (IS_DEV={config.IS_DEV}, IS_RENDER={config.IS_RENDER})")
+except Exception as e:
+    print(f"[CONFIG] FATAL: Failed to load config: {repr(e)}")
+    raise
 
 # ─────────────────────────────────────────────────────────────
 # Backward compatibility exports (for existing code)
