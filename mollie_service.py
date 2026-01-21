@@ -268,6 +268,40 @@ class MollieService:
                     "error": "Failed to process paid payment",
                 }
 
+        # Refund statuses: refunded, charged_back
+        # Revoke credits (idempotent by checking existing refund ledger entry)
+        if status in ("refunded", "charged_back"):
+            result = MollieService._handle_payment_refunded(payment)
+
+            if result:
+                was_existing = result.get("was_existing", False)
+                if was_existing:
+                    print(
+                        f"[MOLLIE] Duplicate refund webhook ignored (already processed): "
+                        f"payment_id={payment_id}, identity_id={identity_id}"
+                    )
+                else:
+                    print(
+                        f"[MOLLIE] Credits revoked (refund): payment_id={payment_id}, "
+                        f"identity_id={identity_id}, credits={result.get('credits_revoked', 0)}"
+                    )
+                return {
+                    "ok": True,
+                    "status": status,
+                    "message": "Refund processed successfully" if not was_existing else "Already processed",
+                    "credits_revoked": result.get("credits_revoked", 0),
+                }
+            else:
+                print(
+                    f"[MOLLIE] ERROR: Failed to process refund: payment_id={payment_id}, "
+                    f"identity_id={identity_id}"
+                )
+                return {
+                    "ok": False,
+                    "status": status,
+                    "error": "Failed to process refund",
+                }
+
         # Non-paid statuses: failed, canceled, expired, open, pending
         # No credits granted - just acknowledge the webhook
         if status in ("failed", "canceled", "expired"):
@@ -279,7 +313,7 @@ class MollieService:
         return {
             "ok": True,
             "status": status,
-            "message": f"Payment status is '{status}', no credits granted",
+            "message": f"Payment status is '{status}', no action taken",
         }
 
     @staticmethod
@@ -493,6 +527,153 @@ class MollieService:
         return None
 
     @staticmethod
+    def _handle_payment_refunded(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle a refunded/charged_back payment - revoke credits.
+
+        Idempotent: uses INSERT ... ON CONFLICT DO NOTHING with partial unique index.
+        Safe: wallet balance never goes below 0 (uses GREATEST in SQL).
+
+        Args:
+            payment: Full Mollie payment object
+
+        Returns:
+            Dict with refund info, or None on failure
+        """
+        from db import fetch_one, transaction, Tables
+        from wallet_service import LedgerEntryType
+        from purchase_service import PurchaseService
+
+        payment_id = payment.get("id")
+        status = payment.get("status")  # 'refunded' or 'charged_back'
+        metadata = payment.get("metadata", {})
+        identity_id = metadata.get("identity_id")
+
+        if not payment_id:
+            print("[MOLLIE] Refund skipped - no payment_id in payment object")
+            return None
+
+        if not identity_id:
+            print(f"[MOLLIE] Refund skipped - no identity_id in metadata: payment_id={payment_id}")
+            return None
+
+        # Determine entry_type based on status
+        if status == "charged_back":
+            entry_type = LedgerEntryType.CHARGEBACK
+            purchase_status = "charged_back"
+        else:
+            entry_type = LedgerEntryType.REFUND
+            purchase_status = "refunded"
+
+        try:
+            # Find the original purchase by (provider='mollie', provider_payment_id=payment_id)
+            purchase = PurchaseService.get_purchase_by_provider_id(payment_id)
+            if not purchase:
+                print(f"[MOLLIE] Refund skipped - no purchase found for payment_id={payment_id}")
+                return {"was_existing": False, "credits_revoked": 0, "reason": "no_purchase"}
+
+            purchase_id = str(purchase["id"])
+            credits_to_revoke = purchase.get("credits_granted", 0)
+
+            if credits_to_revoke <= 0:
+                print(f"[MOLLIE] Refund skipped - no credits to revoke: payment_id={payment_id}")
+                return {"was_existing": False, "credits_revoked": 0, "reason": "no_credits"}
+
+            with transaction() as cur:
+                # Lock wallet row first to prevent concurrent balance updates
+                cur.execute(
+                    f"""
+                    SELECT balance_credits
+                    FROM {Tables.WALLETS}
+                    WHERE identity_id = %s
+                    FOR UPDATE
+                    """,
+                    (identity_id,),
+                )
+                wallet = fetch_one(cur)
+                current_balance = wallet.get("balance_credits", 0) if wallet else 0
+
+                # Insert refund/chargeback ledger entry (idempotent via ON CONFLICT DO NOTHING)
+                # Relies on partial unique index: uq_ledger_refund_per_purchase
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.LEDGER_ENTRIES}
+                    (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (identity_id, ref_type, ref_id)
+                        WHERE entry_type IN ('refund', 'chargeback') AND ref_type = 'purchase'
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        identity_id,
+                        entry_type,
+                        -credits_to_revoke,  # Full negative amount (actual deduction handled by GREATEST)
+                        "purchase",
+                        purchase_id,
+                        json.dumps({
+                            "payment_id": payment_id,
+                            "status": status,
+                            "credits_granted": credits_to_revoke,
+                            "balance_before": current_balance,
+                            "provider": "mollie",
+                        }),
+                    ),
+                )
+                ledger_result = fetch_one(cur)
+
+                # If no row returned, the entry already exists (ON CONFLICT fired)
+                if not ledger_result:
+                    print(f"[MOLLIE] {entry_type} already applied: payment_id={payment_id}, purchase_id={purchase_id}")
+                    return {
+                        "was_existing": True,
+                        "credits_revoked": credits_to_revoke,
+                    }
+
+                ledger_entry_id = str(ledger_result["id"])
+
+                # Update wallet balance safely: never go below 0
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.WALLETS}
+                    SET balance_credits = GREATEST(balance_credits - %s, 0),
+                        updated_at = NOW()
+                    WHERE identity_id = %s
+                    RETURNING balance_credits
+                    """,
+                    (credits_to_revoke, identity_id),
+                )
+                wallet_result = fetch_one(cur)
+                new_balance = wallet_result["balance_credits"] if wallet_result else 0
+
+                # Update purchase status
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.PURCHASES}
+                    SET status = %s
+                    WHERE id = %s
+                    """,
+                    (purchase_status, purchase_id),
+                )
+
+                actual_deduction = current_balance - new_balance
+                print(
+                    f"[MOLLIE] {entry_type} applied: payment_id={payment_id}, purchase_id={purchase_id}, "
+                    f"credits_revoked={actual_deduction}, balance: {current_balance} -> {new_balance}"
+                )
+
+                return {
+                    "was_existing": False,
+                    "credits_revoked": actual_deduction,
+                    "ledger_entry_id": ledger_entry_id,
+                    "new_balance": new_balance,
+                }
+
+        except Exception as e:
+            print(f"[MOLLIE] Error processing {entry_type}: {e}")
+            return None
+
+    @staticmethod
     def _record_mollie_purchase(
         identity_id: str,
         plan_id: str,
@@ -605,7 +786,7 @@ class MollieService:
                     identity_id,
                     LedgerEntryType.PURCHASE_CREDIT,
                     credits_granted,  # Positive amount
-                    "purchases",
+                    "purchase",
                     purchase_id,
                     json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "provider": "mollie"}),
                 ),
