@@ -146,7 +146,7 @@ def get_ledger():
                 "id": "uuid",
                 "type": "purchase_credit",
                 "amount": 80,
-                "ref_type": "purchases",
+                "ref_type": "purchase",
                 "ref_id": "uuid",
                 "meta": {...},
                 "created_at": "2024-01-15T12:00:00Z"
