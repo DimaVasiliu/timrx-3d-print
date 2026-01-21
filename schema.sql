@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS timrx_billing.sessions (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   identity_id      UUID NOT NULL REFERENCES timrx_billing.identities(id) ON DELETE CASCADE,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at       TIMESTAMPTZ NOT NULL,
   revoked_at       TIMESTAMPTZ,
   ip_hash          TEXT,
@@ -108,6 +109,15 @@ CREATE TABLE IF NOT EXISTS timrx_billing.ledger_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_identity_created
 ON timrx_billing.ledger_entries(identity_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_refund_once
+ON timrx_billing.ledger_entries (ref_type, ref_id, entry_type)
+WHERE entry_type = 'refund';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_refund_per_purchase
+ON timrx_billing.ledger_entries (identity_id, ref_id)
+WHERE entry_type = 'refund' AND ref_type = 'purchase' AND ref_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ledger_chargeback_per_purchase
+ON timrx_billing.ledger_entries (identity_id, ref_id)
+WHERE entry_type = 'chargeback' AND ref_type = 'purchase' AND ref_id IS NOT NULL;
 
 -- Unique index for charge idempotency: (identity_id, ref_type, ref_id)
 -- Ensures the same (identity, action, job_id/upstream_id) combo can only be charged once
@@ -134,6 +144,8 @@ ON timrx_billing.purchases(provider, provider_payment_id);
 CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
 ON timrx_billing.purchases (provider, payment_id)
 WHERE payment_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_purchases_provider_payment_id
+ON timrx_billing.purchases (provider, provider_payment_id);
 
 ALTER TABLE timrx_billing.purchases
   ADD COLUMN IF NOT EXISTS payment_id TEXT;
@@ -462,5 +474,36 @@ DROP TRIGGER IF EXISTS trg_active_jobs_touch ON timrx_app.active_jobs;
 CREATE TRIGGER trg_active_jobs_touch
 BEFORE UPDATE ON timrx_app.active_jobs
 FOR EACH ROW EXECUTE FUNCTION timrx_app.touch_updated_at();
+
+DROP VIEW IF EXISTS timrx_billing.v_credits_ledger;
+CREATE VIEW timrx_billing.v_credits_ledger AS
+SELECT
+  le.id                 AS ledger_id,
+  le.identity_id,
+  le.entry_type         AS source,
+  le.amount_credits     AS credits_delta,
+  le.ref_type,
+  le.ref_id,
+  le.meta,
+  le.created_at,
+  p.id                  AS purchase_id,
+  p.provider,
+  p.provider_payment_id,
+  p.payment_id,
+  p.plan_id,
+  p.status              AS purchase_status,
+  p.amount_gbp,
+  p.currency,
+  p.credits_granted     AS purchase_credits,
+  p.paid_at
+FROM timrx_billing.ledger_entries le
+LEFT JOIN timrx_billing.purchases p
+  ON le.ref_type = 'purchase'
+ AND le.ref_id IS NOT NULL
+ AND p.id::text = le.ref_id;
+
+UPDATE timrx_billing.ledger_entries
+SET ref_type = 'purchase'
+WHERE ref_type = 'purchases';
 
 COMMIT;
