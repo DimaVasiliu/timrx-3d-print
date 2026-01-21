@@ -10,6 +10,8 @@ from botocore.exceptions import ClientError
 load_dotenv()
 
 # Add backend directories to Python path for module imports
+# NOTE: Use append() instead of insert(0) to avoid shadowing root modules
+# This prevents circular import issues where modules could be imported from wrong location
 import sys
 _app_dir = Path(__file__).resolve().parent
 _backend_dir = _app_dir / "backend"
@@ -17,7 +19,7 @@ _routes_dir = _backend_dir / "routes"
 _services_dir = _backend_dir / "services"
 for _dir in [_backend_dir, _routes_dir, _services_dir]:
     if str(_dir) not in sys.path:
-        sys.path.insert(0, str(_dir))
+        sys.path.append(str(_dir))
 
 import requests
 try:
@@ -789,8 +791,8 @@ def _set_anonymous_user():
 # ─────────────────────────────────────────────────────────────
 for name, bp, prefix in _loaded_blueprints:
     app.register_blueprint(bp, url_prefix=prefix)
-if _loaded_blueprints:
-    print(f"[APP] Blueprints registered: {', '.join(name for name, _, _ in _loaded_blueprints)}")
+# Log loaded blueprints for Render startup verification
+print(f"[BOOT] Loaded blueprints: {[name for name, _, _ in _loaded_blueprints]}")
 
 # ─────────────────────────────────────────────────────────────
 # GET /api/wallet - Simple wallet balance endpoint
