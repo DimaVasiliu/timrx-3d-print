@@ -31,7 +31,7 @@ from db import (
     DatabaseError,
     DatabaseIntegrityError,
 )
-from config import config
+import config as cfg
 from emailer import notify_new_identity
 
 
@@ -45,7 +45,7 @@ class IdentityService:
     @staticmethod
     def get_session_id_from_request(request) -> Optional[str]:
         """Extract session ID from request cookies."""
-        return request.cookies.get(config.SESSION_COOKIE_NAME)
+        return request.cookies.get(cfg.config.SESSION_COOKIE_NAME)
 
     @staticmethod
     def set_session_cookie(response, session_id: str) -> None:
@@ -62,37 +62,37 @@ class IdentityService:
         """
         # Build cookie kwargs - only include domain if set (None omits it)
         cookie_kwargs = {
-            "max_age": config.SESSION_TTL_SECONDS,
-            "httponly": config.SESSION_COOKIE_HTTPONLY,
-            "secure": config.SESSION_COOKIE_SECURE,
-            "samesite": config.SESSION_COOKIE_SAMESITE,
-            "path": config.SESSION_COOKIE_PATH,
+            "max_age": cfg.config.SESSION_TTL_SECONDS,
+            "httponly": cfg.config.SESSION_COOKIE_HTTPONLY,
+            "secure": cfg.config.SESSION_COOKIE_SECURE,
+            "samesite": cfg.config.SESSION_COOKIE_SAMESITE,
+            "path": cfg.config.SESSION_COOKIE_PATH,
         }
 
         # Add domain for cross-subdomain sharing (e.g., ".timrx.live")
-        domain = config.SESSION_COOKIE_DOMAIN
+        domain = cfg.config.SESSION_COOKIE_DOMAIN
         if domain:
             cookie_kwargs["domain"] = domain
 
-        response.set_cookie(config.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
+        response.set_cookie(cfg.config.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
 
         print(
-            f"[SESSION] Cookie set: name={config.SESSION_COOKIE_NAME}, "
-            f"domain={domain!r}, secure={config.SESSION_COOKIE_SECURE}, "
-            f"samesite={config.SESSION_COOKIE_SAMESITE}"
+            f"[SESSION] Cookie set: name={cfg.config.SESSION_COOKIE_NAME}, "
+            f"domain={domain!r}, secure={cfg.config.SESSION_COOKIE_SECURE}, "
+            f"samesite={cfg.config.SESSION_COOKIE_SAMESITE}"
         )
 
     @staticmethod
     def clear_session_cookie(response) -> None:
         """Clear the session cookie from the response."""
         # Must include domain to properly clear cross-subdomain cookie
-        delete_kwargs = {"path": config.SESSION_COOKIE_PATH}
+        delete_kwargs = {"path": cfg.config.SESSION_COOKIE_PATH}
 
-        domain = config.SESSION_COOKIE_DOMAIN
+        domain = cfg.config.SESSION_COOKIE_DOMAIN
         if domain:
             delete_kwargs["domain"] = domain
 
-        response.delete_cookie(config.SESSION_COOKIE_NAME, **delete_kwargs)
+        response.delete_cookie(cfg.config.SESSION_COOKIE_NAME, **delete_kwargs)
 
     # ─────────────────────────────────────────────────────────────
     # Identity CRUD
@@ -129,7 +129,7 @@ class IdentityService:
             identity_id = str(identity["id"])
 
             # Create wallet with initial balance
-            initial_balance = config.FREE_CREDITS_ON_SIGNUP
+            initial_balance = cfg.config.FREE_CREDITS_ON_SIGNUP
             cur.execute(
                 f"""
                 INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
@@ -320,7 +320,7 @@ class IdentityService:
             DatabaseError: On database failure
         """
         session_id = str(uuid.uuid4())
-        expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
+        expires_at = now_utc() + timedelta(days=cfg.config.SESSION_TTL_DAYS)
 
         ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
@@ -436,8 +436,8 @@ class IdentityService:
             DatabaseError: On database failure
         """
         session_id = str(uuid.uuid4())
-        expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
-        initial_balance = config.FREE_CREDITS_ON_SIGNUP
+        expires_at = now_utc() + timedelta(days=cfg.config.SESSION_TTL_DAYS)
+        initial_balance = cfg.config.FREE_CREDITS_ON_SIGNUP
 
         ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
