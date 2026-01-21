@@ -82,9 +82,11 @@ INSERT INTO timrx_billing.action_costs(action_code, cost_credits, provider)
 VALUES
  ('MESHY_TEXT_TO_3D', 20, 'meshy'),
  ('MESHY_REFINE',     10, 'meshy'),
- ('MESHY_RETEXTURE',  10, 'meshy'),
+ ('MESHY_RETEXTURE',  15, 'meshy'),
  ('MESHY_IMAGE_TO_3D',30, 'meshy'),
- ('OPENAI_IMAGE',     12, 'openai')
+ ('MESHY_RIG',        25, 'meshy'),
+ ('OPENAI_IMAGE',     10, 'openai'),
+ ('VIDEO_GENERATE',   60, 'video')
 ON CONFLICT (action_code) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS timrx_billing.wallets (
