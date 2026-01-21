@@ -16,7 +16,6 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from config import config
 from middleware import require_session, require_email
 from pricing_service import PricingService
 from wallet_service import WalletService
