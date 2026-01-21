@@ -4,7 +4,7 @@ Middleware for TimrX Backend routes.
 Provides decorators and helpers for session/identity management in routes.
 
 Usage:
-    from backend.middleware import with_session, require_session
+    from middleware import with_session, require_session
 
     @app.route("/api/me")
     @with_session
@@ -17,13 +17,27 @@ Usage:
     def checkout():
         # Requires valid session, returns 401 if not authenticated
         return jsonify({"ok": True})
+
+Note: All service imports are lazy (inside functions) to avoid circular import issues.
 """
 
 from functools import wraps
 from flask import request, g, jsonify, make_response
 
-from identity_service import IdentityService
-from db import DatabaseError
+# NOTE: Do NOT import IdentityService, config, or db at module level!
+# These cause circular imports. Import them lazily inside functions.
+
+
+def _get_identity_service():
+    """Lazy import of IdentityService to avoid circular imports."""
+    from identity_service import IdentityService
+    return IdentityService
+
+
+def _get_database_error():
+    """Lazy import of DatabaseError to avoid circular imports."""
+    from db import DatabaseError
+    return DatabaseError
 
 
 def with_session(f):
@@ -40,6 +54,10 @@ def with_session(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Lazy imports to avoid circular import at module load time
+        IdentityService = _get_identity_service()
+        DatabaseError = _get_database_error()
+
         # Create response wrapper to set cookies
         try:
             # Check for existing valid session first
@@ -108,6 +126,10 @@ def require_session(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Lazy imports to avoid circular import at module load time
+        IdentityService = _get_identity_service()
+        DatabaseError = _get_database_error()
+
         try:
             identity = IdentityService.get_current_identity(request)
 
@@ -146,6 +168,10 @@ def require_email(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Lazy imports to avoid circular import at module load time
+        IdentityService = _get_identity_service()
+        DatabaseError = _get_database_error()
+
         try:
             identity = IdentityService.get_current_identity(request)
 
@@ -189,6 +215,7 @@ def get_identity_from_request():
     Returns None if no valid session.
     Use this when you don't want a decorator.
     """
+    IdentityService = _get_identity_service()
     return IdentityService.get_current_identity(request)
 
 
@@ -197,6 +224,7 @@ def get_session_id_from_request():
     Helper function to get session ID from current request.
     Returns None if no session cookie.
     """
+    IdentityService = _get_identity_service()
     return IdentityService.get_session_id_from_request(request)
 
 
@@ -214,10 +242,13 @@ def require_admin(f):
         - g.admin_email: The admin email (if email-based auth)
         - g.identity: The identity (if email-based auth)
     """
-    from config import config
-
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Lazy imports to avoid circular import at module load time
+        from config import config
+        IdentityService = _get_identity_service()
+        DatabaseError = _get_database_error()
+
         # Check if admin auth is configured at all
         if not config.ADMIN_AUTH_CONFIGURED:
             return jsonify({
