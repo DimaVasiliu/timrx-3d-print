@@ -444,7 +444,7 @@ class PurchaseService:
                     identity_id,
                     LedgerEntryType.PURCHASE_CREDIT,
                     credits_granted,  # Positive amount
-                    "purchases",
+                    "purchase",
                     purchase_id,
                     json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp}),
                 ),
