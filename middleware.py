@@ -24,6 +24,54 @@ Note: All service imports are lazy (inside functions) to avoid circular import i
 from functools import wraps
 from flask import request, g, jsonify, make_response
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG: Session Cookie Diagnostics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _log_session_debug(endpoint_name: str):
+    """
+    Log detailed session/cookie diagnostics for debugging cookie collisions.
+    Call this at the start of session-related middleware.
+    """
+    try:
+        from config import config
+
+        # Only log for specific endpoints to reduce noise
+        path = request.path
+        if not any(p in path for p in ["/api/me", "/api/billing/checkout", "/api/auth/"]):
+            return
+
+        # Get raw Cookie header
+        raw_cookie_header = request.headers.get("Cookie", "(no Cookie header)")
+
+        # Get parsed cookie value
+        parsed_sid = request.cookies.get("timrx_sid", "(not found)")
+
+        # Count how many timrx_sid appear in raw header (detect collision)
+        sid_count = raw_cookie_header.count("timrx_sid=")
+
+        print("=" * 70)
+        print(f"[SESSION DEBUG] {endpoint_name} - {request.method} {path}")
+        print("-" * 70)
+        print("  Config:")
+        print(f"    IS_PROD={config.IS_PROD}, IS_RENDER={config.IS_RENDER}")
+        print(f"    SESSION_COOKIE_DOMAIN={config.SESSION_COOKIE_DOMAIN!r}")
+        print(f"    SESSION_COOKIE_SAMESITE={config.SESSION_COOKIE_SAMESITE!r}")
+        print(f"    SESSION_COOKIE_SECURE={config.SESSION_COOKIE_SECURE}")
+        print("  Request:")
+        print(f"    Host: {request.host}")
+        print(f"    Origin: {request.headers.get('Origin', '(none)')}")
+        print(f"    timrx_sid count in Cookie header: {sid_count}")
+        if sid_count > 1:
+            print("    WARNING: COOKIE COLLISION DETECTED! Multiple timrx_sid values!")
+        print(f"    Raw Cookie header: {raw_cookie_header[:200]}{'...' if len(raw_cookie_header) > 200 else ''}")
+        print(f"    Parsed timrx_sid: {parsed_sid[:20] if parsed_sid != '(not found)' else parsed_sid}...")
+        print("=" * 70)
+
+    except Exception as e:
+        print(f"[SESSION DEBUG] Error in debug logging: {e}")
+
 # NOTE: Do NOT import IdentityService, config, or db at module level!
 # These cause circular imports. Import them lazily inside functions.
 
@@ -57,6 +105,9 @@ def with_session(f):
         # Lazy imports to avoid circular import at module load time
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
+
+        # DEBUG: Log session diagnostics
+        _log_session_debug("with_session")
 
         # Create response wrapper to set cookies
         try:
@@ -130,10 +181,22 @@ def require_session(f):
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
+        # DEBUG: Log session diagnostics
+        _log_session_debug("require_session")
+
         try:
+            # Get session ID first for logging
+            session_id = IdentityService.get_session_id_from_request(request)
             identity = IdentityService.get_current_identity(request)
 
             if not identity:
+                # DEBUG: Log why we're returning 401
+                print(
+                    f"[MIDDLEWARE] require_session 401: "
+                    f"session_id={session_id[:16] + '...' if session_id else 'None'}, "
+                    f"path={request.path}, "
+                    f"identity=None (session invalid/expired/revoked)"
+                )
                 return jsonify({
                     "error": {
                         "code": "UNAUTHORIZED",
@@ -141,7 +204,7 @@ def require_session(f):
                     }
                 }), 401
 
-            g.session_id = IdentityService.get_session_id_from_request(request)
+            g.session_id = session_id
             g.identity_id = str(identity["id"])
             g.identity = identity
 
