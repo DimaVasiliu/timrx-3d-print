@@ -6,6 +6,11 @@ Anonymous-first identity system:
 - Email can be attached later (for purchases/recovery)
 - Sessions are stored in HttpOnly cookies
 
+Cookie Collision Handling:
+- Browsers may have multiple timrx_sid cookies (host-only vs domain cookie)
+- We parse ALL values and select the one with an ACTIVE session in DB
+- Legacy/invalid cookies are expired in responses
+
 Usage:
     from backend.services.identity_service import IdentityService
 
@@ -14,10 +19,12 @@ Usage:
     identity = IdentityService.get_identity(identity_id)
 """
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, timedelta
 import uuid
 import hashlib
+import os
+import re
 
 from db import (
     transaction,
@@ -34,18 +41,153 @@ from db import (
 import config as cfg
 from emailer import notify_new_identity
 
+# Debug flag for verbose cookie logging (set SESSION_DEBUG=1 to enable)
+SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
+
 
 class IdentityService:
     """Service for managing identities and sessions."""
 
     # ─────────────────────────────────────────────────────────────
-    # Cookie Management
+    # Cookie Parsing & Collision Resolution
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _parse_all_session_ids_from_header(request) -> List[str]:
+        """
+        Parse ALL timrx_sid values from the raw Cookie header.
+
+        When browsers have cookie collisions (multiple cookies with same name
+        but different Domain attributes), Flask's request.cookies only returns
+        one value. We need to parse the raw header to get all of them.
+
+        Returns: List of session ID strings (may be empty, may have duplicates removed)
+        """
+        raw_cookie = request.headers.get("Cookie", "")
+        if not raw_cookie:
+            return []
+
+        cookie_name = cfg.config.SESSION_COOKIE_NAME
+        # Pattern: timrx_sid=<value> where value continues until ; or end
+        # Cookie values are typically alphanumeric + hyphens (UUIDs)
+        pattern = rf'{re.escape(cookie_name)}=([a-fA-F0-9\-]+)'
+        matches = re.findall(pattern, raw_cookie)
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique = []
+        for sid in matches:
+            if sid not in seen:
+                seen.add(sid)
+                unique.append(sid)
+
+        return unique
+
+    @staticmethod
+    def _check_session_active(session_id: str) -> bool:
+        """
+        Check if a session ID corresponds to an active session in the database.
+        Active = exists, not revoked, not expired.
+
+        This is a lightweight check (no identity join) for collision resolution.
+        """
+        if not session_id:
+            return False
+
+        try:
+            result = query_one(
+                f"""
+                SELECT 1 FROM {Tables.SESSIONS}
+                WHERE id = %s
+                  AND revoked_at IS NULL
+                  AND expires_at > NOW()
+                """,
+                (session_id,),
+            )
+            return result is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def resolve_session_id(request) -> Tuple[Optional[str], List[str], str]:
+        """
+        Resolve the correct session ID from potentially multiple cookie values.
+
+        Strategy:
+        1. Parse all timrx_sid values from raw Cookie header
+        2. Check each against DB for active session
+        3. Return the first active one, or None if none active
+
+        Returns:
+            Tuple of (selected_session_id, all_candidates, reason)
+            - selected_session_id: The session ID to use, or None
+            - all_candidates: List of all session IDs found in cookies
+            - reason: Why this session was selected (for logging)
+        """
+        candidates = IdentityService._parse_all_session_ids_from_header(request)
+
+        if not candidates:
+            # Fallback to Flask's parsed value (in case our regex missed something)
+            flask_sid = request.cookies.get(cfg.config.SESSION_COOKIE_NAME)
+            if flask_sid:
+                candidates = [flask_sid]
+
+        if not candidates:
+            return (None, [], "no_cookies")
+
+        if len(candidates) == 1:
+            # Single cookie - just use it (will be validated later)
+            return (candidates[0], candidates, "single_cookie")
+
+        # Multiple cookies detected - check which is active
+        if SESSION_DEBUG:
+            print(f"[SESSION] Cookie collision: {len(candidates)} timrx_sid values found")
+
+        active_sessions = []
+        for sid in candidates:
+            if IdentityService._check_session_active(sid):
+                active_sessions.append(sid)
+
+        if len(active_sessions) == 1:
+            selected = active_sessions[0]
+            reason = "single_active_from_collision"
+            if SESSION_DEBUG:
+                print(f"[SESSION] Resolved collision: selected {selected[:8]}... (only active session)")
+            return (selected, candidates, reason)
+
+        if len(active_sessions) > 1:
+            # Multiple active sessions - pick the first one (arbitrary but deterministic)
+            selected = active_sessions[0]
+            reason = "first_active_from_multiple"
+            if SESSION_DEBUG:
+                print(f"[SESSION] Multiple active sessions in collision, picking first: {selected[:8]}...")
+            return (selected, candidates, reason)
+
+        # No active sessions found - return first candidate (will fail validation, new session created)
+        reason = "no_active_sessions"
+        if SESSION_DEBUG:
+            print(f"[SESSION] No active sessions among {len(candidates)} candidates")
+        return (candidates[0], candidates, reason)
+
+    @staticmethod
     def get_session_id_from_request(request) -> Optional[str]:
-        """Extract session ID from request cookies."""
-        return request.cookies.get(cfg.config.SESSION_COOKIE_NAME)
+        """
+        Extract session ID from request cookies.
+
+        Handles cookie collisions by checking which session is actually active.
+        """
+        selected, candidates, reason = IdentityService.resolve_session_id(request)
+
+        # Log collision detection (always log collisions, debug for normal cases)
+        if len(candidates) > 1:
+            print(
+                f"[SESSION] COLLISION RESOLVED: {len(candidates)} cookies -> "
+                f"selected={selected[:8] + '...' if selected else 'None'}, reason={reason}"
+            )
+        elif SESSION_DEBUG and selected:
+            print(f"[SESSION] Single cookie: {selected[:8]}...")
+
+        return selected
 
     @staticmethod
     def set_session_cookie(response, session_id: str) -> None:
@@ -80,13 +222,14 @@ class IdentityService:
             canonical_secure = False
 
         # ─────────────────────────────────────────────────────────────
-        # LEGACY COOKIE KILLER: Expire any host-only cookie that may exist
-        # This removes cookies set without domain (e.g., 3d.timrx.live host-only)
+        # LEGACY COOKIE KILLER: Expire ALL collision-causing cookies
+        # This removes:
+        # 1. Host-only cookies (no domain, scoped to 3d.timrx.live exactly)
+        # 2. Explicit 3d.timrx.live domain cookies (if any)
         # Must be done BEFORE setting the canonical cookie
         # ─────────────────────────────────────────────────────────────
         if is_prod and canonical_domain:
-            # Expire the host-only cookie (no domain attribute = host-only)
-            # Using SameSite=Lax here since we're just expiring it
+            # 1. Expire host-only cookie (no domain attribute = host-only)
             response.set_cookie(
                 cfg.config.SESSION_COOKIE_NAME,
                 "",  # Empty value
@@ -98,10 +241,38 @@ class IdentityService:
                 samesite="Lax",
                 # NO domain attribute = targets host-only cookie
             )
-            print(
-                "[SESSION] Legacy cookie killer: expired host-only cookie "
-                "(no domain, will remove 3d.timrx.live collision)"
+
+            # 2. Expire explicit 3d.timrx.live domain cookie (if exists)
+            response.set_cookie(
+                cfg.config.SESSION_COOKIE_NAME,
+                "",
+                max_age=0,
+                expires=0,
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="Lax",
+                domain="3d.timrx.live",  # Explicit subdomain cookie
             )
+
+            # 3. Also try www.timrx.live in case that got set incorrectly
+            response.set_cookie(
+                cfg.config.SESSION_COOKIE_NAME,
+                "",
+                max_age=0,
+                expires=0,
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="Lax",
+                domain="www.timrx.live",
+            )
+
+            if SESSION_DEBUG:
+                print(
+                    "[SESSION] Legacy cookie killer: expired host-only + "
+                    "3d.timrx.live + www.timrx.live cookies"
+                )
 
         # ─────────────────────────────────────────────────────────────
         # SET CANONICAL COOKIE with proper domain
@@ -132,28 +303,30 @@ class IdentityService:
     @staticmethod
     def clear_session_cookie(response) -> None:
         """
-        Clear the session cookie from the response.
-        In production, clears BOTH the canonical (.timrx.live) and any
-        host-only cookie to prevent collision issues.
+        Clear ALL session cookies from the response.
+        In production, clears the canonical (.timrx.live), host-only,
+        and explicit subdomain cookies to prevent collision issues.
         """
         is_prod = cfg.config.IS_PROD
+        cookie_name = cfg.config.SESSION_COOKIE_NAME
         canonical_domain = cfg.config.SESSION_COOKIE_DOMAIN or (".timrx.live" if is_prod else None)
 
-        # In production: clear host-only cookie first (legacy cleanup)
         if is_prod:
-            response.delete_cookie(
-                cfg.config.SESSION_COOKIE_NAME,
-                path="/",
-                # No domain = clears host-only cookie
-            )
+            # 1. Clear host-only cookie (no domain)
+            response.delete_cookie(cookie_name, path="/")
 
-        # Clear canonical cookie with domain
-        delete_kwargs = {"path": "/"}
+            # 2. Clear explicit subdomain cookies
+            for subdomain in ["3d.timrx.live", "www.timrx.live"]:
+                response.delete_cookie(cookie_name, path="/", domain=subdomain)
+
+        # 3. Clear canonical cookie with proper domain
         if canonical_domain:
-            delete_kwargs["domain"] = canonical_domain
+            response.delete_cookie(cookie_name, path="/", domain=canonical_domain)
+        else:
+            response.delete_cookie(cookie_name, path="/")
 
-        response.delete_cookie(cfg.config.SESSION_COOKIE_NAME, **delete_kwargs)
-        print(f"[SESSION] Cookies cleared: domain={canonical_domain!r}, is_prod={is_prod}")
+        if SESSION_DEBUG:
+            print(f"[SESSION] All cookies cleared: canonical_domain={canonical_domain!r}, is_prod={is_prod}")
 
     # ─────────────────────────────────────────────────────────────
     # Identity CRUD
