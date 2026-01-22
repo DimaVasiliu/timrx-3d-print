@@ -16,7 +16,7 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from middleware import require_session, require_email
+from middleware import require_session, require_email, no_cache
 from pricing_service import PricingService
 from wallet_service import WalletService
 from reservation_service import ReservationService
@@ -128,6 +128,7 @@ def get_costs():
 
 @bp.route("/ledger", methods=["GET"])
 @require_session
+@no_cache
 def get_ledger():
     """
     Get ledger entries for the current identity.
@@ -443,6 +444,7 @@ def create_mollie_checkout():
 
 @bp.route("/confirm", methods=["GET"])
 @require_session
+@no_cache
 def confirm_payment():
     """
     Confirm a Mollie payment and grant credits if paid.
@@ -749,6 +751,7 @@ def mollie_webhook():
 
 @bp.route("/purchase/<purchase_id>", methods=["GET"])
 @require_session
+@no_cache
 def get_purchase(purchase_id):
     """
     Get purchase details by ID.
@@ -806,6 +809,7 @@ def get_purchase(purchase_id):
 
 @bp.route("/purchases", methods=["GET"])
 @require_session
+@no_cache
 def get_purchases():
     """
     Get purchase history for the current identity.
