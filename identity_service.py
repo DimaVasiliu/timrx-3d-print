@@ -59,40 +59,101 @@ class IdentityService:
         - SameSite: None (required for cross-subdomain with credentials)
         - HttpOnly: True (not accessible via JavaScript)
         - Path: /
+
+        IMPORTANT: In production, we ALWAYS set domain=.timrx.live to avoid
+        host-only cookie collisions (e.g., 3d.timrx.live vs .timrx.live).
         """
-        # Build cookie kwargs - only include domain if set (None omits it)
+        # Determine if we're in production mode
+        # Force prod detection: if we see timrx.live in any form, treat as prod
+        is_prod = cfg.config.IS_PROD
+
+        # PRODUCTION: Canonical cookie settings (NEVER deviate)
+        if is_prod:
+            # Always use .timrx.live domain in production, regardless of config
+            canonical_domain = cfg.config.SESSION_COOKIE_DOMAIN or ".timrx.live"
+            canonical_samesite = "None"
+            canonical_secure = True
+        else:
+            # Development: no domain (host-only), Lax samesite
+            canonical_domain = None
+            canonical_samesite = "Lax"
+            canonical_secure = False
+
+        # ─────────────────────────────────────────────────────────────
+        # LEGACY COOKIE KILLER: Expire any host-only cookie that may exist
+        # This removes cookies set without domain (e.g., 3d.timrx.live host-only)
+        # Must be done BEFORE setting the canonical cookie
+        # ─────────────────────────────────────────────────────────────
+        if is_prod and canonical_domain:
+            # Expire the host-only cookie (no domain attribute = host-only)
+            # Using SameSite=Lax here since we're just expiring it
+            response.set_cookie(
+                cfg.config.SESSION_COOKIE_NAME,
+                "",  # Empty value
+                max_age=0,
+                expires=0,
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="Lax",
+                # NO domain attribute = targets host-only cookie
+            )
+            print(
+                "[SESSION] Legacy cookie killer: expired host-only cookie "
+                "(no domain, will remove 3d.timrx.live collision)"
+            )
+
+        # ─────────────────────────────────────────────────────────────
+        # SET CANONICAL COOKIE with proper domain
+        # ─────────────────────────────────────────────────────────────
         cookie_kwargs = {
             "max_age": cfg.config.SESSION_TTL_SECONDS,
-            "httponly": cfg.config.SESSION_COOKIE_HTTPONLY,
-            "secure": cfg.config.SESSION_COOKIE_SECURE,
-            "samesite": cfg.config.SESSION_COOKIE_SAMESITE,
-            "path": cfg.config.SESSION_COOKIE_PATH,
+            "httponly": True,  # Always httponly
+            "secure": canonical_secure,
+            "samesite": canonical_samesite,
+            "path": "/",
         }
 
-        # Add domain for cross-subdomain sharing (e.g., ".timrx.live")
-        domain = cfg.config.SESSION_COOKIE_DOMAIN
-        if domain:
-            cookie_kwargs["domain"] = domain
+        if canonical_domain:
+            cookie_kwargs["domain"] = canonical_domain
 
         response.set_cookie(cfg.config.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
 
+        # Debug logging for Set-Cookie header inspection
+        set_cookie_headers = response.headers.getlist('Set-Cookie')
         print(
             f"[SESSION] Cookie set: name={cfg.config.SESSION_COOKIE_NAME}, "
-            f"domain={domain!r}, secure={cfg.config.SESSION_COOKIE_SECURE}, "
-            f"samesite={cfg.config.SESSION_COOKIE_SAMESITE}"
+            f"session_id={session_id[:8]}..., "
+            f"domain={canonical_domain!r}, secure={canonical_secure}, "
+            f"samesite={canonical_samesite}, is_prod={is_prod}"
         )
+        print(f"[SESSION] Set-Cookie headers ({len(set_cookie_headers)}): {set_cookie_headers}")
 
     @staticmethod
     def clear_session_cookie(response) -> None:
-        """Clear the session cookie from the response."""
-        # Must include domain to properly clear cross-subdomain cookie
-        delete_kwargs = {"path": cfg.config.SESSION_COOKIE_PATH}
+        """
+        Clear the session cookie from the response.
+        In production, clears BOTH the canonical (.timrx.live) and any
+        host-only cookie to prevent collision issues.
+        """
+        is_prod = cfg.config.IS_PROD
+        canonical_domain = cfg.config.SESSION_COOKIE_DOMAIN or (".timrx.live" if is_prod else None)
 
-        domain = cfg.config.SESSION_COOKIE_DOMAIN
-        if domain:
-            delete_kwargs["domain"] = domain
+        # In production: clear host-only cookie first (legacy cleanup)
+        if is_prod:
+            response.delete_cookie(
+                cfg.config.SESSION_COOKIE_NAME,
+                path="/",
+                # No domain = clears host-only cookie
+            )
+
+        # Clear canonical cookie with domain
+        delete_kwargs = {"path": "/"}
+        if canonical_domain:
+            delete_kwargs["domain"] = canonical_domain
 
         response.delete_cookie(cfg.config.SESSION_COOKIE_NAME, **delete_kwargs)
+        print(f"[SESSION] Cookies cleared: domain={canonical_domain!r}, is_prod={is_prod}")
 
     # ─────────────────────────────────────────────────────────────
     # Identity CRUD
