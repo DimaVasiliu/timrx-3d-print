@@ -21,9 +21,12 @@ Usage:
 Note: All service imports are lazy (inside functions) to avoid circular import issues.
 """
 
+import os
 from functools import wraps
 from flask import request, g, jsonify, make_response
 
+# Debug flag for verbose session logging (set SESSION_DEBUG=1 to enable)
+SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEBUG: Session Cookie Diagnostics
@@ -36,10 +39,9 @@ def _log_session_debug(endpoint_name: str):
     """
     try:
         from config import config
-        import os
 
-        # Check if debug logging is enabled
-        session_debug = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
+        # Use module-level SESSION_DEBUG constant
+        session_debug = SESSION_DEBUG
 
         # Only log for specific endpoints to reduce noise
         path = request.path
@@ -256,13 +258,14 @@ def require_session(f):
             identity = IdentityService.get_current_identity(request)
 
             if not identity:
-                # DEBUG: Log why we're returning 401
-                print(
-                    f"[MIDDLEWARE] require_session 401: "
-                    f"session_id={session_id[:16] + '...' if session_id else 'None'}, "
-                    f"path={request.path}, "
-                    f"identity=None (session invalid/expired/revoked)"
-                )
+                # DEBUG: Log why we're returning 401 (only when SESSION_DEBUG=1)
+                if SESSION_DEBUG:
+                    print(
+                        f"[MIDDLEWARE] require_session 401: "
+                        f"session_id={session_id[:16] + '...' if session_id else 'None'}, "
+                        f"path={request.path}, "
+                        f"identity=None (session invalid/expired/revoked)"
+                    )
                 return jsonify({
                     "error": {
                         "code": "UNAUTHORIZED",
