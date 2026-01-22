@@ -12,7 +12,7 @@ This module provides a simple, stable interface for:
 
 from flask import Blueprint, request, jsonify, g
 
-from middleware import require_session
+from middleware import require_session, no_cache
 from wallet_service import WalletService, LedgerEntryType
 from pricing_service import PricingService
 from db import transaction, fetch_one, Tables, DatabaseIntegrityError
@@ -84,6 +84,7 @@ def _resolve_action_cost(action: str) -> tuple[str, int]:
 
 @bp.route("/wallet", methods=["GET"])
 @require_session
+@no_cache
 def get_wallet():
     """
     Get current wallet credits for the active identity.
