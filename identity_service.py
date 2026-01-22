@@ -222,14 +222,22 @@ class IdentityService:
             canonical_secure = False
 
         # ─────────────────────────────────────────────────────────────
-        # LEGACY COOKIE KILLER: Expire ALL collision-causing cookies
-        # This removes:
-        # 1. Host-only cookies (no domain, scoped to 3d.timrx.live exactly)
-        # 2. Explicit 3d.timrx.live domain cookies (if any)
-        # Must be done BEFORE setting the canonical cookie
+        # LEGACY COOKIE KILLER: Expire host-only cookie from current host
+        #
+        # Cookie Domain rules (RFC 6265):
+        # - A response from 3d.timrx.live can only set/delete cookies where
+        #   the Domain attribute is a suffix-match of the response host.
+        # - We CAN manage: no-domain (host-only), Domain=.timrx.live, Domain=3d.timrx.live
+        # - We CANNOT manage: Domain=www.timrx.live (sibling host, browser ignores)
+        #
+        # Strategy:
+        # 1. Delete host-only cookie (no Domain attr) - clears 3d.timrx.live-scoped cookie
+        # 2. Set canonical cookie with Domain=.timrx.live - shared across all subdomains
         # ─────────────────────────────────────────────────────────────
         if is_prod and canonical_domain:
-            # 1. Expire host-only cookie (no domain attribute = host-only)
+            # Expire host-only cookie (no domain attribute = scoped to current host only)
+            # This removes any cookie that was set without a Domain attribute,
+            # which would be scoped to exactly the response host (e.g., 3d.timrx.live)
             response.set_cookie(
                 cfg.config.SESSION_COOKIE_NAME,
                 "",  # Empty value
@@ -239,40 +247,11 @@ class IdentityService:
                 secure=True,
                 httponly=True,
                 samesite="Lax",
-                # NO domain attribute = targets host-only cookie
-            )
-
-            # 2. Expire explicit 3d.timrx.live domain cookie (if exists)
-            response.set_cookie(
-                cfg.config.SESSION_COOKIE_NAME,
-                "",
-                max_age=0,
-                expires=0,
-                path="/",
-                secure=True,
-                httponly=True,
-                samesite="Lax",
-                domain="3d.timrx.live",  # Explicit subdomain cookie
-            )
-
-            # 3. Also try www.timrx.live in case that got set incorrectly
-            response.set_cookie(
-                cfg.config.SESSION_COOKIE_NAME,
-                "",
-                max_age=0,
-                expires=0,
-                path="/",
-                secure=True,
-                httponly=True,
-                samesite="Lax",
-                domain="www.timrx.live",
+                # NO domain attribute = targets host-only cookie on current host
             )
 
             if SESSION_DEBUG:
-                print(
-                    "[SESSION] Legacy cookie killer: expired host-only + "
-                    "3d.timrx.live + www.timrx.live cookies"
-                )
+                print("[SESSION] Legacy cookie killer: expired host-only cookie (current host)")
 
         # ─────────────────────────────────────────────────────────────
         # SET CANONICAL COOKIE with proper domain
@@ -303,30 +282,33 @@ class IdentityService:
     @staticmethod
     def clear_session_cookie(response) -> None:
         """
-        Clear ALL session cookies from the response.
-        In production, clears the canonical (.timrx.live), host-only,
-        and explicit subdomain cookies to prevent collision issues.
+        Clear session cookies from the response.
+
+        Cookie Domain rules (RFC 6265):
+        - A response can only delete cookies where Domain is a suffix-match of response host.
+        - From 3d.timrx.live: can delete host-only and Domain=.timrx.live
+        - From 3d.timrx.live: CANNOT delete Domain=www.timrx.live (sibling, browser ignores)
+
+        In production, clears:
+        1. Host-only cookie (scoped to current host)
+        2. Canonical cookie (Domain=.timrx.live, shared across subdomains)
         """
         is_prod = cfg.config.IS_PROD
         cookie_name = cfg.config.SESSION_COOKIE_NAME
         canonical_domain = cfg.config.SESSION_COOKIE_DOMAIN or (".timrx.live" if is_prod else None)
 
         if is_prod:
-            # 1. Clear host-only cookie (no domain)
+            # 1. Clear host-only cookie (no domain = current host only)
             response.delete_cookie(cookie_name, path="/")
 
-            # 2. Clear explicit subdomain cookies
-            for subdomain in ["3d.timrx.live", "www.timrx.live"]:
-                response.delete_cookie(cookie_name, path="/", domain=subdomain)
-
-        # 3. Clear canonical cookie with proper domain
+        # 2. Clear canonical cookie with proper domain
         if canonical_domain:
             response.delete_cookie(cookie_name, path="/", domain=canonical_domain)
         else:
             response.delete_cookie(cookie_name, path="/")
 
         if SESSION_DEBUG:
-            print(f"[SESSION] All cookies cleared: canonical_domain={canonical_domain!r}, is_prod={is_prod}")
+            print(f"[SESSION] Cookies cleared: host-only + domain={canonical_domain!r}")
 
     # ─────────────────────────────────────────────────────────────
     # Identity CRUD
