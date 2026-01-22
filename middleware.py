@@ -36,6 +36,10 @@ def _log_session_debug(endpoint_name: str):
     """
     try:
         from config import config
+        import os
+
+        # Check if debug logging is enabled
+        session_debug = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 
         # Only log for specific endpoints to reduce noise
         path = request.path
@@ -45,11 +49,23 @@ def _log_session_debug(endpoint_name: str):
         # Get raw Cookie header
         raw_cookie_header = request.headers.get("Cookie", "(no Cookie header)")
 
-        # Get parsed cookie value
-        parsed_sid = request.cookies.get("timrx_sid", "(not found)")
+        # Get parsed cookie value (Flask's version)
+        flask_parsed_sid = request.cookies.get("timrx_sid", "(not found)")
 
         # Count how many timrx_sid appear in raw header (detect collision)
         sid_count = raw_cookie_header.count("timrx_sid=")
+
+        # Get resolved session ID using our collision-aware logic
+        try:
+            from identity_service import IdentityService
+            resolved_sid, candidates, reason = IdentityService.resolve_session_id(request)
+        except Exception:
+            resolved_sid, candidates, reason = None, [], "error"
+
+        # Always log collisions, otherwise only in debug mode
+        is_collision = sid_count > 1
+        if not is_collision and not session_debug:
+            return
 
         print("=" * 70)
         print(f"[SESSION DEBUG] {endpoint_name} - {request.method} {path}")
@@ -63,10 +79,14 @@ def _log_session_debug(endpoint_name: str):
         print(f"    Host: {request.host}")
         print(f"    Origin: {request.headers.get('Origin', '(none)')}")
         print(f"    timrx_sid count in Cookie header: {sid_count}")
-        if sid_count > 1:
-            print("    WARNING: COOKIE COLLISION DETECTED! Multiple timrx_sid values!")
-        print(f"    Raw Cookie header: {raw_cookie_header[:200]}{'...' if len(raw_cookie_header) > 200 else ''}")
-        print(f"    Parsed timrx_sid: {parsed_sid[:20] if parsed_sid != '(not found)' else parsed_sid}...")
+        if is_collision:
+            print("    *** COOKIE COLLISION DETECTED! ***")
+            print(f"    Candidates: {[s[:8] + '...' for s in candidates]}")
+            print(f"    Resolution: {reason}")
+        print(f"    Flask parsed: {flask_parsed_sid[:16] + '...' if flask_parsed_sid != '(not found)' else flask_parsed_sid}")
+        print(f"    Our resolved: {resolved_sid[:16] + '...' if resolved_sid else 'None'}")
+        if session_debug:
+            print(f"    Raw Cookie: {raw_cookie_header[:300]}{'...' if len(raw_cookie_header) > 300 else ''}")
         print("=" * 70)
 
     except Exception as e:
