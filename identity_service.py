@@ -269,15 +269,16 @@ class IdentityService:
 
         response.set_cookie(cfg.config.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
 
-        # Debug logging for Set-Cookie header inspection
-        set_cookie_headers = response.headers.getlist('Set-Cookie')
-        print(
-            f"[SESSION] Cookie set: name={cfg.config.SESSION_COOKIE_NAME}, "
-            f"session_id={session_id[:8]}..., "
-            f"domain={canonical_domain!r}, secure={canonical_secure}, "
-            f"samesite={canonical_samesite}, is_prod={is_prod}"
-        )
-        print(f"[SESSION] Set-Cookie headers ({len(set_cookie_headers)}): {set_cookie_headers}")
+        # Debug logging for Set-Cookie header inspection (only when SESSION_DEBUG=1)
+        if SESSION_DEBUG:
+            set_cookie_headers = response.headers.getlist('Set-Cookie')
+            print(
+                f"[SESSION] Cookie set: name={cfg.config.SESSION_COOKIE_NAME}, "
+                f"session_id={session_id[:8]}..., "
+                f"domain={canonical_domain!r}, secure={canonical_secure}, "
+                f"samesite={canonical_samesite}, is_prod={is_prod}"
+            )
+            print(f"[SESSION] Set-Cookie headers ({len(set_cookie_headers)}): {set_cookie_headers}")
 
     @staticmethod
     def clear_session_cookie(response) -> None:
