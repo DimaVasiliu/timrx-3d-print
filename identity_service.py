@@ -44,6 +44,13 @@ from emailer import notify_new_identity
 # Debug flag for verbose cookie logging (set SESSION_DEBUG=1 to enable)
 SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 
+# Production safety warning (one-time at startup)
+if SESSION_DEBUG and cfg.config.IS_PROD:
+    print(
+        "[WARN] SESSION_DEBUG enabled in production - "
+        "disable after troubleshooting (set SESSION_DEBUG=0 or remove env var)"
+    )
+
 
 class IdentityService:
     """Service for managing identities and sessions."""
@@ -178,14 +185,15 @@ class IdentityService:
         """
         selected, candidates, reason = IdentityService.resolve_session_id(request)
 
-        # Log collision detection (always log collisions, debug for normal cases)
-        if len(candidates) > 1:
-            print(
-                f"[SESSION] COLLISION RESOLVED: {len(candidates)} cookies -> "
-                f"selected={selected[:8] + '...' if selected else 'None'}, reason={reason}"
-            )
-        elif SESSION_DEBUG and selected:
-            print(f"[SESSION] Single cookie: {selected[:8]}...")
+        # Log collision detection (gated by SESSION_DEBUG)
+        if SESSION_DEBUG:
+            if len(candidates) > 1:
+                print(
+                    f"[SESSION] COLLISION RESOLVED: {len(candidates)} cookies -> "
+                    f"selected={selected[:8] + '...' if selected else 'None'}, reason={reason}"
+                )
+            elif selected:
+                print(f"[SESSION] Single cookie: {selected[:8]}...")
 
         return selected
 
@@ -555,7 +563,8 @@ class IdentityService:
         if not session:
             raise DatabaseError("Failed to create session")
 
-        print(f"[SESSION] Created session {session_id} for identity {identity_id}")
+        if SESSION_DEBUG:
+            print(f"[SESSION] Created session {session_id[:8]}... for identity {identity_id[:8]}...")
         return session
 
     @staticmethod
@@ -600,8 +609,8 @@ class IdentityService:
                 f"UPDATE {Tables.SESSIONS} SET revoked_at = NOW() WHERE id = %s AND revoked_at IS NULL",
                 (session_id,),
             )
-            if count > 0:
-                print(f"[SESSION] Revoked session {session_id}")
+            if count > 0 and SESSION_DEBUG:
+                print(f"[SESSION] Revoked session {session_id[:8]}...")
             return count > 0
         except DatabaseError:
             return False
@@ -628,7 +637,8 @@ class IdentityService:
                     f"UPDATE {Tables.SESSIONS} SET revoked_at = NOW() WHERE identity_id = %s AND revoked_at IS NULL",
                     (identity_id,),
                 )
-            print(f"[SESSION] Revoked {count} sessions for identity {identity_id}")
+            if SESSION_DEBUG:
+                print(f"[SESSION] Revoked {count} sessions for identity {identity_id[:8]}...")
             return count
         except DatabaseError:
             return 0
@@ -710,7 +720,8 @@ class IdentityService:
             if not session:
                 raise DatabaseError("Failed to create session")
 
-        print(f"[SESSION] Created anonymous session {session_id} for new identity {identity_id}")
+        if SESSION_DEBUG:
+            print(f"[SESSION] Created anonymous session {session_id[:8]}... for new identity {identity_id[:8]}...")
         return session_id, identity_id, identity
 
     @staticmethod
@@ -741,7 +752,8 @@ class IdentityService:
                 return cookie_session_id, str(identity["id"])
 
             # Session invalid/expired - do NOT reuse cookie value, create fresh
-            print(f"[SESSION] Invalid/expired session {cookie_session_id}, creating new")
+            if SESSION_DEBUG:
+                print(f"[SESSION] Invalid/expired session {cookie_session_id[:8]}..., creating new")
 
         # Create new anonymous identity + session atomically
         ip_address = request.remote_addr
@@ -810,7 +822,8 @@ class IdentityService:
 
         new_session = IdentityService.create_session(new_identity_id, ip_address, user_agent)
 
-        print(f"[SESSION] Linked session to identity {new_identity_id} (old session: {session_id})")
+        if SESSION_DEBUG:
+            print(f"[SESSION] Linked session to identity {new_identity_id[:8]}... (old session: {session_id[:8]}...)")
         return new_session
 
     # ─────────────────────────────────────────────────────────────
@@ -828,7 +841,7 @@ class IdentityService:
             count = execute(
                 f"DELETE FROM {Tables.SESSIONS} WHERE expires_at < NOW()"
             )
-            if count > 0:
+            if count > 0 and SESSION_DEBUG:
                 print(f"[SESSION] Cleaned up {count} expired sessions")
             return count
         except DatabaseError:
