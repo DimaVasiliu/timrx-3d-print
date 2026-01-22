@@ -62,11 +62,18 @@ def _log_session_debug(endpoint_name: str):
         except Exception:
             resolved_sid, candidates, reason = None, [], "error"
 
-        # Always log collisions, otherwise only in debug mode
+        # Collision detection
         is_collision = sid_count > 1
-        if not is_collision and not session_debug:
+
+        # Production: only log a minimal one-liner for collisions (for monitoring)
+        # Debug mode (SESSION_DEBUG=1): log verbose block
+        if not session_debug:
+            if is_collision:
+                # Minimal collision log for production monitoring
+                print(f"[SESSION] Cookie collision: {len(candidates)} cookies, resolved={reason}")
             return
 
+        # Verbose debug block (only when SESSION_DEBUG=1)
         print("=" * 70)
         print(f"[SESSION DEBUG] {endpoint_name} - {request.method} {path}")
         print("-" * 70)
@@ -85,8 +92,7 @@ def _log_session_debug(endpoint_name: str):
             print(f"    Resolution: {reason}")
         print(f"    Flask parsed: {flask_parsed_sid[:16] + '...' if flask_parsed_sid != '(not found)' else flask_parsed_sid}")
         print(f"    Our resolved: {resolved_sid[:16] + '...' if resolved_sid else 'None'}")
-        if session_debug:
-            print(f"    Raw Cookie: {raw_cookie_header[:300]}{'...' if len(raw_cookie_header) > 300 else ''}")
+        print(f"    Raw Cookie: {raw_cookie_header[:300]}{'...' if len(raw_cookie_header) > 300 else ''}")
         print("=" * 70)
 
     except Exception as e:
@@ -106,6 +112,46 @@ def _get_database_error():
     """Lazy import of DatabaseError to avoid circular imports."""
     from db import DatabaseError
     return DatabaseError
+
+
+def no_cache(f):
+    """
+    Decorator that adds Cache-Control headers to prevent caching.
+
+    Adds:
+        - Cache-Control: no-store, no-cache, must-revalidate, max-age=0
+        - Pragma: no-cache (for HTTP/1.0 compatibility)
+        - Expires: 0
+
+    Use for sensitive endpoints like /api/me, /api/credits/*, /api/billing/*.
+    This ensures Cloudflare returns CF-Cache-Status: DYNAMIC.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        result = f(*args, **kwargs)
+
+        # Handle different return types
+        if hasattr(result, 'headers'):
+            # Already a Response object
+            response = result
+        elif isinstance(result, tuple):
+            # Tuple (body, status) or (body, status, headers)
+            response = make_response(result[0], result[1] if len(result) > 1 else 200)
+            if len(result) > 2:
+                for key, value in result[2].items():
+                    response.headers[key] = value
+        else:
+            # Plain return value (dict, string, etc.)
+            response = make_response(result)
+
+        # Add no-cache headers
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+
+        return response
+
+    return decorated
 
 
 def with_session(f):
