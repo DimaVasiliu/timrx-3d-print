@@ -11,7 +11,7 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from middleware import with_session, require_session
+from middleware import with_session, require_session, no_cache
 from identity_service import IdentityService
 from wallet_service import WalletService
 
@@ -20,6 +20,7 @@ bp = Blueprint("me", __name__)
 
 @bp.route("", methods=["GET"])
 @with_session
+@no_cache
 def get_me():
     """
     Get current session info.
@@ -90,6 +91,7 @@ def attach_email():
 
 @bp.route("/wallet", methods=["GET"])
 @require_session
+@no_cache
 def get_wallet():
     """
     Get wallet information for Buy modal and action gating.
@@ -129,6 +131,7 @@ def get_wallet():
 
 @bp.route("/ledger", methods=["GET"])
 @require_session
+@no_cache
 def get_ledger():
     """
     Get billing ledger entries (credit grants, purchases, usage).
