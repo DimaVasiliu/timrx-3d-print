@@ -792,9 +792,10 @@ def _ensure_cors_headers(response):
     return response
 
 @app.before_request
-def _set_anonymous_user():
-    # Auth removed; keep request user_id consistently set to None.
-    g.user_id = None
+def _init_identity():
+    # Initialize identity context - will be overwritten by @with_session middleware
+    # g.identity_id is the authoritative identity (set by middleware)
+    g.identity_id = None
 
 # ─────────────────────────────────────────────────────────────
 # Register Blueprints (credits system)
@@ -3774,10 +3775,11 @@ def api_text_to_3d_start():
     if not MESHY_API_KEY:
         return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"text3d-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-preview"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
     if credit_error:
         return credit_error
 
@@ -3808,19 +3810,19 @@ def api_text_to_3d_start():
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         log_event("text-to-3d/start:meshy-resp", resp)
-        job_id = resp.get("result")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"ok": False, "error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     store = load_store()
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "preview",
         "prompt": prompt,
         "root_prompt": prompt,
@@ -3836,17 +3838,18 @@ def api_text_to_3d_start():
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,  # Track the internal UUID
     }
     save_store(store)
 
-    # Save to DB for recovery
-    save_active_job_to_db(job_id, "text-to-3d", "preview", store[job_id], user_id)
+    # Save to DB for recovery (meshy_task_id goes to upstream_job_id TEXT column)
+    save_active_job_to_db(meshy_task_id, "text-to-3d", "preview", store[meshy_task_id], user_id)
 
     # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,  # Return Meshy task ID to frontend for polling
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -3872,10 +3875,11 @@ def api_text_to_3d_refine():
     if not MESHY_API_KEY:
         return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"refine-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-refine"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
     if credit_error:
         return credit_error
 
@@ -3896,16 +3900,16 @@ def api_text_to_3d_refine():
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         log_event("text-to-3d/refine:meshy-resp", resp)
-        job_id = resp.get("result")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"ok": False, "error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     store = load_store()
     preview_meta = get_job_metadata(preview_task_id_input, store)
@@ -3913,7 +3917,7 @@ def api_text_to_3d_refine():
         preview_meta = get_job_metadata(preview_task_id, store)
     original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = preview_meta.get("root_prompt") or original_prompt
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "refine",
         "preview_task_id": preview_task_id,
         "created_at": now_s() * 1000,
@@ -3925,16 +3929,17 @@ def api_text_to_3d_refine():
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
-    save_active_job_to_db(job_id, "text-to-3d", "refine", store[job_id], user_id)
+    save_active_job_to_db(meshy_task_id, "text-to-3d", "refine", store[meshy_task_id], user_id)
 
     # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -3959,10 +3964,11 @@ def api_text_to_3d_remesh_start():
     if not MESHY_API_KEY:
         return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"remesh-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
     if credit_error:
         return credit_error
 
@@ -3990,19 +3996,19 @@ def api_text_to_3d_remesh_start():
     # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        job_id = resp.get("result")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"ok": False, "error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     store = load_store()
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "preview",
         "prompt": prompt,
         "art_style": payload["art_style"],
@@ -4017,6 +4023,7 @@ def api_text_to_3d_remesh_start():
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
@@ -4024,7 +4031,7 @@ def api_text_to_3d_remesh_start():
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -4041,8 +4048,8 @@ def api_text_to_3d_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    user_id = g.user_id
-    if not verify_job_ownership(job_id, user_id):
+    identity_id = g.identity_id
+    if not verify_job_ownership(job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -4113,7 +4120,7 @@ def api_save_active_job():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        user_id = g.user_id
+        identity_id = g.identity_id
         data = request.get_json() or {}
         job_id = data.get("job_id")
         job_type = data.get("job_type", "unknown")
@@ -4134,7 +4141,7 @@ def api_get_active_jobs():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        user_id = g.user_id
+        identity_id = g.identity_id
         jobs = get_active_jobs_from_db(user_id)
         return jsonify(jobs)
     except Exception as e:
@@ -4146,7 +4153,7 @@ def api_complete_job(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        user_id = g.user_id
+        identity_id = g.identity_id
         mark_job_completed_in_db(job_id, user_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
@@ -4158,7 +4165,7 @@ def api_delete_active_job(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        user_id = g.user_id
+        identity_id = g.identity_id
         delete_active_job_from_db(job_id, user_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
@@ -4219,10 +4226,11 @@ def api_mesh_remesh():
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"remesh-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
     if credit_error:
         return credit_error
 
@@ -4258,23 +4266,23 @@ def api_mesh_remesh():
     try:
         resp = mesh_post("/openapi/v1/remesh", payload)
         log_event("mesh/remesh:meshy-resp", resp)
-        job_id = resp.get("result") or resp.get("id")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"ok": False, "error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     store = load_store()
     source_task_id = body.get("source_task_id") or body.get("model_task_id")
     source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "remesh",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
@@ -4286,16 +4294,17 @@ def api_mesh_remesh():
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
-    save_active_job_to_db(job_id, "remesh", "remesh", store[job_id], user_id)
+    save_active_job_to_db(meshy_task_id, "remesh", "remesh", store[meshy_task_id], user_id)
 
     # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -4309,8 +4318,8 @@ def api_mesh_remesh_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    user_id = g.user_id
-    if not verify_job_ownership(job_id, user_id):
+    identity_id = g.identity_id
+    if not verify_job_ownership(job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -4384,10 +4393,11 @@ def api_mesh_retexture():
     if not prompt and not style_img:
         return jsonify({"error": "text_style_prompt or image_style_url required"}), 400
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"texture-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["texture"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id, {"texture_prompt": prompt[:100] if prompt else None})
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, {"texture_prompt": prompt[:100] if prompt else None})
     if credit_error:
         return credit_error
 
@@ -4408,16 +4418,16 @@ def api_mesh_retexture():
     try:
         resp = mesh_post("/openapi/v1/retexture", payload)
         log_event("mesh/retexture:meshy-resp", resp)
-        job_id = resp.get("result") or resp.get("id")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     # Save metadata to store (checks local store AND database for source)
     store = load_store()
@@ -4425,7 +4435,7 @@ def api_mesh_retexture():
     source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "texture",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
@@ -4435,17 +4445,20 @@ def api_mesh_retexture():
         "texture_prompt": prompt,
         "enable_pbr": bool(body.get("enable_pbr", False)),
         "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
     # Save to DB for recovery
-    save_active_job_to_db(job_id, "retexture", "texture", store[job_id], user_id)
+    save_active_job_to_db(meshy_task_id, "retexture", "texture", store[meshy_task_id], user_id)
 
     # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -4459,8 +4472,8 @@ def api_mesh_retexture_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    user_id = g.user_id
-    if not verify_job_ownership(job_id, user_id):
+    identity_id = g.identity_id
+    if not verify_job_ownership(job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -4536,10 +4549,11 @@ def api_mesh_rigging():
     if err:
         return jsonify({"error": err}), 400
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"rig-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["rig"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
     if credit_error:
         return credit_error
 
@@ -4558,16 +4572,16 @@ def api_mesh_rigging():
     try:
         resp = mesh_post("/openapi/v1/rigging", payload)
         log_event("mesh/rigging:meshy-resp", resp)
-        job_id = resp.get("result") or resp.get("id")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     # Save metadata to store (checks local store AND database for source)
     store = load_store()
@@ -4575,7 +4589,7 @@ def api_mesh_rigging():
     source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "rigging",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
@@ -4583,17 +4597,20 @@ def api_mesh_rigging():
         "root_prompt": root_prompt,
         "title": f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
         "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
     # Save to DB for recovery
-    save_active_job_to_db(job_id, "rigging", "rigging", store[job_id], user_id)
+    save_active_job_to_db(meshy_task_id, "rigging", "rigging", store[meshy_task_id], user_id)
 
     # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -4607,8 +4624,8 @@ def api_mesh_rigging_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    user_id = g.user_id
-    if not verify_job_ownership(job_id, user_id):
+    identity_id = g.identity_id
+    if not verify_job_ownership(job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -4681,10 +4698,11 @@ def api_image_to_3d_start():
     if not image_url:
         return jsonify({"error": "image_url required"}), 400
 
-    # ─── 2. Generate job ID and reserve credits ───
-    temp_job_id = f"img3d-{uuid.uuid4().hex[:12]}"
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["image-to-3d"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id, {"prompt": (body.get("prompt") or "")[:100]})
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, {"prompt": (body.get("prompt") or "")[:100]})
     if credit_error:
         return credit_error
 
@@ -4701,16 +4719,16 @@ def api_image_to_3d_start():
     try:
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
         log_event("image-to-3d/start:meshy-resp", resp)
-        job_id = resp.get("result") or resp.get("id")
-        if not job_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
 
     # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, job_id)
+    finalize_job_credits(reservation_id, meshy_task_id)
 
     s3_name = prompt if prompt else "image_to_3d_source"
     s3_user_id = user_id or "public"
@@ -4726,7 +4744,7 @@ def api_image_to_3d_start():
                 "source_images",
                 s3_name,
                 user_id=user_id,
-                key_base=f"source_images/{s3_user_id}/{job_id}",
+                key_base=f"source_images/{s3_user_id}/{meshy_task_id}",
                 provider="user",
             )
             print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
@@ -4735,7 +4753,7 @@ def api_image_to_3d_start():
 
     # Save metadata to store so we can retrieve it when job finishes
     store = load_store()
-    store[job_id] = {
+    store[meshy_task_id] = {
         "stage": "image3d",
         "created_at": now_s() * 1000,
         "prompt": prompt,
@@ -4745,17 +4763,20 @@ def api_image_to_3d_start():
         "original_image_url": image_url,  # Keep original for reference
         "ai_model": payload.get("ai_model"),
         "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
     # Save to DB for recovery
-    save_active_job_to_db(job_id, "image-to-3d", "image3d", store[job_id], user_id)
+    save_active_job_to_db(meshy_task_id, "image-to-3d", "image3d", store[meshy_task_id], user_id)
 
     # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": job_id,
+        "job_id": meshy_task_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None
     })
@@ -4769,8 +4790,8 @@ def api_image_to_3d_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    user_id = g.user_id
-    if not verify_job_ownership(job_id, user_id):
+    identity_id = g.identity_id
+    if not verify_job_ownership(job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -5033,8 +5054,13 @@ def api_history():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # Use identity_id from @with_session middleware for consistent identity resolution
-    user_id = getattr(g, 'identity_id', None)  # May be None for anonymous users
+    # REQUIRE identity - no anonymous history access
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_SESSION", "message": "A valid session is required to access history."}
+        }), 401
 
     if request.method == "GET":
         if USE_DB:
@@ -5043,24 +5069,14 @@ def api_history():
                 return jsonify({"error": "db_unavailable"}), 503
             try:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Fetch history items (filtered by user if logged in)
-                    if user_id:
-                        cur.execute(f"""
-                            SELECT id, item_type, status, stage, title, prompt,
-                                   thumbnail_url, glb_url, image_url, payload, created_at
-                            FROM {APP_SCHEMA}.history_items
-                            WHERE identity_id = %s
-                            ORDER BY created_at DESC;
-                        """, (user_id,))
-                    else:
-                        # Anonymous: return all items without user_id (legacy data)
-                        cur.execute(f"""
-                            SELECT id, item_type, status, stage, title, prompt,
-                                   thumbnail_url, glb_url, image_url, payload, created_at
-                            FROM {APP_SCHEMA}.history_items
-                            WHERE identity_id IS NULL
-                            ORDER BY created_at DESC;
-                        """)
+                    # Fetch history items - STRICT identity isolation, no NULL fallback
+                    cur.execute(f"""
+                        SELECT id, item_type, status, stage, title, prompt,
+                               thumbnail_url, glb_url, image_url, payload, created_at
+                        FROM {APP_SCHEMA}.history_items
+                        WHERE identity_id = %s
+                        ORDER BY created_at DESC;
+                    """, (identity_id,))
                     rows = cur.fetchall()
                 conn.close()
                 print(f"[History] GET: Fetched {len(rows)} items from database")
@@ -5117,27 +5133,16 @@ def api_history():
                                 if not item_id:
                                     continue
 
-                                # Check if this item already exists for this user
-                                if user_id:
-                                    cur.execute(f"""
-                                        SELECT id FROM {APP_SCHEMA}.history_items
-                                        WHERE (id::text = %s
-                                           OR payload->>'original_job_id' = %s
-                                           OR payload->>'original_id' = %s
-                                           OR payload->>'job_id' = %s)
-                                          AND identity_id = %s
-                                        LIMIT 1
-                                    """, (str(item_id), str(item_id), str(item_id), str(item_id), user_id))
-                                else:
-                                    cur.execute(f"""
-                                        SELECT id FROM {APP_SCHEMA}.history_items
-                                        WHERE (id::text = %s
-                                           OR payload->>'original_job_id' = %s
-                                           OR payload->>'original_id' = %s
-                                           OR payload->>'job_id' = %s)
-                                          AND identity_id IS NULL
-                                        LIMIT 1
-                                    """, (str(item_id), str(item_id), str(item_id), str(item_id)))
+                                # Check if this item already exists for this user (STRICT identity isolation)
+                                cur.execute(f"""
+                                    SELECT id FROM {APP_SCHEMA}.history_items
+                                    WHERE (id::text = %s
+                                       OR payload->>'original_job_id' = %s
+                                       OR payload->>'original_id' = %s
+                                       OR payload->>'job_id' = %s)
+                                      AND identity_id = %s
+                                    LIMIT 1
+                                """, (str(item_id), str(item_id), str(item_id), str(item_id), identity_id))
                                 existing = cur.fetchone()
                                 existing_id = existing[0] if existing else None
 
@@ -5164,13 +5169,13 @@ def api_history():
                                         item["original_id"] = item_id
 
                                 provider = "openai" if item_type == "image" else "meshy"
-                                s3_user_id = user_id or "public"
+                                s3_user_id = identity_id  # Always have identity_id now (required at top)
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
                                         thumbnail_url,
                                         "thumbnails",
                                         f"thumbnails/{s3_user_id}/{use_id}",
-                                        user_id=user_id,
+                                        user_id=identity_id,
                                         name="thumbnail",
                                         provider=provider,
                                     )
@@ -5179,7 +5184,7 @@ def api_history():
                                         image_url,
                                         "images",
                                         f"images/{s3_user_id}/{use_id}",
-                                        user_id=user_id,
+                                        user_id=identity_id,
                                         name="image",
                                         provider=provider,
                                     )
@@ -5205,7 +5210,7 @@ def api_history():
                                                payload = %s,
                                                updated_at = NOW()
                                            WHERE id = %s;""",
-                                        (item_type, status, stage, title, prompt, root_prompt, user_id,
+                                        (item_type, status, stage, title, prompt, root_prompt, identity_id,
                                          thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
                                     )
                                     updated_ids.append(use_id)
@@ -5218,7 +5223,7 @@ def api_history():
                                     if not model_id and not image_id:
                                         # Try to find the asset in DB
                                         model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                            cur, item_type, item_id, glb_url, image_url, user_id, provider
+                                            cur, item_type, item_id, glb_url, image_url, identity_id, provider
                                         )
                                     # Validate XOR constraint
                                     if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
@@ -5252,7 +5257,7 @@ def api_history():
                                                image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                                                payload = EXCLUDED.payload,
                                                updated_at = NOW();""",
-                                        (use_id, user_id, item_type, status, stage, title, prompt,
+                                        (use_id, identity_id, item_type, status, stage, title, prompt,
                                          root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
                                     )
                                     inserted_ids.append(use_id)
@@ -5289,11 +5294,18 @@ def api_history():
 
 # Add single history item to database
 @app.route("/api/history/item", methods=["POST", "OPTIONS"])
+@with_session
 def api_history_item_add():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id
+    # REQUIRE identity - no anonymous history access
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_SESSION", "message": "A valid session is required to add history items."}
+        }), 401
 
     try:
         item = request.get_json(silent=True) or {}
@@ -5312,27 +5324,16 @@ def api_history_item_add():
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            # Check if this item already exists (for this user)
-                            if user_id:
-                                cur.execute(f"""
-                                    SELECT id FROM {APP_SCHEMA}.history_items
-                                    WHERE (id::text = %s
-                                       OR payload->>'original_job_id' = %s
-                                       OR payload->>'original_id' = %s
-                                       OR payload->>'job_id' = %s)
-                                      AND identity_id = %s
-                                    LIMIT 1
-                                """, (str(item_id), str(item_id), str(item_id), str(item_id), user_id))
-                            else:
-                                cur.execute(f"""
-                                    SELECT id FROM {APP_SCHEMA}.history_items
-                                    WHERE (id::text = %s
-                                       OR payload->>'original_job_id' = %s
-                                       OR payload->>'original_id' = %s
-                                       OR payload->>'job_id' = %s)
-                                      AND identity_id IS NULL
-                                    LIMIT 1
-                                """, (str(item_id), str(item_id), str(item_id), str(item_id)))
+                            # Check if this item already exists (STRICT identity isolation)
+                            cur.execute(f"""
+                                SELECT id FROM {APP_SCHEMA}.history_items
+                                WHERE (id::text = %s
+                                   OR payload->>'original_job_id' = %s
+                                   OR payload->>'original_id' = %s
+                                   OR payload->>'job_id' = %s)
+                                  AND identity_id = %s
+                                LIMIT 1
+                            """, (str(item_id), str(item_id), str(item_id), str(item_id), identity_id))
                             existing = cur.fetchone()
                             existing_id = existing[0] if existing else None
 
@@ -5359,13 +5360,13 @@ def api_history_item_add():
                                     item["original_id"] = item_id
 
                             provider = "openai" if item_type == "image" else "meshy"
-                            s3_user_id = user_id or "public"
+                            s3_user_id = identity_id  # Always have identity now (required at top)
                             if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                 thumbnail_url = ensure_s3_url_for_data_uri(
                                     thumbnail_url,
                                     "thumbnails",
                                     f"thumbnails/{s3_user_id}/{use_id}",
-                                    user_id=user_id,
+                                    user_id=identity_id,
                                     name="thumbnail",
                                     provider=provider,
                                 )
@@ -5374,7 +5375,7 @@ def api_history_item_add():
                                     image_url,
                                     "images",
                                     f"images/{s3_user_id}/{use_id}",
-                                    user_id=user_id,
+                                    user_id=identity_id,
                                     name="image",
                                     provider=provider,
                                 )
@@ -5400,7 +5401,7 @@ def api_history_item_add():
                                            payload = %s,
                                            updated_at = NOW()
                                        WHERE id = %s;""",
-                                    (item_type, status, stage, title, prompt, root_prompt, user_id,
+                                    (item_type, status, stage, title, prompt, root_prompt, identity_id,
                                      thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
                                 )
                                 db_ok = True
@@ -5414,7 +5415,7 @@ def api_history_item_add():
                                 if not model_id and not image_id:
                                     # Try to find the asset in DB
                                     model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                        cur, item_type, item_id, glb_url, image_url, user_id, provider
+                                        cur, item_type, item_id, glb_url, image_url, identity_id, provider
                                     )
                                 # Validate XOR constraint
                                 if not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
@@ -5452,7 +5453,7 @@ def api_history_item_add():
                                                image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                                                payload = EXCLUDED.payload,
                                                updated_at = NOW();""",
-                                        (use_id, user_id, item_type, status, stage, title, prompt,
+                                        (use_id, identity_id, item_type, status, stage, title, prompt,
                                          root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
                                     )
                                     db_ok = True
@@ -5487,11 +5488,18 @@ def api_history_item_add():
 
 # Update single history item in database
 @app.route("/api/history/item/<item_id>", methods=["PATCH", "DELETE", "OPTIONS"])
+@with_session
 def api_history_item_update(item_id):
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id
+    # REQUIRE identity - no anonymous history access
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_SESSION", "message": "A valid session is required to modify history items."}
+        }), 401
 
     # Validate UUID format
     try:
@@ -5512,20 +5520,13 @@ def api_history_item_update(item_id):
                 return jsonify({"ok": False, "error": "db_unavailable"}), 503
             try:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    if user_id:
-                        cur.execute(f"""
-                            SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
-                            FROM {APP_SCHEMA}.history_items
-                            WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
-                            LIMIT 1
-                        """, (str(item_id), user_id))
-                    else:
-                        cur.execute(f"""
-                            SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
-                            FROM {APP_SCHEMA}.history_items
-                            WHERE id::text = %s AND identity_id IS NULL
-                            LIMIT 1
-                        """, (str(item_id),))
+                    # STRICT identity isolation - only delete user's own items
+                    cur.execute(f"""
+                        SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
+                        FROM {APP_SCHEMA}.history_items
+                        WHERE id::text = %s AND identity_id = %s
+                        LIMIT 1
+                    """, (str(item_id), identity_id))
                     row = cur.fetchone()
                 if not row:
                     conn.close()
@@ -5547,16 +5548,11 @@ def api_history_item_update(item_id):
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            if user_id:
-                                cur.execute(f"""
-                                    DELETE FROM {APP_SCHEMA}.history_items
-                                    WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
-                                """, (str(item_id), user_id))
-                            else:
-                                cur.execute(f"""
-                                    DELETE FROM {APP_SCHEMA}.history_items
-                                    WHERE id::text = %s AND identity_id IS NULL
-                                """, (str(item_id),))
+                            # STRICT identity isolation - only delete user's own items
+                            cur.execute(f"""
+                                DELETE FROM {APP_SCHEMA}.history_items
+                                WHERE id::text = %s AND identity_id = %s
+                            """, (str(item_id), identity_id))
 
                             if model_id:
                                 cur.execute(f"DELETE FROM {APP_SCHEMA}.models WHERE id = %s", (model_id,))
@@ -5612,21 +5608,13 @@ def api_history_item_update(item_id):
                     try:
                         with conn:
                             with conn.cursor(row_factory=dict_row) as cur:
-                                # Get existing item (verify user ownership)
-                                if user_id:
-                                    cur.execute(f"""SELECT id, payload FROM {APP_SCHEMA}.history_items
-                                                   WHERE (id::text = %s
-                                                      OR payload->>'original_id' = %s
-                                                      OR payload->>'job_id' = %s)
-                                                     AND (identity_id = %s OR identity_id IS NULL)
-                                                   LIMIT 1;""", (str(item_id), str(item_id), str(item_id), user_id))
-                                else:
-                                    cur.execute(f"""SELECT id, payload FROM {APP_SCHEMA}.history_items
-                                                   WHERE (id::text = %s
-                                                      OR payload->>'original_id' = %s
-                                                      OR payload->>'job_id' = %s)
-                                                     AND identity_id IS NULL
-                                                   LIMIT 1;""", (str(item_id), str(item_id), str(item_id)))
+                                # STRICT identity isolation - only update user's own items
+                                cur.execute(f"""SELECT id, payload FROM {APP_SCHEMA}.history_items
+                                               WHERE (id::text = %s
+                                                  OR payload->>'original_id' = %s
+                                                  OR payload->>'job_id' = %s)
+                                                 AND identity_id = %s
+                                               LIMIT 1;""", (str(item_id), str(item_id), str(item_id), identity_id))
                                 row = cur.fetchone()
                                 if not row:
                                     return jsonify({"error": "Item not found or access denied"}), 404
@@ -5651,13 +5639,13 @@ def api_history_item_update(item_id):
                                 image_url = updates.get("image_url")
 
                                 provider = "openai" if item_type == "image" else "meshy"
-                                s3_user_id = user_id or "public"
+                                s3_user_id = identity_id  # Always have identity now
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
                                         thumbnail_url,
                                         "thumbnails",
                                         f"thumbnails/{s3_user_id}/{actual_id}",
-                                        user_id=user_id,
+                                        user_id=identity_id,
                                         name="thumbnail",
                                         provider=provider,
                                     )
@@ -5667,50 +5655,31 @@ def api_history_item_update(item_id):
                                         image_url,
                                         "images",
                                         f"images/{s3_user_id}/{actual_id}",
-                                        user_id=user_id,
+                                        user_id=identity_id,
                                         name="image",
                                         provider=provider,
                                     )
                                     updates["image_url"] = image_url
                                 existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url"}})
 
-                                # Update with column values if provided (with ownership check)
-                                if user_id:
-                                    cur.execute(
-                                        f"""UPDATE {APP_SCHEMA}.history_items
-                                           SET item_type = COALESCE(%s, item_type),
-                                               status = COALESCE(%s, status),
-                                               stage = COALESCE(%s, stage),
-                                               title = COALESCE(%s, title),
-                                               prompt = COALESCE(%s, prompt),
-                                               thumbnail_url = COALESCE(%s, thumbnail_url),
-                                               glb_url = COALESCE(%s, glb_url),
-                                               image_url = COALESCE(%s, image_url),
-                                               payload = %s,
-                                               updated_at = NOW()
-                                           WHERE id = %s AND (identity_id = %s OR identity_id IS NULL);""",
-                                        (item_type, status, stage, title, prompt,
-                                         thumbnail_url, glb_url, image_url,
-                                         json.dumps(existing), actual_id, user_id)
-                                    )
-                                else:
-                                    cur.execute(
-                                        f"""UPDATE {APP_SCHEMA}.history_items
-                                           SET item_type = COALESCE(%s, item_type),
-                                               status = COALESCE(%s, status),
-                                               stage = COALESCE(%s, stage),
-                                               title = COALESCE(%s, title),
-                                               prompt = COALESCE(%s, prompt),
-                                               thumbnail_url = COALESCE(%s, thumbnail_url),
-                                               glb_url = COALESCE(%s, glb_url),
-                                               image_url = COALESCE(%s, image_url),
-                                               payload = %s,
-                                               updated_at = NOW()
-                                           WHERE id = %s AND identity_id IS NULL;""",
-                                        (item_type, status, stage, title, prompt,
-                                         thumbnail_url, glb_url, image_url,
-                                         json.dumps(existing), actual_id)
-                                    )
+                                # STRICT identity isolation - only update user's own items
+                                cur.execute(
+                                    f"""UPDATE {APP_SCHEMA}.history_items
+                                       SET item_type = COALESCE(%s, item_type),
+                                           status = COALESCE(%s, status),
+                                           stage = COALESCE(%s, stage),
+                                           title = COALESCE(%s, title),
+                                           prompt = COALESCE(%s, prompt),
+                                           thumbnail_url = COALESCE(%s, thumbnail_url),
+                                           glb_url = COALESCE(%s, glb_url),
+                                           image_url = COALESCE(%s, image_url),
+                                           payload = %s,
+                                           updated_at = NOW()
+                                       WHERE id = %s AND identity_id = %s;""",
+                                    (item_type, status, stage, title, prompt,
+                                     thumbnail_url, glb_url, image_url,
+                                     json.dumps(existing), actual_id, identity_id)
+                                )
                         conn.close()
                         db_ok = True
                     except Exception as e:
@@ -5737,6 +5706,545 @@ def api_history_item_update(item_id):
             return jsonify({"ok": True, "id": item_id, "db": db_ok, "db_errors": db_errors or None, "local": local_ok})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+# ─────────────────────────────────────────────────────────────
+# Community Posts - Public sharing of models/images
+# ─────────────────────────────────────────────────────────────
+
+@app.route("/api/community/feed", methods=["GET", "OPTIONS"])
+def api_community_feed():
+    """
+    GET /api/community/feed - Public feed of shared community posts.
+
+    Query params:
+        limit (int): Max items to return (default 20, max 100)
+        offset (int): Pagination offset (default 0)
+        type (str): Filter by asset type: 'model', 'image', 'history' (optional)
+
+    Response (200):
+    {
+        "ok": true,
+        "posts": [
+            {
+                "id": "uuid",
+                "display_name": "Cool Dragon",
+                "prompt_public": "A fierce dragon..." (if show_prompt=true),
+                "show_prompt": true/false,
+                "created_at": "2025-01-23T...",
+                "asset_type": "model" | "image" | "history",
+                "asset": { ...asset details... }
+            }
+        ],
+        "total": 42,
+        "has_more": true
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    try:
+        limit = min(int(request.args.get("limit", 20)), 100)
+        offset = int(request.args.get("offset", 0))
+        asset_type = request.args.get("type")  # 'model', 'image', 'history'
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
+
+        cursor = conn.cursor()
+
+        # Build type filter
+        type_filter = ""
+        params = []
+        if asset_type == "model":
+            type_filter = "AND cp.model_id IS NOT NULL"
+        elif asset_type == "image":
+            type_filter = "AND cp.image_id IS NOT NULL"
+        elif asset_type == "history":
+            type_filter = "AND cp.history_item_id IS NOT NULL"
+
+        # Get total count
+        cursor.execute(f"""
+            SELECT COUNT(*) FROM timrx_app.community_posts cp
+            WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
+        """)
+        total = cursor.fetchone()[0]
+
+        # Get posts with joined asset data
+        cursor.execute(f"""
+            SELECT
+                cp.id, cp.display_name, cp.prompt_public, cp.show_prompt, cp.created_at,
+                cp.model_id, cp.image_id, cp.history_item_id,
+                m.title as model_title, m.prompt as model_prompt, m.thumbnail_url as model_thumbnail,
+                m.glb_url as model_glb_url,
+                i.filename as image_filename, i.thumbnail_url as image_thumbnail,
+                h.title as history_title, h.prompt as history_prompt, h.thumbnail_url as history_thumbnail,
+                h.glb_url as history_glb_url, h.image_url as history_image_url
+            FROM timrx_app.community_posts cp
+            LEFT JOIN timrx_app.models m ON cp.model_id = m.id
+            LEFT JOIN timrx_app.images i ON cp.image_id = i.id
+            LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
+            WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
+            ORDER BY cp.created_at DESC
+            LIMIT %s OFFSET %s
+        """, (limit, offset))
+
+        rows = cursor.fetchall()
+        posts = []
+
+        for row in rows:
+            (post_id, display_name, prompt_public, show_prompt, created_at,
+             model_id, image_id, history_item_id,
+             model_title, model_prompt, model_thumbnail, model_glb_url,
+             image_filename, image_thumbnail,
+             history_title, history_prompt, history_thumbnail, history_glb_url, history_image_url) = row
+
+            post = {
+                "id": str(post_id),
+                "display_name": display_name,
+                "show_prompt": show_prompt,
+                "created_at": created_at.isoformat() if created_at else None,
+            }
+
+            # Only include prompt if show_prompt is true
+            if show_prompt and prompt_public:
+                post["prompt_public"] = prompt_public
+
+            # Build asset info based on which ref is set
+            if model_id:
+                post["asset_type"] = "model"
+                post["asset"] = {
+                    "id": str(model_id),
+                    "title": model_title,
+                    "thumbnail_url": model_thumbnail,
+                }
+            elif image_id:
+                post["asset_type"] = "image"
+                post["asset"] = {
+                    "id": str(image_id),
+                    "filename": image_filename,
+                    "thumbnail_url": image_thumbnail,
+                }
+            elif history_item_id:
+                post["asset_type"] = "history"
+                post["asset"] = {
+                    "id": str(history_item_id),
+                    "title": history_title,
+                    "thumbnail_url": history_thumbnail,
+                }
+
+            posts.append(post)
+
+        conn.close()
+
+        return jsonify({
+            "ok": True,
+            "posts": posts,
+            "total": total,
+            "has_more": offset + len(posts) < total
+        })
+
+    except Exception as e:
+        print(f"[COMMUNITY] Error in feed: {e}")
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+
+
+@app.route("/api/community/share", methods=["POST", "OPTIONS"])
+@with_session
+def api_community_share():
+    """
+    POST /api/community/share - Share a model/image/history item to community.
+
+    Requires valid session (identity).
+
+    Request body:
+    {
+        "asset_type": "model" | "image" | "history",
+        "asset_id": "uuid of the asset",
+        "display_name": "My Cool Dragon",
+        "prompt_public": "A fierce dragon..." (optional),
+        "show_prompt": true/false (default false)
+    }
+
+    Response (200):
+    {
+        "ok": true,
+        "post_id": "uuid"
+    }
+
+    Errors:
+        401 - NO_SESSION: No valid session
+        400 - INVALID_ASSET_TYPE: asset_type must be model, image, or history
+        400 - MISSING_FIELD: Required field missing
+        403 - NOT_OWNER: Asset doesn't belong to this identity
+        404 - ASSET_NOT_FOUND: Asset not found
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    # Require identity
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_SESSION", "message": "A valid session is required to share content."}
+        }), 401
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    try:
+        data = request.get_json() or {}
+        asset_type = data.get("asset_type")
+        asset_id = data.get("asset_id")
+        display_name = data.get("display_name")
+        prompt_public = data.get("prompt_public")
+        show_prompt = bool(data.get("show_prompt", False))
+
+        # Validate required fields
+        if asset_type not in ("model", "image", "history"):
+            return jsonify({
+                "ok": False,
+                "error": {"code": "INVALID_ASSET_TYPE", "message": "asset_type must be 'model', 'image', or 'history'"}
+            }), 400
+
+        if not asset_id:
+            return jsonify({
+                "ok": False,
+                "error": {"code": "MISSING_FIELD", "message": "asset_id is required"}
+            }), 400
+
+        if not display_name:
+            return jsonify({
+                "ok": False,
+                "error": {"code": "MISSING_FIELD", "message": "display_name is required"}
+            }), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
+
+        cursor = conn.cursor()
+
+        # Verify ownership and asset exists
+        if asset_type == "model":
+            cursor.execute("""
+                SELECT id FROM timrx_app.models
+                WHERE id = %s AND identity_id = %s
+            """, (asset_id, identity_id))
+            col_name = "model_id"
+        elif asset_type == "image":
+            cursor.execute("""
+                SELECT id FROM timrx_app.images
+                WHERE id = %s AND identity_id = %s
+            """, (asset_id, identity_id))
+            col_name = "image_id"
+        else:  # history
+            cursor.execute("""
+                SELECT id FROM timrx_app.history_items
+                WHERE id = %s AND identity_id = %s
+            """, (asset_id, identity_id))
+            col_name = "history_item_id"
+
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({
+                "ok": False,
+                "error": {"code": "ASSET_NOT_FOUND", "message": "Asset not found or you don't have permission to share it"}
+            }), 404
+
+        # Insert community post
+        cursor.execute(f"""
+            INSERT INTO timrx_app.community_posts
+            (identity_id, {col_name}, display_name, prompt_public, show_prompt)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+        """, (identity_id, asset_id, display_name, prompt_public, show_prompt))
+
+        post_id = cursor.fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "ok": True,
+            "post_id": str(post_id)
+        })
+
+    except Exception as e:
+        print(f"[COMMUNITY] Error in share: {e}")
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+
+
+@app.route("/api/community/post/<post_id>", methods=["DELETE", "OPTIONS"])
+@with_session
+def api_community_delete(post_id):
+    """
+    DELETE /api/community/post/<post_id> - Remove a shared post (soft delete).
+
+    Requires valid session. Only the post owner can delete.
+
+    Response (200):
+    { "ok": true }
+
+    Errors:
+        401 - NO_SESSION
+        404 - POST_NOT_FOUND or not owner
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_SESSION", "message": "A valid session is required."}
+        }), 401
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
+
+        cursor = conn.cursor()
+
+        # Soft delete - only if owned by this identity
+        cursor.execute("""
+            UPDATE timrx_app.community_posts
+            SET status = 'deleted', deleted_at = NOW()
+            WHERE id = %s AND identity_id = %s AND deleted_at IS NULL
+        """, (post_id, identity_id))
+
+        if cursor.rowcount == 0:
+            conn.close()
+            return jsonify({
+                "ok": False,
+                "error": {"code": "POST_NOT_FOUND", "message": "Post not found or you don't have permission to delete it"}
+            }), 404
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"ok": True})
+
+    except Exception as e:
+        print(f"[COMMUNITY] Error in delete: {e}")
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# Secure Asset Downloads - Signed S3 URLs with ownership verification
+# ─────────────────────────────────────────────────────────────
+
+def _extract_s3_key_from_url(url: str) -> str | None:
+    """
+    Extract S3 key from a full S3 URL.
+    Supports formats:
+        https://bucket.s3.region.amazonaws.com/key/path
+        https://s3.region.amazonaws.com/bucket/key/path
+    Returns None if not an S3 URL.
+    """
+    if not url:
+        return None
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+
+    # Format: bucket.s3.region.amazonaws.com/key
+    if ".s3." in parsed.netloc and ".amazonaws.com" in parsed.netloc:
+        # Key is the path without leading slash
+        return parsed.path.lstrip("/") if parsed.path else None
+
+    return None
+
+
+@app.route("/api/assets/<asset_type>/<asset_id>/download", methods=["GET", "OPTIONS"])
+@with_session
+def api_asset_download(asset_type, asset_id):
+    """
+    GET /api/assets/:type/:id/download - Get a signed download URL for an asset.
+
+    Requires valid session. Only the asset owner can download.
+
+    Path params:
+        asset_type: "model" | "image" | "history"
+        asset_id: UUID of the asset
+
+    Query params:
+        file: Which file to download (default varies by type)
+            - model: "glb" (default), "thumbnail"
+            - image: "original" (default), "thumbnail"
+            - history: "glb" (default), "thumbnail", "image"
+
+    Response (200):
+    {
+        "ok": true,
+        "download_url": "https://...signed-url...",
+        "filename": "my_model.glb",
+        "expires_in": 3600
+    }
+
+    Errors:
+        401 - NO_SESSION
+        400 - INVALID_ASSET_TYPE
+        403 - NOT_OWNER
+        404 - ASSET_NOT_FOUND or FILE_NOT_FOUND
+        503 - S3_NOT_CONFIGURED
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "NO_SESSION", "message": "A valid session is required to download assets."}
+        }), 401
+
+    if asset_type not in ("model", "image", "history"):
+        return jsonify({
+            "ok": False,
+            "error": {"code": "INVALID_ASSET_TYPE", "message": "asset_type must be 'model', 'image', or 'history'"}
+        }), 400
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    if not AWS_BUCKET_MODELS:
+        return jsonify({"ok": False, "error": {"code": "S3_NOT_CONFIGURED", "message": "S3 storage not configured"}}), 503
+
+    file_type = request.args.get("file")
+
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
+
+        cursor = conn.cursor()
+
+        # Query the appropriate table based on asset type
+        if asset_type == "model":
+            file_type = file_type or "glb"
+            if file_type == "glb":
+                url_col = "glb_url"
+            elif file_type == "thumbnail":
+                url_col = "thumbnail_url"
+            else:
+                conn.close()
+                return jsonify({
+                    "ok": False,
+                    "error": {"code": "INVALID_FILE_TYPE", "message": "file must be 'glb' or 'thumbnail' for models"}
+                }), 400
+
+            cursor.execute(f"""
+                SELECT {url_col}, title FROM timrx_app.models
+                WHERE id = %s AND identity_id = %s
+            """, (asset_id, identity_id))
+
+        elif asset_type == "image":
+            file_type = file_type or "original"
+            if file_type == "original":
+                url_col = "s3_url"
+            elif file_type == "thumbnail":
+                url_col = "thumbnail_url"
+            else:
+                conn.close()
+                return jsonify({
+                    "ok": False,
+                    "error": {"code": "INVALID_FILE_TYPE", "message": "file must be 'original' or 'thumbnail' for images"}
+                }), 400
+
+            cursor.execute(f"""
+                SELECT {url_col}, filename FROM timrx_app.images
+                WHERE id = %s AND identity_id = %s
+            """, (asset_id, identity_id))
+
+        else:  # history
+            file_type = file_type or "glb"
+            if file_type == "glb":
+                url_col = "glb_url"
+            elif file_type == "thumbnail":
+                url_col = "thumbnail_url"
+            elif file_type == "image":
+                url_col = "image_url"
+            else:
+                conn.close()
+                return jsonify({
+                    "ok": False,
+                    "error": {"code": "INVALID_FILE_TYPE", "message": "file must be 'glb', 'thumbnail', or 'image' for history items"}
+                }), 400
+
+            cursor.execute(f"""
+                SELECT {url_col}, title FROM timrx_app.history_items
+                WHERE id = %s AND identity_id = %s
+            """, (asset_id, identity_id))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({
+                "ok": False,
+                "error": {"code": "ASSET_NOT_FOUND", "message": "Asset not found or you don't have permission to access it"}
+            }), 404
+
+        url, name = row
+
+        if not url:
+            return jsonify({
+                "ok": False,
+                "error": {"code": "FILE_NOT_FOUND", "message": f"No {file_type} file available for this asset"}
+            }), 404
+
+        # Extract S3 key from URL
+        s3_key = _extract_s3_key_from_url(url)
+        if not s3_key:
+            # Not an S3 URL - might be external (Meshy), return as-is
+            return jsonify({
+                "ok": True,
+                "download_url": url,
+                "filename": name or "download",
+                "expires_in": None,
+                "note": "External URL, not signed"
+            })
+
+        # Generate presigned URL
+        expires_in = 3600  # 1 hour
+        try:
+            presigned_url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": AWS_BUCKET_MODELS, "Key": s3_key},
+                ExpiresIn=expires_in
+            )
+        except Exception as e:
+            print(f"[DOWNLOAD] Error generating presigned URL: {e}")
+            return jsonify({
+                "ok": False,
+                "error": {"code": "S3_ERROR", "message": "Failed to generate download URL"}
+            }), 500
+
+        # Determine filename
+        filename = name or s3_key.split("/")[-1]
+        if file_type == "glb" and not filename.endswith(".glb"):
+            filename = f"{filename}.glb"
+        elif file_type == "thumbnail" and not any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
+            filename = f"{filename}.png"
+
+        return jsonify({
+            "ok": True,
+            "download_url": presigned_url,
+            "filename": filename,
+            "expires_in": expires_in
+        })
+
+    except Exception as e:
+        print(f"[DOWNLOAD] Error: {e}")
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
 
 # Entrypoint
 # ─────────────────────────────────────────────────────────────
