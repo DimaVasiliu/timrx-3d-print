@@ -409,12 +409,25 @@ class MollieService:
                     f"identity_id={identity_id}, plan_code={plan_code}, credits={credits}"
                 )
 
+            # Fetch current wallet balance to return in response
+            # This allows frontend to update UI immediately without polling /api/me
+            from wallet_service import WalletService
+            wallet = WalletService.get_or_create_wallet(identity_id)
+            balance_credits = wallet.get("balance_credits", 0) if wallet else 0
+            reserved_credits = wallet.get("reserved_credits", 0) if wallet else 0
+            available_credits = max(0, balance_credits - reserved_credits)
+
             return {
                 "ok": True,
                 "status": "paid",
                 "credits_granted": True,
                 "was_existing": was_existing,
                 "message": "Credits granted" if not was_existing else "Already processed",
+                # Include wallet balance for frontend to use directly
+                "balance_credits": balance_credits,
+                "reserved_credits": reserved_credits,
+                "available_credits": available_credits,
+                "identity_id": identity_id,
             }
         else:
             print(
