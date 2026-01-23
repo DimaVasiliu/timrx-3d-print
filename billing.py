@@ -97,6 +97,11 @@ def get_action_costs():
     """
     try:
         action_costs = PricingService.get_action_costs_list()
+        # Diagnostic logging
+        if action_costs:
+            print(f"[BILLING] Returning {len(action_costs)} action costs: {[c['action_key'] for c in action_costs]}")
+        else:
+            print("[BILLING] WARNING: No action costs returned from PricingService!")
         response = make_response(jsonify({
             "ok": True,
             "action_costs": action_costs,
@@ -104,6 +109,8 @@ def get_action_costs():
         return _add_cache_headers(response)
     except Exception as e:
         print(f"[BILLING] Error fetching action costs: {e}")
+        import traceback
+        traceback.print_exc()
         # Return hardcoded fallback if DB fails
         return jsonify({
             "ok": True,
