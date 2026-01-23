@@ -355,46 +355,88 @@ def create_mollie_checkout():
     """
     # Check if Mollie is configured
     if not MollieService.is_available():
+        print("[BILLING] Checkout failed: Mollie service unavailable")
         return jsonify({
             "ok": False,
             "error_code": "SERVICE_UNAVAILABLE",
+            "error": "payment_service_unavailable",
         }), 503
 
-    data = request.get_json() or {}
+    # Parse and log request body
+    data = request.get_json(silent=True)
+    if data is None:
+        print(f"[BILLING] Checkout failed: Invalid JSON body. Raw: {request.data[:200] if request.data else '(empty)'}")
+        return jsonify({
+            "ok": False,
+            "error_code": "VALIDATION_ERROR",
+            "error": "invalid_json",
+            "message": "Request body must be valid JSON",
+        }), 400
+
+    print(f"[BILLING] Checkout request: plan={data.get('plan') or data.get('plan_code')}, email={data.get('email', '')[:20]}...")
+
     # Accept both "plan" and "plan_code" for flexibility
     plan_code = data.get("plan") or data.get("plan_code")
     email = data.get("email", "").strip()
 
-    # Validation
+    # Validation with logging
     if not plan_code:
+        print(f"[BILLING] Checkout validation failed: plan_code missing. Body keys: {list(data.keys())}")
         return jsonify({
             "ok": False,
             "error_code": "VALIDATION_ERROR",
-            "message": "plan is required",
+            "error": "plan_required",
+            "message": "plan or plan_code is required",
         }), 400
 
     if not email:
-        return jsonify({
-            "ok": False,
-            "error_code": "VALIDATION_ERROR",
-            "message": "email is required",
-        }), 400
+        # Try to get email from identity if available
+        identity_email = getattr(g, 'identity_email', None)
+        if identity_email:
+            email = identity_email
+            print(f"[BILLING] Using identity email: {email[:20]}...")
+        else:
+            print(f"[BILLING] Checkout validation failed: email missing for plan={plan_code}")
+            return jsonify({
+                "ok": False,
+                "error_code": "VALIDATION_ERROR",
+                "error": "email_required",
+                "message": "email is required",
+            }), 400
 
     # Basic email validation
     if "@" not in email or "." not in email:
+        print(f"[BILLING] Checkout validation failed: invalid email format for plan={plan_code}")
         return jsonify({
             "ok": False,
             "error_code": "VALIDATION_ERROR",
+            "error": "invalid_email",
             "message": "Invalid email format",
         }), 400
 
-    # Lookup plan by code (uses: SELECT * FROM timrx_billing.plans WHERE code=%s AND is_active=true)
+    # Lookup plan by code (uses credit_grant column for credits amount)
     plan = PricingService.get_plan_by_code(plan_code)
     if not plan:
+        print(f"[BILLING] Checkout failed: plan not found. code={plan_code}")
+        # List available plans for debugging
+        try:
+            available = PricingService.get_plans(active_only=True)
+            available_codes = [p.get("code") for p in available] if available else []
+            print(f"[BILLING] Available plans: {available_codes}")
+        except Exception as e:
+            print(f"[BILLING] Could not list plans: {e}")
+            available_codes = []
+
         return jsonify({
             "ok": False,
             "error_code": "PLAN_NOT_FOUND",
+            "error": "plan_not_found",
+            "plan_code": plan_code,
+            "available_plans": available_codes,
         }), 400
+
+    # Log plan details (credit_grant is mapped to "credits" key)
+    print(f"[BILLING] Plan found: {plan_code} -> {plan.get('credits')} credits @ £{plan.get('price')}")
 
     try:
         result = MollieService.create_checkout(
