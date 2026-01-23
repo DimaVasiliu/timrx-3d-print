@@ -370,14 +370,31 @@ class PricingService:
         """
         Seed the default plans into the database.
         Uses INSERT ... ON CONFLICT DO UPDATE to ensure plans exist and are active.
+        Safe to call multiple times (idempotent).
+
+        Plans use the credit_grant column to store the number of credits to grant.
 
         Returns:
             Number of plans seeded/updated
         """
         from db import is_available
 
+        print("[PRICING] Starting plan seed...")
+
         if not is_available():
             print("[PRICING] Database not available, skipping plan seed")
+            return 0
+
+        # First verify the table exists
+        try:
+            result = query_one(
+                f"SELECT COUNT(*) as cnt FROM {Tables.PLANS}"
+            )
+            existing_count = result["cnt"] if result else 0
+            print(f"[PRICING] Plans table exists, current count: {existing_count}")
+        except Exception as e:
+            print(f"[PRICING] Plans table check failed: {e}")
+            print("[PRICING] Table may not exist - ensure migrations have run")
             return 0
 
         seeded = 0
@@ -410,6 +427,8 @@ class PricingService:
                 print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ £{plan['price_gbp']})")
             except Exception as e:
                 print(f"[PRICING] Error seeding plan {plan['code']}: {e}")
+                import traceback
+                traceback.print_exc()
 
-        print(f"[PRICING] Plans seeded: {seeded}/{len(DEFAULT_PLANS)}")
+        print(f"[PRICING] Plans seed complete: {seeded}/{len(DEFAULT_PLANS)}")
         return seeded
