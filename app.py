@@ -2633,9 +2633,19 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 has_image = image_id is not None
                 if has_model == has_image:  # Both set or both NULL = invalid
                     if not has_model and not has_image:
-                        print(f"[WARN] history_items XOR violation: both model_id and image_id are NULL (job_id={job_id})")
-                        # Skip history_items insert - no asset was created
-                        raise RuntimeError(f"Cannot create history_items: no model or image asset created for job {job_id}")
+                        print(f"[HISTORY] Skipping history_items: no asset created (job_id={job_id})")
+                        print(f"[HISTORY]   glb_url={glb_url}, image_url={image_url}")
+                        print(f"[HISTORY]   This is expected for jobs that failed or haven't finished yet")
+                        # Release savepoint and return - don't create history without asset
+                        cur.execute("RELEASE SAVEPOINT normalized_save")
+                        conn.close()
+                        return {
+                            "success": True,
+                            "db_ok": True,
+                            "skipped": True,
+                            "reason": "missing_asset_reference",
+                            "job_id": job_id
+                        }
                     else:
                         print(f"[WARN] history_items XOR violation: both model_id={model_id} and image_id={image_id} are set (job_id={job_id})")
                         # Prefer the asset matching item_type
@@ -3343,84 +3353,167 @@ def build_source_payload(body: dict):
         return {"model_url": model_url}, None
 
 # ─────────────────────────────────────────────────────────────
-# Credit Enforcement Helpers
+# Credit Enforcement Helpers (Centralized Pipeline)
 # ─────────────────────────────────────────────────────────────
-def check_and_reserve_credits(identity_id: str, action_key: str, job_id: str):
-    """
-    Check if user has enough credits and reserve them for the job.
 
-    Args:
-        identity_id: User's identity ID (from g.identity_id or g.user_id)
-        action_key: Action key for pricing (e.g., 'text_to_3d_generate')
-        job_id: Job ID to associate with the reservation
+def _make_credit_error(code: str, message: str, status: int = 400, **extra) -> tuple:
+    """Create a standardized credit error response."""
+    error_body = {
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": message,
+            **extra,
+        }
+    }
+    return jsonify(error_body), status
+
+
+def require_identity() -> tuple:
+    """
+    Check that g.identity_id is set (by @with_session middleware).
 
     Returns:
-        (reservation_id, None) on success
-        (None, error_response) on failure (can return directly from endpoint)
+        (identity_id, None) on success
+        (None, error_response) on failure - return from route
+    """
+    identity_id = getattr(g, 'identity_id', None)
+    if not identity_id:
+        print(f"[CREDITS] ERROR: No identity_id - @with_session not applied or session invalid")
+        return None, _make_credit_error(
+            "NO_SESSION",
+            "Please sign in or restore your session to continue. You need credits for this action.",
+            401
+        )
+    return identity_id, None
+
+
+def require_credits(identity_id: str, action_key: str) -> tuple:
+    """
+    Check if user has sufficient credits for an action WITHOUT reserving.
+    Use this for pre-flight checks before expensive operations.
+
+    Args:
+        identity_id: User's identity ID
+        action_key: Action key (e.g., 'text_to_3d_generate')
+
+    Returns:
+        (cost, None) on success
+        (0, error_response) on failure - return from route
     """
     if not CREDITS_AVAILABLE:
-        # Credits system not loaded - allow request (graceful degradation)
-        print(f"[CREDITS] System not available, allowing {action_key} without credit check")
-        return None, None
-
-    if not identity_id:
-        # No identity - block the request (identity should be set by @with_session)
-        print(f"[CREDITS] ERROR: No identity for {action_key} - session middleware not applied?")
-        return None, (jsonify({
-            "ok": False,
-            "error": {
-                "code": "SESSION_REQUIRED",
-                "message": "A valid session is required for this action",
-            }
-        }), 401)
+        print(f"[CREDITS] System not available, allowing {action_key}")
+        return 0, None
 
     try:
-        # Get cost for this action
         cost = PricingService.get_action_cost(action_key)
         if cost == 0:
             print(f"[CREDITS] No cost defined for {action_key}, allowing")
-            return None, None
+            return 0, None
 
-        # Check available balance
         balance = WalletService.get_balance(identity_id)
         reserved = WalletService.get_reserved_credits(identity_id)
         available = max(0, balance - reserved)
 
-        print(f"[CREDITS] {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}")
+        print(f"[CREDITS] Check {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}")
 
         if available < cost:
-            # Insufficient credits
-            return None, jsonify({
-                "ok": False,
-                "error": {
-                    "code": "INSUFFICIENT_CREDITS",
-                    "message": f"Insufficient credits. Need {cost}, have {available}.",
-                    "required": cost,
-                    "available": available,
-                    "balance": balance,
-                    "reserved": reserved,
-                }
-            }), 402
+            return 0, _make_credit_error(
+                "INSUFFICIENT_CREDITS",
+                f"You need {cost} credits but only have {available} available.",
+                402,
+                required=cost,
+                available=available,
+                balance=balance,
+                reserved=reserved
+            )
 
-        # Reserve credits
+        return cost, None
+
+    except Exception as e:
+        print(f"[CREDITS] Check error for {action_key}: {e}")
+        # Don't block on system errors
+        return 0, None
+
+
+def start_paid_job(identity_id: str, action_key: str, job_id: str, meta: dict = None) -> tuple:
+    """
+    Reserve credits for a paid job. Call this BEFORE calling upstream API.
+
+    Args:
+        identity_id: User's identity ID (required, non-null)
+        action_key: Action key for pricing
+        job_id: Unique job ID for idempotency
+        meta: Additional metadata for the reservation
+
+    Returns:
+        (reservation_id, None) on success
+        (None, error_response) on failure - return from route
+    """
+    if not CREDITS_AVAILABLE:
+        print(f"[CREDITS] System not available, allowing {action_key} job_id={job_id}")
+        return None, None
+
+    if not identity_id:
+        print(f"[CREDITS] ERROR: No identity for {action_key} job_id={job_id}")
+        return None, _make_credit_error(
+            "NO_SESSION",
+            "A valid session is required for this action. Please sign in or restore your session.",
+            401
+        )
+
+    try:
+        cost = PricingService.get_action_cost(action_key)
+        if cost == 0:
+            print(f"[CREDITS] No cost for {action_key}, no reservation needed")
+            return None, None
+
+        # Check balance before reserving
+        balance = WalletService.get_balance(identity_id)
+        reserved = WalletService.get_reserved_credits(identity_id)
+        available = max(0, balance - reserved)
+
+        print(f"[CREDITS] Reserve {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}, job_id={job_id}")
+
+        if available < cost:
+            return None, _make_credit_error(
+                "INSUFFICIENT_CREDITS",
+                f"You need {cost} credits but only have {available} available.",
+                402,
+                required=cost,
+                available=available,
+                balance=balance,
+                reserved=reserved
+            )
+
+        # Create reservation
         result = ReservationService.reserve_credits(
             identity_id=identity_id,
             action_key=action_key,
             job_id=job_id,
-            meta={"action_key": action_key, "source": "legacy_endpoint"},
+            meta={
+                "action_key": action_key,
+                "source": "paid_job_pipeline",
+                **(meta or {})
+            },
         )
 
         reservation_id = result["reservation"]["id"]
-        print(f"[CREDITS] Reserved {cost} credits for {action_key}, reservation_id={reservation_id}")
+        is_existing = result.get("is_existing", False)
+
+        if is_existing:
+            print(f"[CREDITS] Idempotent: existing reservation {reservation_id} for job_id={job_id}")
+        else:
+            print(f"[CREDITS] Reserved {cost} credits, reservation_id={reservation_id}, job_id={job_id}")
+
         return reservation_id, None
 
     except ValueError as e:
-        # Insufficient credits error from ReservationService
         error_msg = str(e)
         print(f"[CREDITS] Reservation failed: {error_msg}")
 
         if "INSUFFICIENT_CREDITS" in error_msg:
-            # Parse the error to get details
+            # Parse error details
             parts = error_msg.split(":")
             required = available = 0
             for part in parts:
@@ -3435,123 +3528,140 @@ def check_and_reserve_credits(identity_id: str, action_key: str, job_id: str):
                     except:
                         pass
 
-            return None, jsonify({
-                "ok": False,
-                "error": {
-                    "code": "INSUFFICIENT_CREDITS",
-                    "message": error_msg,
-                    "required": required,
-                    "available": available,
-                }
-            }), 402
+            return None, _make_credit_error(
+                "INSUFFICIENT_CREDITS",
+                error_msg,
+                402,
+                required=required,
+                available=available
+            )
 
-        return None, jsonify({
-            "ok": False,
-            "error": {
-                "code": "CREDIT_ERROR",
-                "message": str(e),
-            }
-        }), 400
+        return None, _make_credit_error("CREDIT_ERROR", str(e), 400)
 
     except Exception as e:
-        print(f"[CREDITS] Unexpected error: {e}")
-        # Don't block on credit system errors - allow request
+        print(f"[CREDITS] Unexpected error reserving credits: {e}")
+        # Don't block on system errors - but log for debugging
+        import traceback
+        traceback.print_exc()
         return None, None
 
 
-def finalize_reservation(reservation_id: str):
-    """Finalize (capture) a credit reservation after successful job start."""
-    if not CREDITS_AVAILABLE or not reservation_id:
-        return
-
-    try:
-        ReservationService.finalize_reservation(reservation_id)
-        print(f"[CREDITS] Finalized reservation {reservation_id}")
-    except Exception as e:
-        print(f"[CREDITS] Failed to finalize reservation {reservation_id}: {e}")
-
-
-def release_reservation(reservation_id: str, reason: str = "job_failed"):
-    """Release a credit reservation after job failure."""
-    if not CREDITS_AVAILABLE or not reservation_id:
-        return
-
-    try:
-        ReservationService.release_reservation(reservation_id, reason)
-        print(f"[CREDITS] Released reservation {reservation_id} ({reason})")
-    except Exception as e:
-        print(f"[CREDITS] Failed to release reservation {reservation_id}: {e}")
-
-
-# Action key mapping for legacy endpoints
-LEGACY_ACTION_KEYS = {
-    "text-to-3d-preview": "text_to_3d_generate",
-    "text-to-3d-refine": "refine",
-    "image-to-3d": "image_to_3d_generate",
-    "remesh": "remesh",
-    "texture": "texture",
-    "rig": "rig",
-    "image-studio": "image_studio_generate",
-}
-
-
-def check_credits_available(identity_id: str, action_key: str):
+def finalize_job_credits(reservation_id: str, job_id: str = None):
     """
-    Check if user has enough credits for an action BEFORE calling upstream API.
-    Does NOT reserve or charge - just a balance check.
+    Finalize (capture) credits after successful job completion.
+    Idempotent - safe to call multiple times.
 
     Args:
-        identity_id: User's identity ID
-        action_key: Action key from LEGACY_ACTION_KEYS (e.g., 'text_to_3d_generate')
-
-    Returns:
-        (True, cost, None) if credits available
-        (False, cost, error_response) if insufficient - return error_response from route
+        reservation_id: The reservation ID from start_paid_job
+        job_id: Optional job ID for logging
     """
-    if not CREDITS_AVAILABLE:
-        print(f"[CREDITS] System not available, allowing {action_key} without credit check")
-        return True, 0, None
-
-    if not identity_id:
-        # No identity - block the request (identity should be set by @with_session)
-        print(f"[CREDITS] ERROR: No identity for {action_key} - session middleware not applied?")
-        return False, 0, (jsonify({
-            "ok": False,
-            "error": {
-                "code": "SESSION_REQUIRED",
-                "message": "A valid session is required for this action",
-            }
-        }), 401)
+    if not CREDITS_AVAILABLE or not reservation_id:
+        return
 
     try:
-        cost = PricingService.get_action_cost(action_key)
-        if cost == 0:
-            print(f"[CREDITS] No cost defined for {action_key}, allowing")
-            return True, 0, None
+        result = ReservationService.finalize_reservation(reservation_id)
+        was_already = result.get("was_already_finalized", False)
+        if was_already:
+            print(f"[CREDITS] Already finalized: reservation={reservation_id} job_id={job_id}")
+        else:
+            print(f"[CREDITS] Finalized: reservation={reservation_id} job_id={job_id}")
+    except ValueError as e:
+        # Already released - this is ok, don't raise
+        print(f"[CREDITS] Cannot finalize {reservation_id}: {e}")
+    except Exception as e:
+        print(f"[CREDITS] Finalize error {reservation_id}: {e}")
 
+
+def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id: str = None):
+    """
+    Release (refund) credits after job failure/cancellation.
+    Idempotent - safe to call multiple times.
+
+    Args:
+        reservation_id: The reservation ID from start_paid_job
+        reason: Reason for release (logged)
+        job_id: Optional job ID for logging
+    """
+    if not CREDITS_AVAILABLE or not reservation_id:
+        return
+
+    try:
+        result = ReservationService.release_reservation(reservation_id, reason)
+        was_already = result.get("was_already_released", False)
+        if was_already:
+            print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
+        else:
+            print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
+    except ValueError as e:
+        # Already finalized - this is NOT ok for a failed job, log warning
+        print(f"[CREDITS] WARN: Cannot release {reservation_id}: {e}")
+    except Exception as e:
+        print(f"[CREDITS] Release error {reservation_id}: {e}")
+
+
+def get_current_balance(identity_id: str) -> dict:
+    """
+    Get current credit balance info for a user.
+
+    Returns:
+        {balance, reserved, available} or None if credits system unavailable
+    """
+    if not CREDITS_AVAILABLE or not identity_id:
+        return None
+
+    try:
         balance = WalletService.get_balance(identity_id)
         reserved = WalletService.get_reserved_credits(identity_id)
         available = max(0, balance - reserved)
-
-        print(f"[CREDITS] Check {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}")
-
-        if available < cost:
-            return False, cost, (jsonify({
-                "ok": False,
-                "error": "insufficient_credits",
-                "code": "INSUFFICIENT_CREDITS",
-                "message": f"Insufficient credits. Need {cost}, have {available}.",
-                "required": cost,
-                "available": available,
-                "balance": balance,
-            }), 402)
-
-        return True, cost, None
-
+        return {
+            "balance": balance,
+            "reserved": reserved,
+            "available": available
+        }
     except Exception as e:
-        print(f"[CREDITS] Check error for {action_key}: {e}")
-        # Don't block on credit system errors
-        return True, 0, None
+        print(f"[CREDITS] Balance check error: {e}")
+        return None
+
+
+# Legacy aliases for backward compatibility
+def check_and_reserve_credits(identity_id: str, action_key: str, job_id: str):
+    """DEPRECATED: Use start_paid_job() instead."""
+    return start_paid_job(identity_id, action_key, job_id)
+
+
+def finalize_reservation(reservation_id: str):
+    """DEPRECATED: Use finalize_job_credits() instead."""
+    finalize_job_credits(reservation_id)
+
+
+def release_reservation(reservation_id: str, reason: str = "job_failed"):
+    """DEPRECATED: Use release_job_credits() instead."""
+    release_job_credits(reservation_id, reason)
+
+
+# Action key mapping for routes -> pricing action codes
+# These map frontend/route names to the pricing_service action codes
+ACTION_KEYS = {
+    # Text to 3D
+    "text-to-3d-preview": "text_to_3d_generate",
+    "text-to-3d-refine": "refine",
+    "text-to-3d-remesh": "remesh",
+    # Image to 3D
+    "image-to-3d": "image_to_3d_generate",
+    # Mesh operations
+    "remesh": "remesh",
+    "retexture": "texture",
+    "texture": "texture",
+    "rig": "rig",
+    "rigging": "rig",
+    # Image generation
+    "image-studio": "image_studio_generate",
+    "openai-image": "image_studio_generate",
+    "image_generate": "image_studio_generate",
+}
+
+# Legacy alias
+LEGACY_ACTION_KEYS = ACTION_KEYS
 
 
 def charge_credits_for_action(identity_id: str, action_key: str, upstream_job_id: str, metadata: dict = None):
@@ -3615,23 +3725,6 @@ def charge_credits_for_action(identity_id: str, action_key: str, upstream_job_id
         return True, 0, None
 
 
-def get_current_balance(identity_id: str):
-    """
-    Get current available balance for an identity.
-    Returns dict with balance/reserved/available, or None if credits not available.
-    """
-    if not CREDITS_AVAILABLE or not identity_id:
-        return None
-    try:
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
-        return {"balance": balance, "reserved": reserved, "available": available}
-    except Exception as e:
-        print(f"[CREDITS] Failed to get balance: {e}")
-        return None
-
-
 # ─────────────────────────────────────────────────────────────
 # API
 # ─────────────────────────────────────────────────────────────
@@ -3667,23 +3760,24 @@ def api_text_to_3d_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id  # For backward compatibility
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/start:incoming", body)
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
-        return jsonify({"error": "prompt required"}), 400
+        return jsonify({"ok": False, "error": "prompt required"}), 400
     if not MESHY_API_KEY:
-        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    # Generate a temporary job ID for credit reservation (before Meshy call)
+    # ─── 2. Generate job ID and reserve credits ───
     temp_job_id = f"text3d-{uuid.uuid4().hex[:12]}"
-
-    # Check and reserve credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["text-to-3d-preview"]
-    reservation_id, credit_error = check_and_reserve_credits(identity_id, action_key, temp_job_id)
+    action_key = ACTION_KEYS["text-to-3d-preview"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
     if credit_error:
         return credit_error
 
@@ -3710,27 +3804,26 @@ def api_text_to_3d_start():
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
     batch_group_id = (body.get("batch_group_id") or "").strip() or None
 
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         log_event("text-to-3d/start:meshy-resp", resp)
         job_id = resp.get("result")
         if not job_id:
-            # Release reservation on failure
-            release_reservation(reservation_id, "meshy_no_job_id")
-            return jsonify({"error": "No job id in response", "raw": resp}), 502
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        # Release reservation on failure
-        release_reservation(reservation_id, "meshy_api_error")
-        return jsonify({"error": str(e)}), 502
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        return jsonify({"ok": False, "error": str(e)}), 502
 
-    # Finalize reservation - job started successfully
-    finalize_reservation(reservation_id)
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
 
     store = load_store()
     store[job_id] = {
         "stage": "preview",
         "prompt": prompt,
-        "root_prompt": prompt,  # This is the start of a chain
+        "root_prompt": prompt,
         "art_style": art_style or "realistic",
         "model": payload["ai_model"],
         "created_at": now_s() * 1000,
@@ -3740,19 +3833,23 @@ def api_text_to_3d_start():
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
-        "user_id": user_id,  # Track user who started the job
-        "reservation_id": reservation_id,  # Track credit reservation
+        "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
     }
     save_store(store)
 
     # Save to DB for recovery
     save_active_job_to_db(job_id, "text-to-3d", "preview", store[job_id], user_id)
 
-    # Get updated balance after credit deduction
+    # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
-    new_balance = balance_info["available"] if balance_info else None
-
-    return jsonify({"job_id": job_id, "new_balance": new_balance})
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 # ---- Refine from preview ----
 @app.route("/api/text-to-3d/refine", methods=["POST", "OPTIONS"])
@@ -3761,23 +3858,24 @@ def api_text_to_3d_refine():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/refine:incoming", body)
     preview_task_id_input = (body.get("preview_task_id") or "").strip()
     if not preview_task_id_input:
-        return jsonify({"error": "preview_task_id required"}), 400
+        return jsonify({"ok": False, "error": "preview_task_id required"}), 400
     if not MESHY_API_KEY:
-        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    # Generate a temporary job ID for credit reservation
+    # ─── 2. Generate job ID and reserve credits ───
     temp_job_id = f"refine-{uuid.uuid4().hex[:12]}"
-
-    # Check and reserve credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["text-to-3d-refine"]
-    reservation_id, credit_error = check_and_reserve_credits(identity_id, action_key, temp_job_id)
+    action_key = ACTION_KEYS["text-to-3d-refine"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
     if credit_error:
         return credit_error
 
@@ -3794,22 +3892,22 @@ def api_text_to_3d_refine():
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
 
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         log_event("text-to-3d/refine:meshy-resp", resp)
         job_id = resp.get("result")
         if not job_id:
-            release_reservation(reservation_id, "meshy_no_job_id")
-            return jsonify({"error": "No job id in response", "raw": resp}), 502
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_reservation(reservation_id, "meshy_api_error")
-        return jsonify({"error": str(e)}), 502
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        return jsonify({"ok": False, "error": str(e)}), 502
 
-    # Finalize reservation - job started successfully
-    finalize_reservation(reservation_id)
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
 
     store = load_store()
-    # Copy metadata from preview job (try both input ID and resolved ID)
     preview_meta = get_job_metadata(preview_task_id_input, store)
     if not preview_meta.get("prompt"):
         preview_meta = get_job_metadata(preview_task_id, store)
@@ -3817,27 +3915,29 @@ def api_text_to_3d_refine():
     root_prompt = preview_meta.get("root_prompt") or original_prompt
     store[job_id] = {
         "stage": "refine",
-        "preview_task_id": preview_task_id,  # Store the resolved Meshy ID
+        "preview_task_id": preview_task_id,
         "created_at": now_s() * 1000,
-        # Copy from preview job
         "prompt": original_prompt,
         "root_prompt": root_prompt,
         "title": f"(refine) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
         "art_style": preview_meta.get("art_style"),
         "texture_prompt": texture_prompt,
         "user_id": user_id,
+        "identity_id": identity_id,
         "reservation_id": reservation_id,
     }
     save_store(store)
 
-    # Save to DB for recovery
     save_active_job_to_db(job_id, "text-to-3d", "refine", store[job_id], user_id)
 
-    # Get updated balance after credit deduction
+    # ─── 5. Return success with balance ───
     balance_info = get_current_balance(identity_id)
-    new_balance = balance_info["available"] if balance_info else None
-
-    return jsonify({"job_id": job_id, "new_balance": new_balance})
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 # ---- (Soft) Remesh start (re-run preview with flags) ----
 @app.route("/api/text-to-3d/remesh-start", methods=["POST", "OPTIONS"])
@@ -3846,27 +3946,30 @@ def api_text_to_3d_remesh_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
-        return jsonify({"error": "prompt required"}), 400
+        return jsonify({"ok": False, "error": "prompt required"}), 400
     if not MESHY_API_KEY:
-        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    # Check credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["remesh"]
-    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
-    if not has_credits:
+    # ─── 2. Generate job ID and reserve credits ───
+    temp_job_id = f"remesh-{uuid.uuid4().hex[:12]}"
+    action_key = ACTION_KEYS["remesh"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    if credit_error:
         return credit_error
 
     payload = {
         "mode": "preview",
         "prompt": prompt,
         "ai_model": body.get("model") or "latest",
-        # mesh-friendly defaults for a cleaner topology
         "topology": "triangle",
         "should_remesh": True,
         "target_polycount": body.get("target_polycount", 45000),
@@ -3884,16 +3987,19 @@ def api_text_to_3d_remesh_start():
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
 
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         job_id = resp.get("result")
         if not job_id:
-            return jsonify({"error": "No job id in response", "raw": resp}), 502
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        return jsonify({"ok": False, "error": str(e)}), 502
 
-    # Charge credits AFTER successful Meshy call (idempotent via job_id)
-    _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100]})
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
 
     store = load_store()
     store[job_id] = {
@@ -3909,9 +4015,19 @@ def api_text_to_3d_remesh_start():
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
     }
     save_store(store)
-    return jsonify({"job_id": job_id, "new_balance": new_balance or None})
+
+    # ─── 5. Return success with balance ───
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 # ---- Status ----
 @app.route("/api/text-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
@@ -4089,21 +4205,25 @@ def api_mesh_remesh():
     if request.method == "OPTIONS":
         return ("", 204)
     if not MESHY_API_KEY:
-        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/remesh:incoming", body)
     source, err = build_source_payload(body)
     if err:
-        return jsonify({"error": err}), 400
+        return jsonify({"ok": False, "error": err}), 400
 
-    # Check credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["remesh"]
-    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
-    if not has_credits:
+    # ─── 2. Generate job ID and reserve credits ───
+    temp_job_id = f"remesh-{uuid.uuid4().hex[:12]}"
+    action_key = ACTION_KEYS["remesh"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    if credit_error:
         return credit_error
 
     payload = {
@@ -4134,41 +4254,51 @@ def api_mesh_remesh():
     if body.get("convert_format_only") is not None:
         payload["convert_format_only"] = bool(body.get("convert_format_only"))
 
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/remesh", payload)
         log_event("mesh/remesh:meshy-resp", resp)
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
-            return jsonify({"error": "No job id in response", "raw": resp}), 502
-
-        # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id)
-
-        # Save metadata to store (checks local store AND database for source)
-        store = load_store()
-        source_task_id = body.get("source_task_id") or body.get("model_task_id")
-        source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-        original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-        root_prompt = source_meta.get("root_prompt") or original_prompt
-        store[job_id] = {
-            "stage": "remesh",
-            "source_task_id": source_task_id,
-            "created_at": now_s() * 1000,
-            "prompt": original_prompt,
-            "root_prompt": root_prompt,
-            "title": f"(remesh) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
-            "topology": topology,
-            "target_polycount": payload.get("target_polycount"),
-            "user_id": user_id,
-        }
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(job_id, "remesh", "remesh", store[job_id], user_id)
-
-        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
+            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
+
+    store = load_store()
+    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    store[job_id] = {
+        "stage": "remesh",
+        "source_task_id": source_task_id,
+        "created_at": now_s() * 1000,
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": f"(remesh) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "topology": topology,
+        "target_polycount": payload.get("target_polycount"),
+        "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+    }
+    save_store(store)
+
+    save_active_job_to_db(job_id, "remesh", "remesh", store[job_id], user_id)
+
+    # ─── 5. Return success with balance ───
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 @app.route("/api/mesh/remesh/<job_id>", methods=["GET", "OPTIONS"])
 def api_mesh_remesh_status(job_id):
@@ -4237,8 +4367,11 @@ def api_mesh_retexture():
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/retexture:incoming", body)
@@ -4251,10 +4384,11 @@ def api_mesh_retexture():
     if not prompt and not style_img:
         return jsonify({"error": "text_style_prompt or image_style_url required"}), 400
 
-    # Check credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["texture"]
-    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
-    if not has_credits:
+    # ─── 2. Generate job ID and reserve credits ───
+    temp_job_id = f"texture-{uuid.uuid4().hex[:12]}"
+    action_key = ACTION_KEYS["texture"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id, {"texture_prompt": prompt[:100] if prompt else None})
+    if credit_error:
         return credit_error
 
     payload = {
@@ -4270,41 +4404,51 @@ def api_mesh_retexture():
     if ai_model:
         payload["ai_model"] = ai_model
 
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/retexture", payload)
         log_event("mesh/retexture:meshy-resp", resp)
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
             return jsonify({"error": "No job id in response", "raw": resp}), 502
-
-        # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id, {"texture_prompt": prompt[:100] if prompt else None})
-
-        # Save metadata to store (checks local store AND database for source)
-        store = load_store()
-        source_task_id = body.get("source_task_id") or body.get("model_task_id")
-        source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-        original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-        root_prompt = source_meta.get("root_prompt") or original_prompt
-        store[job_id] = {
-            "stage": "texture",
-            "source_task_id": source_task_id,
-            "created_at": now_s() * 1000,
-            "prompt": original_prompt,
-            "root_prompt": root_prompt,
-            "title": f"(texture) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
-            "texture_prompt": prompt,
-            "enable_pbr": bool(body.get("enable_pbr", False)),
-            "user_id": user_id,
-        }
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(job_id, "retexture", "texture", store[job_id], user_id)
-
-        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
         return jsonify({"error": str(e)}), 502
+
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
+
+    # Save metadata to store (checks local store AND database for source)
+    store = load_store()
+    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    store[job_id] = {
+        "stage": "texture",
+        "source_task_id": source_task_id,
+        "created_at": now_s() * 1000,
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": f"(texture) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "texture_prompt": prompt,
+        "enable_pbr": bool(body.get("enable_pbr", False)),
+        "user_id": user_id,
+    }
+    save_store(store)
+
+    # Save to DB for recovery
+    save_active_job_to_db(job_id, "retexture", "texture", store[job_id], user_id)
+
+    # ─── 5. Return success with balance ───
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 @app.route("/api/mesh/retexture/<job_id>", methods=["GET", "OPTIONS"])
 def api_mesh_retexture_status(job_id):
@@ -4380,8 +4524,11 @@ def api_mesh_rigging():
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/rigging:incoming", body)
@@ -4389,10 +4536,11 @@ def api_mesh_rigging():
     if err:
         return jsonify({"error": err}), 400
 
-    # Check credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["rig"]
-    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
-    if not has_credits:
+    # ─── 2. Generate job ID and reserve credits ───
+    temp_job_id = f"rig-{uuid.uuid4().hex[:12]}"
+    action_key = ACTION_KEYS["rig"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id)
+    if credit_error:
         return credit_error
 
     payload = {**source}
@@ -4406,39 +4554,49 @@ def api_mesh_rigging():
     if tex_img:
         payload["texture_image_url"] = tex_img
 
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/rigging", payload)
         log_event("mesh/rigging:meshy-resp", resp)
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
             return jsonify({"error": "No job id in response", "raw": resp}), 502
-
-        # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id)
-
-        # Save metadata to store (checks local store AND database for source)
-        store = load_store()
-        source_task_id = body.get("source_task_id") or body.get("model_task_id")
-        source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-        original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-        root_prompt = source_meta.get("root_prompt") or original_prompt
-        store[job_id] = {
-            "stage": "rigging",
-            "source_task_id": source_task_id,
-            "created_at": now_s() * 1000,
-            "prompt": original_prompt,
-            "root_prompt": root_prompt,
-            "title": f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
-            "user_id": user_id,
-        }
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(job_id, "rigging", "rigging", store[job_id], user_id)
-
-        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
         return jsonify({"error": str(e)}), 502
+
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
+
+    # Save metadata to store (checks local store AND database for source)
+    store = load_store()
+    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    store[job_id] = {
+        "stage": "rigging",
+        "source_task_id": source_task_id,
+        "created_at": now_s() * 1000,
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "user_id": user_id,
+    }
+    save_store(store)
+
+    # Save to DB for recovery
+    save_active_job_to_db(job_id, "rigging", "rigging", store[job_id], user_id)
+
+    # ─── 5. Return success with balance ───
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 @app.route("/api/mesh/rigging/<job_id>", methods=["GET", "OPTIONS"])
 def api_mesh_rigging_status(job_id):
@@ -4511,8 +4669,11 @@ def api_image_to_3d_start():
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     log_event("image-to-3d/start:incoming", body)
@@ -4520,10 +4681,11 @@ def api_image_to_3d_start():
     if not image_url:
         return jsonify({"error": "image_url required"}), 400
 
-    # Check credits BEFORE calling Meshy
-    action_key = LEGACY_ACTION_KEYS["image-to-3d"]
-    has_credits, cost, credit_error = check_credits_available(identity_id, action_key)
-    if not has_credits:
+    # ─── 2. Generate job ID and reserve credits ───
+    temp_job_id = f"img3d-{uuid.uuid4().hex[:12]}"
+    action_key = ACTION_KEYS["image-to-3d"]
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, temp_job_id, {"prompt": (body.get("prompt") or "")[:100]})
+    if credit_error:
         return credit_error
 
     prompt = (body.get("prompt") or "").strip()
@@ -4534,58 +4696,69 @@ def api_image_to_3d_start():
         # Explicitly request textured output when supported
         "enable_pbr": True,
     }
+
+    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
         log_event("image-to-3d/start:meshy-resp", resp)
         job_id = resp.get("result") or resp.get("id")
         if not job_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", temp_job_id)
             return jsonify({"error": "No job id in response", "raw": resp}), 502
-
-        # Charge credits AFTER successful Meshy call (idempotent via job_id)
-        _, new_balance, _ = charge_credits_for_action(identity_id, action_key, job_id, {"prompt": prompt[:100] if prompt else None})
-
-        s3_name = prompt if prompt else "image_to_3d_source"
-        s3_user_id = user_id or "public"
-
-        # Upload source image to S3 for permanent storage with deterministic key
-        # safe_upload_to_s3 handles unauthenticated uploads (user_id=None -> public namespace)
-        s3_image_url = image_url
-        if AWS_BUCKET_MODELS:
-            try:
-                s3_image_url = safe_upload_to_s3(
-                    image_url,
-                    "image/png",
-                    "source_images",
-                    s3_name,
-                    user_id=user_id,
-                    key_base=f"source_images/{s3_user_id}/{job_id}",
-                    provider="user",
-                )
-                print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
-            except Exception as e:
-                print(f"[image-to-3d] Failed to upload source image to S3: {e}, using original URL")
-
-        # Save metadata to store so we can retrieve it when job finishes
-        store = load_store()
-        store[job_id] = {
-            "stage": "image3d",
-            "created_at": now_s() * 1000,
-            "prompt": prompt,
-            "root_prompt": prompt,  # This is the start of a chain
-            "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
-            "image_url": s3_image_url,  # Store S3 URL for our records
-            "original_image_url": image_url,  # Keep original for reference
-            "ai_model": payload.get("ai_model"),
-            "user_id": user_id,
-        }
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(job_id, "image-to-3d", "image3d", store[job_id], user_id)
-
-        return jsonify({"job_id": job_id, "new_balance": new_balance or None})
     except Exception as e:
+        release_job_credits(reservation_id, "meshy_api_error", temp_job_id)
         return jsonify({"error": str(e)}), 502
+
+    # ─── 4. Job started successfully - finalize credits ───
+    finalize_job_credits(reservation_id, job_id)
+
+    s3_name = prompt if prompt else "image_to_3d_source"
+    s3_user_id = user_id or "public"
+
+    # Upload source image to S3 for permanent storage with deterministic key
+    # safe_upload_to_s3 handles unauthenticated uploads (user_id=None -> public namespace)
+    s3_image_url = image_url
+    if AWS_BUCKET_MODELS:
+        try:
+            s3_image_url = safe_upload_to_s3(
+                image_url,
+                "image/png",
+                "source_images",
+                s3_name,
+                user_id=user_id,
+                key_base=f"source_images/{s3_user_id}/{job_id}",
+                provider="user",
+            )
+            print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
+        except Exception as e:
+            print(f"[image-to-3d] Failed to upload source image to S3: {e}, using original URL")
+
+    # Save metadata to store so we can retrieve it when job finishes
+    store = load_store()
+    store[job_id] = {
+        "stage": "image3d",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "root_prompt": prompt,  # This is the start of a chain
+        "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
+        "image_url": s3_image_url,  # Store S3 URL for our records
+        "original_image_url": image_url,  # Keep original for reference
+        "ai_model": payload.get("ai_model"),
+        "user_id": user_id,
+    }
+    save_store(store)
+
+    # Save to DB for recovery
+    save_active_job_to_db(job_id, "image-to-3d", "image3d", store[job_id], user_id)
+
+    # ─── 5. Return success with balance ───
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None
+    })
 
 @app.route("/api/image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
 def api_image_to_3d_status(job_id):
@@ -4659,11 +4832,14 @@ def api_openai_image():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id
-    identity_id = g.identity_id  # Set by @with_session middleware
-
     if not OPENAI_API_KEY:
         return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
+
+    # ─── 1. Require valid identity ───
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
@@ -4689,10 +4865,11 @@ def api_openai_image():
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
-    # Check credits BEFORE calling OpenAI
+    # ─── 2. Check credits BEFORE calling OpenAI ───
     # Note: For n > 1, we check for n * cost (charge per image)
-    action_key = LEGACY_ACTION_KEYS["image-studio"]
-    if CREDITS_AVAILABLE and identity_id:
+    # OpenAI calls are synchronous, so we use direct charging instead of reservation
+    action_key = ACTION_KEYS["image-studio"]
+    if CREDITS_AVAILABLE:
         try:
             base_cost = PricingService.get_action_cost(action_key)
             total_cost = base_cost * n
@@ -4703,15 +4880,15 @@ def api_openai_image():
             print(f"[CREDITS] OpenAI image: n={n}, base_cost={base_cost}, total_cost={total_cost}, available={available}")
 
             if total_cost > 0 and available < total_cost:
-                return jsonify({
-                    "ok": False,
-                    "error": "insufficient_credits",
-                    "code": "INSUFFICIENT_CREDITS",
-                    "message": f"Insufficient credits. Need {total_cost}, have {available}.",
-                    "required": total_cost,
-                    "available": available,
-                    "balance": balance,
-                }), 402
+                return _make_credit_error(
+                    "INSUFFICIENT_CREDITS",
+                    f"You need {total_cost} credits but only have {available} available.",
+                    402,
+                    required=total_cost,
+                    available=available,
+                    balance=balance,
+                    reserved=reserved
+                )
         except Exception as e:
             print(f"[CREDITS] Check error for OpenAI image: {e}")
 
@@ -4748,10 +4925,10 @@ def api_openai_image():
             user_id=user_id
         )
 
-        # Charge credits AFTER successful OpenAI call (idempotent via image_id)
+        # ─── 4. Charge credits AFTER successful OpenAI call (idempotent via image_id) ───
         # For n > 1, we charge n times the base cost
         new_balance = None
-        if CREDITS_AVAILABLE and identity_id:
+        if CREDITS_AVAILABLE:
             try:
                 base_cost = PricingService.get_action_cost(action_key)
                 total_cost = base_cost * n
@@ -4770,7 +4947,10 @@ def api_openai_image():
             except Exception as e:
                 print(f"[CREDITS] Failed to charge for OpenAI image: {e}")
 
+    # ─── 5. Return success with balance ───
+    balance_info = get_current_balance(identity_id)
     return jsonify({
+        "ok": True,
         "image_id": image_id,
         "image_url": urls[0] if urls else None,
         "image_urls": urls,
@@ -4778,7 +4958,7 @@ def api_openai_image():
         "status": "done",
         "model": model,
         "size": size,
-        "new_balance": new_balance,
+        "new_balance": balance_info["available"] if balance_info else new_balance,
         "raw": resp
     })
 
@@ -4848,11 +5028,13 @@ def api_cache_image_get(filename):
 
 # ---- History persistence (DATABASE PRIMARY STORAGE) ----
 @app.route("/api/history", methods=["GET", "POST", "OPTIONS"])
+@with_session
 def api_history():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id  # May be None for anonymous users
+    # Use identity_id from @with_session middleware for consistent identity resolution
+    user_id = getattr(g, 'identity_id', None)  # May be None for anonymous users
 
     if request.method == "GET":
         if USE_DB:
