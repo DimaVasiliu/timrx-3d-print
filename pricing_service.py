@@ -72,9 +72,19 @@ class PricingService:
     }
 
     # Additional frontend aliases that map to same DB codes
+    # These cover all UI action keys used in workspace-credits.js BUTTON_CONFIG
     FRONTEND_ALIASES = {
-        "remesh": "MESHY_REFINE",  # remesh uses same cost as refine (10c)
-        "rigging": "MESHY_RIG",    # rigging alias for rig (25c)
+        # Hyphenated frontend keys (from BUTTON_CONFIG)
+        "text-to-3d": "MESHY_TEXT_TO_3D",
+        "image-to-3d": "MESHY_IMAGE_TO_3D",
+        "text-to-image": "OPENAI_IMAGE",
+        # Alternative names
+        "remesh": "MESHY_REFINE",      # remesh uses same cost as refine (10c)
+        "rigging": "MESHY_RIG",        # rigging alias for rig (25c)
+        "upscale": "MESHY_REFINE",     # upscale is same as refine (10c)
+        "image_generate": "OPENAI_IMAGE",  # Legacy key
+        "video_generate": "VIDEO_GENERATE",  # Alternative video key
+        "preview": "MESHY_TEXT_TO_3D",  # Preview is text-to-3d cost
     }
 
     @staticmethod
@@ -246,15 +256,21 @@ class PricingService:
         # Map to frontend keys
         result: Dict[str, int] = {}
 
-        # Primary mappings
+        # Primary mappings (DB codes to stable frontend keys)
         for db_code, frontend_key in PricingService.ACTION_CODE_MAP.items():
             if db_code in db_costs:
                 result[frontend_key] = db_costs[db_code]
 
-        # Aliases (remesh, rig point to same costs)
+        # All aliases (remesh, rig, hyphenated keys, etc.)
         for alias, db_code in PricingService.FRONTEND_ALIASES.items():
             if db_code in db_costs:
                 result[alias] = db_costs[db_code]
+
+        # Log what we're returning for debugging
+        if result:
+            print(f"[PRICING] Action costs loaded from DB: {len(result)} keys")
+        else:
+            print("[PRICING] WARNING: No action costs found in database!")
 
         # Cache the result
         PricingService._action_costs_cache = result.copy()
