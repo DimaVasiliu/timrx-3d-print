@@ -116,6 +116,16 @@ except ImportError as e:
     WalletService = None
     PricingService = None
 
+# Import session middleware for identity resolution
+try:
+    from middleware import with_session
+    print("[MIDDLEWARE] Session middleware loaded")
+except ImportError as e:
+    print(f"[WARN] Session middleware not available: {e}")
+    # Fallback: no-op decorator if middleware not available
+    def with_session(f):
+        return f
+
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
@@ -3354,9 +3364,15 @@ def check_and_reserve_credits(identity_id: str, action_key: str, job_id: str):
         return None, None
 
     if not identity_id:
-        # No identity - allow anonymous (legacy behavior)
-        print(f"[CREDITS] No identity for {action_key}, allowing without credit check")
-        return None, None
+        # No identity - block the request (identity should be set by @with_session)
+        print(f"[CREDITS] ERROR: No identity for {action_key} - session middleware not applied?")
+        return None, (jsonify({
+            "ok": False,
+            "error": {
+                "code": "SESSION_REQUIRED",
+                "message": "A valid session is required for this action",
+            }
+        }), 401)
 
     try:
         # Get cost for this action
@@ -3497,8 +3513,15 @@ def check_credits_available(identity_id: str, action_key: str):
         return True, 0, None
 
     if not identity_id:
-        print(f"[CREDITS] No identity for {action_key}, allowing without credit check")
-        return True, 0, None
+        # No identity - block the request (identity should be set by @with_session)
+        print(f"[CREDITS] ERROR: No identity for {action_key} - session middleware not applied?")
+        return False, 0, (jsonify({
+            "ok": False,
+            "error": {
+                "code": "SESSION_REQUIRED",
+                "message": "A valid session is required for this action",
+            }
+        }), 401)
 
     try:
         cost = PricingService.get_action_cost(action_key)
@@ -3639,12 +3662,13 @@ def db_check():
 
 # ---- Start preview (Text → 3D) ----
 @app.route("/api/text-to-3d/start", methods=["POST", "OPTIONS"])
+@with_session
 def api_text_to_3d_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id  # May be None for anonymous users
-    identity_id = getattr(g, 'identity_id', None) or user_id  # Use billing identity if available
+    user_id = g.user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/start:incoming", body)
@@ -3732,12 +3756,13 @@ def api_text_to_3d_start():
 
 # ---- Refine from preview ----
 @app.route("/api/text-to-3d/refine", methods=["POST", "OPTIONS"])
+@with_session
 def api_text_to_3d_refine():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    user_id = g.user_id  # May be None for anonymous users
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    user_id = g.user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/refine:incoming", body)
@@ -3816,12 +3841,13 @@ def api_text_to_3d_refine():
 
 # ---- (Soft) Remesh start (re-run preview with flags) ----
 @app.route("/api/text-to-3d/remesh-start", methods=["POST", "OPTIONS"])
+@with_session
 def api_text_to_3d_remesh_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
     user_id = g.user_id
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
@@ -4058,6 +4084,7 @@ def api_proxy_glb():
 
 # ---- Meshy Remesh ----
 @app.route("/api/mesh/remesh", methods=["POST", "OPTIONS"])
+@with_session
 def api_mesh_remesh():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -4065,7 +4092,7 @@ def api_mesh_remesh():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/remesh:incoming", body)
@@ -4203,6 +4230,7 @@ def api_mesh_remesh_status(job_id):
 
 # ---- Meshy Retexture ----
 @app.route("/api/mesh/retexture", methods=["POST", "OPTIONS"])
+@with_session
 def api_mesh_retexture():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -4210,7 +4238,7 @@ def api_mesh_retexture():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/retexture:incoming", body)
@@ -4345,6 +4373,7 @@ def api_mesh_retexture_status(job_id):
 
 # ---- Meshy Rigging ----
 @app.route("/api/mesh/rigging", methods=["POST", "OPTIONS"])
+@with_session
 def api_mesh_rigging():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -4352,7 +4381,7 @@ def api_mesh_rigging():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/rigging:incoming", body)
@@ -4475,6 +4504,7 @@ def api_mesh_rigging_status(job_id):
 
 # ---- Meshy Image to 3D ----
 @app.route("/api/image-to-3d/start", methods=["POST", "OPTIONS"])
+@with_session
 def api_image_to_3d_start():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -4482,7 +4512,7 @@ def api_image_to_3d_start():
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     user_id = g.user_id
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     body = request.get_json(silent=True) or {}
     log_event("image-to-3d/start:incoming", body)
@@ -4624,12 +4654,13 @@ def api_nano_image_status(job_id):
 
 # ---- OpenAI (DALL·E / GPT-Image) Image Generation ----
 @app.route("/api/image/openai", methods=["POST", "OPTIONS"])
+@with_session
 def api_openai_image():
     if request.method == "OPTIONS":
         return ("", 204)
 
     user_id = g.user_id
-    identity_id = getattr(g, 'identity_id', None) or user_id
+    identity_id = g.identity_id  # Set by @with_session middleware
 
     if not OPENAI_API_KEY:
         return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
