@@ -28,7 +28,7 @@ import requests
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from config import config
+import config as cfg
 from pricing_service import PricingService
 
 
@@ -40,10 +40,10 @@ class MollieCreateError(Exception):
 
 
 # Check if Mollie is configured
-MOLLIE_AVAILABLE = config.MOLLIE_CONFIGURED
+MOLLIE_AVAILABLE = cfg.config.MOLLIE_CONFIGURED
 
 if MOLLIE_AVAILABLE:
-    print(f"[MOLLIE] Mollie configured and ready (mode: {config.MOLLIE_MODE})")
+    print(f"[MOLLIE] Mollie configured and ready (mode: {cfg.config.MOLLIE_MODE})")
 else:
     print("[MOLLIE] Mollie not configured - Mollie payments disabled")
 
@@ -62,7 +62,7 @@ class MollieService:
     def _get_headers() -> Dict[str, str]:
         """Get headers for Mollie API requests."""
         return {
-            "Authorization": f"Bearer {config.MOLLIE_API_KEY}",
+            "Authorization": f"Bearer {cfg.config.MOLLIE_API_KEY}",
             "Content-Type": "application/json",
         }
 
@@ -111,10 +111,10 @@ class MollieService:
 
         # Build redirect URL - Mollie redirects user HERE after payment
         # MUST use FRONTEND_BASE_URL (timrx.live), NOT backend URL (3d.timrx.live)
-        frontend_url = config.FRONTEND_BASE_URL.rstrip("/") if config.FRONTEND_BASE_URL else ""
+        frontend_url = cfg.config.FRONTEND_BASE_URL.rstrip("/") if cfg.config.FRONTEND_BASE_URL else ""
         if not frontend_url:
             # Fallback to PUBLIC_BASE_URL for backward compatibility (not recommended)
-            frontend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+            frontend_url = cfg.config.PUBLIC_BASE_URL.rstrip("/") if cfg.config.PUBLIC_BASE_URL else ""
             print("[MOLLIE] WARNING: FRONTEND_BASE_URL not set, using PUBLIC_BASE_URL for redirects")
 
         if not success_url:
@@ -122,7 +122,7 @@ class MollieService:
             success_url = f"{frontend_url}/hub.html?checkout=success"
 
         # Build webhook URL - MUST use backend API URL (3d.timrx.live)
-        backend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        backend_url = cfg.config.PUBLIC_BASE_URL.rstrip("/") if cfg.config.PUBLIC_BASE_URL else ""
         webhook_url = f"{backend_url}/api/billing/webhook/mollie"
 
         # Build metadata (stored with payment, returned in webhook)
@@ -803,43 +803,20 @@ class MollieService:
                 (new_balance, identity_id),
             )
 
-            # 5. Attach email to identity if provided (safe + idempotent)
-            # Only attach if: identity has no email AND email not used by another identity
-            email_attached = False
-            if customer_email:
-                normalized_email = customer_email.lower().strip()
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.IDENTITIES}
-                    SET email = %s,
-                        last_seen_at = NOW()
-                    WHERE id = %s
-                      AND email IS NULL
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM {Tables.IDENTITIES} i2
-                          WHERE lower(i2.email) = lower(%s)
-                      )
-                    """,
-                    (normalized_email, identity_id, normalized_email),
-                )
-                email_attached = cur.rowcount > 0
-                print(
-                    f"[MOLLIE] Email attach attempted for identity={identity_id} "
-                    f"email={normalized_email} (rows={cur.rowcount})"
-                )
+            # NOTE: Email is NOT auto-attached during purchase.
+            # The email is stored in purchase metadata for the receipt only.
+            # User must explicitly use "Secure Your Credits" to attach & verify email.
+            # This prevents the UI from showing "verify code" state when no code was sent.
 
             print(
                 f"[MOLLIE] Purchase recorded: purchase_id={purchase_id}, identity={identity_id}, "
-                f"credits={credits_granted}, balance: {current_balance} -> {new_balance}, "
-                f"email_attached={email_attached}"
+                f"credits={credits_granted}, balance: {current_balance} -> {new_balance}"
             )
 
             return {
                 "purchase": PurchaseService._format_purchase(purchase),
                 "ledger_entry_id": str(ledger_entry["id"]),
                 "balance": new_balance,
-                "email_attached": email_attached,
             }
 
     # ─────────────────────────────────────────────────────────────
