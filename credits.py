@@ -88,12 +88,15 @@ def _resolve_action_cost(action: str) -> tuple[str, int]:
 def get_wallet():
     """
     Get current wallet credits for the active identity.
+    Returns balance, reserved, and available credits.
 
     Response (200):
     {
         "ok": true,
         "identity_id": "uuid",
-        "credits_balance": 150
+        "credits_balance": 150,
+        "reserved_credits": 20,
+        "available_credits": 130
     }
 
     Response (401 - no session):
@@ -103,11 +106,17 @@ def get_wallet():
     """
     try:
         balance = WalletService.get_balance(g.identity_id)
+        reserved = WalletService.get_reserved_credits(g.identity_id)
+        available = max(0, balance - reserved)
+
+        print(f"[CREDITS] Wallet fetch: identity={g.identity_id}, balance={balance}, reserved={reserved}, available={available}")
 
         return jsonify({
             "ok": True,
             "identity_id": g.identity_id,
             "credits_balance": balance,
+            "reserved_credits": reserved,
+            "available_credits": available,
         })
     except Exception as e:
         print(f"[CREDITS] Error fetching wallet: {e}")
