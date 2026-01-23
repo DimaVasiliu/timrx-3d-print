@@ -25,6 +25,7 @@ import json
 from db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
 from wallet_service import WalletService, LedgerEntryType
 from pricing_service import PricingService
+from config import config
 
 
 class ReservationStatus:
