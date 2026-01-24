@@ -3118,11 +3118,11 @@ def _dispatch_meshy_text_to_3d_async(
             _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
             return
 
-        # Success - finalize credits
-        if reservation_id:
-            finalize_job_credits(reservation_id, meshy_task_id)
+        # Provider accepted job - keep credits HELD (don't finalize yet)
+        # Credits will be captured when asset is successfully saved to DB+S3
+        # Credits will be released if job fails later
 
-        # Update job with upstream_job_id
+        # Update job with upstream_job_id (status becomes 'processing')
         _update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
         # Save to local store (for status polling compatibility)
@@ -3150,6 +3150,196 @@ def _dispatch_meshy_text_to_3d_async(
         # Release credits on failure
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+
+        # Mark job as failed
+        _update_job_status_failed(internal_job_id, str(e))
+
+
+def _dispatch_meshy_image_to_3d_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+    image_url: str,
+):
+    """
+    Background task to call Meshy image-to-3d API.
+    Called via ThreadPoolExecutor after /start returns.
+
+    Args:
+        internal_job_id: Our UUID job ID (already in jobs table)
+        identity_id: User's identity
+        reservation_id: Credit reservation (stays HELD until asset saved)
+        payload: Meshy API payload
+        store_meta: Metadata to save in local store
+        image_url: Original image URL for S3 upload
+    """
+    start_time = time.time()
+    print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
+
+    try:
+        # Call Meshy API
+        resp = mesh_post("/openapi/v1/image-to-3d", payload)
+        meshy_task_id = resp.get("result") or resp.get("id")
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] Meshy image-to-3d returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
+
+        if not meshy_task_id:
+            # Meshy didn't return a task ID - release credits
+            print(f"[ASYNC] ERROR: No task_id from Meshy image-to-3d for job {internal_job_id}")
+            if reservation_id:
+                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
+            return
+
+        # Provider accepted job - keep credits HELD (don't finalize yet)
+        # Credits will be captured when asset is successfully saved to DB+S3
+
+        # Update job with upstream_job_id (status becomes 'processing')
+        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
+
+        # Upload source image to S3 for permanent storage
+        user_id = identity_id
+        s3_image_url = image_url
+        prompt = store_meta.get("prompt", "")
+        s3_name = prompt if prompt else "image_to_3d_source"
+
+        if AWS_BUCKET_MODELS:
+            try:
+                s3_image_url = safe_upload_to_s3(
+                    image_url,
+                    "image/png",
+                    "source_images",
+                    s3_name,
+                    user_id=user_id,
+                    key_base=f"source_images/{user_id or 'public'}/{meshy_task_id}",
+                    provider="user",
+                )
+                print(f"[ASYNC] Uploaded source image to S3: {s3_image_url}")
+            except Exception as e:
+                print(f"[ASYNC] Failed to upload source image to S3: {e}, using original URL")
+
+        # Save to local store (for status polling compatibility)
+        store = load_store()
+        store_meta["upstream_job_id"] = meshy_task_id
+        store_meta["image_url"] = s3_image_url
+        store[meshy_task_id] = store_meta  # Key by meshy_task_id for polling
+        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}
+        save_store(store)
+
+        # Save to DB for recovery
+        save_active_job_to_db(
+            meshy_task_id,
+            "image-to-3d",
+            "image3d",
+            store_meta,
+            identity_id
+        )
+
+        print(f"[ASYNC] Image-to-3d job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Meshy image-to-3d call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+
+        # Release credits on failure
+        if reservation_id:
+            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+
+        # Mark job as failed
+        _update_job_status_failed(internal_job_id, str(e))
+
+
+def _dispatch_openai_image_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    prompt: str,
+    size: str,
+    model: str,
+    n: int,
+    response_format: str,
+    store_meta: dict,
+):
+    """
+    Background task to call OpenAI image generation API.
+    Called via ThreadPoolExecutor after /start returns.
+
+    Unlike Meshy, OpenAI returns the image immediately so we:
+    - Call OpenAI
+    - Save image to DB + S3
+    - Capture credits
+    - Mark job as ready
+    """
+    start_time = time.time()
+    print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
+
+    try:
+        # Call OpenAI API
+        resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
+
+        data_list = resp.get("data") or []
+        urls = []
+        b64_first = None
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            if item.get("url"):
+                urls.append(item["url"])
+            elif item.get("b64_json"):
+                if not b64_first:
+                    b64_first = item["b64_json"]
+                urls.append(f"data:image/png;base64,{item['b64_json']}")
+
+        if not urls:
+            print(f"[ASYNC] ERROR: No images from OpenAI for job {internal_job_id}")
+            if reservation_id:
+                release_job_credits(reservation_id, "openai_no_images", internal_job_id)
+            _update_job_status_failed(internal_job_id, "OpenAI returned no images")
+            return
+
+        # Save image to normalized DB
+        save_image_to_normalized_db(
+            image_id=internal_job_id,
+            image_url=urls[0],
+            prompt=prompt,
+            ai_model=model,
+            size=size,
+            image_urls=urls,
+            user_id=identity_id
+        )
+
+        # Update store with results
+        store = load_store()
+        store_meta["status"] = "done"
+        store_meta["image_url"] = urls[0]
+        store_meta["image_urls"] = urls
+        store_meta["image_base64"] = b64_first
+        store[internal_job_id] = store_meta
+        save_store(store)
+
+        # Capture credits - image saved successfully
+        if reservation_id:
+            finalize_job_credits(reservation_id, internal_job_id)
+            print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
+
+        # Mark job as ready
+        _update_job_status_ready(internal_job_id, None)
+
+        print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: OpenAI call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+
+        # Release credits on failure
+        if reservation_id:
+            release_job_credits(reservation_id, "openai_api_error", internal_job_id)
 
         # Mark job as failed
         _update_job_status_failed(internal_job_id, str(e))
@@ -3190,9 +3380,36 @@ def _update_job_status_failed(job_id: str, error_message: str):
             """, (error_message[:500] if error_message else None, job_id))
             conn.commit()
             conn.close()
-            print(f"[ASYNC] Marked job {job_id} as failed: {error_message[:100]}")
+            print(f"[JOB] Marked job {job_id} as failed: {error_message[:100] if error_message else 'no message'}")
     except Exception as e:
-        print(f"[ASYNC] ERROR marking job {job_id} as failed: {e}")
+        print(f"[JOB] ERROR marking job {job_id} as failed: {e}")
+
+
+def _update_job_status_ready(job_id: str, upstream_job_id: str = None):
+    """Mark job as ready (completed successfully) in timrx_billing.jobs."""
+    if not USE_DB:
+        return
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            if upstream_job_id:
+                cursor.execute("""
+                    UPDATE timrx_billing.jobs
+                    SET status = 'ready', upstream_job_id = COALESCE(upstream_job_id, %s), updated_at = NOW()
+                    WHERE id = %s
+                """, (upstream_job_id, job_id))
+            else:
+                cursor.execute("""
+                    UPDATE timrx_billing.jobs
+                    SET status = 'ready', updated_at = NOW()
+                    WHERE id = %s
+                """, (job_id,))
+            conn.commit()
+            conn.close()
+            print(f"[JOB] Marked job {job_id} as ready")
+    except Exception as e:
+        print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3957,8 +4174,9 @@ def api_text_to_3d_start():
     # ─── 4. Dispatch Meshy API call to background (NON-BLOCKING) ───
     # This returns immediately - the background worker will:
     # - Call Meshy API
-    # - On success: finalize credits, update job with upstream_id
+    # - On success: update job with upstream_id (credits stay HELD)
     # - On error: release credits, mark job as failed
+    # Credits are captured only when asset is saved to DB+S3 (in status endpoint)
     _background_executor.submit(
         _dispatch_meshy_text_to_3d_async,
         internal_job_id,
@@ -4285,6 +4503,32 @@ def api_text_to_3d_status(job_id):
             if s3_result.get("db_ok") is False:
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
+
+            # ─── CAPTURE CREDITS: Asset saved successfully ───
+            # Only capture (charge) credits after asset is persisted to DB+S3
+            reservation_id = meta.get("reservation_id")
+            internal_job_id = meta.get("internal_job_id")
+            if reservation_id:
+                finalize_job_credits(reservation_id, job_id)
+                print(f"[STATUS] Credits captured for job {job_id}, reservation={reservation_id}")
+
+            # Update job status to 'ready' in timrx_billing.jobs
+            if internal_job_id:
+                _update_job_status_ready(internal_job_id, job_id)
+
+    # Handle failed jobs - release credits
+    if out["status"] == "failed":
+        reservation_id = meta.get("reservation_id")
+        internal_job_id = meta.get("internal_job_id")
+        error_msg = out.get("message") or out.get("error") or "Provider job failed"
+
+        if reservation_id:
+            release_job_credits(reservation_id, "provider_job_failed", job_id)
+            print(f"[STATUS] Credits released for failed job {job_id}, reservation={reservation_id}")
+
+        # Update job status to 'failed' in timrx_billing.jobs
+        if internal_job_id:
+            _update_job_status_failed(internal_job_id, error_msg)
 
     return jsonify(out)
 
@@ -4974,70 +5218,48 @@ def api_image_to_3d_start():
         "enable_pbr": True,
     }
 
-    # ─── 3. Call Meshy API ───
-    try:
-        resp = mesh_post("/openapi/v1/image-to-3d", payload)
-        log_event("image-to-3d/start:meshy-resp", resp)
-        meshy_task_id = resp.get("result") or resp.get("id")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"error": "No job id in response", "raw": resp}), 502
-    except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
-
-    s3_name = prompt if prompt else "image_to_3d_source"
-    s3_user_id = user_id or "public"
-
-    # Upload source image to S3 for permanent storage with deterministic key
-    # safe_upload_to_s3 handles unauthenticated uploads (user_id=None -> public namespace)
-    s3_image_url = image_url
-    if AWS_BUCKET_MODELS:
-        try:
-            s3_image_url = safe_upload_to_s3(
-                image_url,
-                "image/png",
-                "source_images",
-                s3_name,
-                user_id=user_id,
-                key_base=f"source_images/{s3_user_id}/{meshy_task_id}",
-                provider="user",
-            )
-            print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
-        except Exception as e:
-            print(f"[image-to-3d] Failed to upload source image to S3: {e}, using original URL")
-
-    # Save metadata to store so we can retrieve it when job finishes
-    store = load_store()
-    store[meshy_task_id] = {
+    # ─── 3. Build store metadata for async dispatch ───
+    store_meta = {
         "stage": "image3d",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "root_prompt": prompt,  # This is the start of a chain
+        "root_prompt": prompt,
         "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
-        "image_url": s3_image_url,  # Store S3 URL for our records
-        "original_image_url": image_url,  # Keep original for reference
+        "original_image_url": image_url,
         "ai_model": payload.get("ai_model"),
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
-    save_store(store)
 
-    # Save to DB for recovery
-    save_active_job_to_db(meshy_task_id, "image-to-3d", "image3d", store[meshy_task_id], user_id)
+    # ─── 4. Dispatch Meshy API call to background (NON-BLOCKING) ───
+    # This returns immediately - the background worker will:
+    # - Call Meshy API
+    # - On success: update job with upstream_id (credits stay HELD)
+    # - On error: release credits, mark job as failed
+    # Credits are captured only when asset is saved to DB+S3 (in status endpoint)
+    _background_executor.submit(
+        _dispatch_meshy_image_to_3d_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        payload,
+        store_meta,
+        image_url,
+    )
 
-    # ─── 5. Return success with balance ───
+    log_event("image-to-3d/start:dispatched", {"internal_job_id": internal_job_id})
+
+    # ─── 5. Return immediately with internal job ID ───
+    # Frontend polls /api/image-to-3d/status/<id> to get status
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": meshy_task_id,
+        "job_id": internal_job_id,  # Return internal UUID - frontend polls this
         "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
     })
 
 @app.route("/api/image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
@@ -5050,23 +5272,72 @@ def api_image_to_3d_status(job_id):
 
     # Verify job ownership
     identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
+
+    # ─── Check if this is an internal job ID (UUID) ───
+    meshy_job_id = job_id
+    internal_job = None
+
+    if USE_DB:
+        try:
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute("""
+                    SELECT id, status, upstream_job_id, error_message
+                    FROM timrx_billing.jobs
+                    WHERE id::text = %s AND identity_id = %s
+                    LIMIT 1
+                """, (job_id, identity_id))
+                internal_job = cursor.fetchone()
+                conn.close()
+
+                if internal_job:
+                    if internal_job["status"] == "queued":
+                        return jsonify({
+                            "status": "queued",
+                            "pct": 0,
+                            "stage": "image3d",
+                            "message": "Job is being dispatched to provider...",
+                            "job_id": job_id,
+                        })
+
+                    if internal_job["status"] == "failed":
+                        return jsonify({
+                            "status": "failed",
+                            "error": internal_job.get("error_message", "Job failed"),
+                            "job_id": job_id,
+                        })
+
+                    if internal_job["upstream_job_id"]:
+                        meshy_job_id = internal_job["upstream_job_id"]
+                    else:
+                        return jsonify({
+                            "status": "pending",
+                            "pct": 0,
+                            "stage": "image3d",
+                            "message": "Waiting for provider response...",
+                            "job_id": job_id,
+                        })
+        except Exception as e:
+            print(f"[STATUS] Error checking internal job {job_id}: {e}")
+
+    if not verify_job_ownership(meshy_job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
-        ms = mesh_get(f"/openapi/v1/image-to-3d/{job_id}")
+        ms = mesh_get(f"/openapi/v1/image-to-3d/{meshy_job_id}")
         log_event("image-to-3d/status:meshy-resp", ms)
     except Exception as e:
         return jsonify({"error": str(e)}), 404
     out = normalize_meshy_task(ms, stage="image3d")
-    log_status_summary("image-to-3d", job_id, out)
+    log_status_summary("image-to-3d", meshy_job_id, out)
+
+    # Get metadata from local store
+    store = load_store()
+    meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
 
     # Save to normalized DB tables when job finishes
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
-        store = load_store()
-        # Get metadata from local store OR database (in case server restarted)
-        meta = get_job_metadata(job_id, store)
-
         # Get prompt from metadata or Meshy response
         if not meta.get("prompt"):
             meta["prompt"] = out.get("prompt") or ""
@@ -5079,7 +5350,7 @@ def api_image_to_3d_status(job_id):
             meta["title"] = f"(image-to-3d) {prompt_for_title[:40]}" if prompt_for_title else f"(image-to-3d) {DEFAULT_MODEL_TITLE}"
 
         user_id = meta.get("user_id") or getattr(g, 'user_id', None)
-        s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type='image-to-3d', user_id=user_id)
+        s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type='image-to-3d', user_id=user_id)
 
         # Update response with S3 URLs so frontend gets permanent URLs
         if s3_result and s3_result.get("success"):
@@ -5093,6 +5364,29 @@ def api_image_to_3d_status(job_id):
                 out["model_urls"] = s3_result["model_urls"]
             if s3_result.get("texture_urls"):
                 out["texture_urls"] = s3_result["texture_urls"]
+
+            # ─── CAPTURE CREDITS: Asset saved successfully ───
+            reservation_id = meta.get("reservation_id")
+            internal_job_id = meta.get("internal_job_id")
+            if reservation_id:
+                finalize_job_credits(reservation_id, meshy_job_id)
+                print(f"[STATUS] Credits captured for image-to-3d job {meshy_job_id}, reservation={reservation_id}")
+
+            if internal_job_id:
+                _update_job_status_ready(internal_job_id, meshy_job_id)
+
+    # Handle failed jobs - release credits
+    if out["status"] == "failed":
+        reservation_id = meta.get("reservation_id")
+        internal_job_id = meta.get("internal_job_id")
+        error_msg = out.get("message") or out.get("error") or "Provider job failed"
+
+        if reservation_id:
+            release_job_credits(reservation_id, "provider_job_failed", meshy_job_id)
+            print(f"[STATUS] Credits released for failed image-to-3d job {meshy_job_id}, reservation={reservation_id}")
+
+        if internal_job_id:
+            _update_job_status_failed(internal_job_id, error_msg)
 
     return jsonify(out)
 
@@ -5145,102 +5439,143 @@ def api_openai_image():
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
-    # ─── 2. Check credits BEFORE calling OpenAI ───
-    # Note: For n > 1, we check for n * cost (charge per image)
-    # OpenAI calls are synchronous, so we use direct charging instead of reservation
+    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
+    internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["image-studio"]
-    if CREDITS_AVAILABLE:
-        try:
-            base_cost = PricingService.get_action_cost(action_key)
-            total_cost = base_cost * n
-            balance = WalletService.get_balance(identity_id)
-            reserved = WalletService.get_reserved_credits(identity_id)
-            available = max(0, balance - reserved)
 
-            print(f"[CREDITS] OpenAI image: n={n}, base_cost={base_cost}, total_cost={total_cost}, available={available}")
+    # For n > 1, multiply cost (handled by start_paid_job if we adjust meta)
+    reservation_id, credit_error = start_paid_job(
+        identity_id, action_key, internal_job_id,
+        {"prompt": prompt[:100], "n": n, "model": model, "size": size}
+    )
+    if credit_error:
+        return credit_error
 
-            if total_cost > 0 and available < total_cost:
-                return _make_credit_error(
-                    "INSUFFICIENT_CREDITS",
-                    f"You need {total_cost} credits but only have {available} available.",
-                    402,
-                    required=total_cost,
-                    available=available,
-                    balance=balance,
-                    reserved=reserved
-                )
-        except Exception as e:
-            print(f"[CREDITS] Check error for OpenAI image: {e}")
+    # ─── 3. Build store metadata for async dispatch ───
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": model,
+        "size": size,
+        "n": n,
+        "response_format": response_format,
+        "user_id": user_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+    }
 
-    try:
-        resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+    # ─── 4. Dispatch OpenAI API call to background (NON-BLOCKING) ──���
+    _background_executor.submit(
+        _dispatch_openai_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        prompt,
+        size,
+        model,
+        n,
+        response_format,
+        store_meta,
+    )
 
-    data_list = resp.get("data") or []
-    urls = []
-    b64_first = None
-    for item in data_list:
-        if not isinstance(item, dict):
-            continue
-        if item.get("url"):
-            urls.append(item["url"])
-        elif item.get("b64_json"):
-            if not b64_first:
-                b64_first = item["b64_json"]
-            urls.append(f"data:image/png;base64,{item['b64_json']}")
+    log_event("image/openai:dispatched", {"internal_job_id": internal_job_id})
 
-    # Save to normalized DB tables
-    image_id = None
-    if urls:
-        client_id = (body.get("client_id") or "").strip()
-        image_id = client_id or f"img_{int(time.time() * 1000)}"
-        save_image_to_normalized_db(
-            image_id=image_id,
-            image_url=urls[0],
-            prompt=prompt,
-            ai_model=model,
-            size=size,
-            image_urls=urls,
-            user_id=user_id
-        )
-
-        # ─── 4. Charge credits AFTER successful OpenAI call (idempotent via image_id) ───
-        # For n > 1, we charge n times the base cost
-        new_balance = None
-        if CREDITS_AVAILABLE:
-            try:
-                base_cost = PricingService.get_action_cost(action_key)
-                total_cost = base_cost * n
-                if total_cost > 0:
-                    from credits import _charge_credits_idempotent
-                    result = _charge_credits_idempotent(
-                        identity_id=identity_id,
-                        action=action_key,
-                        ref_type=action_key,
-                        ref_id=image_id,
-                        cost_credits=total_cost,
-                        meta={"prompt": prompt[:100], "n": n, "model": model, "size": size},
-                    )
-                    new_balance = result.get("new_balance")
-                    print(f"[CREDITS] Charged {total_cost} credits for OpenAI image, image_id={image_id}, n={n}, new_balance={new_balance}")
-            except Exception as e:
-                print(f"[CREDITS] Failed to charge for OpenAI image: {e}")
-
-    # ─── 5. Return success with balance ───
+    # ─── 5. Return immediately with internal job ID ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "image_id": image_id,
-        "image_url": urls[0] if urls else None,
-        "image_urls": urls,
-        "image_base64": b64_first,
-        "status": "done",
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,  # Backwards compatibility
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
         "model": model,
         "size": size,
-        "new_balance": balance_info["available"] if balance_info else new_balance,
-        "raw": resp
     })
+
+
+# ---- OpenAI Image Status (for polling async jobs) ----
+@app.route("/api/image/openai/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def api_openai_image_status(job_id):
+    """Get status of async OpenAI image generation job."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    # Check local store first
+    store = load_store()
+    meta = store.get(job_id) or {}
+
+    # Check timrx_billing.jobs table
+    if USE_DB:
+        try:
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute("""
+                    SELECT id, status, error_message
+                    FROM timrx_billing.jobs
+                    WHERE id::text = %s AND identity_id = %s
+                    LIMIT 1
+                """, (job_id, identity_id))
+                job = cursor.fetchone()
+                conn.close()
+
+                if job:
+                    if job["status"] == "queued":
+                        return jsonify({
+                            "ok": True,
+                            "status": "queued",
+                            "job_id": job_id,
+                            "message": "Generating image...",
+                        })
+
+                    if job["status"] == "failed":
+                        return jsonify({
+                            "ok": False,
+                            "status": "failed",
+                            "job_id": job_id,
+                            "error": job.get("error_message", "Image generation failed"),
+                        })
+
+                    if job["status"] == "ready":
+                        # Job completed - return results from store
+                        return jsonify({
+                            "ok": True,
+                            "status": "done",
+                            "job_id": job_id,
+                            "image_id": job_id,
+                            "image_url": meta.get("image_url"),
+                            "image_urls": meta.get("image_urls", []),
+                            "image_base64": meta.get("image_base64"),
+                            "model": meta.get("model"),
+                            "size": meta.get("size"),
+                        })
+        except Exception as e:
+            print(f"[STATUS] Error checking OpenAI job {job_id}: {e}")
+
+    # Fallback: check store status
+    if meta.get("status") == "done":
+        return jsonify({
+            "ok": True,
+            "status": "done",
+            "job_id": job_id,
+            "image_id": job_id,
+            "image_url": meta.get("image_url"),
+            "image_urls": meta.get("image_urls", []),
+            "image_base64": meta.get("image_base64"),
+            "model": meta.get("model"),
+            "size": meta.get("size"),
+        })
+
+    return jsonify({"error": "Job not found"}), 404
 
 # ---- Proxy external images (OpenAI blobs) ----
 @app.route("/api/proxy-image")
