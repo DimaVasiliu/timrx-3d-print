@@ -2754,8 +2754,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         if db_save_ok and history_item_id:
             if model_id:
                 print(f"[DB] model persisted: model_id={model_id} glb_url={final_glb_url} history_item_id={history_item_id}")
+                # Structured log for job lifecycle tracking
+                print(f"[JOB] asset_saved job_id={job_id} model_id={model_id} history_item_id={history_item_id}")
             if image_id:
                 print(f"[DB] image persisted: image_id={image_id} image_url={image_url} history_item_id={history_item_id}")
+                # Structured log for job lifecycle tracking
+                print(f"[JOB] asset_saved job_id={job_id} image_id={image_id} history_item_id={history_item_id}")
         if db_save_ok and model_log_info is not None:
             print(f"[S3] model stored: key={model_log_info['key']} hash={model_log_info['hash']} reused={model_log_info['reused']}")
         if db_save_ok and image_log_info is not None:
@@ -3102,6 +3106,7 @@ def _dispatch_meshy_text_to_3d_async(
     """
     start_time = time.time()
     print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=text-to-3d reservation_id={reservation_id}")
 
     try:
         # Call Meshy API
@@ -3110,6 +3115,7 @@ def _dispatch_meshy_text_to_3d_async(
 
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
+        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
 
         if not meshy_task_id:
             # Meshy didn't return a task ID - release credits
@@ -3178,6 +3184,7 @@ def _dispatch_meshy_image_to_3d_async(
     """
     start_time = time.time()
     print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
 
     try:
         # Call Meshy API
@@ -3186,6 +3193,7 @@ def _dispatch_meshy_image_to_3d_async(
 
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[ASYNC] Meshy image-to-3d returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
+        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
 
         if not meshy_task_id:
             # Meshy didn't return a task ID - release credits
@@ -3276,6 +3284,7 @@ def _dispatch_openai_image_async(
     """
     start_time = time.time()
     print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=openai action=image-gen reservation_id={reservation_id}")
 
     try:
         # Call OpenAI API
@@ -3283,6 +3292,7 @@ def _dispatch_openai_image_async(
 
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
+        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
 
         data_list = resp.get("data") or []
         urls = []
@@ -3314,6 +3324,8 @@ def _dispatch_openai_image_async(
             image_urls=urls,
             user_id=identity_id
         )
+        # Structured log for job lifecycle tracking
+        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id}")
 
         # Update store with results
         store = load_store()
@@ -3885,6 +3897,9 @@ def start_paid_job(identity_id: str, action_key: str, job_id: str, meta: dict = 
         else:
             print(f"[CREDITS] Reserved {cost} credits, reservation_id={reservation_id}, job_id={job_id}")
 
+        # Structured log for job lifecycle tracking
+        print(f"[JOB] started job_id={job_id} reservation_id={reservation_id} action={action_key} cost={cost}")
+
         return reservation_id, None
 
     except ValueError as e:
@@ -3928,7 +3943,7 @@ def start_paid_job(identity_id: str, action_key: str, job_id: str, meta: dict = 
 def finalize_job_credits(reservation_id: str, job_id: str = None):
     """
     Finalize (capture) credits after successful job completion.
-    Idempotent - safe to call multiple times.
+    Fully idempotent - safe to call multiple times, handles all edge cases gracefully.
 
     Args:
         reservation_id: The reservation ID from start_paid_job
@@ -3939,14 +3954,19 @@ def finalize_job_credits(reservation_id: str, job_id: str = None):
 
     try:
         result = ReservationService.finalize_reservation(reservation_id)
-        was_already = result.get("was_already_finalized", False)
-        if was_already:
+
+        # Handle all idempotent cases gracefully
+        if result.get("not_found"):
+            print(f"[CREDITS] Finalize: reservation not found (idempotent): {reservation_id} job_id={job_id}")
+        elif result.get("was_already_finalized"):
             print(f"[CREDITS] Already finalized: reservation={reservation_id} job_id={job_id}")
+        elif result.get("was_already_released"):
+            # Job was cancelled/failed before we could finalize - that's ok
+            print(f"[CREDITS] Finalize skipped (already released): reservation={reservation_id} job_id={job_id}")
         else:
             print(f"[CREDITS] Finalized: reservation={reservation_id} job_id={job_id}")
-    except ValueError as e:
-        # Already released - this is ok, don't raise
-        print(f"[CREDITS] Cannot finalize {reservation_id}: {e}")
+            # Structured log for job lifecycle tracking
+            print(f"[JOB] credits_captured job_id={job_id} reservation_id={reservation_id}")
     except Exception as e:
         print(f"[CREDITS] Finalize error {reservation_id}: {e}")
 
@@ -3954,7 +3974,12 @@ def finalize_job_credits(reservation_id: str, job_id: str = None):
 def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id: str = None):
     """
     Release (refund) credits after job failure/cancellation.
-    Idempotent - safe to call multiple times.
+    Fully idempotent - safe to call multiple times, handles all edge cases gracefully.
+
+    Handles:
+    - Already released: no-op (idempotent)
+    - Already finalized: no-op (job actually succeeded, credits correctly captured)
+    - Not found: no-op (reservation expired or never existed)
 
     Args:
         reservation_id: The reservation ID from start_paid_job
@@ -3966,14 +3991,18 @@ def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id:
 
     try:
         result = ReservationService.release_reservation(reservation_id, reason)
-        was_already = result.get("was_already_released", False)
-        if was_already:
+
+        # Handle all idempotent cases gracefully
+        if result.get("not_found"):
+            print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={job_id}")
+        elif result.get("was_already_released"):
             print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
+        elif result.get("was_already_finalized"):
+            # Job actually succeeded and credits were captured - this is fine!
+            # This can happen when: frontend timeout triggers release, but backend already finalized
+            print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={job_id}")
         else:
             print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
-    except ValueError as e:
-        # Already finalized - this is NOT ok for a failed job, log warning
-        print(f"[CREDITS] WARN: Cannot release {reservation_id}: {e}")
     except Exception as e:
         print(f"[CREDITS] Release error {reservation_id}: {e}")
 
@@ -6055,26 +6084,39 @@ def api_history_item_add():
                                     model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
                                         cur, item_type, item_id, glb_url, image_url, identity_id, provider
                                     )
-                                # Validate XOR constraint - REJECT with 400 if both NULL
+                                # Validate XOR constraint
                                 if not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
-                                    # Determine error reason
+                                    # Determine reason
                                     if lookup_reason:
-                                        error_reason = lookup_reason
+                                        skip_reason = lookup_reason
                                     elif model_id and image_id:
-                                        error_reason = "xor_violation"
+                                        skip_reason = "xor_violation"
                                     else:
-                                        error_reason = "missing_asset_reference"
-                                    print(f"[History] Rejecting item {item_id} - reason: {error_reason}")
-                                    # Return 400 error instead of soft-skipping
+                                        skip_reason = "missing_asset_reference"
+
+                                    # XOR violation (both set) is a real error - return 400
+                                    if skip_reason == "xor_violation":
+                                        print(f"[History] Rejecting item {item_id} - reason: {skip_reason}")
+                                        return jsonify({
+                                            "ok": False,
+                                            "error": {
+                                                "code": "INVALID_ASSET_REFERENCE",
+                                                "message": f"History item cannot have both model_id and image_id set",
+                                                "reason": skip_reason,
+                                                "client_id": str(item_id),
+                                            }
+                                        }), 400
+
+                                    # Missing asset reference - backend will create history when job completes
+                                    # Return success so frontend doesn't break, but indicate no DB write happened
+                                    print(f"[History] Skipped early insert for {item_id} - backend will create on job completion")
                                     return jsonify({
-                                        "ok": False,
-                                        "error": {
-                                            "code": "INVALID_ASSET_REFERENCE",
-                                            "message": f"History item must have exactly one asset reference (model_id XOR image_id). Got: model_id={model_id}, image_id={image_id}",
-                                            "reason": error_reason,
-                                            "client_id": str(item_id),
-                                        }
-                                    }), 400
+                                        "ok": True,
+                                        "id": str(item_id),
+                                        "db": False,
+                                        "backend_handles": True,
+                                        "message": "History will be created automatically when job completes and asset is saved",
+                                    })
                                 # Validation passed - INSERT the history item
                                 cur.execute(
                                     f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
