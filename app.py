@@ -2,10 +2,16 @@ import os, json, time, base64, uuid, hashlib, re
 import boto3
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from urllib.parse import urlparse, urlunparse, quote, unquote
 from datetime import datetime
 from botocore.exceptions import ClientError
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+# Background task executor for async provider calls
+# Use max 4 workers to avoid overwhelming provider APIs
+_background_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="job_worker")
 
 load_dotenv()
 
@@ -2848,14 +2854,18 @@ def verify_job_ownership(job_id: str, user_id: str = None) -> bool:
 
     try:
         with conn.cursor() as cur:
+            # Check active_jobs, history_items, AND timrx_billing.jobs tables
             cur.execute(f"""
                 SELECT identity_id FROM {APP_SCHEMA}.active_jobs WHERE upstream_job_id = %s
                 UNION
                 SELECT identity_id FROM {APP_SCHEMA}.history_items WHERE id::text = %s
                    OR payload->>'original_job_id' = %s
                    OR payload->>'job_id' = %s
+                UNION
+                SELECT identity_id FROM timrx_billing.jobs WHERE id::text = %s
+                   OR upstream_job_id = %s
                 LIMIT 1
-            """, (job_id, job_id, job_id, job_id))
+            """, (job_id, job_id, job_id, job_id, job_id, job_id))
             row = cur.fetchone()
         conn.close()
 
@@ -3066,6 +3076,124 @@ def openai_image_generate(prompt: str, size: str = "1024x1024", model: str = "gp
         return r.json()
     except Exception:
         raise RuntimeError(f"OpenAI image returned non-JSON: {r.text[:200]}")
+
+# ─────────────────────────────────────────────────────────────
+# Background Job Dispatch - Async provider calls
+# ─────────────────────────────────────────────────────────────
+
+def _dispatch_meshy_text_to_3d_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+):
+    """
+    Background task to call Meshy text-to-3d API.
+    Called via ThreadPoolExecutor after /start returns.
+
+    Args:
+        internal_job_id: Our UUID job ID (already in jobs table)
+        identity_id: User's identity
+        reservation_id: Credit reservation to finalize/release
+        payload: Meshy API payload
+        store_meta: Metadata to save in local store
+    """
+    start_time = time.time()
+    print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
+
+    try:
+        # Call Meshy API
+        resp = mesh_post("/openapi/v2/text-to-3d", payload)
+        meshy_task_id = resp.get("result")
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
+
+        if not meshy_task_id:
+            # Meshy didn't return a task ID - release credits
+            print(f"[ASYNC] ERROR: No task_id from Meshy for job {internal_job_id}")
+            if reservation_id:
+                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
+            return
+
+        # Success - finalize credits
+        if reservation_id:
+            finalize_job_credits(reservation_id, meshy_task_id)
+
+        # Update job with upstream_job_id
+        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
+
+        # Save to local store (for status polling compatibility)
+        store = load_store()
+        store_meta["upstream_job_id"] = meshy_task_id
+        store[meshy_task_id] = store_meta  # Key by meshy_task_id for polling
+        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}  # Also key by internal ID
+        save_store(store)
+
+        # Save to DB for recovery
+        save_active_job_to_db(
+            meshy_task_id,
+            "text-to-3d",
+            store_meta.get("stage", "preview"),
+            store_meta,
+            identity_id
+        )
+
+        print(f"[ASYNC] Job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Meshy call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+
+        # Release credits on failure
+        if reservation_id:
+            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+
+        # Mark job as failed
+        _update_job_status_failed(internal_job_id, str(e))
+
+
+def _update_job_with_upstream_id(job_id: str, upstream_job_id: str):
+    """Update job in timrx_billing.jobs with upstream_job_id and status='processing'."""
+    if not USE_DB:
+        return
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE timrx_billing.jobs
+                SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
+                WHERE id = %s
+            """, (upstream_job_id, job_id))
+            conn.commit()
+            conn.close()
+            print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
+    except Exception as e:
+        print(f"[ASYNC] ERROR updating job {job_id}: {e}")
+
+
+def _update_job_status_failed(job_id: str, error_message: str):
+    """Mark job as failed in timrx_billing.jobs."""
+    if not USE_DB:
+        return
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE timrx_billing.jobs
+                SET status = 'failed', error_message = %s, updated_at = NOW()
+                WHERE id = %s
+            """, (error_message[:500] if error_message else None, job_id))
+            conn.commit()
+            conn.close()
+            print(f"[ASYNC] Marked job {job_id} as failed: {error_message[:100]}")
+    except Exception as e:
+        print(f"[ASYNC] ERROR marking job {job_id} as failed: {e}")
+
 
 # ─────────────────────────────────────────────────────────────
 # Utils
@@ -3806,23 +3934,8 @@ def api_text_to_3d_start():
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
     batch_group_id = (body.get("batch_group_id") or "").strip() or None
 
-    # ─── 3. Call Meshy API ───
-    try:
-        resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        log_event("text-to-3d/start:meshy-resp", resp)
-        meshy_task_id = resp.get("result")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
-    except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
-
-    store = load_store()
-    store[meshy_task_id] = {
+    # ─── 3. Build store metadata for async dispatch ───
+    store_meta = {
         "stage": "preview",
         "prompt": prompt,
         "root_prompt": prompt,
@@ -3838,20 +3951,34 @@ def api_text_to_3d_start():
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,  # Track the internal UUID
+        "internal_job_id": internal_job_id,
     }
-    save_store(store)
 
-    # Save to DB for recovery (meshy_task_id goes to upstream_job_id TEXT column)
-    save_active_job_to_db(meshy_task_id, "text-to-3d", "preview", store[meshy_task_id], user_id)
+    # ─── 4. Dispatch Meshy API call to background (NON-BLOCKING) ───
+    # This returns immediately - the background worker will:
+    # - Call Meshy API
+    # - On success: finalize credits, update job with upstream_id
+    # - On error: release credits, mark job as failed
+    _background_executor.submit(
+        _dispatch_meshy_text_to_3d_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        payload,
+        store_meta,
+    )
 
-    # ─── 5. Return success with balance ───
+    log_event("text-to-3d/start:dispatched", {"internal_job_id": internal_job_id})
+
+    # ─── 5. Return immediately with internal job ID ───
+    # Frontend polls /api/jobs/<id> to get status and upstream_job_id
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": meshy_task_id,  # Return Meshy task ID to frontend for polling
+        "job_id": internal_job_id,  # Return internal UUID - frontend polls this
         "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",  # Job is queued, pending provider dispatch
     })
 
 # ---- Refine from preview ----
@@ -4049,11 +4176,68 @@ def api_text_to_3d_status(job_id):
 
     # Verify job ownership
     identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
+
+    # ─── Check if this is an internal job ID (UUID) ───
+    # If so, look up the job status and upstream_job_id
+    meshy_job_id = job_id  # Default: assume job_id is already meshy task ID
+    internal_job = None
+
+    if USE_DB:
+        try:
+            conn = get_db_connection()
+            if conn:
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                # Check if job_id is our internal UUID
+                cursor.execute("""
+                    SELECT id, status, upstream_job_id, error_message
+                    FROM timrx_billing.jobs
+                    WHERE id::text = %s AND identity_id = %s
+                    LIMIT 1
+                """, (job_id, identity_id))
+                internal_job = cursor.fetchone()
+                conn.close()
+
+                if internal_job:
+                    # This is an internal job ID
+                    if internal_job["status"] == "queued":
+                        # Job is still being dispatched to Meshy
+                        return jsonify({
+                            "status": "queued",
+                            "pct": 0,
+                            "stage": "preview",
+                            "message": "Job is being dispatched to provider...",
+                            "job_id": job_id,
+                        })
+
+                    if internal_job["status"] == "failed":
+                        # Job failed during dispatch
+                        return jsonify({
+                            "status": "failed",
+                            "error": internal_job.get("error_message", "Job failed"),
+                            "job_id": job_id,
+                        })
+
+                    # Job has upstream_job_id - use that for Meshy API call
+                    if internal_job["upstream_job_id"]:
+                        meshy_job_id = internal_job["upstream_job_id"]
+                    else:
+                        # Shouldn't happen - status is not queued but no upstream_job_id
+                        return jsonify({
+                            "status": "pending",
+                            "pct": 0,
+                            "stage": "preview",
+                            "message": "Waiting for provider response...",
+                            "job_id": job_id,
+                        })
+        except Exception as e:
+            print(f"[STATUS] Error checking internal job {job_id}: {e}")
+            # Continue with original job_id
+
+    if not verify_job_ownership(meshy_job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
-        ms = mesh_get(f"/openapi/v2/text-to-3d/{job_id}")
+        ms = mesh_get(f"/openapi/v2/text-to-3d/{meshy_job_id}")
         log_event("text-to-3d/status:meshy-resp", ms)
     except Exception as e:
         return jsonify({"error": str(e)}), 404
@@ -4116,6 +4300,7 @@ def api_text_to_3d_list():
 
 # ---- Save active job to database ----
 @app.route("/api/jobs/save", methods=["POST", "OPTIONS"])
+@with_session
 def api_save_active_job():
     if request.method == "OPTIONS":
         return ("", 204)
@@ -4130,43 +4315,117 @@ def api_save_active_job():
         if not job_id:
             return jsonify({"error": "job_id required"}), 400
 
-        success = save_active_job_to_db(job_id, job_type, stage, metadata, user_id)
+        success = save_active_job_to_db(job_id, job_type, stage, metadata, identity_id)
         return jsonify({"success": success, "job_id": job_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ---- Get all active jobs from database ----
 @app.route("/api/jobs/active", methods=["GET", "OPTIONS"])
+@with_session
 def api_get_active_jobs():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
         identity_id = g.identity_id
-        jobs = get_active_jobs_from_db(user_id)
+        jobs = get_active_jobs_from_db(identity_id)
         return jsonify(jobs)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ---- Mark job as completed ----
 @app.route("/api/jobs/<job_id>/complete", methods=["POST", "OPTIONS"])
+@with_session
 def api_complete_job(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
     try:
         identity_id = g.identity_id
-        mark_job_completed_in_db(job_id, user_id)
+        mark_job_completed_in_db(job_id, identity_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ---- Get job status (for polling async jobs) ----
+@app.route("/api/jobs/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def api_get_job_status(job_id):
+    """
+    Get job status for polling.
+    Supports both internal UUID and upstream job IDs.
+    Returns status, upstream_job_id (once available), and error info if failed.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    if not USE_DB:
+        return jsonify({"error": "Database not configured"}), 503
+
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Database connection failed"}), 503
+
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Try to find by id (internal UUID) or upstream_job_id (meshy/openai ID)
+        cursor.execute("""
+            SELECT id, identity_id, provider, action_code, status,
+                   upstream_job_id, cost_credits, error_message, meta,
+                   created_at, updated_at
+            FROM timrx_billing.jobs
+            WHERE (id::text = %s OR upstream_job_id = %s)
+              AND identity_id = %s
+            LIMIT 1
+        """, (job_id, job_id, identity_id))
+
+        job = cursor.fetchone()
+        conn.close()
+
+        if not job:
+            return jsonify({"error": "Job not found", "job_id": job_id}), 404
+
+        # Build response
+        response = {
+            "ok": True,
+            "job_id": str(job["id"]),
+            "status": job["status"],
+            "provider": job["provider"],
+            "action_code": job["action_code"],
+            "upstream_job_id": job["upstream_job_id"],  # May be None if still queued
+            "cost_credits": job["cost_credits"],
+            "created_at": job["created_at"].isoformat() if job["created_at"] else None,
+            "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
+        }
+
+        # Include error message if failed
+        if job["status"] == "failed" and job["error_message"]:
+            response["error_message"] = job["error_message"]
+
+        # Include meta if present
+        if job["meta"]:
+            response["meta"] = job["meta"]
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"[API] Error getting job status for {job_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ---- Delete active job ----
 @app.route("/api/jobs/<job_id>", methods=["DELETE", "OPTIONS"])
+@with_session
 def api_delete_active_job(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
     try:
         identity_id = g.identity_id
-        delete_active_job_from_db(job_id, user_id)
+        delete_active_job_from_db(job_id, identity_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
