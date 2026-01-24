@@ -6149,7 +6149,7 @@ def api_asset_download(asset_type, asset_id):
         elif asset_type == "image":
             file_type = file_type or "original"
             if file_type == "original":
-                url_col = "s3_url"
+                url_col = "image_url"
             elif file_type == "thumbnail":
                 url_col = "thumbnail_url"
             else:
