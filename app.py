@@ -2,30 +2,12 @@ import os, json, time, base64, uuid, hashlib, re
 import boto3
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from urllib.parse import urlparse, urlunparse, quote, unquote
 from datetime import datetime
 from botocore.exceptions import ClientError
-from concurrent.futures import ThreadPoolExecutor
-import threading
-
-# Background task executor for async provider calls
-# Use max 4 workers to avoid overwhelming provider APIs
-_background_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="job_worker")
 
 load_dotenv()
-
-# Add backend directories to Python path for module imports
-# NOTE: Use append() instead of insert(0) to avoid shadowing root modules
-# This prevents circular import issues where modules could be imported from wrong location
-import sys
-_app_dir = Path(__file__).resolve().parent
-_backend_dir = _app_dir / "backend"
-_routes_dir = _backend_dir / "routes"
-_services_dir = _backend_dir / "services"
-for _dir in [_backend_dir, _routes_dir, _services_dir]:
-    if str(_dir) not in sys.path:
-        sys.path.append(str(_dir))
 
 import requests
 try:
@@ -37,100 +19,8 @@ except Exception as e:
     print(f"[DB] Failed to import psycopg3: {e}")
     psycopg = None
     PSYCOPG_VERSION = 0
-from flask import Flask, request, jsonify, Response, abort, g, send_from_directory, redirect
+from flask import Flask, request, jsonify, Response, abort, g
 from flask_cors import CORS
-from werkzeug.exceptions import HTTPException
-
-# Import config for FRONTEND_BASE_URL
-try:
-    import config as cfg
-except ImportError:
-    cfg = None
-    print("[APP] Warning: Could not import config module")
-
-# ─────────────────────────────────────────────────────────────
-# Credits System - Flat Module Imports
-# ─────────────────────────────────────────────────────────────
-# Import blueprints individually so one failure doesn't break all
-_loaded_blueprints = []
-
-# Required: me blueprint
-try:
-    from me import bp as me_bp
-    _loaded_blueprints.append(("me", me_bp, "/api/me"))
-except ImportError as e:
-    print(f"[WARN] me blueprint not loaded: {e}")
-    me_bp = None
-
-# Required: admin blueprint
-try:
-    from admin import bp as admin_bp
-    _loaded_blueprints.append(("admin", admin_bp, "/api/admin"))
-except ImportError as e:
-    print(f"[WARN] admin blueprint not loaded: {e}")
-    admin_bp = None
-
-# Optional: billing blueprint
-try:
-    from billing import bp as billing_bp
-    _loaded_blueprints.append(("billing", billing_bp, "/api/billing"))
-except ImportError as e:
-    print(f"[WARN] billing blueprint not loaded: {e}")
-    billing_bp = None
-
-# Optional: auth blueprint
-try:
-    from auth import bp as auth_bp
-    _loaded_blueprints.append(("auth", auth_bp, "/api/auth"))
-except ImportError as e:
-    print(f"[WARN] auth blueprint not loaded: {e}")
-    auth_bp = None
-
-# Optional: jobs blueprint
-try:
-    from jobs import bp as jobs_bp
-    _loaded_blueprints.append(("jobs", jobs_bp, "/api/jobs"))
-except ImportError as e:
-    print(f"[WARN] jobs blueprint not loaded: {e}")
-    jobs_bp = None
-
-# Optional: credits blueprint (wallet balance + charge)
-try:
-    from credits import bp as credits_bp
-    _loaded_blueprints.append(("credits", credits_bp, "/api/credits"))
-except ImportError as e:
-    print(f"[WARN] credits blueprint not loaded: {e}")
-    credits_bp = None
-
-# Import DatabaseError for error handler
-try:
-    from db import DatabaseError
-except ImportError:
-    DatabaseError = None
-
-# Import credit services for enforcement
-try:
-    from reservation_service import ReservationService, ReservationStatus
-    from wallet_service import WalletService
-    from pricing_service import PricingService
-    CREDITS_AVAILABLE = True
-    print("[CREDITS] Credit enforcement services loaded")
-except ImportError as e:
-    print(f"[CREDITS] Credit services not available: {e}")
-    CREDITS_AVAILABLE = False
-    ReservationService = None
-    WalletService = None
-    PricingService = None
-
-# Import session middleware for identity resolution
-try:
-    from middleware import with_session
-    print("[MIDDLEWARE] Session middleware loaded")
-except ImportError as e:
-    print(f"[WARN] Session middleware not available: {e}")
-    # Fallback: no-op decorator if middleware not available
-    def with_session(f):
-        return f
 
 # ─────────────────────────────────────────────────────────────
 # Config
@@ -661,405 +551,57 @@ ALLOWED_IMAGE_HOSTS = {
 # DEV: Allow localhost origins for local development
 # PROD: Restrict to specific domains via ALLOWED_ORIGINS env var
 #
-# Example env var (comma-separated URLs only, no variable name prefix):
-#   ALLOWED_ORIGINS=https://timrx.live,https://www.timrx.live,http://localhost:5503
+# Example .env for production:
+#   ALLOWED_ORIGINS=https://hub.yourdomain.com,https://3d.yourdomain.com,https://yourdomain.com
 #
 DEV_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3001",
-    "http://localhost:5173",
-    "http://localhost:5500",
-    "http://localhost:5501",
-    "http://localhost:5502",
-    "http://localhost:5503",
+    "http://localhost:5173",      # Vite default
     "http://localhost:8080",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
-    "http://127.0.0.1:5500",
-    "http://127.0.0.1:5503",
 ]
 
-# Production origins for TimrX frontend
-PROD_ORIGINS = [
-    "https://timrx.live",
-    "https://www.timrx.live",
-    "https://3d.timrx.live",
-]
+# Parse ALLOWED_ORIGINS from env (comma-separated)
+_env_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+ALLOW_ALL_ORIGINS = False  # Flag for wildcard mode
 
+if _env_origins == "*":
+    # Wildcard mode: allow all origins dynamically
+    # NOTE: With credentials=True, we can't use literal "*" - must echo the requesting origin
+    ALLOW_ALL_ORIGINS = True
+    ALLOWED_ORIGINS = [
+        # Match any origin - we'll echo it back
+        re.compile(r".*"),
+    ]
+    print("[CORS] Wildcard mode enabled - allowing all origins")
+elif _env_origins:
+    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
+elif IS_DEV:
+    # Dev mode with no explicit origins: allow localhost
+    ALLOWED_ORIGINS = DEV_ORIGINS
+else:
+    # Production with no explicit origins: block by default for safety
+    ALLOWED_ORIGINS = []
+    print("[CORS] ERROR: ALLOWED_ORIGINS not set in production; requests will be blocked until configured.")
 
-def _parse_cors_origins() -> list:
-    """
-    Parse ALLOWED_ORIGINS env var into a clean list of URLs.
-    Handles common misconfiguration issues.
-    """
-    # Step 1: Get raw env var exactly as-is
-    raw = os.getenv("ALLOWED_ORIGINS", "")
-    print(f"[CORS] ────────────────────────────────────────────────────────")
-    print(f"[CORS] Raw os.getenv('ALLOWED_ORIGINS'): {raw!r}")
-    print(f"[CORS] Length: {len(raw)} chars")
-
-    # Step 2: Strip whitespace
-    raw = raw.strip()
-
-    if not raw:
-        if IS_DEV:
-            print("[CORS] No ALLOWED_ORIGINS set, using dev + prod defaults")
-            return DEV_ORIGINS + PROD_ORIGINS
-        else:
-            print("[CORS] No ALLOWED_ORIGINS set, using production defaults")
-            return PROD_ORIGINS
-
-    if raw == "*":
-        # Wildcard mode: can't use literal * with credentials, use explicit list
-        print("[CORS] Wildcard '*' requested - using prod + dev origins for credentials support")
-        return PROD_ORIGINS + DEV_ORIGINS
-
-    # Step 3: SANITIZE - Strip accidental "ALLOWED_ORIGINS=" prefix from the ENTIRE string
-    # This happens when env var is misconfigured as: ALLOWED_ORIGINS=ALLOWED_ORIGINS=https://...
-    # Check case-insensitive but preserve the actual URL casing
-    if raw.upper().startswith("ALLOWED_ORIGINS="):
-        old_raw = raw
-        raw = raw[len("ALLOWED_ORIGINS="):]
-        print(f"[CORS] WARNING: Stripped 'ALLOWED_ORIGINS=' prefix from value")
-        print(f"[CORS] Before: {old_raw!r}")
-        print(f"[CORS] After:  {raw!r}")
-
-    # Step 4: Parse comma-separated list
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
-    print(f"[CORS] After split: {origins}")
-
-    # Step 5: Validate each origin is a valid URL
-    valid_origins = []
-    for origin in origins:
-        if origin.startswith("http://") or origin.startswith("https://"):
-            valid_origins.append(origin)
-        else:
-            print(f"[CORS] WARNING: Skipping invalid origin (not http/https): {origin!r}")
-
-    if not valid_origins:
-        print("[CORS] WARNING: No valid origins parsed, falling back to production defaults")
-        return PROD_ORIGINS
-
-    return valid_origins
-
-
-# Parse and validate CORS origins at startup
-ALLOWED_ORIGINS = _parse_cors_origins()
-
-# Log the final parsed list clearly
-print(f"[CORS] ════════════════════════════════════════════════════════")
-print(f"[CORS] Final allowed origins ({len(ALLOWED_ORIGINS)} total):")
-for i, origin in enumerate(ALLOWED_ORIGINS, 1):
-    print(f"[CORS]   {i}. {origin}")
-print(f"[CORS] ════════════════════════════════════════════════════════")
+print(f"[CORS] Allowed origins: {ALLOWED_ORIGINS}")
 
 app = Flask(__name__)
-
-# Configure CORS with explicit origin list (required for credentials)
-# NO wildcards - explicit origins only for cookie/credential support
 CORS(
     app,
     resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
     supports_credentials=True,  # Required for httpOnly cookies
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
-    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 )
 
-
-@app.after_request
-def _ensure_cors_headers(response):
-    """
-    Ensure CORS headers are present on all responses, including errors.
-    Flask-CORS handles most cases, but this ensures preflight responses work.
-
-    Headers set:
-    - Access-Control-Allow-Origin: <origin> (NOT wildcard when using credentials)
-    - Access-Control-Allow-Credentials: true
-    - Vary: Origin (required for caching with dynamic origin)
-    - Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With
-    - Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
-    """
-    origin = request.headers.get("Origin")
-
-    # Always set Vary: Origin for proper caching when CORS varies by origin
-    response.headers["Vary"] = "Origin"
-
-    if origin and origin in ALLOWED_ORIGINS:
-        # Explicitly set headers (Flask-CORS may miss some edge cases)
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-
-        # For preflight (OPTIONS) requests, include method and header info
-        if request.method == "OPTIONS":
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-
-    return response
-
 @app.before_request
-def _init_identity():
-    # Initialize identity context - will be overwritten by @with_session middleware
-    # g.identity_id is the authoritative identity (set by middleware)
-    g.identity_id = None
-
-# ─────────────────────────────────────────────────────────────
-# Register Blueprints (credits system)
-# ─────────────────────────────────────────────────────────────
-for name, bp, prefix in _loaded_blueprints:
-    app.register_blueprint(bp, url_prefix=prefix)
-# Log loaded blueprints for Render startup verification
-print(f"[BOOT] Loaded blueprints: {[name for name, _, _ in _loaded_blueprints]}")
-
-# ─────────────────────────────────────────────────────────────
-# GET /api/wallet - Simple wallet balance endpoint
-# ─────────────────────────────────────────────────────────────
-@app.route("/api/wallet", methods=["GET"])
-def api_wallet():
-    """
-    Get current wallet credits for the active identity/session.
-
-    Response (200):
-    {
-        "identity_id": "uuid",
-        "credits_balance": 150
-    }
-
-    Response (401 - no session):
-    {
-        "error": {"code": "UNAUTHORIZED", "message": "No valid session"}
-    }
-    """
-    from identity_service import IdentityService
-
-    # Get session from cookie
-    session_id = IdentityService.get_session_id_from_request(request)
-    if not session_id:
-        return jsonify({
-            "error": {
-                "code": "UNAUTHORIZED",
-                "message": "No valid session",
-            }
-        }), 401
-
-    # Validate session
-    identity = IdentityService.validate_session(session_id)
-    if not identity:
-        return jsonify({
-            "error": {
-                "code": "UNAUTHORIZED",
-                "message": "Invalid or expired session",
-            }
-        }), 401
-
-    identity_id = str(identity["id"])
-
-    # Get balance
-    try:
-        balance = WalletService.get_balance(identity_id) if WalletService else 0
-        return jsonify({
-            "identity_id": identity_id,
-            "credits_balance": balance,
-        })
-    except Exception as e:
-        print(f"[WALLET] Error fetching balance: {e}")
-        return jsonify({
-            "error": {
-                "code": "INTERNAL_ERROR",
-                "message": "Failed to fetch wallet balance",
-            }
-        }), 500
-
-# ─────────────────────────────────────────────────────────────
-# Seed Default Plans (ensures plans exist in DB)
-# ─────────────────────────────────────────────────────────────
-if CREDITS_AVAILABLE and PricingService:
-    try:
-        PricingService.seed_plans()
-    except Exception as e:
-        print(f"[APP] Warning: Failed to seed plans: {e}")
-
-# ─────────────────────────────────────────────────────────────
-# Frontend Serving (same-origin for cookies)
-# ─────────────────────────────────────────────────────────────
-# Find frontend directory - check multiple locations
-FRONTEND_DIR = None
-_possible_frontend_paths = [
-    APP_DIR / "frontend",                    # Deployed: frontend/ in same dir as app.py
-    APP_DIR / ".." / ".." / "Frontend",      # Local dev: TimrX/Backend/meshy -> TimrX/Frontend
-    APP_DIR.parent.parent / "Frontend",      # Alternative path
-]
-for _fp in _possible_frontend_paths:
-    if _fp.exists() and _fp.is_dir():
-        FRONTEND_DIR = _fp.resolve()
-        break
-
-# Get FRONTEND_BASE_URL for redirects when FRONTEND_DIR is not available
-_FRONTEND_BASE_URL = None
-if cfg and hasattr(cfg.config, 'FRONTEND_BASE_URL'):
-    _FRONTEND_BASE_URL = cfg.config.FRONTEND_BASE_URL.rstrip("/") if cfg.config.FRONTEND_BASE_URL else None
-
-if FRONTEND_DIR:
-    print(f"[FRONTEND] Serving from: {FRONTEND_DIR}")
-elif _FRONTEND_BASE_URL:
-    print(f"[FRONTEND] No local frontend dir. Will redirect HTML routes to: {_FRONTEND_BASE_URL}")
-else:
-    print("[FRONTEND] WARNING: No FRONTEND_DIR or FRONTEND_BASE_URL. HTML routes will 404.")
-
-
-def _redirect_to_frontend(path: str):
-    """
-    Redirect to frontend URL, preserving query string.
-    Used when FRONTEND_DIR is not available but FRONTEND_BASE_URL is set.
-    """
-    if not _FRONTEND_BASE_URL:
-        return jsonify({"error": "Frontend not configured. Set FRONTEND_BASE_URL env var."}), 404
-    # Preserve query string (e.g., ?checkout=success)
-    query = request.query_string.decode('utf-8')
-    target_url = f"{_FRONTEND_BASE_URL}/{path.lstrip('/')}"
-    if query:
-        target_url = f"{target_url}?{query}"
-    return redirect(target_url, code=302)
-
-
-@app.route("/")
-def serve_hub():
-    """Serve hub.html at root."""
-    if not FRONTEND_DIR:
-        return _redirect_to_frontend("hub.html")
-    return send_from_directory(FRONTEND_DIR, "hub.html")
-
-@app.route("/3dprint")
-@app.route("/3dprint.html")
-def serve_3dprint():
-    """Serve 3dprint.html."""
-    if not FRONTEND_DIR:
-        return _redirect_to_frontend("3dprint.html")
-    return send_from_directory(FRONTEND_DIR, "3dprint.html")
-
-@app.route("/hub.html")
-def serve_hub_html():
-    """Serve hub.html explicitly."""
-    if not FRONTEND_DIR:
-        return _redirect_to_frontend("hub.html")
-    return send_from_directory(FRONTEND_DIR, "hub.html")
-
-@app.route("/index.html")
-def serve_index_html():
-    """Serve index.html."""
-    if not FRONTEND_DIR:
-        return _redirect_to_frontend("index.html")
-    return send_from_directory(FRONTEND_DIR, "index.html")
-
-# Serve static assets (CSS, JS, etc.)
-@app.route("/<path:filename>")
-def serve_static_file(filename):
-    """Serve static files from frontend directory."""
-    if not FRONTEND_DIR:
-        # For static assets, redirect if FRONTEND_BASE_URL is set
-        if _FRONTEND_BASE_URL and filename.endswith(('.css', '.js', '.html', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot')):
-            return _redirect_to_frontend(filename)
-        abort(404)
-    # Security: only allow certain extensions
-    allowed_extensions = {'.css', '.js', '.html', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot'}
-    ext = os.path.splitext(filename)[1].lower()
-    if ext not in allowed_extensions:
-        abort(404)
-    try:
-        return send_from_directory(FRONTEND_DIR, filename)
-    except Exception:
-        abort(404)
-
-# ─────────────────────────────────────────────────────────────
-# JSON Error Handlers
-# Returns consistent error format: {error: {code, message, details?}}
-# ─────────────────────────────────────────────────────────────
-def make_error_response(code: str, message: str, status: int, details: dict = None):
-    """Create a consistent error response."""
-    error_body = {
-        "error": {
-            "code": code,
-            "message": message,
-        }
-    }
-    if details:
-        error_body["error"]["details"] = details
-    return jsonify(error_body), status
-
-
-@app.errorhandler(HTTPException)
-def handle_http_exception(e):
-    """Handle all HTTP exceptions with JSON response."""
-    code = e.name.upper().replace(" ", "_")
-    return make_error_response(code, e.description or str(e), e.code)
-
-
-@app.errorhandler(400)
-def handle_bad_request(e):
-    """Handle 400 Bad Request."""
-    message = e.description if hasattr(e, 'description') else "Bad request"
-    return make_error_response("BAD_REQUEST", message, 400)
-
-
-@app.errorhandler(401)
-def handle_unauthorized(e):
-    """Handle 401 Unauthorized."""
-    return make_error_response("UNAUTHORIZED", "Authentication required", 401)
-
-
-@app.errorhandler(403)
-def handle_forbidden(e):
-    """Handle 403 Forbidden."""
-    return make_error_response("FORBIDDEN", "Access denied", 403)
-
-
-@app.errorhandler(404)
-def handle_not_found(e):
-    """Handle 404 Not Found."""
-    return make_error_response("NOT_FOUND", "Resource not found", 404)
-
-
-@app.errorhandler(405)
-def handle_method_not_allowed(e):
-    """Handle 405 Method Not Allowed."""
-    return make_error_response("METHOD_NOT_ALLOWED", "Method not allowed", 405)
-
-
-@app.errorhandler(422)
-def handle_unprocessable_entity(e):
-    """Handle 422 Unprocessable Entity."""
-    message = e.description if hasattr(e, 'description') else "Unprocessable entity"
-    return make_error_response("UNPROCESSABLE_ENTITY", message, 422)
-
-
-@app.errorhandler(429)
-def handle_rate_limit(e):
-    """Handle 429 Too Many Requests."""
-    return make_error_response("RATE_LIMITED", "Too many requests, please slow down", 429)
-
-
-@app.errorhandler(500)
-def handle_internal_error(e):
-    """Handle 500 Internal Server Error."""
-    # Log the actual error for debugging
-    print(f"[ERROR] Internal server error: {e}")
-    return make_error_response("INTERNAL_ERROR", "An internal error occurred", 500)
-
-
-# Handle DatabaseError from db module
-if DatabaseError is not None:
-    @app.errorhandler(DatabaseError)
-    def handle_database_error(e):
-        """Handle database errors."""
-        print(f"[ERROR] Database error: {e}")
-        return make_error_response(
-            "DATABASE_ERROR",
-            "A database error occurred",
-            500,
-            details={"type": type(e).__name__} if IS_DEV else None
-        )
-
-
+def _set_anonymous_user():
+    # Auth removed; keep request user_id consistently set to None.
+    g.user_id = None
 # ─────────────────────────────────────────────────────────────
 # DEV ONLY: Local JSON file storage for job metadata
 # In production (USE_DB=True), this is used as in-memory cache only
@@ -1285,8 +827,8 @@ def _map_action_code(job_type: str) -> str:
         "texture": "MESHY_RETEXTURE",
         "retexture": "MESHY_RETEXTURE",
         "remesh": "MESHY_REFINE",
-        "rig": "MESHY_RIG",
-        "rigging": "MESHY_RIG",
+        "rig": "MESHY_REFINE",
+        "rigging": "MESHY_REFINE",
         "image": "OPENAI_IMAGE",
         "openai_image": "OPENAI_IMAGE",
     }
@@ -1299,158 +841,6 @@ def _map_action_code(job_type: str) -> str:
 def _map_provider(job_type: str) -> str:
     job = (job_type or "").lower()
     return "openai" if "image" in job else "meshy"
-
-
-def _validate_history_item_asset_ids(model_id, image_id, context: str = ""):
-    """
-    Validate that exactly one of model_id or image_id is set (XOR constraint).
-    Returns True if valid, False otherwise. Logs a warning if invalid.
-    """
-    has_model = model_id is not None
-    has_image = image_id is not None
-    if has_model == has_image:  # Both set or both NULL = invalid
-        print(f"[WARN] history_items XOR violation ({context}): model_id={model_id}, image_id={image_id}")
-        return False
-    return True
-
-
-def _parse_s3_bucket_and_key(url: str):
-    """
-    Extract S3 bucket and key from an S3 URL.
-    Returns (bucket, key) tuple, or (None, None) if not an S3 URL.
-
-    Supports formats:
-    - https://bucket.s3.region.amazonaws.com/key
-    - https://s3.region.amazonaws.com/bucket/key
-    """
-    if not is_s3_url(url):
-        return None, None
-    try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
-        path = parsed.path.lstrip("/")
-
-        # Format: bucket.s3.region.amazonaws.com/key
-        if host.endswith(".amazonaws.com") and ".s3." in host:
-            bucket = host.split(".s3.")[0]
-            key = path
-            return bucket, key if key else None
-
-        # Format: s3.region.amazonaws.com/bucket/key
-        if host.startswith("s3.") and host.endswith(".amazonaws.com"):
-            parts = path.split("/", 1)
-            if len(parts) >= 1:
-                bucket = parts[0]
-                key = parts[1] if len(parts) > 1 else None
-                return bucket, key
-
-        return None, None
-    except Exception:
-        return None, None
-
-
-def _lookup_asset_id_for_history(cur, item_type: str, job_id: str, glb_url: str = None, image_url: str = None, user_id: str = None, provider: str = None):
-    """
-    Try to find an existing model_id or image_id for a history item.
-    Returns (model_id, image_id, reason) tuple:
-    - If found: (model_id or None, image_id or None, None)
-    - If ambiguous match: (None, None, "ambiguous_asset_match")
-    - If not found: (None, None, "missing_asset_reference")
-
-    Strict priority order (never uses weak matching):
-    1. provider + upstream_id (strongest key)
-    2. s3_bucket + s3_key (exact match on unique index)
-    3. Never falls back to raw URL matching without S3 key extraction
-
-    If multiple matches found, returns (None, None, "ambiguous_asset_match") and logs warning.
-    """
-    model_id = None
-    image_id = None
-
-    if item_type == "image":
-        # Priority 1: Look up by provider + upstream_id (strongest key)
-        if job_id:
-            prov = provider or "openai"
-            cur.execute(f"""
-                SELECT id FROM {APP_SCHEMA}.images
-                WHERE provider = %s AND upstream_id = %s
-            """, (prov, str(job_id)))
-            rows = cur.fetchall()
-            if len(rows) == 1:
-                image_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
-            elif len(rows) > 1:
-                ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
-                print(f"[WARN] _lookup_asset_id_for_history: multiple images for provider={prov}, upstream_id={job_id}: {ids}")
-                return None, None, "ambiguous_asset_match"
-
-        # Priority 2: Look up by s3_bucket + image_s3_key (unique index)
-        if not image_id and image_url:
-            bucket, key = _parse_s3_bucket_and_key(image_url)
-            if bucket and key:
-                cur.execute(f"""
-                    SELECT id FROM {APP_SCHEMA}.images
-                    WHERE s3_bucket = %s AND image_s3_key = %s
-                """, (bucket, key))
-                rows = cur.fetchall()
-                if len(rows) == 1:
-                    image_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
-                elif len(rows) > 1:
-                    ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
-                    print(f"[WARN] _lookup_asset_id_for_history: multiple images for s3_bucket={bucket}, key={key}: {ids}")
-                    return None, None, "ambiguous_asset_match"
-
-        # Priority 3: Look up by s3_bucket + thumbnail_s3_key (unique index)
-        if not image_id and image_url:
-            bucket, key = _parse_s3_bucket_and_key(image_url)
-            if bucket and key:
-                cur.execute(f"""
-                    SELECT id FROM {APP_SCHEMA}.images
-                    WHERE s3_bucket = %s AND thumbnail_s3_key = %s
-                """, (bucket, key))
-                rows = cur.fetchall()
-                if len(rows) == 1:
-                    image_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
-                elif len(rows) > 1:
-                    ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
-                    print(f"[WARN] _lookup_asset_id_for_history: multiple images for s3_bucket={bucket}, thumb_key={key}: {ids}")
-                    return None, None, "ambiguous_asset_match"
-    else:
-        # Priority 1: Look up by provider + upstream_job_id (strongest key)
-        if job_id:
-            prov = provider or "meshy"
-            cur.execute(f"""
-                SELECT id FROM {APP_SCHEMA}.models
-                WHERE provider = %s AND upstream_job_id = %s
-            """, (prov, str(job_id)))
-            rows = cur.fetchall()
-            if len(rows) == 1:
-                model_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
-            elif len(rows) > 1:
-                ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
-                print(f"[WARN] _lookup_asset_id_for_history: multiple models for provider={prov}, upstream_job_id={job_id}: {ids}")
-                return None, None, "ambiguous_asset_match"
-
-        # Priority 2: Look up by s3_bucket + glb_s3_key (unique index)
-        if not model_id and glb_url:
-            bucket, key = _parse_s3_bucket_and_key(glb_url)
-            if bucket and key:
-                cur.execute(f"""
-                    SELECT id FROM {APP_SCHEMA}.models
-                    WHERE s3_bucket = %s AND glb_s3_key = %s
-                """, (bucket, key))
-                rows = cur.fetchall()
-                if len(rows) == 1:
-                    model_id = rows[0][0] if isinstance(rows[0], tuple) else rows[0].get("id")
-                elif len(rows) > 1:
-                    ids = [r[0] if isinstance(r, tuple) else r.get("id") for r in rows]
-                    print(f"[WARN] _lookup_asset_id_for_history: multiple models for s3_bucket={bucket}, key={key}: {ids}")
-                    return None, None, "ambiguous_asset_match"
-
-    # Return result with reason if not found
-    if model_id or image_id:
-        return model_id, image_id, None
-    return None, None, "missing_asset_reference"
-
 
 def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadata: dict = None, user_id: str = None):
     """Save active job to database for recovery"""
@@ -1492,13 +882,48 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         payload["image_url"] = image_url
 
         with conn, conn.cursor(row_factory=dict_row) as cur:
-            # NOTE: We no longer create history_items placeholders here.
-            # The history_item will be created by the job completion webhook
-            # after the model/image asset exists (required by XOR constraint).
-            # Use active_jobs table for tracking in-progress jobs.
+            cur.execute(f"""
+                INSERT INTO {APP_SCHEMA}.history_items (
+                    id, identity_id, item_type, status, stage,
+                    title, prompt, root_prompt,
+                    thumbnail_url, glb_url, image_url,
+                    payload
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s,
+                    %s
+                )
+                ON CONFLICT (id) DO UPDATE
+                SET status = EXCLUDED.status,
+                    stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
+                    title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                    prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                    root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                    identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                    thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                    glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
+                    image_url = EXCLUDED.image_url,
+                    payload = EXCLUDED.payload,
+                    updated_at = NOW()
+            """, (
+                history_id,
+                user_id,
+                item_type,
+                "processing",
+                stage,
+                title,
+                prompt,
+                root_prompt,
+                thumbnail_url,
+                glb_url,
+                image_url,
+                json.dumps(payload),
+            ))
 
             action_code = _map_action_code(job_type)
             provider = _map_provider(job_type)
+            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
             cur.execute(f"""
                 SELECT id FROM {APP_SCHEMA}.active_jobs
                 WHERE upstream_job_id = %s
@@ -1514,19 +939,20 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
                         action_code = %s,
                         status = 'running',
                         progress = %s,
+                        related_history_id = COALESCE(%s, related_history_id),
                         updated_at = NOW()
                     WHERE id = %s
-                """, (user_id, provider, action_code, progress, existing["id"]))
+                """, (user_id, provider, action_code, progress, history_id, existing["id"]))
             else:
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.active_jobs (
                         id, identity_id, provider, action_code, upstream_job_id,
-                        status, progress
+                        status, progress, related_history_id
                     ) VALUES (
                         %s, %s, %s, %s, %s,
-                        'running', %s
+                        'running', %s, %s
                     )
-                """, (str(uuid.uuid4()), user_id, provider, action_code, job_id, progress))
+                """, (str(uuid.uuid4()), user_id, provider, action_code, job_id, progress, history_id))
         conn.close()
         return True
     except Exception as e:
@@ -2011,7 +1437,6 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     json.dumps(payload),
                     history_uuid,
                 ))
-                print(f"[history] updated item: history_id={history_uuid}, model_id=None, image_id={returned_image_id}, job_id={image_id}")
             else:
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.history_items (
@@ -2054,11 +1479,11 @@ def save_image_to_normalized_db(image_id: str, image_url: str, prompt: str, ai_m
                     returned_image_id,
                     json.dumps(payload),
                 ))
-                print(f"[history] inserted item: history_id={history_uuid}, model_id=None, image_id={returned_image_id}, job_id={image_id}")
 
         conn.close()
         if image_log_info:
             print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
+        print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
@@ -2388,6 +1813,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB]   glb_url: {final_glb_url[:80] if final_glb_url else 'None'}...")
             print(f"[DB]   thumbnail_url: {final_thumbnail_url[:80] if final_thumbnail_url else 'None'}...")
             print(f"[DB]   title: {final_title}")
+            print(f"[DB] Inserting history_items with id={history_uuid}")
 
             db_save_ok = True
             history_item_id = None
@@ -2634,34 +2060,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             "hash": image_content_hash,
                             "reused": bool(image_reused),
                         }
-
-                # XOR validation: exactly one of model_id or image_id must be set
-                has_model = model_id is not None
-                has_image = image_id is not None
-                if has_model == has_image:  # Both set or both NULL = invalid
-                    if not has_model and not has_image:
-                        print(f"[HISTORY] Skipping history_items: no asset created (job_id={job_id})")
-                        print(f"[HISTORY]   glb_url={glb_url}, image_url={image_url}")
-                        print(f"[HISTORY]   This is expected for jobs that failed or haven't finished yet")
-                        # Release savepoint and return - don't create history without asset
-                        cur.execute("RELEASE SAVEPOINT normalized_save")
-                        conn.close()
-                        return {
-                            "success": True,
-                            "db_ok": True,
-                            "skipped": True,
-                            "reason": "missing_asset_reference",
-                            "job_id": job_id
-                        }
-                    else:
-                        print(f"[WARN] history_items XOR violation: both model_id={model_id} and image_id={image_id} are set (job_id={job_id})")
-                        # Prefer the asset matching item_type
-                        if item_type == "image":
-                            model_id = None
-                        else:
-                            image_id = None
-                        print(f"[WARN] Resolved: keeping {item_type}_id, cleared the other")
-
                 cur.execute(f"""
                     INSERT INTO {APP_SCHEMA}.history_items (
                         id, identity_id, item_type, status, stage,
@@ -2686,17 +2084,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         thumbnail_url = EXCLUDED.thumbnail_url,
                         glb_url = EXCLUDED.glb_url,
                         image_url = EXCLUDED.image_url,
-                        -- XOR enforcement: use EXCLUDED values directly, clearing the other if one is set
-                        model_id = CASE
-                            WHEN EXCLUDED.model_id IS NOT NULL THEN EXCLUDED.model_id
-                            WHEN EXCLUDED.image_id IS NOT NULL THEN NULL
-                            ELSE {APP_SCHEMA}.history_items.model_id
-                        END,
-                        image_id = CASE
-                            WHEN EXCLUDED.image_id IS NOT NULL THEN EXCLUDED.image_id
-                            WHEN EXCLUDED.model_id IS NOT NULL THEN NULL
-                            ELSE {APP_SCHEMA}.history_items.image_id
-                        END,
+                        model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
+                        image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                         payload = EXCLUDED.payload,
                         updated_at = NOW()
                     RETURNING id
@@ -2720,7 +2109,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not history_row:
                     raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
                 history_item_id = history_row["id"]
-                print(f"[history] inserted item: history_id={history_item_id}, model_id={model_id}, image_id={image_id}, job_id={job_id}")
                 cur.execute("RELEASE SAVEPOINT normalized_save")
             except Exception as e:
                 db_save_ok = False
@@ -2754,12 +2142,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         if db_save_ok and history_item_id:
             if model_id:
                 print(f"[DB] model persisted: model_id={model_id} glb_url={final_glb_url} history_item_id={history_item_id}")
-                # Structured log for job lifecycle tracking
-                print(f"[JOB] asset_saved job_id={job_id} model_id={model_id} history_item_id={history_item_id}")
             if image_id:
                 print(f"[DB] image persisted: image_id={image_id} image_url={image_url} history_item_id={history_item_id}")
-                # Structured log for job lifecycle tracking
-                print(f"[JOB] asset_saved job_id={job_id} image_id={image_id} history_item_id={history_item_id}")
         if db_save_ok and model_log_info is not None:
             print(f"[S3] model stored: key={model_log_info['key']} hash={model_log_info['hash']} reused={model_log_info['reused']}")
         if db_save_ok and image_log_info is not None:
@@ -2773,7 +2157,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             "success": True,
             "db_ok": db_save_ok and len(db_errors) == 0,
             "db_errors": db_errors or None,
-            "model_id": model_id,  # UUID of saved model in timrx_app.models
             "glb_url": final_glb_url,
             "thumbnail_url": final_thumbnail_url,
             "textured_glb_url": textured_glb_url,
@@ -2859,18 +2242,14 @@ def verify_job_ownership(job_id: str, user_id: str = None) -> bool:
 
     try:
         with conn.cursor() as cur:
-            # Check active_jobs, history_items, AND timrx_billing.jobs tables
             cur.execute(f"""
                 SELECT identity_id FROM {APP_SCHEMA}.active_jobs WHERE upstream_job_id = %s
                 UNION
                 SELECT identity_id FROM {APP_SCHEMA}.history_items WHERE id::text = %s
                    OR payload->>'original_job_id' = %s
                    OR payload->>'job_id' = %s
-                UNION
-                SELECT identity_id FROM timrx_billing.jobs WHERE id::text = %s
-                   OR upstream_job_id = %s
                 LIMIT 1
-            """, (job_id, job_id, job_id, job_id, job_id, job_id))
+            """, (job_id, job_id, job_id, job_id))
             row = cur.fetchone()
         conn.close()
 
@@ -3081,381 +2460,6 @@ def openai_image_generate(prompt: str, size: str = "1024x1024", model: str = "gp
         return r.json()
     except Exception:
         raise RuntimeError(f"OpenAI image returned non-JSON: {r.text[:200]}")
-
-# ─────────────────────────────────────────────────────────────
-# Background Job Dispatch - Async provider calls
-# ─────────────────────────────────────────────────────────────
-
-def _dispatch_meshy_text_to_3d_async(
-    internal_job_id: str,
-    identity_id: str,
-    reservation_id: Optional[str],
-    payload: dict,
-    store_meta: dict,
-):
-    """
-    Background task to call Meshy text-to-3d API.
-    Called via ThreadPoolExecutor after /start returns.
-
-    Args:
-        internal_job_id: Our UUID job ID (already in jobs table)
-        identity_id: User's identity
-        reservation_id: Credit reservation to finalize/release
-        payload: Meshy API payload
-        store_meta: Metadata to save in local store
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=text-to-3d reservation_id={reservation_id}")
-
-    try:
-        # Call Meshy API
-        resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        meshy_task_id = resp.get("result")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
-
-        if not meshy_task_id:
-            # Meshy didn't return a task ID - release credits
-            print(f"[ASYNC] ERROR: No task_id from Meshy for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
-            return
-
-        # Provider accepted job - keep credits HELD (don't finalize yet)
-        # Credits will be captured when asset is successfully saved to DB+S3
-        # Credits will be released if job fails later
-
-        # Update job with upstream_job_id (status becomes 'processing')
-        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
-
-        # Save to local store (for status polling compatibility)
-        store = load_store()
-        store_meta["upstream_job_id"] = meshy_task_id
-        store[meshy_task_id] = store_meta  # Key by meshy_task_id for polling
-        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}  # Also key by internal ID
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(
-            meshy_task_id,
-            "text-to-3d",
-            store_meta.get("stage", "preview"),
-            store_meta,
-            identity_id
-        )
-
-        print(f"[ASYNC] Job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy call failed for job {internal_job_id} after {duration_ms}ms: {e}")
-
-        # Release credits on failure
-        if reservation_id:
-            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-
-        # Mark job as failed
-        _update_job_status_failed(internal_job_id, str(e))
-
-
-def _dispatch_meshy_image_to_3d_async(
-    internal_job_id: str,
-    identity_id: str,
-    reservation_id: Optional[str],
-    payload: dict,
-    store_meta: dict,
-    image_url: str,
-):
-    """
-    Background task to call Meshy image-to-3d API.
-    Called via ThreadPoolExecutor after /start returns.
-
-    Args:
-        internal_job_id: Our UUID job ID (already in jobs table)
-        identity_id: User's identity
-        reservation_id: Credit reservation (stays HELD until asset saved)
-        payload: Meshy API payload
-        store_meta: Metadata to save in local store
-        image_url: Original image URL for S3 upload
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
-
-    try:
-        # Call Meshy API
-        resp = mesh_post("/openapi/v1/image-to-3d", payload)
-        meshy_task_id = resp.get("result") or resp.get("id")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Meshy image-to-3d returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
-
-        if not meshy_task_id:
-            # Meshy didn't return a task ID - release credits
-            print(f"[ASYNC] ERROR: No task_id from Meshy image-to-3d for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
-            return
-
-        # Provider accepted job - keep credits HELD (don't finalize yet)
-        # Credits will be captured when asset is successfully saved to DB+S3
-
-        # Update job with upstream_job_id (status becomes 'processing')
-        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
-
-        # Upload source image to S3 for permanent storage
-        user_id = identity_id
-        s3_image_url = image_url
-        prompt = store_meta.get("prompt", "")
-        s3_name = prompt if prompt else "image_to_3d_source"
-
-        if AWS_BUCKET_MODELS:
-            try:
-                s3_image_url = safe_upload_to_s3(
-                    image_url,
-                    "image/png",
-                    "source_images",
-                    s3_name,
-                    user_id=user_id,
-                    key_base=f"source_images/{user_id or 'public'}/{meshy_task_id}",
-                    provider="user",
-                )
-                print(f"[ASYNC] Uploaded source image to S3: {s3_image_url}")
-            except Exception as e:
-                print(f"[ASYNC] Failed to upload source image to S3: {e}, using original URL")
-
-        # Save to local store (for status polling compatibility)
-        store = load_store()
-        store_meta["upstream_job_id"] = meshy_task_id
-        store_meta["image_url"] = s3_image_url
-        store[meshy_task_id] = store_meta  # Key by meshy_task_id for polling
-        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(
-            meshy_task_id,
-            "image-to-3d",
-            "image3d",
-            store_meta,
-            identity_id
-        )
-
-        print(f"[ASYNC] Image-to-3d job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy image-to-3d call failed for job {internal_job_id} after {duration_ms}ms: {e}")
-
-        # Release credits on failure
-        if reservation_id:
-            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-
-        # Mark job as failed
-        _update_job_status_failed(internal_job_id, str(e))
-
-
-def _dispatch_openai_image_async(
-    internal_job_id: str,
-    identity_id: str,
-    reservation_id: Optional[str],
-    prompt: str,
-    size: str,
-    model: str,
-    n: int,
-    response_format: str,
-    store_meta: dict,
-):
-    """
-    Background task to call OpenAI image generation API.
-    Called via ThreadPoolExecutor after /start returns.
-
-    Unlike Meshy, OpenAI returns the image immediately so we:
-    - Call OpenAI
-    - Save image to DB + S3
-    - Capture credits
-    - Mark job as ready
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=openai action=image-gen reservation_id={reservation_id}")
-
-    try:
-        # Call OpenAI API
-        resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
-
-        data_list = resp.get("data") or []
-        urls = []
-        b64_first = None
-        for item in data_list:
-            if not isinstance(item, dict):
-                continue
-            if item.get("url"):
-                urls.append(item["url"])
-            elif item.get("b64_json"):
-                if not b64_first:
-                    b64_first = item["b64_json"]
-                urls.append(f"data:image/png;base64,{item['b64_json']}")
-
-        if not urls:
-            print(f"[ASYNC] ERROR: No images from OpenAI for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "openai_no_images", internal_job_id)
-            _update_job_status_failed(internal_job_id, "OpenAI returned no images")
-            return
-
-        # Save image to normalized DB
-        save_image_to_normalized_db(
-            image_id=internal_job_id,
-            image_url=urls[0],
-            prompt=prompt,
-            ai_model=model,
-            size=size,
-            image_urls=urls,
-            user_id=identity_id
-        )
-        # Structured log for job lifecycle tracking
-        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id}")
-
-        # Update store with results
-        store = load_store()
-        store_meta["status"] = "done"
-        store_meta["image_url"] = urls[0]
-        store_meta["image_urls"] = urls
-        store_meta["image_base64"] = b64_first
-        store[internal_job_id] = store_meta
-        save_store(store)
-
-        # Capture credits - image saved successfully
-        if reservation_id:
-            finalize_job_credits(reservation_id, internal_job_id)
-            print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
-
-        # Mark job as ready with asset info
-        _update_job_status_ready(
-            internal_job_id,
-            upstream_job_id=None,
-            image_id=internal_job_id,  # Image ID is same as job ID for OpenAI
-            image_url=urls[0],
-        )
-
-        print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: OpenAI call failed for job {internal_job_id} after {duration_ms}ms: {e}")
-
-        # Release credits on failure
-        if reservation_id:
-            release_job_credits(reservation_id, "openai_api_error", internal_job_id)
-
-        # Mark job as failed
-        _update_job_status_failed(internal_job_id, str(e))
-
-
-def _update_job_with_upstream_id(job_id: str, upstream_job_id: str):
-    """Update job in timrx_billing.jobs with upstream_job_id and status='processing'."""
-    if not USE_DB:
-        return
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE timrx_billing.jobs
-                SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
-                WHERE id = %s
-            """, (upstream_job_id, job_id))
-            conn.commit()
-            conn.close()
-            print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
-    except Exception as e:
-        print(f"[ASYNC] ERROR updating job {job_id}: {e}")
-
-
-def _update_job_status_failed(job_id: str, error_message: str):
-    """Mark job as failed in timrx_billing.jobs."""
-    if not USE_DB:
-        return
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE timrx_billing.jobs
-                SET status = 'failed', error_message = %s, updated_at = NOW()
-                WHERE id = %s
-            """, (error_message[:500] if error_message else None, job_id))
-            conn.commit()
-            conn.close()
-            print(f"[JOB] Marked job {job_id} as failed: {error_message[:100] if error_message else 'no message'}")
-    except Exception as e:
-        print(f"[JOB] ERROR marking job {job_id} as failed: {e}")
-
-
-def _update_job_status_ready(
-    job_id: str,
-    upstream_job_id: str = None,
-    model_id: str = None,
-    image_id: str = None,
-    glb_url: str = None,
-    image_url: str = None,
-    progress: int = 100,
-):
-    """
-    Mark job as ready (completed successfully) in timrx_billing.jobs.
-    Also updates meta column with asset info for polling.
-    """
-    if not USE_DB:
-        return
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            # Build meta updates
-            meta_updates = {"progress": progress}
-            if model_id:
-                meta_updates["model_id"] = model_id
-            if image_id:
-                meta_updates["image_id"] = image_id
-            if glb_url:
-                meta_updates["glb_url"] = glb_url
-            if image_url:
-                meta_updates["image_url"] = image_url
-
-            if upstream_job_id:
-                cursor.execute("""
-                    UPDATE timrx_billing.jobs
-                    SET status = 'ready',
-                        upstream_job_id = COALESCE(upstream_job_id, %s),
-                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (upstream_job_id, json.dumps(meta_updates), job_id))
-            else:
-                cursor.execute("""
-                    UPDATE timrx_billing.jobs
-                    SET status = 'ready',
-                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (json.dumps(meta_updates), job_id))
-            conn.commit()
-            conn.close()
-            print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
-    except Exception as e:
-        print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
-
 
 # ─────────────────────────────────────────────────────────────
 # Utils
@@ -3744,396 +2748,6 @@ def build_source_payload(body: dict):
         return {"model_url": model_url}, None
 
 # ─────────────────────────────────────────────────────────────
-# Credit Enforcement Helpers (Centralized Pipeline)
-# ─────────────────────────────────────────────────────────────
-
-def _make_credit_error(code: str, message: str, status: int = 400, **extra) -> tuple:
-    """Create a standardized credit error response."""
-    error_body = {
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-            **extra,
-        }
-    }
-    return jsonify(error_body), status
-
-
-def require_identity() -> tuple:
-    """
-    Check that g.identity_id is set (by @with_session middleware).
-
-    Returns:
-        (identity_id, None) on success
-        (None, error_response) on failure - return from route
-    """
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        print(f"[CREDITS] ERROR: No identity_id - @with_session not applied or session invalid")
-        return None, _make_credit_error(
-            "NO_SESSION",
-            "Please sign in or restore your session to continue. You need credits for this action.",
-            401
-        )
-    return identity_id, None
-
-
-def require_credits(identity_id: str, action_key: str) -> tuple:
-    """
-    Check if user has sufficient credits for an action WITHOUT reserving.
-    Use this for pre-flight checks before expensive operations.
-
-    Args:
-        identity_id: User's identity ID
-        action_key: Action key (e.g., 'text_to_3d_generate')
-
-    Returns:
-        (cost, None) on success
-        (0, error_response) on failure - return from route
-    """
-    if not CREDITS_AVAILABLE:
-        print(f"[CREDITS] System not available, allowing {action_key}")
-        return 0, None
-
-    try:
-        cost = PricingService.get_action_cost(action_key)
-        if cost == 0:
-            print(f"[CREDITS] No cost defined for {action_key}, allowing")
-            return 0, None
-
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
-
-        print(f"[CREDITS] Check {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}")
-
-        if available < cost:
-            return 0, _make_credit_error(
-                "INSUFFICIENT_CREDITS",
-                f"You need {cost} credits but only have {available} available.",
-                402,
-                required=cost,
-                available=available,
-                balance=balance,
-                reserved=reserved
-            )
-
-        return cost, None
-
-    except Exception as e:
-        print(f"[CREDITS] Check error for {action_key}: {e}")
-        # Don't block on system errors
-        return 0, None
-
-
-def start_paid_job(identity_id: str, action_key: str, job_id: str, meta: dict = None) -> tuple:
-    """
-    Reserve credits for a paid job. Call this BEFORE calling upstream API.
-
-    Args:
-        identity_id: User's identity ID (required, non-null)
-        action_key: Action key for pricing
-        job_id: Unique job ID for idempotency
-        meta: Additional metadata for the reservation
-
-    Returns:
-        (reservation_id, None) on success
-        (None, error_response) on failure - return from route
-    """
-    if not CREDITS_AVAILABLE:
-        print(f"[CREDITS] System not available, allowing {action_key} job_id={job_id}")
-        return None, None
-
-    if not identity_id:
-        print(f"[CREDITS] ERROR: No identity for {action_key} job_id={job_id}")
-        return None, _make_credit_error(
-            "NO_SESSION",
-            "A valid session is required for this action. Please sign in or restore your session.",
-            401
-        )
-
-    try:
-        cost = PricingService.get_action_cost(action_key)
-        if cost == 0:
-            print(f"[CREDITS] No cost for {action_key}, no reservation needed")
-            return None, None
-
-        # Check balance before reserving
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
-
-        print(f"[CREDITS] Reserve {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}, job_id={job_id}")
-
-        if available < cost:
-            return None, _make_credit_error(
-                "INSUFFICIENT_CREDITS",
-                f"You need {cost} credits but only have {available} available.",
-                402,
-                required=cost,
-                available=available,
-                balance=balance,
-                reserved=reserved
-            )
-
-        # Create reservation
-        result = ReservationService.reserve_credits(
-            identity_id=identity_id,
-            action_key=action_key,
-            job_id=job_id,
-            meta={
-                "action_key": action_key,
-                "source": "paid_job_pipeline",
-                **(meta or {})
-            },
-        )
-
-        reservation_id = result["reservation"]["id"]
-        is_existing = result.get("is_existing", False)
-
-        if is_existing:
-            print(f"[CREDITS] Idempotent: existing reservation {reservation_id} for job_id={job_id}")
-        else:
-            print(f"[CREDITS] Reserved {cost} credits, reservation_id={reservation_id}, job_id={job_id}")
-
-        # Structured log for job lifecycle tracking
-        print(f"[JOB] started job_id={job_id} reservation_id={reservation_id} action={action_key} cost={cost}")
-
-        return reservation_id, None
-
-    except ValueError as e:
-        error_msg = str(e)
-        print(f"[CREDITS] Reservation failed: {error_msg}")
-
-        if "INSUFFICIENT_CREDITS" in error_msg:
-            # Parse error details
-            parts = error_msg.split(":")
-            required = available = 0
-            for part in parts:
-                if "required=" in part:
-                    try:
-                        required = int(part.split("=")[1].strip())
-                    except:
-                        pass
-                elif "available=" in part:
-                    try:
-                        available = int(part.split("=")[1].strip())
-                    except:
-                        pass
-
-            return None, _make_credit_error(
-                "INSUFFICIENT_CREDITS",
-                error_msg,
-                402,
-                required=required,
-                available=available
-            )
-
-        return None, _make_credit_error("CREDIT_ERROR", str(e), 400)
-
-    except Exception as e:
-        print(f"[CREDITS] Unexpected error reserving credits: {e}")
-        # Don't block on system errors - but log for debugging
-        import traceback
-        traceback.print_exc()
-        return None, None
-
-
-def finalize_job_credits(reservation_id: str, job_id: str = None):
-    """
-    Finalize (capture) credits after successful job completion.
-    Fully idempotent - safe to call multiple times, handles all edge cases gracefully.
-
-    Args:
-        reservation_id: The reservation ID from start_paid_job
-        job_id: Optional job ID for logging
-    """
-    if not CREDITS_AVAILABLE or not reservation_id:
-        return
-
-    try:
-        result = ReservationService.finalize_reservation(reservation_id)
-
-        # Handle all idempotent cases gracefully
-        if result.get("not_found"):
-            print(f"[CREDITS] Finalize: reservation not found (idempotent): {reservation_id} job_id={job_id}")
-        elif result.get("was_already_finalized"):
-            print(f"[CREDITS] Already finalized: reservation={reservation_id} job_id={job_id}")
-        elif result.get("was_already_released"):
-            # Job was cancelled/failed before we could finalize - that's ok
-            print(f"[CREDITS] Finalize skipped (already released): reservation={reservation_id} job_id={job_id}")
-        else:
-            print(f"[CREDITS] Finalized: reservation={reservation_id} job_id={job_id}")
-            # Structured log for job lifecycle tracking
-            print(f"[JOB] credits_captured job_id={job_id} reservation_id={reservation_id}")
-    except Exception as e:
-        print(f"[CREDITS] Finalize error {reservation_id}: {e}")
-
-
-def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id: str = None):
-    """
-    Release (refund) credits after job failure/cancellation.
-    Fully idempotent - safe to call multiple times, handles all edge cases gracefully.
-
-    Handles:
-    - Already released: no-op (idempotent)
-    - Already finalized: no-op (job actually succeeded, credits correctly captured)
-    - Not found: no-op (reservation expired or never existed)
-
-    Args:
-        reservation_id: The reservation ID from start_paid_job
-        reason: Reason for release (logged)
-        job_id: Optional job ID for logging
-    """
-    if not CREDITS_AVAILABLE or not reservation_id:
-        return
-
-    try:
-        result = ReservationService.release_reservation(reservation_id, reason)
-
-        # Handle all idempotent cases gracefully
-        if result.get("not_found"):
-            print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={job_id}")
-        elif result.get("was_already_released"):
-            print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
-        elif result.get("was_already_finalized"):
-            # Job actually succeeded and credits were captured - this is fine!
-            # This can happen when: frontend timeout triggers release, but backend already finalized
-            print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={job_id}")
-        else:
-            print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
-    except Exception as e:
-        print(f"[CREDITS] Release error {reservation_id}: {e}")
-
-
-def get_current_balance(identity_id: str) -> dict:
-    """
-    Get current credit balance info for a user.
-
-    Returns:
-        {balance, reserved, available} or None if credits system unavailable
-    """
-    if not CREDITS_AVAILABLE or not identity_id:
-        return None
-
-    try:
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
-        return {
-            "balance": balance,
-            "reserved": reserved,
-            "available": available
-        }
-    except Exception as e:
-        print(f"[CREDITS] Balance check error: {e}")
-        return None
-
-
-# Legacy aliases for backward compatibility
-def check_and_reserve_credits(identity_id: str, action_key: str, job_id: str):
-    """DEPRECATED: Use start_paid_job() instead."""
-    return start_paid_job(identity_id, action_key, job_id)
-
-
-def finalize_reservation(reservation_id: str):
-    """DEPRECATED: Use finalize_job_credits() instead."""
-    finalize_job_credits(reservation_id)
-
-
-def release_reservation(reservation_id: str, reason: str = "job_failed"):
-    """DEPRECATED: Use release_job_credits() instead."""
-    release_job_credits(reservation_id, reason)
-
-
-# Action key mapping for routes -> pricing action codes
-# These map frontend/route names to the pricing_service action codes
-ACTION_KEYS = {
-    # Text to 3D
-    "text-to-3d-preview": "text_to_3d_generate",
-    "text-to-3d-refine": "refine",
-    "text-to-3d-remesh": "remesh",
-    # Image to 3D
-    "image-to-3d": "image_to_3d_generate",
-    # Mesh operations
-    "remesh": "remesh",
-    "retexture": "texture",
-    "texture": "texture",
-    "rig": "rig",
-    "rigging": "rig",
-    # Image generation
-    "image-studio": "image_studio_generate",
-    "openai-image": "image_studio_generate",
-    "image_generate": "image_studio_generate",
-}
-
-# Legacy alias
-LEGACY_ACTION_KEYS = ACTION_KEYS
-
-
-def charge_credits_for_action(identity_id: str, action_key: str, upstream_job_id: str, metadata: dict = None):
-    """
-    Charge credits AFTER successful upstream API call.
-    Uses upstream_job_id as idempotency key to prevent double-charging.
-
-    Args:
-        identity_id: User's identity ID
-        action_key: Action key from LEGACY_ACTION_KEYS
-        upstream_job_id: The job ID returned by Meshy/OpenAI (idempotency key)
-        metadata: Optional metadata to store with the charge
-
-    Returns:
-        (True, new_balance, ledger_entry_id) on success
-        (False, 0, error_message) on failure (should not happen if check passed first)
-    """
-    if not CREDITS_AVAILABLE:
-        return True, 0, None
-
-    if not identity_id:
-        return True, 0, None
-
-    try:
-        cost = PricingService.get_action_cost(action_key)
-        if cost == 0:
-            return True, WalletService.get_balance(identity_id), None
-
-        # Import the charge function from credits module
-        from credits import _charge_credits_idempotent
-
-        result = _charge_credits_idempotent(
-            identity_id=identity_id,
-            action=action_key,
-            ref_type=action_key,
-            ref_id=upstream_job_id,
-            cost_credits=cost,
-            meta={
-                "upstream_job_id": upstream_job_id,
-                "source": "legacy_endpoint",
-                **(metadata or {}),
-            },
-        )
-
-        if result["idempotent"]:
-            print(f"[CREDITS] Idempotent charge for {action_key}, job={upstream_job_id}")
-        else:
-            print(f"[CREDITS] Charged {cost} credits for {action_key}, job={upstream_job_id}, new_balance={result['new_balance']}")
-
-        return True, result["new_balance"], None
-
-    except ValueError as e:
-        error_msg = str(e)
-        print(f"[CREDITS] Charge failed for {action_key}: {error_msg}")
-        # This shouldn't happen if check_credits_available passed, but handle gracefully
-        return False, 0, error_msg
-
-    except Exception as e:
-        print(f"[CREDITS] Unexpected charge error for {action_key}: {e}")
-        # Don't fail the request on credit errors - job already started
-        return True, 0, None
-
-
-# ─────────────────────────────────────────────────────────────
 # API
 # ─────────────────────────────────────────────────────────────
 @app.route("/api/health", methods=["GET"])
@@ -4163,32 +2777,19 @@ def db_check():
 
 # ---- Start preview (Text → 3D) ----
 @app.route("/api/text-to-3d/start", methods=["POST", "OPTIONS"])
-@with_session
 def api_text_to_3d_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id  # For backward compatibility
+    user_id = g.user_id  # May be None for anonymous users
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/start:incoming", body)
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
-        return jsonify({"ok": False, "error": "prompt required"}), 400
+        return jsonify({"error": "prompt required"}), 400
     if not MESHY_API_KEY:
-        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["text-to-3d-preview"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     payload = {
         "mode": "preview",
@@ -4213,11 +2814,20 @@ def api_text_to_3d_start():
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
     batch_group_id = (body.get("batch_group_id") or "").strip() or None
 
-    # ─── 3. Build store metadata for async dispatch ───
-    store_meta = {
+    try:
+        resp = mesh_post("/openapi/v2/text-to-3d", payload)
+        log_event("text-to-3d/start:meshy-resp", resp)
+        job_id = resp.get("result")
+        if not job_id:
+            return jsonify({"error": "No job id in response", "raw": resp}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    store = load_store()
+    store[job_id] = {
         "stage": "preview",
         "prompt": prompt,
-        "root_prompt": prompt,
+        "root_prompt": prompt,  # This is the start of a chain
         "art_style": art_style or "realistic",
         "model": payload["ai_model"],
         "created_at": now_s() * 1000,
@@ -4227,68 +2837,30 @@ def api_text_to_3d_start():
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
+        "user_id": user_id,  # Track user who started the job
     }
+    save_store(store)
 
-    # ─── 4. Dispatch Meshy API call to background (NON-BLOCKING) ───
-    # This returns immediately - the background worker will:
-    # - Call Meshy API
-    # - On success: update job with upstream_id (credits stay HELD)
-    # - On error: release credits, mark job as failed
-    # Credits are captured only when asset is saved to DB+S3 (in status endpoint)
-    _background_executor.submit(
-        _dispatch_meshy_text_to_3d_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        payload,
-        store_meta,
-    )
+    # Save to DB for recovery
+    save_active_job_to_db(job_id, "text-to-3d", "preview", store[job_id], user_id)
 
-    log_event("text-to-3d/start:dispatched", {"internal_job_id": internal_job_id})
-
-    # ─── 5. Return immediately with internal job ID ───
-    # Frontend polls /api/jobs/<id> to get status and upstream_job_id
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": internal_job_id,  # Return internal UUID - frontend polls this
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",  # Job is queued, pending provider dispatch
-    })
+    return jsonify({"job_id": job_id})
 
 # ---- Refine from preview ----
 @app.route("/api/text-to-3d/refine", methods=["POST", "OPTIONS"])
-@with_session
 def api_text_to_3d_refine():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
+    user_id = g.user_id  # May be None for anonymous users
 
     body = request.get_json(silent=True) or {}
     log_event("text-to-3d/refine:incoming", body)
     preview_task_id_input = (body.get("preview_task_id") or "").strip()
     if not preview_task_id_input:
-        return jsonify({"ok": False, "error": "preview_task_id required"}), 400
+        return jsonify({"error": "preview_task_id required"}), 400
     if not MESHY_API_KEY:
-        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["text-to-3d-refine"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Resolve to original Meshy job ID if this is our database UUID
     preview_task_id = resolve_meshy_job_id(preview_task_id_input)
@@ -4303,86 +2875,59 @@ def api_text_to_3d_refine():
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
 
-    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         log_event("text-to-3d/refine:meshy-resp", resp)
-        meshy_task_id = resp.get("result")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
+        job_id = resp.get("result")
+        if not job_id:
+            return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
+        return jsonify({"error": str(e)}), 502
 
     store = load_store()
+    # Copy metadata from preview job (try both input ID and resolved ID)
     preview_meta = get_job_metadata(preview_task_id_input, store)
     if not preview_meta.get("prompt"):
         preview_meta = get_job_metadata(preview_task_id, store)
     original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = preview_meta.get("root_prompt") or original_prompt
-    store[meshy_task_id] = {
+    store[job_id] = {
         "stage": "refine",
-        "preview_task_id": preview_task_id,
+        "preview_task_id": preview_task_id,  # Store the resolved Meshy ID
         "created_at": now_s() * 1000,
+        # Copy from preview job
         "prompt": original_prompt,
         "root_prompt": root_prompt,
         "title": f"(refine) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
         "art_style": preview_meta.get("art_style"),
         "texture_prompt": texture_prompt,
         "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
     }
     save_store(store)
 
-    save_active_job_to_db(meshy_task_id, "text-to-3d", "refine", store[meshy_task_id], user_id)
+    # Save to DB for recovery
+    save_active_job_to_db(job_id, "text-to-3d", "refine", store[job_id], user_id)
 
-    # ─── 5. Return success with balance ───
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": meshy_task_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
-    })
+    return jsonify({"job_id": job_id})
 
 # ---- (Soft) Remesh start (re-run preview with flags) ----
 @app.route("/api/text-to-3d/remesh-start", methods=["POST", "OPTIONS"])
-@with_session
 def api_text_to_3d_remesh_start():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
-
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
-        return jsonify({"ok": False, "error": "prompt required"}), 400
+        return jsonify({"error": "prompt required"}), 400
     if not MESHY_API_KEY:
-        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["remesh"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     payload = {
         "mode": "preview",
         "prompt": prompt,
         "ai_model": body.get("model") or "latest",
+        # mesh-friendly defaults for a cleaner topology
         "topology": "triangle",
         "should_remesh": True,
         "target_polycount": body.get("target_polycount", 45000),
@@ -4400,22 +2945,16 @@ def api_text_to_3d_remesh_start():
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
 
-    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        meshy_task_id = resp.get("result")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
+        job_id = resp.get("result")
+        if not job_id:
+            return jsonify({"error": "No job id in response", "raw": resp}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
+        return jsonify({"error": str(e)}), 502
 
     store = load_store()
-    store[meshy_task_id] = {
+    store[job_id] = {
         "stage": "preview",
         "prompt": prompt,
         "art_style": payload["art_style"],
@@ -4427,21 +2966,9 @@ def api_text_to_3d_remesh_start():
         "is_a_t_pose": bool(body.get("is_a_t_pose")),
         "batch_count": batch_count,
         "batch_slot": batch_slot,
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
     }
     save_store(store)
-
-    # ─── 5. Return success with balance ───
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": meshy_task_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
-    })
+    return jsonify({"job_id": job_id})
 
 # ---- Status ----
 @app.route("/api/text-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
@@ -4455,69 +2982,12 @@ def api_text_to_3d_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    identity_id = g.identity_id
-
-    # ─── Check if this is an internal job ID (UUID) ───
-    # If so, look up the job status and upstream_job_id
-    meshy_job_id = job_id  # Default: assume job_id is already meshy task ID
-    internal_job = None
-
-    if USE_DB:
-        try:
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor(cursor_factory=RealDictCursor)
-                # Check if job_id is our internal UUID
-                cursor.execute("""
-                    SELECT id, status, upstream_job_id, error_message
-                    FROM timrx_billing.jobs
-                    WHERE id::text = %s AND identity_id = %s
-                    LIMIT 1
-                """, (job_id, identity_id))
-                internal_job = cursor.fetchone()
-                conn.close()
-
-                if internal_job:
-                    # This is an internal job ID
-                    if internal_job["status"] == "queued":
-                        # Job is still being dispatched to Meshy
-                        return jsonify({
-                            "status": "queued",
-                            "pct": 0,
-                            "stage": "preview",
-                            "message": "Job is being dispatched to provider...",
-                            "job_id": job_id,
-                        })
-
-                    if internal_job["status"] == "failed":
-                        # Job failed during dispatch
-                        return jsonify({
-                            "status": "failed",
-                            "error": internal_job.get("error_message", "Job failed"),
-                            "job_id": job_id,
-                        })
-
-                    # Job has upstream_job_id - use that for Meshy API call
-                    if internal_job["upstream_job_id"]:
-                        meshy_job_id = internal_job["upstream_job_id"]
-                    else:
-                        # Shouldn't happen - status is not queued but no upstream_job_id
-                        return jsonify({
-                            "status": "pending",
-                            "pct": 0,
-                            "stage": "preview",
-                            "message": "Waiting for provider response...",
-                            "job_id": job_id,
-                        })
-        except Exception as e:
-            print(f"[STATUS] Error checking internal job {job_id}: {e}")
-            # Continue with original job_id
-
-    if not verify_job_ownership(meshy_job_id, identity_id):
+    user_id = g.user_id
+    if not verify_job_ownership(job_id, user_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
-        ms = mesh_get(f"/openapi/v2/text-to-3d/{meshy_job_id}")
+        ms = mesh_get(f"/openapi/v2/text-to-3d/{job_id}")
         log_event("text-to-3d/status:meshy-resp", ms)
     except Exception as e:
         return jsonify({"error": str(e)}), 404
@@ -4566,37 +3036,6 @@ def api_text_to_3d_status(job_id):
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
 
-            # ─── CAPTURE CREDITS: Asset saved successfully ───
-            # Only capture (charge) credits after asset is persisted to DB+S3
-            reservation_id = meta.get("reservation_id")
-            internal_job_id = meta.get("internal_job_id")
-            if reservation_id:
-                finalize_job_credits(reservation_id, job_id)
-                print(f"[STATUS] Credits captured for job {job_id}, reservation={reservation_id}")
-
-            # Update job status to 'ready' in timrx_billing.jobs with asset info
-            if internal_job_id:
-                _update_job_status_ready(
-                    internal_job_id,
-                    upstream_job_id=job_id,
-                    model_id=s3_result.get("model_id"),
-                    glb_url=s3_result.get("glb_url"),
-                )
-
-    # Handle failed jobs - release credits
-    if out["status"] == "failed":
-        reservation_id = meta.get("reservation_id")
-        internal_job_id = meta.get("internal_job_id")
-        error_msg = out.get("message") or out.get("error") or "Provider job failed"
-
-        if reservation_id:
-            release_job_credits(reservation_id, "provider_job_failed", job_id)
-            print(f"[STATUS] Credits released for failed job {job_id}, reservation={reservation_id}")
-
-        # Update job status to 'failed' in timrx_billing.jobs
-        if internal_job_id:
-            _update_job_status_failed(internal_job_id, error_msg)
-
     return jsonify(out)
 
 # ---- List active/known jobs (for resume logic) ----
@@ -4611,12 +3050,11 @@ def api_text_to_3d_list():
 
 # ---- Save active job to database ----
 @app.route("/api/jobs/save", methods=["POST", "OPTIONS"])
-@with_session
 def api_save_active_job():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        identity_id = g.identity_id
+        user_id = g.user_id
         data = request.get_json() or {}
         job_id = data.get("job_id")
         job_type = data.get("job_type", "unknown")
@@ -4626,117 +3064,43 @@ def api_save_active_job():
         if not job_id:
             return jsonify({"error": "job_id required"}), 400
 
-        success = save_active_job_to_db(job_id, job_type, stage, metadata, identity_id)
+        success = save_active_job_to_db(job_id, job_type, stage, metadata, user_id)
         return jsonify({"success": success, "job_id": job_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ---- Get all active jobs from database ----
 @app.route("/api/jobs/active", methods=["GET", "OPTIONS"])
-@with_session
 def api_get_active_jobs():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        identity_id = g.identity_id
-        jobs = get_active_jobs_from_db(identity_id)
+        user_id = g.user_id
+        jobs = get_active_jobs_from_db(user_id)
         return jsonify(jobs)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ---- Mark job as completed ----
 @app.route("/api/jobs/<job_id>/complete", methods=["POST", "OPTIONS"])
-@with_session
 def api_complete_job(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        identity_id = g.identity_id
-        mark_job_completed_in_db(job_id, identity_id)
+        user_id = g.user_id
+        mark_job_completed_in_db(job_id, user_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---- Get job status (for polling async jobs) ----
-@app.route("/api/jobs/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
-def api_get_job_status(job_id):
-    """
-    Get job status for polling.
-    Supports both internal UUID and upstream job IDs.
-    Returns status, upstream_job_id (once available), and error info if failed.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    if not USE_DB:
-        return jsonify({"error": "Database not configured"}), 503
-
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"error": "Database connection failed"}), 503
-
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-
-        # Try to find by id (internal UUID) or upstream_job_id (meshy/openai ID)
-        cursor.execute("""
-            SELECT id, identity_id, provider, action_code, status,
-                   upstream_job_id, cost_credits, error_message, meta,
-                   created_at, updated_at
-            FROM timrx_billing.jobs
-            WHERE (id::text = %s OR upstream_job_id = %s)
-              AND identity_id = %s
-            LIMIT 1
-        """, (job_id, job_id, identity_id))
-
-        job = cursor.fetchone()
-        conn.close()
-
-        if not job:
-            return jsonify({"error": "Job not found", "job_id": job_id}), 404
-
-        # Build response
-        response = {
-            "ok": True,
-            "job_id": str(job["id"]),
-            "status": job["status"],
-            "provider": job["provider"],
-            "action_code": job["action_code"],
-            "upstream_job_id": job["upstream_job_id"],  # May be None if still queued
-            "cost_credits": job["cost_credits"],
-            "created_at": job["created_at"].isoformat() if job["created_at"] else None,
-            "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
-        }
-
-        # Include error message if failed
-        if job["status"] == "failed" and job["error_message"]:
-            response["error_message"] = job["error_message"]
-
-        # Include meta if present
-        if job["meta"]:
-            response["meta"] = job["meta"]
-
-        return jsonify(response)
-
-    except Exception as e:
-        print(f"[API] Error getting job status for {job_id}: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 # ---- Delete active job ----
 @app.route("/api/jobs/<job_id>", methods=["DELETE", "OPTIONS"])
-@with_session
 def api_delete_active_job(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
     try:
-        identity_id = g.identity_id
-        delete_active_job_from_db(job_id, identity_id)
+        user_id = g.user_id
+        delete_active_job_from_db(job_id, user_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4777,32 +3141,19 @@ def api_proxy_glb():
 
 # ---- Meshy Remesh ----
 @app.route("/api/mesh/remesh", methods=["POST", "OPTIONS"])
-@with_session
 def api_mesh_remesh():
     if request.method == "OPTIONS":
         return ("", 204)
     if not MESHY_API_KEY:
-        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
+    user_id = g.user_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/remesh:incoming", body)
     source, err = build_source_payload(body)
     if err:
-        return jsonify({"ok": False, "error": err}), 400
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["remesh"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
+        return jsonify({"error": err}), 400
 
     payload = {
         **source,
@@ -4832,52 +3183,38 @@ def api_mesh_remesh():
     if body.get("convert_format_only") is not None:
         payload["convert_format_only"] = bool(body.get("convert_format_only"))
 
-    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/remesh", payload)
         log_event("mesh/remesh:meshy-resp", resp)
-        meshy_task_id = resp.get("result") or resp.get("id")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
+        job_id = resp.get("result") or resp.get("id")
+        if not job_id:
+            return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        # Save metadata to store (checks local store AND database for source)
+        store = load_store()
+        source_task_id = body.get("source_task_id") or body.get("model_task_id")
+        source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+        original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+        root_prompt = source_meta.get("root_prompt") or original_prompt
+        store[job_id] = {
+            "stage": "remesh",
+            "source_task_id": source_task_id,
+            "created_at": now_s() * 1000,
+            "prompt": original_prompt,
+            "root_prompt": root_prompt,
+            "title": f"(remesh) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+            "topology": topology,
+            "target_polycount": payload.get("target_polycount"),
+            "user_id": user_id,
+        }
+        save_store(store)
+
+        # Save to DB for recovery
+        save_active_job_to_db(job_id, "remesh", "remesh", store[job_id], user_id)
+
+        return jsonify({"job_id": job_id})
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
-
-    store = load_store()
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
-    store[meshy_task_id] = {
-        "stage": "remesh",
-        "source_task_id": source_task_id,
-        "created_at": now_s() * 1000,
-        "prompt": original_prompt,
-        "root_prompt": root_prompt,
-        "title": f"(remesh) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
-        "topology": topology,
-        "target_polycount": payload.get("target_polycount"),
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-    }
-    save_store(store)
-
-    save_active_job_to_db(meshy_task_id, "remesh", "remesh", store[meshy_task_id], user_id)
-
-    # ─── 5. Return success with balance ───
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": meshy_task_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
-    })
+        return jsonify({"error": str(e)}), 502
 
 @app.route("/api/mesh/remesh/<job_id>", methods=["GET", "OPTIONS"])
 def api_mesh_remesh_status(job_id):
@@ -4888,8 +3225,8 @@ def api_mesh_remesh_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
+    user_id = g.user_id
+    if not verify_job_ownership(job_id, user_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -4939,18 +3276,13 @@ def api_mesh_remesh_status(job_id):
 
 # ---- Meshy Retexture ----
 @app.route("/api/mesh/retexture", methods=["POST", "OPTIONS"])
-@with_session
 def api_mesh_retexture():
     if request.method == "OPTIONS":
         return ("", 204)
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
+    user_id = g.user_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/retexture:incoming", body)
@@ -4962,14 +3294,6 @@ def api_mesh_retexture():
     style_img = (body.get("image_style_url") or "").strip()
     if not prompt and not style_img:
         return jsonify({"error": "text_style_prompt or image_style_url required"}), 400
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["texture"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, {"texture_prompt": prompt[:100] if prompt else None})
-    if credit_error:
-        return credit_error
 
     payload = {
         **source,
@@ -4984,54 +3308,38 @@ def api_mesh_retexture():
     if ai_model:
         payload["ai_model"] = ai_model
 
-    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/retexture", payload)
         log_event("mesh/retexture:meshy-resp", resp)
-        meshy_task_id = resp.get("result") or resp.get("id")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+        job_id = resp.get("result") or resp.get("id")
+        if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        # Save metadata to store (checks local store AND database for source)
+        store = load_store()
+        source_task_id = body.get("source_task_id") or body.get("model_task_id")
+        source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+        original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+        root_prompt = source_meta.get("root_prompt") or original_prompt
+        store[job_id] = {
+            "stage": "texture",
+            "source_task_id": source_task_id,
+            "created_at": now_s() * 1000,
+            "prompt": original_prompt,
+            "root_prompt": root_prompt,
+            "title": f"(texture) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+            "texture_prompt": prompt,
+            "enable_pbr": bool(body.get("enable_pbr", False)),
+            "user_id": user_id,
+        }
+        save_store(store)
+
+        # Save to DB for recovery
+        save_active_job_to_db(job_id, "retexture", "texture", store[job_id], user_id)
+
+        return jsonify({"job_id": job_id})
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
-
-    # Save metadata to store (checks local store AND database for source)
-    store = load_store()
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
-    store[meshy_task_id] = {
-        "stage": "texture",
-        "source_task_id": source_task_id,
-        "created_at": now_s() * 1000,
-        "prompt": original_prompt,
-        "root_prompt": root_prompt,
-        "title": f"(texture) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
-        "texture_prompt": prompt,
-        "enable_pbr": bool(body.get("enable_pbr", False)),
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-    }
-    save_store(store)
-
-    # Save to DB for recovery
-    save_active_job_to_db(meshy_task_id, "retexture", "texture", store[meshy_task_id], user_id)
-
-    # ─── 5. Return success with balance ───
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": meshy_task_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
-    })
 
 @app.route("/api/mesh/retexture/<job_id>", methods=["GET", "OPTIONS"])
 def api_mesh_retexture_status(job_id):
@@ -5042,8 +3350,8 @@ def api_mesh_retexture_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
+    user_id = g.user_id
+    if not verify_job_ownership(job_id, user_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -5100,32 +3408,19 @@ def api_mesh_retexture_status(job_id):
 
 # ---- Meshy Rigging ----
 @app.route("/api/mesh/rigging", methods=["POST", "OPTIONS"])
-@with_session
 def api_mesh_rigging():
     if request.method == "OPTIONS":
         return ("", 204)
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
+    user_id = g.user_id
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/rigging:incoming", body)
     source, err = build_source_payload(body)
     if err:
         return jsonify({"error": err}), 400
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["rig"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
 
     payload = {**source}
     try:
@@ -5138,52 +3433,36 @@ def api_mesh_rigging():
     if tex_img:
         payload["texture_image_url"] = tex_img
 
-    # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/rigging", payload)
         log_event("mesh/rigging:meshy-resp", resp)
-        meshy_task_id = resp.get("result") or resp.get("id")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+        job_id = resp.get("result") or resp.get("id")
+        if not job_id:
             return jsonify({"error": "No job id in response", "raw": resp}), 502
+
+        # Save metadata to store (checks local store AND database for source)
+        store = load_store()
+        source_task_id = body.get("source_task_id") or body.get("model_task_id")
+        source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+        original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+        root_prompt = source_meta.get("root_prompt") or original_prompt
+        store[job_id] = {
+            "stage": "rigging",
+            "source_task_id": source_task_id,
+            "created_at": now_s() * 1000,
+            "prompt": original_prompt,
+            "root_prompt": root_prompt,
+            "title": f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+            "user_id": user_id,
+        }
+        save_store(store)
+
+        # Save to DB for recovery
+        save_active_job_to_db(job_id, "rigging", "rigging", store[job_id], user_id)
+
+        return jsonify({"job_id": job_id})
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
-
-    # Save metadata to store (checks local store AND database for source)
-    store = load_store()
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
-    store[meshy_task_id] = {
-        "stage": "rigging",
-        "source_task_id": source_task_id,
-        "created_at": now_s() * 1000,
-        "prompt": original_prompt,
-        "root_prompt": root_prompt,
-        "title": f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-    }
-    save_store(store)
-
-    # Save to DB for recovery
-    save_active_job_to_db(meshy_task_id, "rigging", "rigging", store[meshy_task_id], user_id)
-
-    # ─── 5. Return success with balance ───
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": meshy_task_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
-    })
 
 @app.route("/api/mesh/rigging/<job_id>", methods=["GET", "OPTIONS"])
 def api_mesh_rigging_status(job_id):
@@ -5194,8 +3473,8 @@ def api_mesh_rigging_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
+    user_id = g.user_id
+    if not verify_job_ownership(job_id, user_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
@@ -5249,32 +3528,19 @@ def api_mesh_rigging_status(job_id):
 
 # ---- Meshy Image to 3D ----
 @app.route("/api/image-to-3d/start", methods=["POST", "OPTIONS"])
-@with_session
 def api_image_to_3d_start():
     if request.method == "OPTIONS":
         return ("", 204)
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
+    user_id = g.user_id
 
     body = request.get_json(silent=True) or {}
     log_event("image-to-3d/start:incoming", body)
     image_url = (body.get("image_url") or "").strip()
     if not image_url:
         return jsonify({"error": "image_url required"}), 400
-
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["image-to-3d"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, {"prompt": (body.get("prompt") or "")[:100]})
-    if credit_error:
-        return credit_error
 
     prompt = (body.get("prompt") or "").strip()
     payload = {
@@ -5284,50 +3550,55 @@ def api_image_to_3d_start():
         # Explicitly request textured output when supported
         "enable_pbr": True,
     }
+    try:
+        resp = mesh_post("/openapi/v1/image-to-3d", payload)
+        log_event("image-to-3d/start:meshy-resp", resp)
+        job_id = resp.get("result") or resp.get("id")
+        if not job_id:
+            return jsonify({"error": "No job id in response", "raw": resp}), 502
 
-    # ─── 3. Build store metadata for async dispatch ───
-    store_meta = {
-        "stage": "image3d",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "root_prompt": prompt,
-        "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
-        "original_image_url": image_url,
-        "ai_model": payload.get("ai_model"),
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-    }
+        s3_name = prompt if prompt else "image_to_3d_source"
+        s3_user_id = user_id or "public"
 
-    # ─── 4. Dispatch Meshy API call to background (NON-BLOCKING) ───
-    # This returns immediately - the background worker will:
-    # - Call Meshy API
-    # - On success: update job with upstream_id (credits stay HELD)
-    # - On error: release credits, mark job as failed
-    # Credits are captured only when asset is saved to DB+S3 (in status endpoint)
-    _background_executor.submit(
-        _dispatch_meshy_image_to_3d_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        payload,
-        store_meta,
-        image_url,
-    )
+        # Upload source image to S3 for permanent storage with deterministic key
+        # safe_upload_to_s3 handles unauthenticated uploads (user_id=None -> public namespace)
+        s3_image_url = image_url
+        if AWS_BUCKET_MODELS:
+            try:
+                s3_image_url = safe_upload_to_s3(
+                    image_url,
+                    "image/png",
+                    "source_images",
+                    s3_name,
+                    user_id=user_id,
+                    key_base=f"source_images/{s3_user_id}/{job_id}",
+                    provider="user",
+                )
+                print(f"[image-to-3d] Uploaded source image to S3: {s3_image_url}")
+            except Exception as e:
+                print(f"[image-to-3d] Failed to upload source image to S3: {e}, using original URL")
 
-    log_event("image-to-3d/start:dispatched", {"internal_job_id": internal_job_id})
+        # Save metadata to store so we can retrieve it when job finishes
+        store = load_store()
+        store[job_id] = {
+            "stage": "image3d",
+            "created_at": now_s() * 1000,
+            "prompt": prompt,
+            "root_prompt": prompt,  # This is the start of a chain
+            "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
+            "image_url": s3_image_url,  # Store S3 URL for our records
+            "original_image_url": image_url,  # Keep original for reference
+            "ai_model": payload.get("ai_model"),
+            "user_id": user_id,
+        }
+        save_store(store)
 
-    # ─── 5. Return immediately with internal job ID ───
-    # Frontend polls /api/image-to-3d/status/<id> to get status
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": internal_job_id,  # Return internal UUID - frontend polls this
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-    })
+        # Save to DB for recovery
+        save_active_job_to_db(job_id, "image-to-3d", "image3d", store[job_id], user_id)
+
+        return jsonify({"job_id": job_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 @app.route("/api/image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
 def api_image_to_3d_status(job_id):
@@ -5338,73 +3609,24 @@ def api_image_to_3d_status(job_id):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     # Verify job ownership
-    identity_id = g.identity_id
-
-    # ─── Check if this is an internal job ID (UUID) ───
-    meshy_job_id = job_id
-    internal_job = None
-
-    if USE_DB:
-        try:
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor(cursor_factory=RealDictCursor)
-                cursor.execute("""
-                    SELECT id, status, upstream_job_id, error_message
-                    FROM timrx_billing.jobs
-                    WHERE id::text = %s AND identity_id = %s
-                    LIMIT 1
-                """, (job_id, identity_id))
-                internal_job = cursor.fetchone()
-                conn.close()
-
-                if internal_job:
-                    if internal_job["status"] == "queued":
-                        return jsonify({
-                            "status": "queued",
-                            "pct": 0,
-                            "stage": "image3d",
-                            "message": "Job is being dispatched to provider...",
-                            "job_id": job_id,
-                        })
-
-                    if internal_job["status"] == "failed":
-                        return jsonify({
-                            "status": "failed",
-                            "error": internal_job.get("error_message", "Job failed"),
-                            "job_id": job_id,
-                        })
-
-                    if internal_job["upstream_job_id"]:
-                        meshy_job_id = internal_job["upstream_job_id"]
-                    else:
-                        return jsonify({
-                            "status": "pending",
-                            "pct": 0,
-                            "stage": "image3d",
-                            "message": "Waiting for provider response...",
-                            "job_id": job_id,
-                        })
-        except Exception as e:
-            print(f"[STATUS] Error checking internal job {job_id}: {e}")
-
-    if not verify_job_ownership(meshy_job_id, identity_id):
+    user_id = g.user_id
+    if not verify_job_ownership(job_id, user_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
-        ms = mesh_get(f"/openapi/v1/image-to-3d/{meshy_job_id}")
+        ms = mesh_get(f"/openapi/v1/image-to-3d/{job_id}")
         log_event("image-to-3d/status:meshy-resp", ms)
     except Exception as e:
         return jsonify({"error": str(e)}), 404
     out = normalize_meshy_task(ms, stage="image3d")
-    log_status_summary("image-to-3d", meshy_job_id, out)
-
-    # Get metadata from local store
-    store = load_store()
-    meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
+    log_status_summary("image-to-3d", job_id, out)
 
     # Save to normalized DB tables when job finishes
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
+        store = load_store()
+        # Get metadata from local store OR database (in case server restarted)
+        meta = get_job_metadata(job_id, store)
+
         # Get prompt from metadata or Meshy response
         if not meta.get("prompt"):
             meta["prompt"] = out.get("prompt") or ""
@@ -5417,7 +3639,7 @@ def api_image_to_3d_status(job_id):
             meta["title"] = f"(image-to-3d) {prompt_for_title[:40]}" if prompt_for_title else f"(image-to-3d) {DEFAULT_MODEL_TITLE}"
 
         user_id = meta.get("user_id") or getattr(g, 'user_id', None)
-        s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type='image-to-3d', user_id=user_id)
+        s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type='image-to-3d', user_id=user_id)
 
         # Update response with S3 URLs so frontend gets permanent URLs
         if s3_result and s3_result.get("success"):
@@ -5432,35 +3654,6 @@ def api_image_to_3d_status(job_id):
             if s3_result.get("texture_urls"):
                 out["texture_urls"] = s3_result["texture_urls"]
 
-            # ─── CAPTURE CREDITS: Asset saved successfully ───
-            reservation_id = meta.get("reservation_id")
-            internal_job_id = meta.get("internal_job_id")
-            if reservation_id:
-                finalize_job_credits(reservation_id, meshy_job_id)
-                print(f"[STATUS] Credits captured for image-to-3d job {meshy_job_id}, reservation={reservation_id}")
-
-            # Update job status to 'ready' with asset info
-            if internal_job_id:
-                _update_job_status_ready(
-                    internal_job_id,
-                    upstream_job_id=meshy_job_id,
-                    model_id=s3_result.get("model_id"),
-                    glb_url=s3_result.get("glb_url"),
-                )
-
-    # Handle failed jobs - release credits
-    if out["status"] == "failed":
-        reservation_id = meta.get("reservation_id")
-        internal_job_id = meta.get("internal_job_id")
-        error_msg = out.get("message") or out.get("error") or "Provider job failed"
-
-        if reservation_id:
-            release_job_credits(reservation_id, "provider_job_failed", meshy_job_id)
-            print(f"[STATUS] Credits released for failed image-to-3d job {meshy_job_id}, reservation={reservation_id}")
-
-        if internal_job_id:
-            _update_job_status_failed(internal_job_id, error_msg)
-
     return jsonify(out)
 
 # ---- Nano Banana Image Generation (disabled) ----
@@ -5474,19 +3667,14 @@ def api_nano_image_status(job_id):
 
 # ---- OpenAI (DALL·E / GPT-Image) Image Generation ----
 @app.route("/api/image/openai", methods=["POST", "OPTIONS"])
-@with_session
 def api_openai_image():
     if request.method == "OPTIONS":
         return ("", 204)
 
+    user_id = g.user_id
+
     if not OPENAI_API_KEY:
         return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
-
-    # ─── 1. Require valid identity ───
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    user_id = identity_id
 
     body = request.get_json(silent=True) or {}
     prompt = (body.get("prompt") or "").strip()
@@ -5512,143 +3700,49 @@ def api_openai_image():
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
-    # ─── 2. Generate internal job ID (UUID) and reserve credits ───
-    internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["image-studio"]
+    try:
+        resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
-    # For n > 1, multiply cost (handled by start_paid_job if we adjust meta)
-    reservation_id, credit_error = start_paid_job(
-        identity_id, action_key, internal_job_id,
-        {"prompt": prompt[:100], "n": n, "model": model, "size": size}
-    )
-    if credit_error:
-        return credit_error
+    data_list = resp.get("data") or []
+    urls = []
+    b64_first = None
+    for item in data_list:
+        if not isinstance(item, dict):
+            continue
+        if item.get("url"):
+            urls.append(item["url"])
+        elif item.get("b64_json"):
+            if not b64_first:
+                b64_first = item["b64_json"]
+            urls.append(f"data:image/png;base64,{item['b64_json']}")
 
-    # ─── 3. Build store metadata for async dispatch ───
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": model,
-        "size": size,
-        "n": n,
-        "response_format": response_format,
-        "user_id": user_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-    }
+    # Save to normalized DB tables
+    image_id = None
+    if urls:
+        client_id = (body.get("client_id") or "").strip()
+        image_id = client_id or f"img_{int(time.time() * 1000)}"
+        save_image_to_normalized_db(
+            image_id=image_id,
+            image_url=urls[0],
+            prompt=prompt,
+            ai_model=model,
+            size=size,
+            image_urls=urls,
+            user_id=user_id
+        )
 
-    # ─── 4. Dispatch OpenAI API call to background (NON-BLOCKING) ──���
-    _background_executor.submit(
-        _dispatch_openai_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        prompt,
-        size,
-        model,
-        n,
-        response_format,
-        store_meta,
-    )
-
-    log_event("image/openai:dispatched", {"internal_job_id": internal_job_id})
-
-    # ─── 5. Return immediately with internal job ID ───
-    balance_info = get_current_balance(identity_id)
     return jsonify({
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,  # Backwards compatibility
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
+        "image_id": image_id,
+        "image_url": urls[0] if urls else None,
+        "image_urls": urls,
+        "image_base64": b64_first,
+        "status": "done",
         "model": model,
         "size": size,
+        "raw": resp
     })
-
-
-# ---- OpenAI Image Status (for polling async jobs) ----
-@app.route("/api/image/openai/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
-def api_openai_image_status(job_id):
-    """Get status of async OpenAI image generation job."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    # Check local store first
-    store = load_store()
-    meta = store.get(job_id) or {}
-
-    # Check timrx_billing.jobs table
-    if USE_DB:
-        try:
-            conn = get_db_connection()
-            if conn:
-                cursor = conn.cursor(cursor_factory=RealDictCursor)
-                cursor.execute("""
-                    SELECT id, status, error_message
-                    FROM timrx_billing.jobs
-                    WHERE id::text = %s AND identity_id = %s
-                    LIMIT 1
-                """, (job_id, identity_id))
-                job = cursor.fetchone()
-                conn.close()
-
-                if job:
-                    if job["status"] == "queued":
-                        return jsonify({
-                            "ok": True,
-                            "status": "queued",
-                            "job_id": job_id,
-                            "message": "Generating image...",
-                        })
-
-                    if job["status"] == "failed":
-                        return jsonify({
-                            "ok": False,
-                            "status": "failed",
-                            "job_id": job_id,
-                            "error": job.get("error_message", "Image generation failed"),
-                        })
-
-                    if job["status"] == "ready":
-                        # Job completed - return results from store
-                        return jsonify({
-                            "ok": True,
-                            "status": "done",
-                            "job_id": job_id,
-                            "image_id": job_id,
-                            "image_url": meta.get("image_url"),
-                            "image_urls": meta.get("image_urls", []),
-                            "image_base64": meta.get("image_base64"),
-                            "model": meta.get("model"),
-                            "size": meta.get("size"),
-                        })
-        except Exception as e:
-            print(f"[STATUS] Error checking OpenAI job {job_id}: {e}")
-
-    # Fallback: check store status
-    if meta.get("status") == "done":
-        return jsonify({
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "image_id": job_id,
-            "image_url": meta.get("image_url"),
-            "image_urls": meta.get("image_urls", []),
-            "image_base64": meta.get("image_base64"),
-            "model": meta.get("model"),
-            "size": meta.get("size"),
-        })
-
-    return jsonify({"error": "Job not found"}), 404
 
 # ---- Proxy external images (OpenAI blobs) ----
 @app.route("/api/proxy-image")
@@ -5716,18 +3810,11 @@ def api_cache_image_get(filename):
 
 # ---- History persistence (DATABASE PRIMARY STORAGE) ----
 @app.route("/api/history", methods=["GET", "POST", "OPTIONS"])
-@with_session
 def api_history():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # REQUIRE identity - no anonymous history access
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "NO_SESSION", "message": "A valid session is required to access history."}
-        }), 401
+    user_id = g.user_id  # May be None for anonymous users
 
     if request.method == "GET":
         if USE_DB:
@@ -5736,14 +3823,24 @@ def api_history():
                 return jsonify({"error": "db_unavailable"}), 503
             try:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Fetch history items - STRICT identity isolation, no NULL fallback
-                    cur.execute(f"""
-                        SELECT id, item_type, status, stage, title, prompt,
-                               thumbnail_url, glb_url, image_url, payload, created_at
-                        FROM {APP_SCHEMA}.history_items
-                        WHERE identity_id = %s
-                        ORDER BY created_at DESC;
-                    """, (identity_id,))
+                    # Fetch history items (filtered by user if logged in)
+                    if user_id:
+                        cur.execute(f"""
+                            SELECT id, item_type, status, stage, title, prompt,
+                                   thumbnail_url, glb_url, image_url, payload, created_at
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE identity_id = %s
+                            ORDER BY created_at DESC;
+                        """, (user_id,))
+                    else:
+                        # Anonymous: return all items without user_id (legacy data)
+                        cur.execute(f"""
+                            SELECT id, item_type, status, stage, title, prompt,
+                                   thumbnail_url, glb_url, image_url, payload, created_at
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE identity_id IS NULL
+                            ORDER BY created_at DESC;
+                        """)
                     rows = cur.fetchall()
                 conn.close()
                 print(f"[History] GET: Fetched {len(rows)} items from database")
@@ -5784,32 +3881,39 @@ def api_history():
 
         db_ok = None
         db_errors = []
-        # Track results for frontend retry logic
-        updated_ids = []
-        inserted_ids = []
-        skipped_items = []  # [{client_id, reason}]
-
         if USE_DB:
             conn = get_db_conn()
             if conn:
                 try:
                     with conn:
                         with conn.cursor() as cur:
+                            saved = 0
                             for item in payload:
                                 item_id = item.get("id") or item.get("job_id")
                                 if not item_id:
                                     continue
 
-                                # Check if this item already exists for this user (STRICT identity isolation)
-                                cur.execute(f"""
-                                    SELECT id FROM {APP_SCHEMA}.history_items
-                                    WHERE (id::text = %s
-                                       OR payload->>'original_job_id' = %s
-                                       OR payload->>'original_id' = %s
-                                       OR payload->>'job_id' = %s)
-                                      AND identity_id = %s
-                                    LIMIT 1
-                                """, (str(item_id), str(item_id), str(item_id), str(item_id), identity_id))
+                                # Check if this item already exists for this user
+                                if user_id:
+                                    cur.execute(f"""
+                                        SELECT id FROM {APP_SCHEMA}.history_items
+                                        WHERE (id::text = %s
+                                           OR payload->>'original_job_id' = %s
+                                           OR payload->>'original_id' = %s
+                                           OR payload->>'job_id' = %s)
+                                          AND identity_id = %s
+                                        LIMIT 1
+                                    """, (str(item_id), str(item_id), str(item_id), str(item_id), user_id))
+                                else:
+                                    cur.execute(f"""
+                                        SELECT id FROM {APP_SCHEMA}.history_items
+                                        WHERE (id::text = %s
+                                           OR payload->>'original_job_id' = %s
+                                           OR payload->>'original_id' = %s
+                                           OR payload->>'job_id' = %s)
+                                          AND identity_id IS NULL
+                                        LIMIT 1
+                                    """, (str(item_id), str(item_id), str(item_id), str(item_id)))
                                 existing = cur.fetchone()
                                 existing_id = existing[0] if existing else None
 
@@ -5836,13 +3940,13 @@ def api_history():
                                         item["original_id"] = item_id
 
                                 provider = "openai" if item_type == "image" else "meshy"
-                                s3_user_id = identity_id  # Always have identity_id now (required at top)
+                                s3_user_id = user_id or "public"
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
                                         thumbnail_url,
                                         "thumbnails",
                                         f"thumbnails/{s3_user_id}/{use_id}",
-                                        user_id=identity_id,
+                                        user_id=user_id,
                                         name="thumbnail",
                                         provider=provider,
                                     )
@@ -5851,7 +3955,7 @@ def api_history():
                                         image_url,
                                         "images",
                                         f"images/{s3_user_id}/{use_id}",
-                                        user_id=identity_id,
+                                        user_id=user_id,
                                         name="image",
                                         provider=provider,
                                     )
@@ -5861,7 +3965,6 @@ def api_history():
                                 item["id"] = use_id
 
                                 if existing_id:
-                                    # UPDATE existing row (model_id/image_id should already be set)
                                     cur.execute(
                                         f"""UPDATE {APP_SCHEMA}.history_items
                                            SET item_type = %s,
@@ -5877,38 +3980,15 @@ def api_history():
                                                payload = %s,
                                                updated_at = NOW()
                                            WHERE id = %s;""",
-                                        (item_type, status, stage, title, prompt, root_prompt, identity_id,
+                                        (item_type, status, stage, title, prompt, root_prompt, user_id,
                                          thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
                                     )
-                                    updated_ids.append(use_id)
                                 else:
-                                    # NEW INSERT: Must have model_id or image_id (XOR constraint)
-                                    # Try to look up from item or DB
-                                    model_id = item.get("model_id")
-                                    image_id = item.get("image_id")
-                                    lookup_reason = None
-                                    if not model_id and not image_id:
-                                        # Try to find the asset in DB
-                                        model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                            cur, item_type, item_id, glb_url, image_url, identity_id, provider
-                                        )
-                                    # Validate XOR constraint
-                                    if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
-                                        # Determine skip reason
-                                        if lookup_reason:
-                                            skip_reason = lookup_reason
-                                        elif model_id and image_id:
-                                            skip_reason = "xor_violation"
-                                        else:
-                                            skip_reason = "missing_asset_reference"
-                                        print(f"[History] Skipping item {item_id} - reason: {skip_reason}")
-                                        skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
-                                        continue
                                     cur.execute(
                                         f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                               root_prompt, thumbnail_url, glb_url, image_url, payload)
                                            VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s, %s, %s)
+                                               %s, %s, %s, %s, %s)
                                            ON CONFLICT (id) DO UPDATE
                                            SET item_type = EXCLUDED.item_type,
                                                status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
@@ -5920,16 +4000,14 @@ def api_history():
                                                thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
                                                glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
                                                image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
-                                               model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
-                                               image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                                                payload = EXCLUDED.payload,
                                                updated_at = NOW();""",
-                                        (use_id, identity_id, item_type, status, stage, title, prompt,
-                                         root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
+                                        (use_id, user_id, item_type, status, stage, title, prompt,
+                                         root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
                                     )
-                                    inserted_ids.append(use_id)
+                                saved += 1
                     conn.close()
-                    print(f"[History] Bulk sync: updated={len(updated_ids)}, inserted={len(inserted_ids)}, skipped={len(skipped_items)}")
+                    print(f"[History] Saved {saved} items to DB")
                     db_ok = True
                 except Exception as e:
                     log_db_continue("history_bulk_write", e)
@@ -5947,32 +4025,17 @@ def api_history():
 
         # DEV ONLY: sync to local JSON (no-op in production)
         save_history_store(payload)
-        return jsonify({
-            "ok": True,
-            "count": len(payload),
-            "updated": updated_ids,
-            "inserted": inserted_ids,
-            "skipped": skipped_items if skipped_items else None,
-            "db": db_ok,
-            "db_errors": db_errors or None,
-        })
+        return jsonify({"ok": True, "count": len(payload), "db": db_ok, "db_errors": db_errors or None})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # Add single history item to database
 @app.route("/api/history/item", methods=["POST", "OPTIONS"])
-@with_session
 def api_history_item_add():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # REQUIRE identity - no anonymous history access
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "NO_SESSION", "message": "A valid session is required to add history items."}
-        }), 401
+    user_id = g.user_id
 
     try:
         item = request.get_json(silent=True) or {}
@@ -5991,16 +4054,27 @@ def api_history_item_add():
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            # Check if this item already exists (STRICT identity isolation)
-                            cur.execute(f"""
-                                SELECT id FROM {APP_SCHEMA}.history_items
-                                WHERE (id::text = %s
-                                   OR payload->>'original_job_id' = %s
-                                   OR payload->>'original_id' = %s
-                                   OR payload->>'job_id' = %s)
-                                  AND identity_id = %s
-                                LIMIT 1
-                            """, (str(item_id), str(item_id), str(item_id), str(item_id), identity_id))
+                            # Check if this item already exists (for this user)
+                            if user_id:
+                                cur.execute(f"""
+                                    SELECT id FROM {APP_SCHEMA}.history_items
+                                    WHERE (id::text = %s
+                                       OR payload->>'original_job_id' = %s
+                                       OR payload->>'original_id' = %s
+                                       OR payload->>'job_id' = %s)
+                                      AND identity_id = %s
+                                    LIMIT 1
+                                """, (str(item_id), str(item_id), str(item_id), str(item_id), user_id))
+                            else:
+                                cur.execute(f"""
+                                    SELECT id FROM {APP_SCHEMA}.history_items
+                                    WHERE (id::text = %s
+                                       OR payload->>'original_job_id' = %s
+                                       OR payload->>'original_id' = %s
+                                       OR payload->>'job_id' = %s)
+                                      AND identity_id IS NULL
+                                    LIMIT 1
+                                """, (str(item_id), str(item_id), str(item_id), str(item_id)))
                             existing = cur.fetchone()
                             existing_id = existing[0] if existing else None
 
@@ -6027,13 +4101,13 @@ def api_history_item_add():
                                     item["original_id"] = item_id
 
                             provider = "openai" if item_type == "image" else "meshy"
-                            s3_user_id = identity_id  # Always have identity now (required at top)
+                            s3_user_id = user_id or "public"
                             if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                 thumbnail_url = ensure_s3_url_for_data_uri(
                                     thumbnail_url,
                                     "thumbnails",
                                     f"thumbnails/{s3_user_id}/{use_id}",
-                                    user_id=identity_id,
+                                    user_id=user_id,
                                     name="thumbnail",
                                     provider=provider,
                                 )
@@ -6042,7 +4116,7 @@ def api_history_item_add():
                                     image_url,
                                     "images",
                                     f"images/{s3_user_id}/{use_id}",
-                                    user_id=identity_id,
+                                    user_id=user_id,
                                     name="image",
                                     provider=provider,
                                 )
@@ -6052,7 +4126,6 @@ def api_history_item_add():
                             item["id"] = use_id
 
                             if existing_id:
-                                # UPDATE existing row (model_id/image_id should already be set)
                                 cur.execute(
                                     f"""UPDATE {APP_SCHEMA}.history_items
                                        SET item_type = %s,
@@ -6068,61 +4141,15 @@ def api_history_item_add():
                                            payload = %s,
                                            updated_at = NOW()
                                        WHERE id = %s;""",
-                                    (item_type, status, stage, title, prompt, root_prompt, identity_id,
+                                    (item_type, status, stage, title, prompt, root_prompt, user_id,
                                      thumbnail_url, glb_url, image_url, json.dumps(item), use_id)
                                 )
-                                db_ok = True
-                                item_id = use_id
                             else:
-                                # NEW INSERT: Must have model_id or image_id (XOR constraint)
-                                # Try to look up from item or DB
-                                model_id = item.get("model_id")
-                                image_id = item.get("image_id")
-                                lookup_reason = None
-                                if not model_id and not image_id:
-                                    # Try to find the asset in DB
-                                    model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                        cur, item_type, item_id, glb_url, image_url, identity_id, provider
-                                    )
-                                # Validate XOR constraint
-                                if not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
-                                    # Determine reason
-                                    if lookup_reason:
-                                        skip_reason = lookup_reason
-                                    elif model_id and image_id:
-                                        skip_reason = "xor_violation"
-                                    else:
-                                        skip_reason = "missing_asset_reference"
-
-                                    # XOR violation (both set) is a real error - return 400
-                                    if skip_reason == "xor_violation":
-                                        print(f"[History] Rejecting item {item_id} - reason: {skip_reason}")
-                                        return jsonify({
-                                            "ok": False,
-                                            "error": {
-                                                "code": "INVALID_ASSET_REFERENCE",
-                                                "message": f"History item cannot have both model_id and image_id set",
-                                                "reason": skip_reason,
-                                                "client_id": str(item_id),
-                                            }
-                                        }), 400
-
-                                    # Missing asset reference - backend will create history when job completes
-                                    # Return success so frontend doesn't break, but indicate no DB write happened
-                                    print(f"[History] Skipped early insert for {item_id} - backend will create on job completion")
-                                    return jsonify({
-                                        "ok": True,
-                                        "id": str(item_id),
-                                        "db": False,
-                                        "backend_handles": True,
-                                        "message": "History will be created automatically when job completes and asset is saved",
-                                    })
-                                # Validation passed - INSERT the history item
                                 cur.execute(
                                     f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                           root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                           root_prompt, thumbnail_url, glb_url, image_url, payload)
                                        VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s, %s, %s)
+                                           %s, %s, %s, %s, %s)
                                        ON CONFLICT (id) DO UPDATE
                                        SET item_type = EXCLUDED.item_type,
                                            status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
@@ -6134,15 +4161,13 @@ def api_history_item_add():
                                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
                                            glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
                                            image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
-                                           model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
-                                           image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
                                            payload = EXCLUDED.payload,
                                            updated_at = NOW();""",
-                                    (use_id, identity_id, item_type, status, stage, title, prompt,
-                                     root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
+                                    (use_id, user_id, item_type, status, stage, title, prompt,
+                                     root_prompt, thumbnail_url, glb_url, image_url, json.dumps(item))
                                 )
-                                db_ok = True
-                                item_id = use_id  # Return the actual UUID used
+                            db_ok = True
+                            item_id = use_id  # Return the actual UUID used
                     conn.close()
                 except Exception as e:
                     log_db_continue("history_item_add", e)
@@ -6153,30 +4178,17 @@ def api_history_item_add():
                 db_errors.append({"op": "history_item_add_connect", "error": "db_unavailable"})
 
         local_ok = upsert_history_local(item, merge=False)
-        return jsonify({
-            "ok": db_ok or False,
-            "id": item_id,
-            "db": db_ok,
-            "db_errors": db_errors or None,
-            "local": local_ok,
-        })
+        return jsonify({"ok": True, "id": item_id, "db": db_ok, "db_errors": db_errors or None, "local": local_ok})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # Update single history item in database
 @app.route("/api/history/item/<item_id>", methods=["PATCH", "DELETE", "OPTIONS"])
-@with_session
 def api_history_item_update(item_id):
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # REQUIRE identity - no anonymous history access
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "NO_SESSION", "message": "A valid session is required to modify history items."}
-        }), 401
+    user_id = g.user_id
 
     # Validate UUID format
     try:
@@ -6197,13 +4209,20 @@ def api_history_item_update(item_id):
                 return jsonify({"ok": False, "error": "db_unavailable"}), 503
             try:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # STRICT identity isolation - only delete user's own items
-                    cur.execute(f"""
-                        SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
-                        FROM {APP_SCHEMA}.history_items
-                        WHERE id::text = %s AND identity_id = %s
-                        LIMIT 1
-                    """, (str(item_id), identity_id))
+                    if user_id:
+                        cur.execute(f"""
+                            SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
+                            LIMIT 1
+                        """, (str(item_id), user_id))
+                    else:
+                        cur.execute(f"""
+                            SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
+                            FROM {APP_SCHEMA}.history_items
+                            WHERE id::text = %s AND identity_id IS NULL
+                            LIMIT 1
+                        """, (str(item_id),))
                     row = cur.fetchone()
                 if not row:
                     conn.close()
@@ -6225,11 +4244,16 @@ def api_history_item_update(item_id):
                 try:
                     with conn:
                         with conn.cursor() as cur:
-                            # STRICT identity isolation - only delete user's own items
-                            cur.execute(f"""
-                                DELETE FROM {APP_SCHEMA}.history_items
-                                WHERE id::text = %s AND identity_id = %s
-                            """, (str(item_id), identity_id))
+                            if user_id:
+                                cur.execute(f"""
+                                    DELETE FROM {APP_SCHEMA}.history_items
+                                    WHERE id::text = %s AND (identity_id = %s OR identity_id IS NULL)
+                                """, (str(item_id), user_id))
+                            else:
+                                cur.execute(f"""
+                                    DELETE FROM {APP_SCHEMA}.history_items
+                                    WHERE id::text = %s AND identity_id IS NULL
+                                """, (str(item_id),))
 
                             if model_id:
                                 cur.execute(f"DELETE FROM {APP_SCHEMA}.models WHERE id = %s", (model_id,))
@@ -6285,13 +4309,21 @@ def api_history_item_update(item_id):
                     try:
                         with conn:
                             with conn.cursor(row_factory=dict_row) as cur:
-                                # STRICT identity isolation - only update user's own items
-                                cur.execute(f"""SELECT id, payload FROM {APP_SCHEMA}.history_items
-                                               WHERE (id::text = %s
-                                                  OR payload->>'original_id' = %s
-                                                  OR payload->>'job_id' = %s)
-                                                 AND identity_id = %s
-                                               LIMIT 1;""", (str(item_id), str(item_id), str(item_id), identity_id))
+                                # Get existing item (verify user ownership)
+                                if user_id:
+                                    cur.execute(f"""SELECT id, payload FROM {APP_SCHEMA}.history_items
+                                                   WHERE (id::text = %s
+                                                      OR payload->>'original_id' = %s
+                                                      OR payload->>'job_id' = %s)
+                                                     AND (identity_id = %s OR identity_id IS NULL)
+                                                   LIMIT 1;""", (str(item_id), str(item_id), str(item_id), user_id))
+                                else:
+                                    cur.execute(f"""SELECT id, payload FROM {APP_SCHEMA}.history_items
+                                                   WHERE (id::text = %s
+                                                      OR payload->>'original_id' = %s
+                                                      OR payload->>'job_id' = %s)
+                                                     AND identity_id IS NULL
+                                                   LIMIT 1;""", (str(item_id), str(item_id), str(item_id)))
                                 row = cur.fetchone()
                                 if not row:
                                     return jsonify({"error": "Item not found or access denied"}), 404
@@ -6306,23 +4338,19 @@ def api_history_item_update(item_id):
                                 status = updates.get("status")
                                 stage = updates.get("stage")
                                 title = updates.get("title")
-                                if isinstance(title, str):
-                                    title_norm = title.strip().lower()
-                                    if title_norm in ("", "untitled", "(untitled)"):
-                                        title = None
                                 prompt = updates.get("prompt")
                                 thumbnail_url = updates.get("thumbnail_url")
                                 glb_url = updates.get("glb_url")
                                 image_url = updates.get("image_url")
 
                                 provider = "openai" if item_type == "image" else "meshy"
-                                s3_user_id = identity_id  # Always have identity now
+                                s3_user_id = user_id or "public"
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
                                         thumbnail_url,
                                         "thumbnails",
                                         f"thumbnails/{s3_user_id}/{actual_id}",
-                                        user_id=identity_id,
+                                        user_id=user_id,
                                         name="thumbnail",
                                         provider=provider,
                                     )
@@ -6332,31 +4360,50 @@ def api_history_item_update(item_id):
                                         image_url,
                                         "images",
                                         f"images/{s3_user_id}/{actual_id}",
-                                        user_id=identity_id,
+                                        user_id=user_id,
                                         name="image",
                                         provider=provider,
                                     )
                                     updates["image_url"] = image_url
                                 existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url"}})
 
-                                # STRICT identity isolation - only update user's own items
-                                cur.execute(
-                                    f"""UPDATE {APP_SCHEMA}.history_items
-                                       SET item_type = COALESCE(%s, item_type),
-                                           status = COALESCE(%s, status),
-                                           stage = COALESCE(%s, stage),
-                                           title = COALESCE(%s, title),
-                                           prompt = COALESCE(%s, prompt),
-                                           thumbnail_url = COALESCE(%s, thumbnail_url),
-                                           glb_url = COALESCE(%s, glb_url),
-                                           image_url = COALESCE(%s, image_url),
-                                           payload = %s,
-                                           updated_at = NOW()
-                                       WHERE id = %s AND identity_id = %s;""",
-                                    (item_type, status, stage, title, prompt,
-                                     thumbnail_url, glb_url, image_url,
-                                     json.dumps(existing), actual_id, identity_id)
-                                )
+                                # Update with column values if provided (with ownership check)
+                                if user_id:
+                                    cur.execute(
+                                        f"""UPDATE {APP_SCHEMA}.history_items
+                                           SET item_type = COALESCE(%s, item_type),
+                                               status = COALESCE(%s, status),
+                                               stage = COALESCE(%s, stage),
+                                               title = COALESCE(%s, title),
+                                               prompt = COALESCE(%s, prompt),
+                                               thumbnail_url = COALESCE(%s, thumbnail_url),
+                                               glb_url = COALESCE(%s, glb_url),
+                                               image_url = COALESCE(%s, image_url),
+                                               payload = %s,
+                                               updated_at = NOW()
+                                           WHERE id = %s AND (identity_id = %s OR identity_id IS NULL);""",
+                                        (item_type, status, stage, title, prompt,
+                                         thumbnail_url, glb_url, image_url,
+                                         json.dumps(existing), actual_id, user_id)
+                                    )
+                                else:
+                                    cur.execute(
+                                        f"""UPDATE {APP_SCHEMA}.history_items
+                                           SET item_type = COALESCE(%s, item_type),
+                                               status = COALESCE(%s, status),
+                                               stage = COALESCE(%s, stage),
+                                               title = COALESCE(%s, title),
+                                               prompt = COALESCE(%s, prompt),
+                                               thumbnail_url = COALESCE(%s, thumbnail_url),
+                                               glb_url = COALESCE(%s, glb_url),
+                                               image_url = COALESCE(%s, image_url),
+                                               payload = %s,
+                                               updated_at = NOW()
+                                           WHERE id = %s AND identity_id IS NULL;""",
+                                        (item_type, status, stage, title, prompt,
+                                         thumbnail_url, glb_url, image_url,
+                                         json.dumps(existing), actual_id)
+                                    )
                         conn.close()
                         db_ok = True
                     except Exception as e:
@@ -6383,545 +4430,6 @@ def api_history_item_update(item_id):
             return jsonify({"ok": True, "id": item_id, "db": db_ok, "db_errors": db_errors or None, "local": local_ok})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-
-# ─────────────────────────────────────────────────────────────
-# Community Posts - Public sharing of models/images
-# ─────────────────────────────────────────────────────────────
-
-@app.route("/api/community/feed", methods=["GET", "OPTIONS"])
-def api_community_feed():
-    """
-    GET /api/community/feed - Public feed of shared community posts.
-
-    Query params:
-        limit (int): Max items to return (default 20, max 100)
-        offset (int): Pagination offset (default 0)
-        type (str): Filter by asset type: 'model', 'image', 'history' (optional)
-
-    Response (200):
-    {
-        "ok": true,
-        "posts": [
-            {
-                "id": "uuid",
-                "display_name": "Cool Dragon",
-                "prompt_public": "A fierce dragon..." (if show_prompt=true),
-                "show_prompt": true/false,
-                "created_at": "2025-01-23T...",
-                "asset_type": "model" | "image" | "history",
-                "asset": { ...asset details... }
-            }
-        ],
-        "total": 42,
-        "has_more": true
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    if not USE_DB:
-        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
-
-    try:
-        limit = min(int(request.args.get("limit", 20)), 100)
-        offset = int(request.args.get("offset", 0))
-        asset_type = request.args.get("type")  # 'model', 'image', 'history'
-
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
-
-        cursor = conn.cursor()
-
-        # Build type filter
-        type_filter = ""
-        params = []
-        if asset_type == "model":
-            type_filter = "AND cp.model_id IS NOT NULL"
-        elif asset_type == "image":
-            type_filter = "AND cp.image_id IS NOT NULL"
-        elif asset_type == "history":
-            type_filter = "AND cp.history_item_id IS NOT NULL"
-
-        # Get total count
-        cursor.execute(f"""
-            SELECT COUNT(*) FROM timrx_app.community_posts cp
-            WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
-        """)
-        total = cursor.fetchone()[0]
-
-        # Get posts with joined asset data
-        cursor.execute(f"""
-            SELECT
-                cp.id, cp.display_name, cp.prompt_public, cp.show_prompt, cp.created_at,
-                cp.model_id, cp.image_id, cp.history_item_id,
-                m.title as model_title, m.prompt as model_prompt, m.thumbnail_url as model_thumbnail,
-                m.glb_url as model_glb_url,
-                i.filename as image_filename, i.thumbnail_url as image_thumbnail,
-                h.title as history_title, h.prompt as history_prompt, h.thumbnail_url as history_thumbnail,
-                h.glb_url as history_glb_url, h.image_url as history_image_url
-            FROM timrx_app.community_posts cp
-            LEFT JOIN timrx_app.models m ON cp.model_id = m.id
-            LEFT JOIN timrx_app.images i ON cp.image_id = i.id
-            LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
-            WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
-            ORDER BY cp.created_at DESC
-            LIMIT %s OFFSET %s
-        """, (limit, offset))
-
-        rows = cursor.fetchall()
-        posts = []
-
-        for row in rows:
-            (post_id, display_name, prompt_public, show_prompt, created_at,
-             model_id, image_id, history_item_id,
-             model_title, model_prompt, model_thumbnail, model_glb_url,
-             image_filename, image_thumbnail,
-             history_title, history_prompt, history_thumbnail, history_glb_url, history_image_url) = row
-
-            post = {
-                "id": str(post_id),
-                "display_name": display_name,
-                "show_prompt": show_prompt,
-                "created_at": created_at.isoformat() if created_at else None,
-            }
-
-            # Only include prompt if show_prompt is true
-            if show_prompt and prompt_public:
-                post["prompt_public"] = prompt_public
-
-            # Build asset info based on which ref is set
-            if model_id:
-                post["asset_type"] = "model"
-                post["asset"] = {
-                    "id": str(model_id),
-                    "title": model_title,
-                    "thumbnail_url": model_thumbnail,
-                }
-            elif image_id:
-                post["asset_type"] = "image"
-                post["asset"] = {
-                    "id": str(image_id),
-                    "filename": image_filename,
-                    "thumbnail_url": image_thumbnail,
-                }
-            elif history_item_id:
-                post["asset_type"] = "history"
-                post["asset"] = {
-                    "id": str(history_item_id),
-                    "title": history_title,
-                    "thumbnail_url": history_thumbnail,
-                }
-
-            posts.append(post)
-
-        conn.close()
-
-        return jsonify({
-            "ok": True,
-            "posts": posts,
-            "total": total,
-            "has_more": offset + len(posts) < total
-        })
-
-    except Exception as e:
-        print(f"[COMMUNITY] Error in feed: {e}")
-        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
-
-
-@app.route("/api/community/share", methods=["POST", "OPTIONS"])
-@with_session
-def api_community_share():
-    """
-    POST /api/community/share - Share a model/image/history item to community.
-
-    Requires valid session (identity).
-
-    Request body:
-    {
-        "asset_type": "model" | "image" | "history",
-        "asset_id": "uuid of the asset",
-        "display_name": "My Cool Dragon",
-        "prompt_public": "A fierce dragon..." (optional),
-        "show_prompt": true/false (default false)
-    }
-
-    Response (200):
-    {
-        "ok": true,
-        "post_id": "uuid"
-    }
-
-    Errors:
-        401 - NO_SESSION: No valid session
-        400 - INVALID_ASSET_TYPE: asset_type must be model, image, or history
-        400 - MISSING_FIELD: Required field missing
-        403 - NOT_OWNER: Asset doesn't belong to this identity
-        404 - ASSET_NOT_FOUND: Asset not found
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    # Require identity
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "NO_SESSION", "message": "A valid session is required to share content."}
-        }), 401
-
-    if not USE_DB:
-        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
-
-    try:
-        data = request.get_json() or {}
-        asset_type = data.get("asset_type")
-        asset_id = data.get("asset_id")
-        display_name = data.get("display_name")
-        prompt_public = data.get("prompt_public")
-        show_prompt = bool(data.get("show_prompt", False))
-
-        # Validate required fields
-        if asset_type not in ("model", "image", "history"):
-            return jsonify({
-                "ok": False,
-                "error": {"code": "INVALID_ASSET_TYPE", "message": "asset_type must be 'model', 'image', or 'history'"}
-            }), 400
-
-        if not asset_id:
-            return jsonify({
-                "ok": False,
-                "error": {"code": "MISSING_FIELD", "message": "asset_id is required"}
-            }), 400
-
-        if not display_name:
-            return jsonify({
-                "ok": False,
-                "error": {"code": "MISSING_FIELD", "message": "display_name is required"}
-            }), 400
-
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
-
-        cursor = conn.cursor()
-
-        # Verify ownership and asset exists
-        if asset_type == "model":
-            cursor.execute("""
-                SELECT id FROM timrx_app.models
-                WHERE id = %s AND identity_id = %s
-            """, (asset_id, identity_id))
-            col_name = "model_id"
-        elif asset_type == "image":
-            cursor.execute("""
-                SELECT id FROM timrx_app.images
-                WHERE id = %s AND identity_id = %s
-            """, (asset_id, identity_id))
-            col_name = "image_id"
-        else:  # history
-            cursor.execute("""
-                SELECT id FROM timrx_app.history_items
-                WHERE id = %s AND identity_id = %s
-            """, (asset_id, identity_id))
-            col_name = "history_item_id"
-
-        if not cursor.fetchone():
-            conn.close()
-            return jsonify({
-                "ok": False,
-                "error": {"code": "ASSET_NOT_FOUND", "message": "Asset not found or you don't have permission to share it"}
-            }), 404
-
-        # Insert community post
-        cursor.execute(f"""
-            INSERT INTO timrx_app.community_posts
-            (identity_id, {col_name}, display_name, prompt_public, show_prompt)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id
-        """, (identity_id, asset_id, display_name, prompt_public, show_prompt))
-
-        post_id = cursor.fetchone()[0]
-        conn.commit()
-        conn.close()
-
-        return jsonify({
-            "ok": True,
-            "post_id": str(post_id)
-        })
-
-    except Exception as e:
-        print(f"[COMMUNITY] Error in share: {e}")
-        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
-
-
-@app.route("/api/community/post/<post_id>", methods=["DELETE", "OPTIONS"])
-@with_session
-def api_community_delete(post_id):
-    """
-    DELETE /api/community/post/<post_id> - Remove a shared post (soft delete).
-
-    Requires valid session. Only the post owner can delete.
-
-    Response (200):
-    { "ok": true }
-
-    Errors:
-        401 - NO_SESSION
-        404 - POST_NOT_FOUND or not owner
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "NO_SESSION", "message": "A valid session is required."}
-        }), 401
-
-    if not USE_DB:
-        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
-
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
-
-        cursor = conn.cursor()
-
-        # Soft delete - only if owned by this identity
-        cursor.execute("""
-            UPDATE timrx_app.community_posts
-            SET status = 'deleted', deleted_at = NOW()
-            WHERE id = %s AND identity_id = %s AND deleted_at IS NULL
-        """, (post_id, identity_id))
-
-        if cursor.rowcount == 0:
-            conn.close()
-            return jsonify({
-                "ok": False,
-                "error": {"code": "POST_NOT_FOUND", "message": "Post not found or you don't have permission to delete it"}
-            }), 404
-
-        conn.commit()
-        conn.close()
-
-        return jsonify({"ok": True})
-
-    except Exception as e:
-        print(f"[COMMUNITY] Error in delete: {e}")
-        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
-
-
-# ─────────────────────────────────────────────────────────────
-# Secure Asset Downloads - Signed S3 URLs with ownership verification
-# ─────────────────────────────────────────────────────────────
-
-def _extract_s3_key_from_url(url: str) -> str | None:
-    """
-    Extract S3 key from a full S3 URL.
-    Supports formats:
-        https://bucket.s3.region.amazonaws.com/key/path
-        https://s3.region.amazonaws.com/bucket/key/path
-    Returns None if not an S3 URL.
-    """
-    if not url:
-        return None
-
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-
-    # Format: bucket.s3.region.amazonaws.com/key
-    if ".s3." in parsed.netloc and ".amazonaws.com" in parsed.netloc:
-        # Key is the path without leading slash
-        return parsed.path.lstrip("/") if parsed.path else None
-
-    return None
-
-
-@app.route("/api/assets/<asset_type>/<asset_id>/download", methods=["GET", "OPTIONS"])
-@with_session
-def api_asset_download(asset_type, asset_id):
-    """
-    GET /api/assets/:type/:id/download - Get a signed download URL for an asset.
-
-    Requires valid session. Only the asset owner can download.
-
-    Path params:
-        asset_type: "model" | "image" | "history"
-        asset_id: UUID of the asset
-
-    Query params:
-        file: Which file to download (default varies by type)
-            - model: "glb" (default), "thumbnail"
-            - image: "original" (default), "thumbnail"
-            - history: "glb" (default), "thumbnail", "image"
-
-    Response (200):
-    {
-        "ok": true,
-        "download_url": "https://...signed-url...",
-        "filename": "my_model.glb",
-        "expires_in": 3600
-    }
-
-    Errors:
-        401 - NO_SESSION
-        400 - INVALID_ASSET_TYPE
-        403 - NOT_OWNER
-        404 - ASSET_NOT_FOUND or FILE_NOT_FOUND
-        503 - S3_NOT_CONFIGURED
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id = getattr(g, 'identity_id', None)
-    if not identity_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "NO_SESSION", "message": "A valid session is required to download assets."}
-        }), 401
-
-    if asset_type not in ("model", "image", "history"):
-        return jsonify({
-            "ok": False,
-            "error": {"code": "INVALID_ASSET_TYPE", "message": "asset_type must be 'model', 'image', or 'history'"}
-        }), 400
-
-    if not USE_DB:
-        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
-
-    if not AWS_BUCKET_MODELS:
-        return jsonify({"ok": False, "error": {"code": "S3_NOT_CONFIGURED", "message": "S3 storage not configured"}}), 503
-
-    file_type = request.args.get("file")
-
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database unavailable"}}), 503
-
-        cursor = conn.cursor()
-
-        # Query the appropriate table based on asset type
-        if asset_type == "model":
-            file_type = file_type or "glb"
-            if file_type == "glb":
-                url_col = "glb_url"
-            elif file_type == "thumbnail":
-                url_col = "thumbnail_url"
-            else:
-                conn.close()
-                return jsonify({
-                    "ok": False,
-                    "error": {"code": "INVALID_FILE_TYPE", "message": "file must be 'glb' or 'thumbnail' for models"}
-                }), 400
-
-            cursor.execute(f"""
-                SELECT {url_col}, title FROM timrx_app.models
-                WHERE id = %s AND identity_id = %s
-            """, (asset_id, identity_id))
-
-        elif asset_type == "image":
-            file_type = file_type or "original"
-            if file_type == "original":
-                url_col = "image_url"
-            elif file_type == "thumbnail":
-                url_col = "thumbnail_url"
-            else:
-                conn.close()
-                return jsonify({
-                    "ok": False,
-                    "error": {"code": "INVALID_FILE_TYPE", "message": "file must be 'original' or 'thumbnail' for images"}
-                }), 400
-
-            cursor.execute(f"""
-                SELECT {url_col}, filename FROM timrx_app.images
-                WHERE id = %s AND identity_id = %s
-            """, (asset_id, identity_id))
-
-        else:  # history
-            file_type = file_type or "glb"
-            if file_type == "glb":
-                url_col = "glb_url"
-            elif file_type == "thumbnail":
-                url_col = "thumbnail_url"
-            elif file_type == "image":
-                url_col = "image_url"
-            else:
-                conn.close()
-                return jsonify({
-                    "ok": False,
-                    "error": {"code": "INVALID_FILE_TYPE", "message": "file must be 'glb', 'thumbnail', or 'image' for history items"}
-                }), 400
-
-            cursor.execute(f"""
-                SELECT {url_col}, title FROM timrx_app.history_items
-                WHERE id = %s AND identity_id = %s
-            """, (asset_id, identity_id))
-
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            return jsonify({
-                "ok": False,
-                "error": {"code": "ASSET_NOT_FOUND", "message": "Asset not found or you don't have permission to access it"}
-            }), 404
-
-        url, name = row
-
-        if not url:
-            return jsonify({
-                "ok": False,
-                "error": {"code": "FILE_NOT_FOUND", "message": f"No {file_type} file available for this asset"}
-            }), 404
-
-        # Extract S3 key from URL
-        s3_key = _extract_s3_key_from_url(url)
-        if not s3_key:
-            # Not an S3 URL - might be external (Meshy), return as-is
-            return jsonify({
-                "ok": True,
-                "download_url": url,
-                "filename": name or "download",
-                "expires_in": None,
-                "note": "External URL, not signed"
-            })
-
-        # Generate presigned URL
-        expires_in = 3600  # 1 hour
-        try:
-            presigned_url = s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": AWS_BUCKET_MODELS, "Key": s3_key},
-                ExpiresIn=expires_in
-            )
-        except Exception as e:
-            print(f"[DOWNLOAD] Error generating presigned URL: {e}")
-            return jsonify({
-                "ok": False,
-                "error": {"code": "S3_ERROR", "message": "Failed to generate download URL"}
-            }), 500
-
-        # Determine filename
-        filename = name or s3_key.split("/")[-1]
-        if file_type == "glb" and not filename.endswith(".glb"):
-            filename = f"{filename}.glb"
-        elif file_type == "thumbnail" and not any(filename.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"]):
-            filename = f"{filename}.png"
-
-        return jsonify({
-            "ok": True,
-            "download_url": presigned_url,
-            "filename": filename,
-            "expires_in": expires_in
-        })
-
-    except Exception as e:
-        print(f"[DOWNLOAD] Error: {e}")
-        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
 
 # Entrypoint
 # ─────────────────────────────────────────────────────────────
