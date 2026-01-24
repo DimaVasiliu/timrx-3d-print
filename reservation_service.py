@@ -21,11 +21,24 @@ Statuses:
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 import json
+import uuid
 
 from db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
 from wallet_service import WalletService, LedgerEntryType
 from pricing_service import PricingService
 from config import config
+
+
+def _derive_provider_from_action_code(action_code: str) -> str:
+    """Derive provider name from action_code prefix."""
+    if action_code.startswith("MESHY_"):
+        return "meshy"
+    elif action_code.startswith("OPENAI_"):
+        return "openai"
+    elif action_code.startswith("VIDEO_"):
+        return "video"
+    else:
+        return "unknown"
 
 
 class ReservationStatus:
@@ -241,7 +254,24 @@ class ReservationService:
                     f"INSUFFICIENT_CREDITS:required={cost_credits}:balance={balance}:reserved={current_reserved}:available={available}"
                 )
 
-            # 4. Create reservation
+            # 4. Create job row FIRST (to satisfy FK constraint on credit_reservations.ref_job_id)
+            provider = _derive_provider_from_action_code(action_code)
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.JOBS}
+                (id, identity_id, provider, action_code, status, cost_credits, meta, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'queued', %s, %s, NOW(), NOW())
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+                """,
+                (job_id, identity_id, provider, action_code, cost_credits, meta_json),
+            )
+            job_row = fetch_one(cur)
+            if not job_row:
+                # Job already existed (idempotent case) - that's fine, FK will be satisfied
+                print(f"[RESERVATION] Job {job_id} already exists, proceeding with reservation")
+
+            # 5. Create reservation with ref_job_id pointing to the job
             cur.execute(
                 f"""
                 INSERT INTO {Tables.CREDIT_RESERVATIONS}
@@ -252,6 +282,16 @@ class ReservationService:
                 (identity_id, action_code, cost_credits, ReservationStatus.HELD, expiry_minutes, job_id, meta_json),
             )
             reservation = fetch_one(cur)
+
+            # 6. Update job with reservation_id for bidirectional link
+            cur.execute(
+                f"""
+                UPDATE {Tables.JOBS}
+                SET reservation_id = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (reservation["id"], job_id),
+            )
 
             new_reserved = current_reserved + cost_credits
             new_available = balance - new_reserved
