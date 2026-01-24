@@ -1206,6 +1206,13 @@ def get_db_conn():
         print(f"[DB] Connection error: {e}")
         return None
 
+def get_db_connection():
+    """
+    Compat wrapper for billing/job queries.
+    Uses the same connection settings as get_db_conn().
+    """
+    return get_db_conn()
+
 def ensure_history_table():
     """
     Verify database connection works. Tables are expected to already exist
@@ -4445,6 +4452,7 @@ def api_text_to_3d_remesh_start():
 
 # ---- Status ----
 @app.route("/api/text-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
 def api_text_to_3d_status(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -4466,7 +4474,7 @@ def api_text_to_3d_status(job_id):
         try:
             conn = get_db_connection()
             if conn:
-                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor = conn.cursor(row_factory=dict_row)
                 # Check if job_id is our internal UUID
                 cursor.execute("""
                     SELECT id, status, upstream_job_id, error_message
@@ -4681,7 +4689,7 @@ def api_get_job_status(job_id):
         if not conn:
             return jsonify({"error": "Database connection failed"}), 503
 
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor = conn.cursor(row_factory=dict_row)
 
         # Try to find by id (internal UUID) or upstream_job_id (meshy/openai ID)
         cursor.execute("""
@@ -4880,6 +4888,7 @@ def api_mesh_remesh():
     })
 
 @app.route("/api/mesh/remesh/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
 def api_mesh_remesh_status(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -5034,6 +5043,7 @@ def api_mesh_retexture():
     })
 
 @app.route("/api/mesh/retexture/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
 def api_mesh_retexture_status(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -5186,6 +5196,7 @@ def api_mesh_rigging():
     })
 
 @app.route("/api/mesh/rigging/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
 def api_mesh_rigging_status(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -5330,6 +5341,7 @@ def api_image_to_3d_start():
     })
 
 @app.route("/api/image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
 def api_image_to_3d_status(job_id):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -5348,7 +5360,7 @@ def api_image_to_3d_status(job_id):
         try:
             conn = get_db_connection()
             if conn:
-                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor = conn.cursor(row_factory=dict_row)
                 cursor.execute("""
                     SELECT id, status, upstream_job_id, error_message
                     FROM timrx_billing.jobs
@@ -5591,7 +5603,7 @@ def api_openai_image_status(job_id):
         try:
             conn = get_db_connection()
             if conn:
-                cursor = conn.cursor(cursor_factory=RealDictCursor)
+                cursor = conn.cursor(row_factory=dict_row)
                 cursor.execute("""
                     SELECT id, status, error_message
                     FROM timrx_billing.jobs
