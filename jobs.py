@@ -183,18 +183,14 @@ def get_job(job_id):
     Response (success - 200):
     {
         "ok": true,
-        "job": {
-            "id": "uuid",
-            "provider": "meshy",
-            "action_code": "MESHY_TEXT_TO_3D",
-            "status": "pending",
-            "cost_credits": 20,
-            "reservation_id": "uuid",
-            "upstream_job_id": "meshy-task-id",
-            "prompt": "a cute robot",
-            "created_at": "2024-01-15T12:00:00Z",
-            "updated_at": "2024-01-15T12:00:00Z"
-        }
+        "job_id": "uuid",
+        "status": "queued|processing|ready|failed",
+        "progress": 0-100,
+        "error_message": null or "...",
+        "model_id": null or "uuid",
+        "image_id": null or "uuid",
+        "glb_url": null or "https://...",
+        "image_url": null or "https://..."
     }
     """
     try:
@@ -217,9 +213,40 @@ def get_job(job_id):
                 }
             }), 404
 
+        # Map internal status to frontend-expected status
+        # Internal: queued, pending, succeeded, failed
+        # Frontend: queued, processing, ready, failed
+        internal_status = job.get("status", "queued")
+        status_map = {
+            "queued": "queued",
+            "pending": "processing",
+            "succeeded": "ready",
+            "failed": "failed",
+        }
+        status = status_map.get(internal_status, internal_status)
+
+        # Extract additional fields from meta
+        meta = job.get("meta") or {}
+        progress = meta.get("progress", 0)
+        model_id = meta.get("model_id")
+        image_id = meta.get("image_id")
+        glb_url = meta.get("glb_url")
+        image_url = meta.get("image_url")
+
+        # Set progress to 100 if job is ready
+        if status == "ready":
+            progress = 100
+
         return jsonify({
             "ok": True,
-            "job": job,
+            "job_id": job.get("id"),
+            "status": status,
+            "progress": progress,
+            "error_message": job.get("error_message"),
+            "model_id": model_id,
+            "image_id": image_id,
+            "glb_url": glb_url,
+            "image_url": image_url,
         })
 
     except Exception as e:
