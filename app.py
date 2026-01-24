@@ -2769,6 +2769,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             "success": True,
             "db_ok": db_save_ok and len(db_errors) == 0,
             "db_errors": db_errors or None,
+            "model_id": model_id,  # UUID of saved model in timrx_app.models
             "glb_url": final_glb_url,
             "thumbnail_url": final_thumbnail_url,
             "textured_glb_url": textured_glb_url,
@@ -3328,8 +3329,13 @@ def _dispatch_openai_image_async(
             finalize_job_credits(reservation_id, internal_job_id)
             print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
 
-        # Mark job as ready
-        _update_job_status_ready(internal_job_id, None)
+        # Mark job as ready with asset info
+        _update_job_status_ready(
+            internal_job_id,
+            upstream_job_id=None,
+            image_id=internal_job_id,  # Image ID is same as job ID for OpenAI
+            image_url=urls[0],
+        )
 
         print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
 
@@ -3385,29 +3391,56 @@ def _update_job_status_failed(job_id: str, error_message: str):
         print(f"[JOB] ERROR marking job {job_id} as failed: {e}")
 
 
-def _update_job_status_ready(job_id: str, upstream_job_id: str = None):
-    """Mark job as ready (completed successfully) in timrx_billing.jobs."""
+def _update_job_status_ready(
+    job_id: str,
+    upstream_job_id: str = None,
+    model_id: str = None,
+    image_id: str = None,
+    glb_url: str = None,
+    image_url: str = None,
+    progress: int = 100,
+):
+    """
+    Mark job as ready (completed successfully) in timrx_billing.jobs.
+    Also updates meta column with asset info for polling.
+    """
     if not USE_DB:
         return
     try:
         conn = get_db_connection()
         if conn:
             cursor = conn.cursor()
+            # Build meta updates
+            meta_updates = {"progress": progress}
+            if model_id:
+                meta_updates["model_id"] = model_id
+            if image_id:
+                meta_updates["image_id"] = image_id
+            if glb_url:
+                meta_updates["glb_url"] = glb_url
+            if image_url:
+                meta_updates["image_url"] = image_url
+
             if upstream_job_id:
                 cursor.execute("""
                     UPDATE timrx_billing.jobs
-                    SET status = 'ready', upstream_job_id = COALESCE(upstream_job_id, %s), updated_at = NOW()
+                    SET status = 'ready',
+                        upstream_job_id = COALESCE(upstream_job_id, %s),
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
                     WHERE id = %s
-                """, (upstream_job_id, job_id))
+                """, (upstream_job_id, json.dumps(meta_updates), job_id))
             else:
                 cursor.execute("""
                     UPDATE timrx_billing.jobs
-                    SET status = 'ready', updated_at = NOW()
+                    SET status = 'ready',
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
                     WHERE id = %s
-                """, (job_id,))
+                """, (json.dumps(meta_updates), job_id))
             conn.commit()
             conn.close()
-            print(f"[JOB] Marked job {job_id} as ready")
+            print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
 
@@ -4512,9 +4545,14 @@ def api_text_to_3d_status(job_id):
                 finalize_job_credits(reservation_id, job_id)
                 print(f"[STATUS] Credits captured for job {job_id}, reservation={reservation_id}")
 
-            # Update job status to 'ready' in timrx_billing.jobs
+            # Update job status to 'ready' in timrx_billing.jobs with asset info
             if internal_job_id:
-                _update_job_status_ready(internal_job_id, job_id)
+                _update_job_status_ready(
+                    internal_job_id,
+                    upstream_job_id=job_id,
+                    model_id=s3_result.get("model_id"),
+                    glb_url=s3_result.get("glb_url"),
+                )
 
     # Handle failed jobs - release credits
     if out["status"] == "failed":
@@ -5372,8 +5410,14 @@ def api_image_to_3d_status(job_id):
                 finalize_job_credits(reservation_id, meshy_job_id)
                 print(f"[STATUS] Credits captured for image-to-3d job {meshy_job_id}, reservation={reservation_id}")
 
+            # Update job status to 'ready' with asset info
             if internal_job_id:
-                _update_job_status_ready(internal_job_id, meshy_job_id)
+                _update_job_status_ready(
+                    internal_job_id,
+                    upstream_job_id=meshy_job_id,
+                    model_id=s3_result.get("model_id"),
+                    glb_url=s3_result.get("glb_url"),
+                )
 
     # Handle failed jobs - release credits
     if out["status"] == "failed":
@@ -6011,47 +6055,52 @@ def api_history_item_add():
                                     model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
                                         cur, item_type, item_id, glb_url, image_url, identity_id, provider
                                     )
-                                # Validate XOR constraint
+                                # Validate XOR constraint - REJECT with 400 if both NULL
                                 if not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
-                                    # Determine skip reason for frontend
+                                    # Determine error reason
                                     if lookup_reason:
-                                        skip_reason = lookup_reason
+                                        error_reason = lookup_reason
                                     elif model_id and image_id:
-                                        skip_reason = "xor_violation"
+                                        error_reason = "xor_violation"
                                     else:
-                                        skip_reason = "missing_asset_reference"
-                                    print(f"[History] Skipping item {item_id} - reason: {skip_reason}")
-                                    db_errors.append({
-                                        "op": "history_item_add",
-                                        "error": f"Skipped: {skip_reason}",
-                                        "skip_reason": skip_reason,
-                                    })
-                                else:
-                                    cur.execute(
-                                        f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
-                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
-                                           VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s, %s, %s)
-                                           ON CONFLICT (id) DO UPDATE
-                                           SET item_type = EXCLUDED.item_type,
-                                               status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
-                                               stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
-                                               title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
-                                               prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
-                                               root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
-                                               identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
-                                               thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
-                                               glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
-                                               image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
-                                               model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
-                                               image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
-                                               payload = EXCLUDED.payload,
-                                               updated_at = NOW();""",
-                                        (use_id, identity_id, item_type, status, stage, title, prompt,
-                                         root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
-                                    )
-                                    db_ok = True
-                                    item_id = use_id  # Return the actual UUID used
+                                        error_reason = "missing_asset_reference"
+                                    print(f"[History] Rejecting item {item_id} - reason: {error_reason}")
+                                    # Return 400 error instead of soft-skipping
+                                    return jsonify({
+                                        "ok": False,
+                                        "error": {
+                                            "code": "INVALID_ASSET_REFERENCE",
+                                            "message": f"History item must have exactly one asset reference (model_id XOR image_id). Got: model_id={model_id}, image_id={image_id}",
+                                            "reason": error_reason,
+                                            "client_id": str(item_id),
+                                        }
+                                    }), 400
+                                # Validation passed - INSERT the history item
+                                cur.execute(
+                                    f"""INSERT INTO {APP_SCHEMA}.history_items (id, identity_id, item_type, status, stage, title, prompt,
+                                           root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                           %s, %s, %s, %s, %s, %s, %s)
+                                       ON CONFLICT (id) DO UPDATE
+                                       SET item_type = EXCLUDED.item_type,
+                                           status = COALESCE(EXCLUDED.status, {APP_SCHEMA}.history_items.status),
+                                           stage = COALESCE(EXCLUDED.stage, {APP_SCHEMA}.history_items.stage),
+                                           title = COALESCE(EXCLUDED.title, {APP_SCHEMA}.history_items.title),
+                                           prompt = COALESCE(EXCLUDED.prompt, {APP_SCHEMA}.history_items.prompt),
+                                           root_prompt = COALESCE(EXCLUDED.root_prompt, {APP_SCHEMA}.history_items.root_prompt),
+                                           identity_id = COALESCE(EXCLUDED.identity_id, {APP_SCHEMA}.history_items.identity_id),
+                                           thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {APP_SCHEMA}.history_items.thumbnail_url),
+                                           glb_url = COALESCE(EXCLUDED.glb_url, {APP_SCHEMA}.history_items.glb_url),
+                                           image_url = COALESCE(EXCLUDED.image_url, {APP_SCHEMA}.history_items.image_url),
+                                           model_id = COALESCE(EXCLUDED.model_id, {APP_SCHEMA}.history_items.model_id),
+                                           image_id = COALESCE(EXCLUDED.image_id, {APP_SCHEMA}.history_items.image_id),
+                                           payload = EXCLUDED.payload,
+                                           updated_at = NOW();""",
+                                    (use_id, identity_id, item_type, status, stage, title, prompt,
+                                     root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, json.dumps(item))
+                                )
+                                db_ok = True
+                                item_id = use_id  # Return the actual UUID used
                     conn.close()
                 except Exception as e:
                     log_db_continue("history_item_add", e)
@@ -6061,18 +6110,10 @@ def api_history_item_add():
             else:
                 db_errors.append({"op": "history_item_add_connect", "error": "db_unavailable"})
 
-        # Check if item was skipped (for frontend retry logic)
-        skipped = None
-        for err in db_errors:
-            if err.get("skip_reason"):
-                skipped = {"client_id": str(item_id), "reason": err["skip_reason"]}
-                break
-
         local_ok = upsert_history_local(item, merge=False)
         return jsonify({
             "ok": db_ok or False,
             "id": item_id,
-            "skipped": skipped,
             "db": db_ok,
             "db_errors": db_errors or None,
             "local": local_ok,
