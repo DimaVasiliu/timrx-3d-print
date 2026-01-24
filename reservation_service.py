@@ -316,14 +316,16 @@ class ReservationService:
         Finalize a reservation (job completed successfully).
         This captures the held credits by creating a ledger spend entry.
 
+        IDEMPOTENT: Safe to call multiple times. Handles:
+        - Already finalized: returns was_already_finalized=True
+        - Already released: returns was_already_released=True (job was cancelled/failed, don't charge)
+        - Not found: returns not_found=True (reservation expired or never existed)
+
         Args:
             reservation_id: The reservation to finalize
 
         Returns:
-            Dict with finalized reservation and new balance
-
-        Raises:
-            ValueError: If reservation not found or already finalized/released
+            Dict with finalized reservation and new balance (never raises for idempotent cases)
         """
         with transaction() as cur:
             # Lock and fetch reservation
@@ -339,7 +341,14 @@ class ReservationService:
             reservation = fetch_one(cur)
 
             if not reservation:
-                raise ValueError(f"Reservation not found: {reservation_id}")
+                # Idempotent: reservation not found (expired, cleaned up, or never existed)
+                print(f"[RESERVATION] Finalize: not found (idempotent): {reservation_id}")
+                return {
+                    "reservation": None,
+                    "not_found": True,
+                    "was_already_finalized": False,
+                    "was_already_released": False,
+                }
 
             if reservation["status"] == ReservationStatus.FINALIZED:
                 # Idempotent: already finalized
@@ -347,10 +356,20 @@ class ReservationService:
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_finalized": True,
+                    "was_already_released": False,
+                    "not_found": False,
                 }
 
             if reservation["status"] == ReservationStatus.RELEASED:
-                raise ValueError(f"Cannot finalize released reservation: {reservation_id}")
+                # Idempotent: already released (job failed/cancelled before completion)
+                # This can happen if job was cancelled while still processing
+                print(f"[RESERVATION] Finalize skipped: already released: {reservation_id}")
+                return {
+                    "reservation": ReservationService._format_reservation(reservation),
+                    "was_already_released": True,
+                    "was_already_finalized": False,
+                    "not_found": False,
+                }
 
             identity_id = str(reservation["identity_id"])
             cost_credits = reservation["cost_credits"]
@@ -421,6 +440,8 @@ class ReservationService:
                 "reservation": ReservationService._format_reservation(updated),
                 "balance": new_balance,
                 "was_already_finalized": False,
+                "was_already_released": False,
+                "not_found": False,
             }
 
     @staticmethod
@@ -429,15 +450,17 @@ class ReservationService:
         Release a reservation (job failed or cancelled).
         This returns the held credits to available balance.
 
+        IDEMPOTENT: Safe to call multiple times. Handles:
+        - Already released: returns was_already_released=True
+        - Already finalized: returns was_already_finalized=True (no error - job succeeded)
+        - Not found: returns not_found=True (reservation expired or never existed)
+
         Args:
             reservation_id: The reservation to release
             reason: Reason for release (e.g., 'failed', 'cancelled', 'expired')
 
         Returns:
-            Dict with released reservation
-
-        Raises:
-            ValueError: If reservation not found or already finalized
+            Dict with released reservation info (never raises for idempotent cases)
         """
         with transaction() as cur:
             # Lock and fetch reservation
@@ -453,7 +476,14 @@ class ReservationService:
             reservation = fetch_one(cur)
 
             if not reservation:
-                raise ValueError(f"Reservation not found: {reservation_id}")
+                # Idempotent: reservation not found (expired, cleaned up, or never existed)
+                print(f"[RESERVATION] Not found (idempotent): {reservation_id}")
+                return {
+                    "reservation": None,
+                    "not_found": True,
+                    "was_already_released": False,
+                    "was_already_finalized": False,
+                }
 
             if reservation["status"] == ReservationStatus.RELEASED:
                 # Idempotent: already released
@@ -461,10 +491,20 @@ class ReservationService:
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_released": True,
+                    "was_already_finalized": False,
+                    "not_found": False,
                 }
 
             if reservation["status"] == ReservationStatus.FINALIZED:
-                raise ValueError(f"Cannot release finalized reservation: {reservation_id}")
+                # Idempotent: already finalized (job succeeded, credits captured)
+                # This is NOT an error - it means the job actually succeeded
+                print(f"[RESERVATION] Already finalized (job succeeded): {reservation_id}")
+                return {
+                    "reservation": ReservationService._format_reservation(reservation),
+                    "was_already_finalized": True,
+                    "was_already_released": False,
+                    "not_found": False,
+                }
 
             # Update reservation status
             cur.execute(
@@ -487,6 +527,8 @@ class ReservationService:
             return {
                 "reservation": ReservationService._format_reservation(updated),
                 "was_already_released": False,
+                "was_already_finalized": False,
+                "not_found": False,
             }
 
     @staticmethod
