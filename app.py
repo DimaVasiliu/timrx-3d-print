@@ -1468,6 +1468,8 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         return False
     try:
         job_meta = metadata or {}
+        if not user_id:
+            user_id = job_meta.get("identity_id") or job_meta.get("user_id")
         payload = dict(job_meta)
         payload.setdefault("job_type", job_type)
         payload.setdefault("stage", stage)
@@ -2090,7 +2092,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
     image_log_info = None
     # Get user_id from job_meta if not provided
     if not user_id:
-        user_id = job_meta.get("user_id")
+        user_id = job_meta.get("identity_id") or job_meta.get("user_id")
     if not USE_DB:
         print("[DB] USE_DB is False, skipping save_finished_job_to_normalized_db")
         return False
@@ -2980,6 +2982,40 @@ def get_job_metadata(job_id: str, local_store: dict | None = None) -> dict:
 
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            job_fallback = {}
+            job_identity_id = None
+            try:
+                cur.execute(f"""
+                    SELECT id, identity_id, prompt, meta
+                    FROM timrx_billing.jobs
+                    WHERE id::text = %s OR upstream_job_id = %s
+                    LIMIT 1
+                """, (job_id, job_id))
+                job_row = cur.fetchone()
+            except Exception as e:
+                print(f"[Metadata] Billing job lookup failed: {e}")
+                job_row = None
+
+            if job_row:
+                job_identity_id = str(job_row["identity_id"]) if job_row.get("identity_id") else None
+                job_meta = job_row["meta"] if job_row.get("meta") else {}
+                if isinstance(job_meta, str):
+                    try:
+                        job_meta = json.loads(job_meta)
+                    except Exception:
+                        job_meta = {}
+                job_prompt = job_row.get("prompt") or job_meta.get("prompt")
+                job_title = job_meta.get("title") or (job_prompt[:50] if job_prompt else None)
+                job_root_prompt = job_meta.get("root_prompt") or job_prompt
+                job_stage = job_meta.get("stage")
+                job_fallback = {
+                    "prompt": job_prompt,
+                    "title": job_title,
+                    "root_prompt": job_root_prompt,
+                    "stage": job_stage,
+                    "identity_id": job_identity_id,
+                    "user_id": job_identity_id,
+                }
             # First check active_jobs table for identity_id / related history
             cur.execute(f"""
                 SELECT identity_id, related_history_id
@@ -3024,12 +3060,20 @@ def get_job_metadata(job_id: str, local_store: dict | None = None) -> dict:
                 "art_style": payload.get("art_style"),
                 "stage": row["stage"] or payload.get("stage"),
                 "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
+                "identity_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
             }
+            if job_fallback:
+                for key, value in job_fallback.items():
+                    if value and not result.get(key):
+                        result[key] = value
             print(f"[Metadata] Found in DB: prompt={result.get('prompt', '')[:40] if result.get('prompt') else 'None'}..., title={result.get('title')}, user_id={result.get('user_id')}")
             return result
         elif active_job:
             print(f"[Metadata] Found in active_jobs: user_id={active_user_id}")
-            return {"user_id": active_user_id}
+            return {"user_id": active_user_id, "identity_id": active_user_id}
+        elif job_fallback:
+            print(f"[Metadata] Found in billing jobs: user_id={job_fallback.get('user_id')}")
+            return job_fallback
         else:
             print(f"[Metadata] Not found in database for job_id={job_id}")
     except Exception as e:
@@ -4193,10 +4237,6 @@ def api_text_to_3d_start():
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-preview"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
-
     payload = {
         "mode": "preview",
         "prompt": prompt,
@@ -4220,10 +4260,31 @@ def api_text_to_3d_start():
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
     batch_group_id = (body.get("batch_group_id") or "").strip() or None
 
+    job_meta = {
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": prompt[:50] if prompt else DEFAULT_MODEL_TITLE,
+        "title": prompt[:50] if prompt else None,
+        "stage": "preview",
+        "art_style": art_style or "realistic",
+        "model": payload["ai_model"],
+        "license": license_choice,
+        "symmetry_mode": payload.get("symmetry_mode", "auto"),
+        "is_a_t_pose": bool(body.get("is_a_t_pose")),
+        "batch_count": batch_count,
+        "batch_slot": batch_slot,
+        "batch_group_id": batch_group_id,
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
+
     # ─── 3. Build store metadata for async dispatch ───
     store_meta = {
         "stage": "preview",
         "prompt": prompt,
+        "title": f"(remesh) {prompt[:40]}" if prompt else f"(remesh) {DEFAULT_MODEL_TITLE}",
         "root_prompt": prompt,
         "art_style": art_style or "realistic",
         "model": payload["ai_model"],
@@ -4289,24 +4350,41 @@ def api_text_to_3d_refine():
     if not MESHY_API_KEY:
         return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
+    # Resolve to original Meshy job ID if this is our database UUID
+    preview_task_id = resolve_meshy_job_id(preview_task_id_input)
+    print(f"[Refine] Resolved preview_task_id: {preview_task_id_input} -> {preview_task_id}")
+
+    store = load_store()
+    preview_meta = get_job_metadata(preview_task_id_input, store)
+    if not preview_meta.get("prompt"):
+        preview_meta = get_job_metadata(preview_task_id, store)
+    original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = preview_meta.get("root_prompt") or original_prompt
+    texture_prompt = body.get("texture_prompt")
+    title = f"(refine) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE)
+
     # ─── 2. Generate internal job ID (UUID) and reserve credits ───
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-refine"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": "refine",
+        "preview_task_id": preview_task_id,
+    }
+    if texture_prompt:
+        job_meta["texture_prompt"] = texture_prompt
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
         return credit_error
-
-    # Resolve to original Meshy job ID if this is our database UUID
-    preview_task_id = resolve_meshy_job_id(preview_task_id_input)
-    print(f"[Refine] Resolved preview_task_id: {preview_task_id_input} -> {preview_task_id}")
 
     payload = {
         "mode": "refine",
         "preview_task_id": preview_task_id,
         "enable_pbr": bool(body.get("enable_pbr", True)),
     }
-    texture_prompt = body.get("texture_prompt")
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
 
@@ -4325,19 +4403,13 @@ def api_text_to_3d_refine():
     # ─── 4. Job started successfully - finalize credits ───
     finalize_job_credits(reservation_id, meshy_task_id)
 
-    store = load_store()
-    preview_meta = get_job_metadata(preview_task_id_input, store)
-    if not preview_meta.get("prompt"):
-        preview_meta = get_job_metadata(preview_task_id, store)
-    original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = preview_meta.get("root_prompt") or original_prompt
     store[meshy_task_id] = {
         "stage": "refine",
         "preview_task_id": preview_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
         "root_prompt": root_prompt,
-        "title": f"(refine) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "title": title,
         "art_style": preview_meta.get("art_style"),
         "texture_prompt": texture_prompt,
         "user_id": user_id,
@@ -4382,10 +4454,6 @@ def api_text_to_3d_remesh_start():
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
-
     payload = {
         "mode": "preview",
         "prompt": prompt,
@@ -4406,6 +4474,25 @@ def api_text_to_3d_remesh_start():
     license_choice = normalize_license(body.get("license"))
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
+
+    job_meta = {
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": prompt[:50] if prompt else None,
+        "stage": "preview",
+        "art_style": payload.get("art_style"),
+        "model": payload.get("ai_model"),
+        "license": license_choice,
+        "symmetry_mode": payload.get("symmetry_mode", "auto"),
+        "is_a_t_pose": bool(body.get("is_a_t_pose")),
+        "batch_count": batch_count,
+        "batch_slot": batch_slot,
+        "remesh_like": True,
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
 
     # ─── 3. Call Meshy API ───
     try:
@@ -4536,7 +4623,11 @@ def api_text_to_3d_status(job_id):
     # persist last-known bits
     store = load_store()
     # Get metadata from local store OR database (in case server restarted)
-    meta = store.get(job_id) or get_job_metadata(job_id, store) or {}
+    meta = (store.get(job_id) or store.get(meshy_job_id)
+            or get_job_metadata(meshy_job_id, store) or get_job_metadata(job_id, store) or {})
+    if identity_id and not meta.get("identity_id"):
+        meta["identity_id"] = identity_id
+        meta["user_id"] = identity_id
     # surface stored batch metadata back to caller if Meshy doesn't return it
     for key in ("batch_count", "batch_slot", "batch_group_id", "license", "symmetry_mode", "is_a_t_pose"):
         if key in meta and key not in out:
@@ -4555,7 +4646,7 @@ def api_text_to_3d_status(job_id):
 
     # Save to normalized DB tables when job finishes
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
-        user_id = meta.get("user_id") or getattr(g, 'user_id', None)
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type='text-to-3d', user_id=user_id)
 
         # Update response with S3 URLs so frontend gets permanent URLs
@@ -4808,10 +4899,6 @@ def api_mesh_remesh():
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
-
     payload = {
         **source,
         "target_formats": body.get("target_formats") or ["glb"],
@@ -4840,6 +4927,27 @@ def api_mesh_remesh():
     if body.get("convert_format_only") is not None:
         payload["convert_format_only"] = bool(body.get("convert_format_only"))
 
+    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    store = load_store()
+    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    title = f"(remesh) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE)
+
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": "remesh",
+        "source_task_id": source_task_id,
+        "topology": topology,
+        "target_polycount": payload.get("target_polycount"),
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
+
     # ─── 3. Call Meshy API ───
     try:
         resp = mesh_post("/openapi/v1/remesh", payload)
@@ -4855,18 +4963,13 @@ def api_mesh_remesh():
     # ─── 4. Job started successfully - finalize credits ───
     finalize_job_credits(reservation_id, meshy_task_id)
 
-    store = load_store()
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
     store[meshy_task_id] = {
         "stage": "remesh",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
         "root_prompt": root_prompt,
-        "title": f"(remesh) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "title": title,
         "topology": topology,
         "target_polycount": payload.get("target_polycount"),
         "user_id": user_id,
@@ -4914,6 +5017,9 @@ def api_mesh_remesh_status(job_id):
         store = load_store()
         # Get metadata from local store OR database (in case server restarted)
         meta = get_job_metadata(job_id, store)
+        if identity_id and not meta.get("identity_id"):
+            meta["identity_id"] = identity_id
+            meta["user_id"] = identity_id
 
         # Always try to get prompt/title from source task if not set
         source_id = meta.get("source_task_id") or out.get("source_task_id")
@@ -4929,7 +5035,7 @@ def api_mesh_remesh_status(job_id):
             prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
             meta["title"] = f"(remesh) {prompt_for_title[:40]}" if prompt_for_title else f"(remesh) {DEFAULT_MODEL_TITLE}"
 
-        user_id = meta.get("user_id") or getattr(g, 'user_id', None)
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type='remesh', user_id=user_id)
 
         # Update response with S3 URLs so frontend gets permanent URLs
@@ -4976,7 +5082,25 @@ def api_mesh_retexture():
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["texture"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, {"texture_prompt": prompt[:100] if prompt else None})
+
+    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    store = load_store()
+    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    title = f"(texture) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE)
+
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": "texture",
+        "source_task_id": source_task_id,
+        "texture_prompt": prompt or None,
+        "enable_pbr": bool(body.get("enable_pbr", False)),
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
         return credit_error
 
@@ -5009,18 +5133,13 @@ def api_mesh_retexture():
     finalize_job_credits(reservation_id, meshy_task_id)
 
     # Save metadata to store (checks local store AND database for source)
-    store = load_store()
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
     store[meshy_task_id] = {
         "stage": "texture",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
         "root_prompt": root_prompt,
-        "title": f"(texture) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "title": title,
         "texture_prompt": prompt,
         "enable_pbr": bool(body.get("enable_pbr", False)),
         "user_id": user_id,
@@ -5069,6 +5188,9 @@ def api_mesh_retexture_status(job_id):
         store = load_store()
         # Get metadata from local store OR database (in case server restarted)
         meta = get_job_metadata(job_id, store)
+        if identity_id and not meta.get("identity_id"):
+            meta["identity_id"] = identity_id
+            meta["user_id"] = identity_id
         print(f"[Texture] Job {job_id} done, meta={meta}")
 
         # Always try to get prompt/title from source task if not set
@@ -5086,7 +5208,7 @@ def api_mesh_retexture_status(job_id):
             prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
             meta["title"] = f"(texture) {prompt_for_title[:40]}" if prompt_for_title else f"(texture) {DEFAULT_MODEL_TITLE}"
 
-        user_id = meta.get("user_id") or getattr(g, 'user_id', None)
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         print(f"[Texture] Saving to DB: title={meta.get('title')}, user_id={user_id}")
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type='texture', user_id=user_id)
 
@@ -5133,10 +5255,6 @@ def api_mesh_rigging():
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["rig"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id)
-    if credit_error:
-        return credit_error
-
     payload = {**source}
     try:
         h = float(body.get("height_meters"))
@@ -5147,6 +5265,25 @@ def api_mesh_rigging():
     tex_img = (body.get("texture_image_url") or "").strip()
     if tex_img:
         payload["texture_image_url"] = tex_img
+
+    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    store = load_store()
+    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    title = f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE)
+
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": "rigging",
+        "source_task_id": source_task_id,
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
 
     # ─── 3. Call Meshy API ───
     try:
@@ -5164,18 +5301,13 @@ def api_mesh_rigging():
     finalize_job_credits(reservation_id, meshy_task_id)
 
     # Save metadata to store (checks local store AND database for source)
-    store = load_store()
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
     store[meshy_task_id] = {
         "stage": "rigging",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
         "root_prompt": root_prompt,
-        "title": f"(rigged) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE),
+        "title": title,
         "user_id": user_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -5222,6 +5354,9 @@ def api_mesh_rigging_status(job_id):
         store = load_store()
         # Get metadata from local store OR database (in case server restarted)
         meta = get_job_metadata(job_id, store)
+        if identity_id and not meta.get("identity_id"):
+            meta["identity_id"] = identity_id
+            meta["user_id"] = identity_id
 
         # Always try to get prompt/title from source task if not set
         source_id = meta.get("source_task_id") or out.get("source_task_id")
@@ -5237,7 +5372,7 @@ def api_mesh_rigging_status(job_id):
             prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
             meta["title"] = f"(rigged) {prompt_for_title[:40]}" if prompt_for_title else f"(rigged) {DEFAULT_MODEL_TITLE}"
 
-        user_id = meta.get("user_id") or getattr(g, 'user_id', None)
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type='rig', user_id=user_id)
 
         # Update response with S3 URLs so frontend gets permanent URLs
@@ -5283,11 +5418,17 @@ def api_image_to_3d_start():
     # CRITICAL: internal_job_id must be a valid UUID for ref_job_id column
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["image-to-3d"]
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, {"prompt": (body.get("prompt") or "")[:100]})
+    prompt = (body.get("prompt") or "").strip()
+    job_meta = {
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
+        "stage": "image3d",
+    }
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
         return credit_error
 
-    prompt = (body.get("prompt") or "").strip()
     payload = {
         "image_url": image_url,  # Send original URL to Meshy (they need to fetch it)
         "prompt": prompt,
@@ -5414,6 +5555,9 @@ def api_image_to_3d_status(job_id):
     # Get metadata from local store
     store = load_store()
     meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
+    if identity_id and not meta.get("identity_id"):
+        meta["identity_id"] = identity_id
+        meta["user_id"] = identity_id
 
     # Save to normalized DB tables when job finishes
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
@@ -5428,7 +5572,7 @@ def api_image_to_3d_status(job_id):
             prompt_for_title = meta.get("prompt") or ""
             meta["title"] = f"(image-to-3d) {prompt_for_title[:40]}" if prompt_for_title else f"(image-to-3d) {DEFAULT_MODEL_TITLE}"
 
-        user_id = meta.get("user_id") or getattr(g, 'user_id', None)
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type='image-to-3d', user_id=user_id)
 
         # Update response with S3 URLs so frontend gets permanent URLs
@@ -5605,7 +5749,7 @@ def api_openai_image_status(job_id):
             if conn:
                 cursor = conn.cursor(row_factory=dict_row)
                 cursor.execute("""
-                    SELECT id, status, error_message
+                    SELECT id, status, error_message, meta
                     FROM timrx_billing.jobs
                     WHERE id::text = %s AND identity_id = %s
                     LIMIT 1
@@ -5614,6 +5758,13 @@ def api_openai_image_status(job_id):
                 conn.close()
 
                 if job:
+                    job_meta = job.get("meta") or {}
+                    if isinstance(job_meta, str):
+                        try:
+                            job_meta = json.loads(job_meta)
+                        except Exception:
+                            job_meta = {}
+
                     if job["status"] == "queued":
                         return jsonify({
                             "ok": True,
@@ -5631,17 +5782,18 @@ def api_openai_image_status(job_id):
                         })
 
                     if job["status"] == "ready":
-                        # Job completed - return results from store
+                        image_url = meta.get("image_url") or job_meta.get("image_url")
+                        image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
                         return jsonify({
                             "ok": True,
                             "status": "done",
                             "job_id": job_id,
                             "image_id": job_id,
-                            "image_url": meta.get("image_url"),
-                            "image_urls": meta.get("image_urls", []),
-                            "image_base64": meta.get("image_base64"),
-                            "model": meta.get("model"),
-                            "size": meta.get("size"),
+                            "image_url": image_url,
+                            "image_urls": image_urls,
+                            "image_base64": meta.get("image_base64") or job_meta.get("image_base64"),
+                            "model": meta.get("model") or job_meta.get("model"),
+                            "size": meta.get("size") or job_meta.get("size"),
                         })
         except Exception as e:
             print(f"[STATUS] Error checking OpenAI job {job_id}: {e}")
