@@ -1,4 +1,3 @@
-
 """
 True modular entrypoint.
 
@@ -42,30 +41,9 @@ def create_app() -> Flask:
         g.user_id = None
 
     # Import and register modular blueprints.
-    from backend.routes.health import bp as health_bp
-    from backend.routes.assets import bp as assets_bp
-    from backend.routes.image_gen import bp as image_gen_bp
-    from backend.routes.text_to_3d import bp as text_to_3d_bp
-    from backend.routes.image_to_3d import bp as image_to_3d_bp
-    from backend.routes.mesh_operations import bp as mesh_ops_bp
-    from backend.routes.history import bp as history_bp
-    from backend.routes.community import bp as community_bp
     from backend.routes import register_blueprints
 
-    # Register under the /api/_mod prefix to keep compatibility with frontend.
-    for bp in (
-        health_bp,
-        assets_bp,
-        image_gen_bp,
-        text_to_3d_bp,
-        image_to_3d_bp,
-        mesh_ops_bp,
-        history_bp,
-        community_bp,
-    ):
-        app.register_blueprint(bp, url_prefix="/api/_mod")
-
-    # Register core API routes (auth, billing, credits, etc.) under /api.
+    # Register all blueprints (core + migrated) in one place.
     register_blueprints(app)
 
     return app
