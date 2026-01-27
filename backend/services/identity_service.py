@@ -871,4 +871,3 @@ def require_identity() -> tuple[str | None, Response | None]:
         }),
         401,
     )
-
