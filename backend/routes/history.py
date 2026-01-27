@@ -575,7 +575,6 @@ def history_item_update_mod(item_id: str):
         if request.method == "DELETE":
             db_ok = False
             db_errors: list[dict[str, str]] = []
-            s3_deleted = 0
             if USE_DB:
                 conn = get_conn()
                 if not conn:
