@@ -3,42 +3,29 @@ Routes package for TimrX Backend.
 Contains Flask Blueprints for different API namespaces.
 """
 
-from .me import bp as me_bp
-from .billing import bp as billing_bp
-from .auth import bp as auth_bp
-from .admin import bp as admin_bp
-from .jobs import bp as jobs_bp
-from .credits import bp as credits_bp
-
-from .health import bp as health_bp
-from .assets import bp as assets_bp
-from .image_gen import bp as image_gen_bp
-from .text_to_3d import bp as text_to_3d_bp
-from .image_to_3d import bp as image_to_3d_bp
-from .mesh_operations import bp as mesh_ops_bp
-from .history import bp as history_bp
-from .community import bp as community_bp
-
 __all__ = [
-    "me_bp",
-    "billing_bp",
-    "auth_bp",
-    "admin_bp",
-    "jobs_bp",
-    "credits_bp",
-    "health_bp",
-    "assets_bp",
-    "image_gen_bp",
-    "text_to_3d_bp",
-    "image_to_3d_bp",
-    "mesh_ops_bp",
-    "history_bp",
-    "community_bp",
+    "register_blueprints",
 ]
 
 
 def register_blueprints(app):
     """Register all blueprints with the Flask app."""
+    from .me import bp as me_bp
+    from .billing import bp as billing_bp
+    from .auth import bp as auth_bp
+    from .admin import bp as admin_bp
+    from .jobs import bp as jobs_bp
+    from .credits import bp as credits_bp
+
+    from .health import bp as health_bp
+    from .assets import bp as assets_bp
+    from .image_gen import bp as image_gen_bp
+    from .text_to_3d import bp as text_to_3d_bp
+    from .image_to_3d import bp as image_to_3d_bp
+    from .mesh_operations import bp as mesh_ops_bp
+    from .history import bp as history_bp
+    from .community import bp as community_bp
+
     app.register_blueprint(me_bp, url_prefix="/api/me")
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
