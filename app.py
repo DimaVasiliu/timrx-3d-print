@@ -3213,6 +3213,80 @@ def _dispatch_meshy_text_to_3d_async(
         _update_job_status_failed(internal_job_id, str(e))
 
 
+
+def _dispatch_meshy_refine_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+):
+    """
+    Background task to call Meshy text-to-3d refine API.
+    Called via ThreadPoolExecutor after /refine returns.
+
+    Credits remain HELD until a finished asset is saved to DB+S3.
+    """
+    start_time = time.time()
+    print(f"[ASYNC] Starting Meshy refine dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=refine reservation_id={reservation_id}")
+
+    try:
+        resp = mesh_post("/openapi/v2/text-to-3d", payload)
+        meshy_task_id = resp.get("result")
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(
+            f"[ASYNC] Meshy refine returned task_id={meshy_task_id} "
+            f"for job {internal_job_id} in {duration_ms}ms"
+        )
+        print(
+            f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} "
+            f"upstream_id={meshy_task_id} status=accepted"
+        )
+
+        if not meshy_task_id:
+            error_msg = "Meshy refine returned no task ID"
+            print(f"[ASYNC] ERROR: {error_msg} for job {internal_job_id}")
+            if reservation_id:
+                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            _update_job_status_failed(internal_job_id, error_msg)
+            return
+
+        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
+
+        store = load_store()
+        store_meta["upstream_job_id"] = meshy_task_id
+        store[meshy_task_id] = store_meta
+        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}
+        save_store(store)
+
+        save_active_job_to_db(
+            meshy_task_id,
+            "text-to-3d",
+            store_meta.get("stage", "refine"),
+            store_meta,
+            identity_id,
+        )
+
+        print(
+            f"[ASYNC] Refine job {internal_job_id} dispatched successfully, "
+            f"meshy_task_id={meshy_task_id}"
+        )
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        err_text = str(e)
+        print(
+            f"[ASYNC] ERROR: Meshy refine call failed for job {internal_job_id} "
+            f"after {duration_ms}ms: {err_text}"
+        )
+
+        if reservation_id:
+            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+
+        _update_job_status_failed(internal_job_id, err_text)
+
 def _dispatch_meshy_image_to_3d_async(
     internal_job_id: str,
     identity_id: str,
@@ -4388,22 +4462,8 @@ def api_text_to_3d_refine():
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
 
-    # ─── 3. Call Meshy API ───
-    try:
-        resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        log_event("text-to-3d/refine:meshy-resp", resp)
-        meshy_task_id = resp.get("result")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
-    except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"ok": False, "error": str(e)}), 502
-
-    # ─── 4. Job started successfully - finalize credits ───
-    finalize_job_credits(reservation_id, meshy_task_id)
-
-    store[meshy_task_id] = {
+    # ─── 3. Build store metadata for async dispatch ───
+    store_meta = {
         "stage": "refine",
         "preview_task_id": preview_task_id,
         "created_at": now_s() * 1000,
@@ -4417,17 +4477,27 @@ def api_text_to_3d_refine():
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
-    save_store(store)
 
-    save_active_job_to_db(meshy_task_id, "text-to-3d", "refine", store[meshy_task_id], user_id)
+    # ─── 4. Dispatch Meshy API call to background (NON-BLOCKING) ───
+    _background_executor.submit(
+        _dispatch_meshy_refine_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        payload,
+        store_meta,
+    )
 
-    # ─── 5. Return success with balance ───
+    log_event("text-to-3d/refine:dispatched", {"internal_job_id": internal_job_id})
+
+    # ─── 5. Return immediately with internal job ID ───
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
-        "job_id": meshy_task_id,
+        "job_id": internal_job_id,
         "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
     })
 
 # ---- (Soft) Remesh start (re-run preview with flags) ----
@@ -4564,7 +4634,7 @@ def api_text_to_3d_status(job_id):
                 cursor = conn.cursor(row_factory=dict_row)
                 # Check if job_id is our internal UUID
                 cursor.execute("""
-                    SELECT id, status, upstream_job_id, error_message
+                    SELECT id, status, upstream_job_id, error_message, meta
                     FROM timrx_billing.jobs
                     WHERE id::text = %s AND identity_id = %s
                     LIMIT 1
@@ -4574,12 +4644,20 @@ def api_text_to_3d_status(job_id):
 
                 if internal_job:
                     # This is an internal job ID
+                    job_meta = internal_job.get("meta") or {}
+                    if isinstance(job_meta, str):
+                        try:
+                            job_meta = json.loads(job_meta)
+                        except Exception:
+                            job_meta = {}
+                    stage_hint = job_meta.get("stage") or "preview"
+
                     if internal_job["status"] == "queued":
                         # Job is still being dispatched to Meshy
                         return jsonify({
                             "status": "queued",
                             "pct": 0,
-                            "stage": "preview",
+                            "stage": stage_hint,
                             "message": "Job is being dispatched to provider...",
                             "job_id": job_id,
                         })
