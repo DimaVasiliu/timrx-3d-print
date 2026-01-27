@@ -102,6 +102,62 @@ except ImportError as e:
     print(f"[WARN] credits blueprint not loaded: {e}")
     credits_bp = None
 
+# Modular migration: health blueprint (registered under /api/_mod)
+try:
+    from health import bp as health_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular health blueprint not loaded: {e}")
+    health_mod_bp = None
+
+# Modular migration: assets blueprint (registered under /api/_mod)
+try:
+    from assets import bp as assets_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular assets blueprint not loaded: {e}")
+    assets_mod_bp = None
+
+# Modular migration: image generation blueprint (registered under /api/_mod)
+try:
+    from image_gen import bp as image_gen_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular image_gen blueprint not loaded: {e}")
+    image_gen_mod_bp = None
+
+# Modular migration: text-to-3d blueprint (registered under /api/_mod)
+try:
+    from text_to_3d import bp as text_to_3d_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular text_to_3d blueprint not loaded: {e}")
+    text_to_3d_mod_bp = None
+
+# Modular migration: image-to-3d blueprint (registered under /api/_mod)
+try:
+    from image_to_3d import bp as image_to_3d_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular image_to_3d blueprint not loaded: {e}")
+    image_to_3d_mod_bp = None
+
+# Modular migration: mesh operations blueprint (registered under /api/_mod)
+try:
+    from mesh_operations import bp as mesh_ops_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular mesh_operations blueprint not loaded: {e}")
+    mesh_ops_mod_bp = None
+
+# Modular migration: history blueprint (registered under /api/_mod)
+try:
+    from history import bp as history_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular history blueprint not loaded: {e}")
+    history_mod_bp = None
+
+# Modular migration: community blueprint (registered under /api/_mod)
+try:
+    from community import bp as community_mod_bp
+except ImportError as e:
+    print(f"[WARN] modular community blueprint not loaded: {e}")
+    community_mod_bp = None
+
 # Import DatabaseError for error handler
 try:
     from db import DatabaseError
@@ -413,226 +469,77 @@ MESHY_STATUS_MAP = {
 }
 
 def ensure_s3_url_for_data_uri(url: str, prefix: str, key_base: str, user_id: str = None, name: str = None, provider: str = None) -> str:
-    if not isinstance(url, str) or not url.startswith("data:"):
-        return url
-    try:
-        s3_url = safe_upload_to_s3(
-            url,
-            "image/png",
-            prefix,
-            name or prefix,
-            user_id=user_id,
-            key_base=key_base,
-            provider=provider,
-        )
-    except Exception as e:
-        print(f"[S3] ERROR: Failed to upload data URI for {prefix}: {e}")
-        return None
-    if isinstance(s3_url, str) and s3_url.startswith("data:"):
-        return None
-    return s3_url
+    """Delegate to the modular S3 service implementation."""
+    from backend.services.s3_service import ensure_s3_url_for_data_uri as _ensure_s3_url_for_data_uri
+
+    return _ensure_s3_url_for_data_uri(url=url, prefix=prefix, key_base=key_base, user_id=user_id, name=name, provider=provider)
+
 
 def upload_bytes_to_s3(data_bytes: bytes, content_type: str = "application/octet-stream", prefix: str = "models", name: str = None, user_id: str = None, key: str = None, return_hash: bool = False) -> str:
-    """
-    Upload raw bytes to S3 and return the public URL.
-    Key structure: {prefix}/{user_id}/{name}_{uuid}{ext} or {prefix}/{user_id}/{uuid}{ext}
+    """Delegate to the modular S3 service implementation."""
+    from backend.services.s3_service import upload_bytes_to_s3 as _upload_bytes_to_s3
 
-    Args:
-        data_bytes: Raw bytes to upload
-        content_type: MIME type of the content
-        prefix: folder prefix, e.g. 'models', 'images', 'thumbnails'
-        name: optional human-readable name to include in the key
-        user_id: REQUIRED - user UUID for namespacing (raises error if missing)
-    """
-    if not AWS_BUCKET_MODELS:
-        print("[S3] ERROR: AWS_BUCKET_MODELS not configured!")
-        raise RuntimeError("AWS_BUCKET_MODELS not configured")
+    return _upload_bytes_to_s3(
+        data_bytes=data_bytes,
+        content_type=content_type,
+        prefix=prefix,
+        name=name,
+        user_id=user_id,
+        key=key,
+        return_hash=return_hash,
+    )
 
-    if not key:
-        if not user_id:
-            print("[S3] ERROR: user_id required for S3 upload (per-user namespacing)")
-            raise ValueError("user_id required for S3 upload")
-
-        # Get file extension based on content type
-        ext = get_extension_for_content_type(content_type)
-
-        # Build key with user namespace: {prefix}/{user_id}/{name}_{uuid}{ext}
-        unique_id = uuid.uuid4().hex[:12]  # Shorter unique ID
-        if name:
-            safe_name = sanitize_filename(name)
-            key = f"{prefix}/{user_id}/{safe_name}_{unique_id}{ext}" if safe_name else f"{prefix}/{user_id}/{unique_id}{ext}"
-        else:
-            key = f"{prefix}/{user_id}/{unique_id}{ext}"
-    else:
-        key = ensure_s3_key_ext(key.lstrip("/"), content_type)
-
-    content_hash = compute_sha256(data_bytes) if return_hash else None
-    if s3_key_exists(key):
-        s3_url = build_s3_url(key)
-        print(f"[S3] SKIP: Key exists -> {s3_url}")
-        return _wrap_upload_result(s3_url, content_hash, return_hash, s3_key=key, reused=True)
-
-    print(f"[S3] Uploading {len(data_bytes)} bytes to bucket={AWS_BUCKET_MODELS}, key={key}, content_type={content_type}")
-    try:
-        s3.put_object(
-            Bucket=AWS_BUCKET_MODELS,
-            Key=key,
-            Body=data_bytes,
-            ContentType=content_type,
-            ACL='public-read',  # Make the object publicly readable
-        )
-        s3_url = build_s3_url(key)
-        print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
-        return _wrap_upload_result(s3_url, content_hash, return_hash, s3_key=key, reused=False)
-    except Exception as e:
-        print(f"[S3] ERROR: put_object failed for {key}: {e}")
-        print(f"[S3] HINT: If you see AccessControlListNotSupported, disable 'Block public access' in S3 bucket settings")
-        import traceback
-        traceback.print_exc()
-        raise
 
 def upload_url_to_s3(url: str, content_type: str = None, prefix: str = "models", name: str = None, user_id: str = None, key: str = None, return_hash: bool = False) -> str:
-    """
-    Download file from URL and upload to S3.
-    Returns the S3 public URL.
+    """Delegate to the modular S3 service implementation."""
+    from backend.services.s3_service import upload_url_to_s3 as _upload_url_to_s3
 
-    Args:
-        url: URL to download from
-        content_type: MIME type (auto-detected if None)
-        prefix: folder prefix
-        name: optional human-readable name to include in the key
-        user_id: REQUIRED - user UUID for namespacing
-    """
-    if key:
-        key = ensure_s3_key_ext(key.lstrip("/"), content_type or "application/octet-stream")
-        if s3_key_exists(key):
-            s3_url = build_s3_url(key)
-            print(f"[S3] SKIP: Key exists -> {s3_url}")
-            return _wrap_upload_result(s3_url, None, return_hash, s3_key=key, reused=True)
+    return _upload_url_to_s3(
+        url=url,
+        content_type=content_type,
+        prefix=prefix,
+        name=name,
+        user_id=user_id,
+        key=key,
+        return_hash=return_hash,
+    )
 
-    print(f"[S3] Downloading from URL: {url[:100]}...")
-    resp = requests.get(url, timeout=120)
-    resp.raise_for_status()
-    ct = content_type or resp.headers.get("Content-Type", "application/octet-stream")
-    print(f"[S3] Downloaded {len(resp.content)} bytes, content-type={ct}")
-    return upload_bytes_to_s3(resp.content, ct, prefix, name, user_id, key=key, return_hash=return_hash)
 
 def safe_upload_to_s3(url: str, content_type: str, prefix: str, name: str = None, user_id: str = None, key: str = None, key_base: str = None, infer_content_type: bool = True, return_hash: bool = False, upstream_id: str = None, stage: str = None, provider: str = None) -> str:
-    """
-    Safely upload URL to S3 using a deterministic hash-based key.
-    Always downloads/decodes to bytes to compute the content hash.
+    """Delegate to the modular S3 service implementation."""
+    from backend.services.s3_service import safe_upload_to_s3 as _safe_upload_to_s3
 
-    Args:
-        url: URL to upload (or base64 data URL)
-        content_type: MIME type
-        prefix: folder prefix
-        name: optional human-readable name (unused for deterministic keys)
-        provider: asset provider namespace for hash-based keys
-    """
-    original_url = url
-    if isinstance(url, dict):
-        url = url.get("url") or url.get("href")
-    if not isinstance(url, str):
-        print(f"[S3] SKIP: URL not a string for {prefix} (type={type(original_url).__name__})")
-        return _wrap_upload_result(original_url, None, return_hash)
-    url_preview = (url[:60] if isinstance(url, str) else str(url)[:60]) if url is not None else "None"
-    if infer_content_type:
-        inferred_type = "application/octet-stream"
-        if url and not url.startswith("data:"):
-            inferred_type = get_content_type_from_url(url)
-            if inferred_type != "application/octet-stream":
-                content_type = inferred_type
-    print(f"[S3] safe_upload_to_s3 called: prefix={prefix}, provider={provider}, url={url_preview}...")
-    if not url:
-        print(f"[S3] SKIP: No URL provided for {prefix}")
-        return _wrap_upload_result(url, None, return_hash)
-    if not AWS_BUCKET_MODELS:
-        msg = "[S3] SKIP: AWS_BUCKET_MODELS not configured, returning original URL"
-        if REQUIRE_AWS_UPLOADS:
-            raise RuntimeError(msg)
-        print(msg)
-        return _wrap_upload_result(url, None, return_hash)
-    if REQUIRE_AWS_UPLOADS and (not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY):
-        raise RuntimeError("[S3] AWS credentials not configured")
-    if is_s3_url(url):
-        s3_key = get_s3_key_from_url(url)
-        return _wrap_upload_result(url, None, return_hash, s3_key=s3_key, reused=True)
+    return _safe_upload_to_s3(
+        url=url,
+        content_type=content_type,
+        prefix=prefix,
+        name=name,
+        user_id=user_id,
+        key=key,
+        key_base=key_base,
+        infer_content_type=infer_content_type,
+        return_hash=return_hash,
+        upstream_id=upstream_id,
+        stage=stage,
+        provider=provider,
+    )
 
-    resolved_type = content_type or "application/octet-stream"
-    data_bytes = None
-    try:
-        if url.startswith("data:"):
-            header, b64data = url.split(",", 1)
-            if ":" in header and ";" in header:
-                resolved_type = header.split(":")[1].split(";")[0] or resolved_type
-            data_bytes = base64.b64decode(b64data)
-        else:
-            print(f"[S3] Downloading from URL: {url[:100]}...")
-            resp = requests.get(url, timeout=120)
-            resp.raise_for_status()
-            if infer_content_type:
-                header_type = resp.headers.get("Content-Type")
-                if header_type:
-                    resolved_type = header_type
-            data_bytes = resp.content
-            print(f"[S3] Downloaded {len(data_bytes)} bytes, content-type={resolved_type}")
-    except Exception as e:
-        print(f"[S3] ERROR: Failed to fetch bytes for {prefix}: {e}")
-        raise
-
-    content_hash = compute_sha256(data_bytes)
-    s3_key = build_hash_s3_key(prefix, provider, content_hash, resolved_type)
-    if s3_key_exists(s3_key):
-        s3_url = build_s3_url(s3_key)
-        print(f"[S3] SKIP: Key exists -> {s3_url}")
-        return _wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=True)
-
-    print(f"[S3] Uploading {len(data_bytes)} bytes to bucket={AWS_BUCKET_MODELS}, key={s3_key}, content_type={resolved_type}")
-    try:
-        s3.put_object(
-            Bucket=AWS_BUCKET_MODELS,
-            Key=s3_key,
-            Body=data_bytes,
-            ContentType=resolved_type,
-            ACL='public-read',
-        )
-        s3_url = build_s3_url(s3_key)
-        print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
-        return _wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=False)
-    except Exception as e:
-        print(f"[S3] ERROR: Failed to upload {prefix}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
 
 def upload_base64_to_s3(data_url: str, prefix: str = "images", name: str = None, user_id: str = None, key: str = None, key_base: str = None, return_hash: bool = False) -> str:
-    """
-    Upload a base64 data URL to S3 and return the public URL.
+    """Delegate to the modular S3 service implementation."""
+    from backend.services.s3_service import upload_base64_to_s3 as _upload_base64_to_s3
 
-    Args:
-        data_url: base64 data URL (data:image/png;base64,...)
-        prefix: folder prefix
-        name: optional human-readable name to include in the key
-        user_id: REQUIRED - user UUID for namespacing
-    """
-    try:
-        # Parse data URL: data:image/png;base64,iVBORw0K...
-        header, b64data = data_url.split(",", 1)
-        # Extract mime type
-        mime = "image/png"
-        if ":" in header and ";" in header:
-            mime = header.split(":")[1].split(";")[0]
+    return _upload_base64_to_s3(
+        data_url=data_url,
+        prefix=prefix,
+        name=name,
+        user_id=user_id,
+        key=key,
+        key_base=key_base,
+        return_hash=return_hash,
+    )
 
-        # Decode base64
-        image_bytes = base64.b64decode(b64data)
 
-        # Upload to S3
-        if key_base and not key:
-            key = ensure_s3_key_ext(key_base, mime)
-        return upload_bytes_to_s3(image_bytes, mime, prefix, name, user_id, key=key, return_hash=return_hash)
-    except Exception as e:
-        print(f"[S3] Failed to parse/upload base64: {e}")
-        raise
 
 MESHY_API_KEY  = os.getenv("MESHY_API_KEY", "").strip()
 MESHY_API_BASE = os.getenv("MESHY_API_BASE", "https://api.meshy.ai").rstrip("/")
@@ -810,6 +717,51 @@ for name, bp, prefix in _loaded_blueprints:
     app.register_blueprint(bp, url_prefix=prefix)
 # Log loaded blueprints for Render startup verification
 print(f"[BOOT] Loaded blueprints: {[name for name, _, _ in _loaded_blueprints]}")
+
+# Register modular health routes under a temporary prefix to avoid conflicts.
+if health_mod_bp is not None:
+    app.register_blueprint(health_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular health blueprint at /api/_mod")
+
+# Register modular assets routes under the same temporary prefix.
+if assets_mod_bp is not None:
+    app.register_blueprint(assets_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular assets blueprint at /api/_mod")
+
+
+# Register modular image generation routes under the same temporary prefix.
+if image_gen_mod_bp is not None:
+    app.register_blueprint(image_gen_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular image_gen blueprint at /api/_mod")
+
+
+# Register modular text-to-3d routes under the same temporary prefix.
+if text_to_3d_mod_bp is not None:
+    app.register_blueprint(text_to_3d_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular text_to_3d blueprint at /api/_mod")
+
+
+# Register modular image-to-3d routes under the same temporary prefix.
+if image_to_3d_mod_bp is not None:
+    app.register_blueprint(image_to_3d_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular image_to_3d blueprint at /api/_mod")
+
+# Register modular mesh operation routes under the same temporary prefix.
+if mesh_ops_mod_bp is not None:
+    app.register_blueprint(mesh_ops_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular mesh_operations blueprint at /api/_mod")
+
+
+# Register modular history routes under the same temporary prefix.
+if history_mod_bp is not None:
+    app.register_blueprint(history_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular history blueprint at /api/_mod")
+
+
+# Register modular community routes under the same temporary prefix.
+if community_mod_bp is not None:
+    app.register_blueprint(community_mod_bp, url_prefix="/api/_mod")
+    print("[BOOT] Registered modular community blueprint at /api/_mod")
 
 # ─────────────────────────────────────────────────────────────
 # GET /api/wallet - Simple wallet balance endpoint
@@ -3094,44 +3046,31 @@ def _auth_headers():
     return {"Authorization": f"Bearer {MESHY_API_KEY}", "Content-Type": "application/json"}
 
 def mesh_post(path: str, payload: dict) -> dict:
-    url = f"{MESHY_API_BASE}{path}"
-    r = requests.post(url, headers=_auth_headers(), json=payload, timeout=60)
-    if not r.ok:
-        raise RuntimeError(f"POST {path} -> {r.status_code}: {r.text[:500]}")
-    return r.json()
+    """Delegate to the modular Meshy service implementation."""
+    from backend.services.meshy_service import mesh_post as _mesh_post
+
+    return _mesh_post(path, payload)
+
 
 def mesh_get(path: str) -> dict:
-    url = f"{MESHY_API_BASE}{path}"
-    r = requests.get(url, headers=_auth_headers(), timeout=60)
-    if not r.ok:
-        raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:500]}")
-    return r.json()
+    """Delegate to the modular Meshy service implementation."""
+    from backend.services.meshy_service import mesh_get as _mesh_get
+
+    return _mesh_get(path)
+
 
 # OpenAI image generation (DALL·E / GPT-Image)
-def openai_image_generate(prompt: str, size: str = "1024x1024", model: str = "gpt-image-1", n: int = 1, response_format: str = "url") -> dict:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    url = "https://api.openai.com/v1/images/generations"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "size": size,
-        "n": max(1, min(4, int(n or 1))),
-    }
-    # gpt-image-1 doesn't support response_format parameter
-    if model != "gpt-image-1":
-        payload["response_format"] = response_format
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if not r.ok:
-        raise RuntimeError(f"OpenAI image -> {r.status_code}: {r.text[:500]}")
-    try:
-        return r.json()
-    except Exception:
-        raise RuntimeError(f"OpenAI image returned non-JSON: {r.text[:200]}")
+def openai_image_generate(
+    prompt: str,
+    size: str = "1024x1024",
+    model: str = "gpt-image-1",
+    n: int = 1,
+    response_format: str = "url",
+) -> dict:
+    """Delegate to the modular OpenAI service implementation."""
+    from backend.services.openai_service import openai_image_generate as _openai_image_generate
+
+    return _openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
 
 # ─────────────────────────────────────────────────────────────
 # Background Job Dispatch - Async provider calls
@@ -3144,74 +3083,16 @@ def _dispatch_meshy_text_to_3d_async(
     payload: dict,
     store_meta: dict,
 ):
-    """
-    Background task to call Meshy text-to-3d API.
-    Called via ThreadPoolExecutor after /start returns.
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import dispatch_meshy_text_to_3d_async
 
-    Args:
-        internal_job_id: Our UUID job ID (already in jobs table)
-        identity_id: User's identity
-        reservation_id: Credit reservation to finalize/release
-        payload: Meshy API payload
-        store_meta: Metadata to save in local store
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=text-to-3d reservation_id={reservation_id}")
-
-    try:
-        # Call Meshy API
-        resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        meshy_task_id = resp.get("result")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
-
-        if not meshy_task_id:
-            # Meshy didn't return a task ID - release credits
-            print(f"[ASYNC] ERROR: No task_id from Meshy for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
-            return
-
-        # Provider accepted job - keep credits HELD (don't finalize yet)
-        # Credits will be captured when asset is successfully saved to DB+S3
-        # Credits will be released if job fails later
-
-        # Update job with upstream_job_id (status becomes 'processing')
-        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
-
-        # Save to local store (for status polling compatibility)
-        store = load_store()
-        store_meta["upstream_job_id"] = meshy_task_id
-        store[meshy_task_id] = store_meta  # Key by meshy_task_id for polling
-        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}  # Also key by internal ID
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(
-            meshy_task_id,
-            "text-to-3d",
-            store_meta.get("stage", "preview"),
-            store_meta,
-            identity_id
-        )
-
-        print(f"[ASYNC] Job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy call failed for job {internal_job_id} after {duration_ms}ms: {e}")
-
-        # Release credits on failure
-        if reservation_id:
-            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-
-        # Mark job as failed
-        _update_job_status_failed(internal_job_id, str(e))
-
+    return dispatch_meshy_text_to_3d_async(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        reservation_id=reservation_id,
+        payload=payload,
+        store_meta=store_meta,
+    )
 
 
 def _dispatch_meshy_refine_async(
@@ -3221,71 +3102,17 @@ def _dispatch_meshy_refine_async(
     payload: dict,
     store_meta: dict,
 ):
-    """
-    Background task to call Meshy text-to-3d refine API.
-    Called via ThreadPoolExecutor after /refine returns.
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import dispatch_meshy_refine_async
 
-    Credits remain HELD until a finished asset is saved to DB+S3.
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting Meshy refine dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=refine reservation_id={reservation_id}")
+    return dispatch_meshy_refine_async(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        reservation_id=reservation_id,
+        payload=payload,
+        store_meta=store_meta,
+    )
 
-    try:
-        resp = mesh_post("/openapi/v2/text-to-3d", payload)
-        meshy_task_id = resp.get("result")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(
-            f"[ASYNC] Meshy refine returned task_id={meshy_task_id} "
-            f"for job {internal_job_id} in {duration_ms}ms"
-        )
-        print(
-            f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} "
-            f"upstream_id={meshy_task_id} status=accepted"
-        )
-
-        if not meshy_task_id:
-            error_msg = "Meshy refine returned no task ID"
-            print(f"[ASYNC] ERROR: {error_msg} for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            _update_job_status_failed(internal_job_id, error_msg)
-            return
-
-        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
-
-        store = load_store()
-        store_meta["upstream_job_id"] = meshy_task_id
-        store[meshy_task_id] = store_meta
-        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}
-        save_store(store)
-
-        save_active_job_to_db(
-            meshy_task_id,
-            "text-to-3d",
-            store_meta.get("stage", "refine"),
-            store_meta,
-            identity_id,
-        )
-
-        print(
-            f"[ASYNC] Refine job {internal_job_id} dispatched successfully, "
-            f"meshy_task_id={meshy_task_id}"
-        )
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        err_text = str(e)
-        print(
-            f"[ASYNC] ERROR: Meshy refine call failed for job {internal_job_id} "
-            f"after {duration_ms}ms: {err_text}"
-        )
-
-        if reservation_id:
-            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-
-        _update_job_status_failed(internal_job_id, err_text)
 
 def _dispatch_meshy_image_to_3d_async(
     internal_job_id: str,
@@ -3295,95 +3122,17 @@ def _dispatch_meshy_image_to_3d_async(
     store_meta: dict,
     image_url: str,
 ):
-    """
-    Background task to call Meshy image-to-3d API.
-    Called via ThreadPoolExecutor after /start returns.
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import dispatch_meshy_image_to_3d_async
 
-    Args:
-        internal_job_id: Our UUID job ID (already in jobs table)
-        identity_id: User's identity
-        reservation_id: Credit reservation (stays HELD until asset saved)
-        payload: Meshy API payload
-        store_meta: Metadata to save in local store
-        image_url: Original image URL for S3 upload
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
-
-    try:
-        # Call Meshy API
-        resp = mesh_post("/openapi/v1/image-to-3d", payload)
-        meshy_task_id = resp.get("result") or resp.get("id")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Meshy image-to-3d returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
-
-        if not meshy_task_id:
-            # Meshy didn't return a task ID - release credits
-            print(f"[ASYNC] ERROR: No task_id from Meshy image-to-3d for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            _update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
-            return
-
-        # Provider accepted job - keep credits HELD (don't finalize yet)
-        # Credits will be captured when asset is successfully saved to DB+S3
-
-        # Update job with upstream_job_id (status becomes 'processing')
-        _update_job_with_upstream_id(internal_job_id, meshy_task_id)
-
-        # Upload source image to S3 for permanent storage
-        user_id = identity_id
-        s3_image_url = image_url
-        prompt = store_meta.get("prompt", "")
-        s3_name = prompt if prompt else "image_to_3d_source"
-
-        if AWS_BUCKET_MODELS:
-            try:
-                s3_image_url = safe_upload_to_s3(
-                    image_url,
-                    "image/png",
-                    "source_images",
-                    s3_name,
-                    user_id=user_id,
-                    key_base=f"source_images/{user_id or 'public'}/{meshy_task_id}",
-                    provider="user",
-                )
-                print(f"[ASYNC] Uploaded source image to S3: {s3_image_url}")
-            except Exception as e:
-                print(f"[ASYNC] Failed to upload source image to S3: {e}, using original URL")
-
-        # Save to local store (for status polling compatibility)
-        store = load_store()
-        store_meta["upstream_job_id"] = meshy_task_id
-        store_meta["image_url"] = s3_image_url
-        store[meshy_task_id] = store_meta  # Key by meshy_task_id for polling
-        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}
-        save_store(store)
-
-        # Save to DB for recovery
-        save_active_job_to_db(
-            meshy_task_id,
-            "image-to-3d",
-            "image3d",
-            store_meta,
-            identity_id
-        )
-
-        print(f"[ASYNC] Image-to-3d job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy image-to-3d call failed for job {internal_job_id} after {duration_ms}ms: {e}")
-
-        # Release credits on failure
-        if reservation_id:
-            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-
-        # Mark job as failed
-        _update_job_status_failed(internal_job_id, str(e))
+    return dispatch_meshy_image_to_3d_async(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        reservation_id=reservation_id,
+        payload=payload,
+        store_meta=store_meta,
+        image_url=image_url,
+    )
 
 
 def _dispatch_openai_image_async(
@@ -3397,135 +3146,34 @@ def _dispatch_openai_image_async(
     response_format: str,
     store_meta: dict,
 ):
-    """
-    Background task to call OpenAI image generation API.
-    Called via ThreadPoolExecutor after /start returns.
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import dispatch_openai_image_async
 
-    Unlike Meshy, OpenAI returns the image immediately so we:
-    - Call OpenAI
-    - Save image to DB + S3
-    - Capture credits
-    - Mark job as ready
-    """
-    start_time = time.time()
-    print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=openai action=image-gen reservation_id={reservation_id}")
-
-    try:
-        # Call OpenAI API
-        resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
-
-        data_list = resp.get("data") or []
-        urls = []
-        b64_first = None
-        for item in data_list:
-            if not isinstance(item, dict):
-                continue
-            if item.get("url"):
-                urls.append(item["url"])
-            elif item.get("b64_json"):
-                if not b64_first:
-                    b64_first = item["b64_json"]
-                urls.append(f"data:image/png;base64,{item['b64_json']}")
-
-        if not urls:
-            print(f"[ASYNC] ERROR: No images from OpenAI for job {internal_job_id}")
-            if reservation_id:
-                release_job_credits(reservation_id, "openai_no_images", internal_job_id)
-            _update_job_status_failed(internal_job_id, "OpenAI returned no images")
-            return
-
-        # Save image to normalized DB
-        save_image_to_normalized_db(
-            image_id=internal_job_id,
-            image_url=urls[0],
-            prompt=prompt,
-            ai_model=model,
-            size=size,
-            image_urls=urls,
-            user_id=identity_id
-        )
-        # Structured log for job lifecycle tracking
-        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id}")
-
-        # Update store with results
-        store = load_store()
-        store_meta["status"] = "done"
-        store_meta["image_url"] = urls[0]
-        store_meta["image_urls"] = urls
-        store_meta["image_base64"] = b64_first
-        store[internal_job_id] = store_meta
-        save_store(store)
-
-        # Capture credits - image saved successfully
-        if reservation_id:
-            finalize_job_credits(reservation_id, internal_job_id)
-            print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
-
-        # Mark job as ready with asset info
-        _update_job_status_ready(
-            internal_job_id,
-            upstream_job_id=None,
-            image_id=internal_job_id,  # Image ID is same as job ID for OpenAI
-            image_url=urls[0],
-        )
-
-        print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: OpenAI call failed for job {internal_job_id} after {duration_ms}ms: {e}")
-
-        # Release credits on failure
-        if reservation_id:
-            release_job_credits(reservation_id, "openai_api_error", internal_job_id)
-
-        # Mark job as failed
-        _update_job_status_failed(internal_job_id, str(e))
+    return dispatch_openai_image_async(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        reservation_id=reservation_id,
+        prompt=prompt,
+        size=size,
+        model=model,
+        n=n,
+        response_format=response_format,
+        store_meta=store_meta,
+    )
 
 
 def _update_job_with_upstream_id(job_id: str, upstream_job_id: str):
-    """Update job in timrx_billing.jobs with upstream_job_id and status='processing'."""
-    if not USE_DB:
-        return
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE timrx_billing.jobs
-                SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
-                WHERE id = %s
-            """, (upstream_job_id, job_id))
-            conn.commit()
-            conn.close()
-            print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
-    except Exception as e:
-        print(f"[ASYNC] ERROR updating job {job_id}: {e}")
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import update_job_with_upstream_id
+
+    return update_job_with_upstream_id(job_id, upstream_job_id)
 
 
 def _update_job_status_failed(job_id: str, error_message: str):
-    """Mark job as failed in timrx_billing.jobs."""
-    if not USE_DB:
-        return
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE timrx_billing.jobs
-                SET status = 'failed', error_message = %s, updated_at = NOW()
-                WHERE id = %s
-            """, (error_message[:500] if error_message else None, job_id))
-            conn.commit()
-            conn.close()
-            print(f"[JOB] Marked job {job_id} as failed: {error_message[:100] if error_message else 'no message'}")
-    except Exception as e:
-        print(f"[JOB] ERROR marking job {job_id} as failed: {e}")
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import update_job_status_failed
+
+    return update_job_status_failed(job_id, error_message)
 
 
 def _update_job_status_ready(
@@ -3537,49 +3185,18 @@ def _update_job_status_ready(
     image_url: str = None,
     progress: int = 100,
 ):
-    """
-    Mark job as ready (completed successfully) in timrx_billing.jobs.
-    Also updates meta column with asset info for polling.
-    """
-    if not USE_DB:
-        return
-    try:
-        conn = get_db_connection()
-        if conn:
-            cursor = conn.cursor()
-            # Build meta updates
-            meta_updates = {"progress": progress}
-            if model_id:
-                meta_updates["model_id"] = model_id
-            if image_id:
-                meta_updates["image_id"] = image_id
-            if glb_url:
-                meta_updates["glb_url"] = glb_url
-            if image_url:
-                meta_updates["image_url"] = image_url
+    """Delegate to the modular async dispatch service."""
+    from backend.services.async_dispatch import update_job_status_ready
 
-            if upstream_job_id:
-                cursor.execute("""
-                    UPDATE timrx_billing.jobs
-                    SET status = 'ready',
-                        upstream_job_id = COALESCE(upstream_job_id, %s),
-                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (upstream_job_id, json.dumps(meta_updates), job_id))
-            else:
-                cursor.execute("""
-                    UPDATE timrx_billing.jobs
-                    SET status = 'ready',
-                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                """, (json.dumps(meta_updates), job_id))
-            conn.commit()
-            conn.close()
-            print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
-    except Exception as e:
-        print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
+    return update_job_status_ready(
+        job_id=job_id,
+        upstream_job_id=upstream_job_id,
+        model_id=model_id,
+        image_id=image_id,
+        glb_url=glb_url,
+        image_url=image_url,
+        progress=progress,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3765,92 +3382,25 @@ def extract_model_urls(ms: dict):
     return glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, rigged_fbx
 
 def log_status_summary(route: str, job_id: str, payload: dict):
-    """
-    Lightweight status logging for debugging stuck jobs without being spammy.
-    """
-    try:
-        glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, _ = extract_model_urls(payload or {})
-        has_model = bool(glb_url or textured_glb_url or rigged_glb)
-        # Also consider populated dicts as "has something"
-        has_model = has_model or bool(
-            (model_urls and isinstance(model_urls, dict) and any(model_urls.values())) or
-            (textured_model_urls and isinstance(textured_model_urls, dict) and any(textured_model_urls.values()))
-        )
-        app.logger.info(
-            "[status] %s job=%s status=%s pct=%s has_model=%s glb=%s",
-            route,
-            job_id,
-            payload.get("status") or payload.get("task_status"),
-            payload.get("pct") or payload.get("progress") or payload.get("progress_percentage"),
-            has_model,
-            (glb_url or textured_glb_url or rigged_glb or "")[:128],
-        )
-    except Exception as e:
-        app.logger.warning("[status] %s job=%s log-failed: %s", route, job_id, e)
+    """Delegate to the modular Meshy service implementation."""
+    from backend.services.meshy_service import log_status_summary as _log_status_summary
+
+    return _log_status_summary(route, job_id, payload)
+
 
 def normalize_status(ms: dict) -> dict:
-    """
-    Map Meshy task to the shape your frontend expects.
-    """
-    containers = _task_containers(ms)
-    st_raw = (_pick_first(containers, ["status", "task_status"]) or "").upper()
-    status = MESHY_STATUS_MAP.get(st_raw, st_raw.lower() or "pending")
-    try:
-        pct = int(
-            _pick_first(containers, ["progress", "progress_percentage", "progress_percent", "percent"]) or 0
-        )
-    except Exception:
-        pct = 0
-    mode = (_pick_first(containers, ["mode", "stage"]) or "").strip().lower()
-    stage = "refine" if mode == "refine" else (mode or "preview")
+    """Delegate to the modular Meshy service implementation."""
+    from backend.services.meshy_service import normalize_status as _normalize_status
 
-    glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, rigged_fbx = extract_model_urls(ms)
+    return _normalize_status(ms)
 
-    return {
-        "id": _pick_first(containers, ["id", "task_id"]),
-        "status": status,
-        "pct": pct,
-        "stage": stage,
-        "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
-        "glb_url": glb_url,
-        "model_urls": model_urls,
-        "textured_model_urls": textured_model_urls,
-        "textured_glb_url": textured_glb_url,
-        "rigged_character_glb_url": rigged_glb,
-        "rigged_character_fbx_url": rigged_fbx,
-        "created_at": normalize_epoch_ms(_pick_first(containers, ["created_at", "created_at_ts", "created_time"])),
-        "preview_task_id": _pick_first(containers, ["preview_task_id", "preview_task"]),
-    }
 
 def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
-    containers = _task_containers(ms)
-    st_raw = (_pick_first(containers, ["status", "task_status"]) or "").upper()
-    status = MESHY_STATUS_MAP.get(st_raw, st_raw.lower() or "pending")
-    try:
-        pct = int(
-            _pick_first(containers, ["progress", "progress_percentage", "progress_percent", "percent"]) or 0
-        )
-    except Exception:
-        pct = 0
+    """Delegate to the modular Meshy service implementation."""
+    from backend.services.meshy_service import normalize_meshy_task as _normalize_meshy_task
 
-    glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, rigged_fbx = extract_model_urls(ms)
+    return _normalize_meshy_task(ms, stage=stage)
 
-    return {
-        "id": _pick_first(containers, ["id", "task_id"]),
-        "status": status,
-        "pct": pct,
-        "stage": (_pick_first(containers, ["stage"]) or "").strip().lower() or stage,
-        "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
-        "glb_url": glb_url,
-        "model_urls": model_urls,
-        "textured_model_urls": textured_model_urls,
-        "textured_glb_url": textured_glb_url,
-        "texture_urls": _pick_first(containers, ["texture_urls", "textures"]),
-        "basic_animations": _pick_first(containers, ["basic_animations", "animations"]),
-        "rigged_character_glb_url": rigged_glb,
-        "rigged_character_fbx_url": rigged_fbx,
-        "created_at": normalize_epoch_ms(_pick_first(containers, ["created_at", "created_at_ts", "created_time"])),
-    }
 
 def build_source_payload(body: dict):
     input_task_id = (body.get("input_task_id") or "").strip()
@@ -3953,207 +3503,33 @@ def require_credits(identity_id: str, action_key: str) -> tuple:
 
 
 def start_paid_job(identity_id: str, action_key: str, job_id: str, meta: dict = None) -> tuple:
-    """
-    Reserve credits for a paid job. Call this BEFORE calling upstream API.
+    """Delegate to the modular credits helper implementation."""
+    from backend.services.credits_helper import start_paid_job as _start_paid_job
 
-    Args:
-        identity_id: User's identity ID (required, non-null)
-        action_key: Action key for pricing
-        job_id: Unique job ID for idempotency
-        meta: Additional metadata for the reservation
-
-    Returns:
-        (reservation_id, None) on success
-        (None, error_response) on failure - return from route
-    """
-    if not CREDITS_AVAILABLE:
-        print(f"[CREDITS] System not available, allowing {action_key} job_id={job_id}")
-        return None, None
-
-    if not identity_id:
-        print(f"[CREDITS] ERROR: No identity for {action_key} job_id={job_id}")
-        return None, _make_credit_error(
-            "NO_SESSION",
-            "A valid session is required for this action. Please sign in or restore your session.",
-            401
-        )
-
-    try:
-        cost = PricingService.get_action_cost(action_key)
-        if cost == 0:
-            print(f"[CREDITS] No cost for {action_key}, no reservation needed")
-            return None, None
-
-        # Check balance before reserving
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
-
-        print(f"[CREDITS] Reserve {action_key}: cost={cost}, balance={balance}, reserved={reserved}, available={available}, job_id={job_id}")
-
-        if available < cost:
-            return None, _make_credit_error(
-                "INSUFFICIENT_CREDITS",
-                f"You need {cost} credits but only have {available} available.",
-                402,
-                required=cost,
-                available=available,
-                balance=balance,
-                reserved=reserved
-            )
-
-        # Create reservation
-        result = ReservationService.reserve_credits(
-            identity_id=identity_id,
-            action_key=action_key,
-            job_id=job_id,
-            meta={
-                "action_key": action_key,
-                "source": "paid_job_pipeline",
-                **(meta or {})
-            },
-        )
-
-        reservation_id = result["reservation"]["id"]
-        is_existing = result.get("is_existing", False)
-
-        if is_existing:
-            print(f"[CREDITS] Idempotent: existing reservation {reservation_id} for job_id={job_id}")
-        else:
-            print(f"[CREDITS] Reserved {cost} credits, reservation_id={reservation_id}, job_id={job_id}")
-
-        # Structured log for job lifecycle tracking
-        print(f"[JOB] started job_id={job_id} reservation_id={reservation_id} action={action_key} cost={cost}")
-
-        return reservation_id, None
-
-    except ValueError as e:
-        error_msg = str(e)
-        print(f"[CREDITS] Reservation failed: {error_msg}")
-
-        if "INSUFFICIENT_CREDITS" in error_msg:
-            # Parse error details
-            parts = error_msg.split(":")
-            required = available = 0
-            for part in parts:
-                if "required=" in part:
-                    try:
-                        required = int(part.split("=")[1].strip())
-                    except:
-                        pass
-                elif "available=" in part:
-                    try:
-                        available = int(part.split("=")[1].strip())
-                    except:
-                        pass
-
-            return None, _make_credit_error(
-                "INSUFFICIENT_CREDITS",
-                error_msg,
-                402,
-                required=required,
-                available=available
-            )
-
-        return None, _make_credit_error("CREDIT_ERROR", str(e), 400)
-
-    except Exception as e:
-        print(f"[CREDITS] Unexpected error reserving credits: {e}")
-        # Don't block on system errors - but log for debugging
-        import traceback
-        traceback.print_exc()
-        return None, None
+    return _start_paid_job(identity_id=identity_id, action_key=action_key, job_id=job_id, meta=meta)
 
 
 def finalize_job_credits(reservation_id: str, job_id: str = None):
-    """
-    Finalize (capture) credits after successful job completion.
-    Fully idempotent - safe to call multiple times, handles all edge cases gracefully.
+    """Delegate to the modular credits helper implementation."""
+    from backend.services.credits_helper import finalize_job_credits as _finalize_job_credits
 
-    Args:
-        reservation_id: The reservation ID from start_paid_job
-        job_id: Optional job ID for logging
-    """
-    if not CREDITS_AVAILABLE or not reservation_id:
-        return
-
-    try:
-        result = ReservationService.finalize_reservation(reservation_id)
-
-        # Handle all idempotent cases gracefully
-        if result.get("not_found"):
-            print(f"[CREDITS] Finalize: reservation not found (idempotent): {reservation_id} job_id={job_id}")
-        elif result.get("was_already_finalized"):
-            print(f"[CREDITS] Already finalized: reservation={reservation_id} job_id={job_id}")
-        elif result.get("was_already_released"):
-            # Job was cancelled/failed before we could finalize - that's ok
-            print(f"[CREDITS] Finalize skipped (already released): reservation={reservation_id} job_id={job_id}")
-        else:
-            print(f"[CREDITS] Finalized: reservation={reservation_id} job_id={job_id}")
-            # Structured log for job lifecycle tracking
-            print(f"[JOB] credits_captured job_id={job_id} reservation_id={reservation_id}")
-    except Exception as e:
-        print(f"[CREDITS] Finalize error {reservation_id}: {e}")
+    return _finalize_job_credits(reservation_id=reservation_id, job_id=job_id)
 
 
 def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id: str = None):
-    """
-    Release (refund) credits after job failure/cancellation.
-    Fully idempotent - safe to call multiple times, handles all edge cases gracefully.
+    """Delegate to the modular credits helper implementation."""
+    from backend.services.credits_helper import release_job_credits as _release_job_credits
 
-    Handles:
-    - Already released: no-op (idempotent)
-    - Already finalized: no-op (job actually succeeded, credits correctly captured)
-    - Not found: no-op (reservation expired or never existed)
-
-    Args:
-        reservation_id: The reservation ID from start_paid_job
-        reason: Reason for release (logged)
-        job_id: Optional job ID for logging
-    """
-    if not CREDITS_AVAILABLE or not reservation_id:
-        return
-
-    try:
-        result = ReservationService.release_reservation(reservation_id, reason)
-
-        # Handle all idempotent cases gracefully
-        if result.get("not_found"):
-            print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={job_id}")
-        elif result.get("was_already_released"):
-            print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
-        elif result.get("was_already_finalized"):
-            # Job actually succeeded and credits were captured - this is fine!
-            # This can happen when: frontend timeout triggers release, but backend already finalized
-            print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={job_id}")
-        else:
-            print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
-    except Exception as e:
-        print(f"[CREDITS] Release error {reservation_id}: {e}")
+    return _release_job_credits(reservation_id=reservation_id, reason=reason, job_id=job_id)
 
 
 def get_current_balance(identity_id: str) -> dict:
-    """
-    Get current credit balance info for a user.
+    """Delegate to the modular credits helper implementation."""
+    from backend.services.credits_helper import get_current_balance as _get_current_balance
 
-    Returns:
-        {balance, reserved, available} or None if credits system unavailable
-    """
-    if not CREDITS_AVAILABLE or not identity_id:
-        return None
+    return _get_current_balance(identity_id=identity_id)
 
-    try:
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
-        return {
-            "balance": balance,
-            "reserved": reserved,
-            "available": available
-        }
-    except Exception as e:
-        print(f"[CREDITS] Balance check error: {e}")
-        return None
+
 
 
 # Legacy aliases for backward compatibility
