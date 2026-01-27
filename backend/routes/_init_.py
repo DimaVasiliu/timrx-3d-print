@@ -10,7 +10,31 @@ from .admin import bp as admin_bp
 from .jobs import bp as jobs_bp
 from .credits import bp as credits_bp
 
-__all__ = ["me_bp", "billing_bp", "auth_bp", "admin_bp", "jobs_bp", "credits_bp"]
+from .health import bp as health_bp
+from .assets import bp as assets_bp
+from .image_gen import bp as image_gen_bp
+from .text_to_3d import bp as text_to_3d_bp
+from .image_to_3d import bp as image_to_3d_bp
+from .mesh_operations import bp as mesh_ops_bp
+from .history import bp as history_bp
+from .community import bp as community_bp
+
+__all__ = [
+    "me_bp",
+    "billing_bp",
+    "auth_bp",
+    "admin_bp",
+    "jobs_bp",
+    "credits_bp",
+    "health_bp",
+    "assets_bp",
+    "image_gen_bp",
+    "text_to_3d_bp",
+    "image_to_3d_bp",
+    "mesh_ops_bp",
+    "history_bp",
+    "community_bp",
+]
 
 
 def register_blueprints(app):
@@ -21,4 +45,17 @@ def register_blueprints(app):
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(jobs_bp, url_prefix="/api/jobs")
     app.register_blueprint(credits_bp, url_prefix="/api/credits")
-    print("[ROUTES] Registered blueprints: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs, /api/credits")
+
+    app.register_blueprint(health_bp, url_prefix="/api/_mod")
+    app.register_blueprint(assets_bp, url_prefix="/api/_mod")
+    app.register_blueprint(image_gen_bp, url_prefix="/api/_mod")
+    app.register_blueprint(text_to_3d_bp, url_prefix="/api/_mod")
+    app.register_blueprint(image_to_3d_bp, url_prefix="/api/_mod")
+    app.register_blueprint(mesh_ops_bp, url_prefix="/api/_mod")
+    app.register_blueprint(history_bp, url_prefix="/api/_mod")
+    app.register_blueprint(community_bp, url_prefix="/api/_mod")
+
+    print(
+        "[ROUTES] Registered blueprints: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs, /api/credits, "
+        "/api/_mod/*"
+    )
