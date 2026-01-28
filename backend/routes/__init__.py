@@ -8,6 +8,22 @@ __all__ = [
 ]
 
 
+def _print_route_map(app):
+    """Print all registered /api/* routes at startup for debugging."""
+    api_routes = []
+    for rule in app.url_map.iter_rules():
+        if rule.rule.startswith("/api"):
+            methods = ",".join(sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS")))
+            api_routes.append(f"  {methods:8s} {rule.rule}")
+
+    api_routes.sort(key=lambda x: x.split()[-1])  # Sort by path
+
+    print("[ROUTES] Registered API endpoints:")
+    for route in api_routes:
+        print(route)
+    print(f"[ROUTES] Total: {len(api_routes)} endpoints")
+
+
 def register_blueprints(app):
     """Register all blueprints with the Flask app."""
     from backend.routes.me import bp as me_bp
@@ -43,11 +59,15 @@ def register_blueprints(app):
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
 
     # Also register under /api for backward compatibility (cached frontend)
+    # These must match the legacy app.py routes exactly
     app.register_blueprint(history_bp, url_prefix="/api", name="history_compat")
     app.register_blueprint(text_to_3d_bp, url_prefix="/api", name="text_to_3d_compat")
     app.register_blueprint(image_to_3d_bp, url_prefix="/api", name="image_to_3d_compat")
+    app.register_blueprint(health_bp, url_prefix="/api", name="health_compat")
+    app.register_blueprint(assets_bp, url_prefix="/api", name="assets_compat")
+    app.register_blueprint(mesh_ops_bp, url_prefix="/api", name="mesh_ops_compat")
+    app.register_blueprint(image_gen_bp, url_prefix="/api", name="image_gen_compat")
+    app.register_blueprint(community_bp, url_prefix="/api", name="community_compat")
 
-    print(
-        "[ROUTES] Registered blueprints: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs, /api/credits, "
-        "/api/_mod/*, /api/history, /api/text-to-3d, /api/image-to-3d"
-    )
+    # Print route map at startup for debugging
+    _print_route_map(app)
