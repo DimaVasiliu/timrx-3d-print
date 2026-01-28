@@ -30,7 +30,7 @@ from backend.db import (
     Tables,
     hash_string,
 )
-from backend import config as cfg
+import backend.config as cfg
 from backend.emailer import send_magic_code, notify_restore_request
 
 
@@ -39,7 +39,7 @@ class MagicCodeService:
 
     # Rate limiting constants
     MAX_ACTIVE_CODES_PER_EMAIL = 3
-    COOLDOWN_SECONDS = cfg.config.MAGIC_CODE_COOLDOWN_SECONDS  # Default: 60
+    COOLDOWN_SECONDS = cfg.MAGIC_CODE_COOLDOWN_SECONDS  # Default: 60
 
     # ─────────────────────────────────────────────────────────────
     # Code Generation
@@ -108,7 +108,7 @@ class MagicCodeService:
         ip_hash = hash_string(ip_address) if ip_address else None
 
         # Store in database
-        expiry_minutes = cfg.config.MAGIC_CODE_EXPIRY_MINUTES
+        expiry_minutes = cfg.MAGIC_CODE_EXPIRY_MINUTES
         with transaction() as cur:
             cur.execute(
                 f"""
@@ -228,7 +228,7 @@ class MagicCodeService:
             return (False, None, "Invalid or expired code")
 
         # Check max attempts on this specific code
-        if code_record["attempts"] >= cfg.config.MAGIC_CODE_MAX_ATTEMPTS:
+        if code_record["attempts"] >= cfg.MAGIC_CODE_MAX_ATTEMPTS:
             return (False, None, "Too many failed attempts. Please request a new code")
 
         code_id = str(code_record["id"])
