@@ -12,9 +12,9 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g
 
-from middleware import require_session
-from job_service import JobService, JobStatus, JobProvider
-from wallet_service import WalletService
+from backend.middleware import require_session
+from backend.job_service import JobService, JobStatus, JobProvider
+from backend.wallet_service import WalletService
 
 bp = Blueprint("jobs", __name__)
 
