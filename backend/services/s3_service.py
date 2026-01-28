@@ -94,6 +94,27 @@ def get_s3_key_from_url(url: str) -> str | None:
     return parse_s3_key(url)
 
 
+def presign_s3_key(key: str, expires_in: int = 3600) -> str | None:
+    if not key or not config.AWS_BUCKET_MODELS:
+        return None
+    try:
+        return _s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": config.AWS_BUCKET_MODELS, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as e:
+        print(f"[S3] Failed to presign key {key}: {e}")
+        return None
+
+
+def presign_s3_url(url: str, expires_in: int = 3600) -> str | None:
+    key = parse_s3_key(url)
+    if not key:
+        return None
+    return presign_s3_key(key, expires_in=expires_in)
+
+
 def collect_s3_keys(history_row: dict) -> list[str]:
     keys: set[str] = set()
     if not isinstance(history_row, dict):
@@ -177,7 +198,6 @@ def upload_bytes_to_s3(
         Key=key,
         Body=data_bytes,
         ContentType=content_type,
-        ACL="public-read",
     )
     s3_url = build_s3_url(key)
     print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
@@ -281,7 +301,6 @@ def safe_upload_to_s3(
         Key=s3_key,
         Body=data_bytes,
         ContentType=resolved_type,
-        ACL="public-read",
     )
     s3_url = build_s3_url(s3_key)
     print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
