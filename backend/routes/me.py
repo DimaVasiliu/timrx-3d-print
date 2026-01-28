@@ -12,8 +12,8 @@ Handles:
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import with_session, require_session, no_cache
-from identity_service import IdentityService
-from wallet_service import WalletService
+from backend.identity_service import IdentityService
+from backend.wallet_service import WalletService
 
 bp = Blueprint("me", __name__)
 
