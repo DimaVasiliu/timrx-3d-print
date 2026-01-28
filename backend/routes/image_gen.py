@@ -21,7 +21,7 @@ from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.identity_service import require_identity
-from backend.services.job_service import load_store
+from backend.services.job_service import create_internal_job_row, load_store, save_store
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("image_gen", __name__)
@@ -107,6 +107,23 @@ def openai_image_mod():
         "internal_job_id": internal_job_id,
         "status": "queued",
     }
+
+    # Persist immediately so status polling works across workers
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    # Persist job row so status polling works across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="openai",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
 
     get_executor().submit(
         _dispatch_openai_image_async,
