@@ -13,7 +13,7 @@ from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import with_session, require_session, no_cache
 from backend.services.identity_service import IdentityService
-from backend.wallet_service import WalletService
+from backend.services.wallet_service import WalletService
 
 bp = Blueprint("me", __name__)
 
