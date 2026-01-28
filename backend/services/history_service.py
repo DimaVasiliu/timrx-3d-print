@@ -1124,67 +1124,168 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             ),
                         )
                     else:
-                        cur.execute(
-                            f"""
-                            INSERT INTO {Tables.MODELS} (
-                                id, identity_id,
-                                title, prompt, root_prompt,
-                                provider, upstream_job_id,
-                                status,
-                                s3_bucket,
-                                glb_url, thumbnail_url,
-                                glb_s3_key, thumbnail_s3_key,
-                                content_hash,
-                                stage,
-                                meta
-                            ) VALUES (
-                                %s, %s,
-                                %s, %s, %s,
-                                %s, %s,
-                                %s,
-                                %s,
-                                %s, %s,
-                                %s, %s,
-                                %s,
-                                %s,
-                                %s
+                        try:
+                            cur.execute(
+                                f"""
+                                INSERT INTO {Tables.MODELS} (
+                                    id, identity_id,
+                                    title, prompt, root_prompt,
+                                    provider, upstream_job_id,
+                                    status,
+                                    s3_bucket,
+                                    glb_url, thumbnail_url,
+                                    glb_s3_key, thumbnail_s3_key,
+                                    content_hash,
+                                    stage,
+                                    meta
+                                ) VALUES (
+                                    %s, %s,
+                                    %s, %s, %s,
+                                    %s, %s,
+                                    %s,
+                                    %s,
+                                    %s, %s,
+                                    %s, %s,
+                                    %s,
+                                    %s,
+                                    %s
+                                )
+                                ON CONFLICT (provider, upstream_job_id) DO UPDATE
+                                SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.MODELS}.identity_id),
+                                    title = COALESCE(EXCLUDED.title, {Tables.MODELS}.title),
+                                    prompt = COALESCE(EXCLUDED.prompt, {Tables.MODELS}.prompt),
+                                    root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.MODELS}.root_prompt),
+                                    status = 'ready',
+                                    s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.MODELS}.s3_bucket),
+                                    glb_url = EXCLUDED.glb_url,
+                                    thumbnail_url = EXCLUDED.thumbnail_url,
+                                    glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {Tables.MODELS}.glb_s3_key),
+                                    thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.MODELS}.thumbnail_s3_key),
+                                    content_hash = COALESCE(EXCLUDED.content_hash, {Tables.MODELS}.content_hash),
+                                    stage = COALESCE(EXCLUDED.stage, {Tables.MODELS}.stage),
+                                    meta = COALESCE(EXCLUDED.meta, {Tables.MODELS}.meta),
+                                    updated_at = NOW()
+                                RETURNING id
+                                """,
+                                (
+                                    str(uuid.uuid4()),
+                                    user_id,
+                                    final_title,
+                                    final_prompt,
+                                    root_prompt,
+                                    provider,
+                                    job_id,
+                                    "ready",
+                                    s3_bucket,
+                                    final_glb_url,
+                                    final_thumbnail_url,
+                                    glb_s3_key,
+                                    thumbnail_s3_key,
+                                    model_content_hash,
+                                    final_stage,
+                                    json.dumps(model_meta),
+                                ),
                             )
-                            ON CONFLICT (provider, upstream_job_id) DO UPDATE
-                            SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.MODELS}.identity_id),
-                                title = COALESCE(EXCLUDED.title, {Tables.MODELS}.title),
-                                prompt = COALESCE(EXCLUDED.prompt, {Tables.MODELS}.prompt),
-                                root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.MODELS}.root_prompt),
-                                status = 'ready',
-                                s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.MODELS}.s3_bucket),
-                                glb_url = EXCLUDED.glb_url,
-                                thumbnail_url = EXCLUDED.thumbnail_url,
-                                glb_s3_key = COALESCE(EXCLUDED.glb_s3_key, {Tables.MODELS}.glb_s3_key),
-                                thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.MODELS}.thumbnail_s3_key),
-                                content_hash = COALESCE(EXCLUDED.content_hash, {Tables.MODELS}.content_hash),
-                                stage = COALESCE(EXCLUDED.stage, {Tables.MODELS}.stage),
-                                meta = COALESCE(EXCLUDED.meta, {Tables.MODELS}.meta),
-                                updated_at = NOW()
-                            RETURNING id
-                            """,
-                            (
-                                str(uuid.uuid4()),
-                                user_id,
-                                final_title,
-                                final_prompt,
-                                root_prompt,
-                                provider,
-                                job_id,
-                                "ready",
-                                s3_bucket,
-                                final_glb_url,
-                                final_thumbnail_url,
-                                glb_s3_key,
-                                thumbnail_s3_key,
-                                model_content_hash,
-                                final_stage,
-                                json.dumps(model_meta),
-                            ),
-                        )
+                        except Exception as e:
+                            # Fallback for deployments missing the unique constraint used by ON CONFLICT
+                            if "no unique or exclusion constraint" not in str(e).lower():
+                                raise
+                            print("[DB] models upsert fallback: missing unique constraint, using manual upsert")
+                            cur.execute(
+                                f"""
+                                SELECT id FROM {Tables.MODELS}
+                                WHERE provider = %s AND upstream_job_id = %s
+                                LIMIT 1
+                                """,
+                                (provider, job_id),
+                            )
+                            existing_row = cur.fetchone()
+                            if existing_row:
+                                cur.execute(
+                                    f"""
+                                    UPDATE {Tables.MODELS}
+                                    SET identity_id = COALESCE(%s, identity_id),
+                                        title = COALESCE(%s, title),
+                                        prompt = COALESCE(%s, prompt),
+                                        root_prompt = COALESCE(%s, root_prompt),
+                                        upstream_job_id = COALESCE(upstream_job_id, %s),
+                                        status = 'ready',
+                                        s3_bucket = COALESCE(%s, s3_bucket),
+                                        glb_url = %s,
+                                        thumbnail_url = %s,
+                                        glb_s3_key = COALESCE(%s, glb_s3_key),
+                                        thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
+                                        content_hash = COALESCE(%s, content_hash),
+                                        stage = COALESCE(%s, stage),
+                                        meta = COALESCE(%s, meta),
+                                        updated_at = NOW()
+                                    WHERE id = %s
+                                    RETURNING id
+                                    """,
+                                    (
+                                        user_id,
+                                        final_title,
+                                        final_prompt,
+                                        root_prompt,
+                                        job_id,
+                                        s3_bucket,
+                                        final_glb_url,
+                                        final_thumbnail_url,
+                                        glb_s3_key,
+                                        thumbnail_s3_key,
+                                        model_content_hash,
+                                        final_stage,
+                                        json.dumps(model_meta),
+                                        existing_row["id"],
+                                    ),
+                                )
+                            else:
+                                cur.execute(
+                                    f"""
+                                    INSERT INTO {Tables.MODELS} (
+                                        id, identity_id,
+                                        title, prompt, root_prompt,
+                                        provider, upstream_job_id,
+                                        status,
+                                        s3_bucket,
+                                        glb_url, thumbnail_url,
+                                        glb_s3_key, thumbnail_s3_key,
+                                        content_hash,
+                                        stage,
+                                        meta
+                                    ) VALUES (
+                                        %s, %s,
+                                        %s, %s, %s,
+                                        %s, %s,
+                                        %s,
+                                        %s,
+                                        %s, %s,
+                                        %s, %s,
+                                        %s,
+                                        %s,
+                                        %s
+                                    )
+                                    RETURNING id
+                                    """,
+                                    (
+                                        str(uuid.uuid4()),
+                                        user_id,
+                                        final_title,
+                                        final_prompt,
+                                        root_prompt,
+                                        provider,
+                                        job_id,
+                                        "ready",
+                                        s3_bucket,
+                                        final_glb_url,
+                                        final_thumbnail_url,
+                                        glb_s3_key,
+                                        thumbnail_s3_key,
+                                        model_content_hash,
+                                        final_stage,
+                                        json.dumps(model_meta),
+                                    ),
+                                )
                     model_row = cur.fetchone()
                     if not model_row:
                         raise RuntimeError("[DB] Failed to upsert model row (no id returned)")
@@ -1245,61 +1346,151 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         thumbnail_url = None
                     image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
                     thumb_s3_key = get_s3_key_from_url(thumbnail_url)
-                    cur.execute(
-                        f"""
-                        INSERT INTO {Tables.IMAGES} (
-                            id, identity_id,
-                            title, prompt,
-                            provider, upstream_id,
-                            status,
-                            s3_bucket,
-                            image_url, thumbnail_url,
-                            image_s3_key, thumbnail_s3_key,
-                            content_hash,
-                            meta
-                        ) VALUES (
-                            %s, %s,
-                            %s, %s,
-                            %s, %s,
-                            %s,
-                            %s,
-                            %s, %s,
-                            %s, %s,
-                            %s,
-                            %s
+                    try:
+                        cur.execute(
+                            f"""
+                            INSERT INTO {Tables.IMAGES} (
+                                id, identity_id,
+                                title, prompt,
+                                provider, upstream_id,
+                                status,
+                                s3_bucket,
+                                image_url, thumbnail_url,
+                                image_s3_key, thumbnail_s3_key,
+                                content_hash,
+                                meta
+                            ) VALUES (
+                                %s, %s,
+                                %s, %s,
+                                %s, %s,
+                                %s,
+                                %s,
+                                %s, %s,
+                                %s, %s,
+                                %s,
+                                %s
+                            )
+                            ON CONFLICT (provider, upstream_id) DO UPDATE
+                            SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
+                                title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
+                                prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
+                                status = 'ready',
+                                s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
+                                image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
+                                thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
+                                image_s3_key = COALESCE(EXCLUDED.image_s3_key, {Tables.IMAGES}.image_s3_key),
+                                thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.IMAGES}.thumbnail_s3_key),
+                                content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
+                                meta = COALESCE(EXCLUDED.meta, {Tables.IMAGES}.meta),
+                                updated_at = NOW()
+                            RETURNING id
+                            """,
+                            (
+                                str(uuid.uuid4()),
+                                user_id,
+                                final_title,
+                                final_prompt,
+                                provider,
+                                image_upstream_id,
+                                "ready",
+                                AWS_BUCKET_MODELS,
+                                image_url,
+                                thumbnail_url,
+                                image_s3_key,
+                                thumb_s3_key,
+                                image_content_hash,
+                                json.dumps(image_meta),
+                            ),
                         )
-                        ON CONFLICT (provider, upstream_id) DO UPDATE
-                        SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
-                            title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
-                            prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
-                            status = 'ready',
-                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
-                            image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
-                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
-                            image_s3_key = COALESCE(EXCLUDED.image_s3_key, {Tables.IMAGES}.image_s3_key),
-                            thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.IMAGES}.thumbnail_s3_key),
-                            content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
-                            meta = COALESCE(EXCLUDED.meta, {Tables.IMAGES}.meta),
-                            updated_at = NOW()
-                        RETURNING id
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            user_id,
-                            final_title,
-                            final_prompt,
-                            provider,
-                            image_upstream_id,
-                            "ready",
-                            AWS_BUCKET_MODELS,
-                            image_url,
-                            thumbnail_url,
-                            image_s3_key,
-                            thumb_s3_key,
-                            image_content_hash,
-                            json.dumps(image_meta),
-                        ),
-                    )
+                    except Exception as e:
+                        if "no unique or exclusion constraint" not in str(e).lower():
+                            raise
+                        print("[DB] images upsert fallback: missing unique constraint, using manual upsert")
+                        cur.execute(
+                            f"""
+                            SELECT id FROM {Tables.IMAGES}
+                            WHERE provider = %s AND upstream_id = %s
+                            LIMIT 1
+                            """,
+                            (provider, image_upstream_id),
+                        )
+                        existing_row = cur.fetchone()
+                        if existing_row:
+                            cur.execute(
+                                f"""
+                                UPDATE {Tables.IMAGES}
+                                SET identity_id = COALESCE(%s, identity_id),
+                                    title = COALESCE(%s, title),
+                                    prompt = COALESCE(%s, prompt),
+                                    status = 'ready',
+                                    s3_bucket = COALESCE(%s, s3_bucket),
+                                    image_url = COALESCE(%s, image_url),
+                                    thumbnail_url = COALESCE(%s, thumbnail_url),
+                                    image_s3_key = COALESCE(%s, image_s3_key),
+                                    thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
+                                    content_hash = COALESCE(%s, content_hash),
+                                    meta = COALESCE(%s, meta),
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                RETURNING id
+                                """,
+                                (
+                                    user_id,
+                                    final_title,
+                                    final_prompt,
+                                    AWS_BUCKET_MODELS,
+                                    image_url,
+                                    thumbnail_url,
+                                    image_s3_key,
+                                    thumb_s3_key,
+                                    image_content_hash,
+                                    json.dumps(image_meta),
+                                    existing_row["id"],
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                f"""
+                                INSERT INTO {Tables.IMAGES} (
+                                    id, identity_id,
+                                    title, prompt,
+                                    provider, upstream_id,
+                                    status,
+                                    s3_bucket,
+                                    image_url, thumbnail_url,
+                                    image_s3_key, thumbnail_s3_key,
+                                    content_hash,
+                                    meta
+                                ) VALUES (
+                                    %s, %s,
+                                    %s, %s,
+                                    %s, %s,
+                                    %s,
+                                    %s,
+                                    %s, %s,
+                                    %s, %s,
+                                    %s,
+                                    %s
+                                )
+                                RETURNING id
+                                """,
+                                (
+                                    str(uuid.uuid4()),
+                                    user_id,
+                                    final_title,
+                                    final_prompt,
+                                    provider,
+                                    image_upstream_id,
+                                    "ready",
+                                    AWS_BUCKET_MODELS,
+                                    image_url,
+                                    thumbnail_url,
+                                    image_s3_key,
+                                    thumb_s3_key,
+                                    image_content_hash,
+                                    json.dumps(image_meta),
+                                ),
+                            )
                     image_row = cur.fetchone()
                     if not image_row:
                         raise RuntimeError("[DB] Failed to upsert image row (no id returned)")
