@@ -19,6 +19,7 @@ from backend.services.identity_service import require_identity
 from backend.services.job_service import (
     _update_job_status_failed,
     _update_job_status_ready,
+    create_internal_job_row,
     get_job_metadata,
     load_store,
     save_store,
@@ -87,6 +88,18 @@ def image_to_3d_start_mod():
     store = load_store()
     store[internal_job_id] = store_meta
     save_store(store)
+
+    # Persist job row so status polling works across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
 
     get_executor().submit(
         _dispatch_meshy_image_to_3d_async,
