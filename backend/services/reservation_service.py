@@ -24,8 +24,8 @@ import json
 import uuid
 
 from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
-from backend.wallet_service import WalletService, LedgerEntryType
-from backend.pricing_service import PricingService
+from backend.services.wallet_service import WalletService, LedgerEntryType
+from backend.services.pricing_service import PricingService
 from backend.config import config
 
 
