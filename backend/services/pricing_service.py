@@ -85,6 +85,10 @@ class PricingService:
         "image_generate": "OPENAI_IMAGE",  # Legacy key
         "video_generate": "VIDEO_GENERATE",  # Alternative video key
         "preview": "MESHY_TEXT_TO_3D",  # Preview is text-to-3d cost
+        # Explicit preview key used by frontend
+        "text-to-3d-preview": "MESHY_TEXT_TO_3D",
+        # Explicit refine key used by frontend
+        "text-to-3d-refine": "MESHY_REFINE",
     }
 
     @staticmethod
