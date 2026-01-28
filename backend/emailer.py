@@ -16,11 +16,11 @@ EMAIL_SERVICE_AVAILABLE = False
 _send_email = None
 
 try:
-    from services.email_service import send_email as _send_email
+    from backend.services.email_service import send_email as _send_email
     EMAIL_SERVICE_AVAILABLE = True
 except ImportError:
     try:
-        from email_service import send_email as _send_email
+        from backend.services.email_service import send_email as _send_email
         EMAIL_SERVICE_AVAILABLE = True
     except ImportError:
         pass
@@ -155,7 +155,7 @@ Your credits are now available in your account.
 # ─────────────────────────────────────────────────────────────
 def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None) -> bool:
     """Send a notification to the admin email."""
-    admin_email = cfg.config.ADMIN_EMAIL
+    admin_email = cfg.ADMIN_EMAIL
     if not admin_email:
         print(f"[EMAIL] Admin notification (no ADMIN_EMAIL configured): {subject}")
         return False
@@ -183,7 +183,7 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
 
 def notify_new_identity(identity_id: str, email: Optional[str] = None) -> bool:
     """Notify admin when a new identity is created (with email)."""
-    if not cfg.config.NOTIFY_ON_NEW_IDENTITY:
+    if not cfg.NOTIFY_ON_NEW_IDENTITY:
         return False
     if not email:  # Only notify when email is attached
         return False
@@ -203,7 +203,7 @@ def notify_purchase(
     amount_gbp: float,
 ) -> bool:
     """Notify admin when a purchase is completed."""
-    if not cfg.config.NOTIFY_ON_PURCHASE:
+    if not cfg.NOTIFY_ON_PURCHASE:
         return False
 
     return notify_admin(
@@ -221,7 +221,7 @@ def notify_purchase(
 
 def notify_restore_request(email: str) -> bool:
     """Notify admin when a restore code is requested."""
-    if not cfg.config.NOTIFY_ON_RESTORE_REQUEST:
+    if not cfg.NOTIFY_ON_RESTORE_REQUEST:
         return False
 
     return notify_admin(
