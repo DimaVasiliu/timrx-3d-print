@@ -19,7 +19,7 @@ Stable frontend keys:
 
 from typing import Optional, Dict, Any, List
 
-from db import query_one, query_all, execute, Tables
+from backend.db import query_one, query_all, execute, Tables
 
 
 # Default plans to seed into the database
