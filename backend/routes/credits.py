@@ -13,8 +13,8 @@ This module provides a simple, stable interface for:
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_session, no_cache
-from backend.wallet_service import WalletService, LedgerEntryType
-from backend.pricing_service import PricingService
+from backend.services.wallet_service import WalletService, LedgerEntryType
+from backend.services.pricing_service import PricingService
 from backend.db import transaction, fetch_one, Tables, DatabaseIntegrityError
 
 bp = Blueprint("credits", __name__)
