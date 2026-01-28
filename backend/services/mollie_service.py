@@ -29,7 +29,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 import config as cfg
-from pricing_service import PricingService
+from backend.pricing_service import PricingService
 
 
 class MollieCreateError(Exception):
