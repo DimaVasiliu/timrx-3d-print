@@ -13,8 +13,8 @@ Handles:
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_session
-from backend.job_service import JobService, JobStatus, JobProvider
-from backend.wallet_service import WalletService
+from backend.services.job_service import JobService, JobStatus, JobProvider
+from backend.services.wallet_service import WalletService
 
 bp = Blueprint("jobs", __name__)
 
