@@ -78,6 +78,8 @@ class PricingService:
         "text-to-3d": "MESHY_TEXT_TO_3D",
         "image-to-3d": "MESHY_IMAGE_TO_3D",
         "text-to-image": "OPENAI_IMAGE",
+        "image-studio": "OPENAI_IMAGE",
+        "openai-image": "OPENAI_IMAGE",
         # Alternative names
         "remesh": "MESHY_REFINE",      # remesh uses same cost as refine (10c)
         "rigging": "MESHY_RIG",        # rigging alias for rig (25c)
