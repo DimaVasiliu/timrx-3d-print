@@ -279,7 +279,7 @@ def cache_image_mod():
     except Exception as e:
         return jsonify({"error": f"Failed to decode data URL: {e}"}), 400
 
-    return jsonify({"url": f"/api/_mod/cache-image/{file_path.name}", "mime": mime})
+    return jsonify({"url": f"/api/cache-image/{file_path.name}", "mime": mime})
 
 
 @bp.route("/cache-image/<path:filename>", methods=["GET"])
