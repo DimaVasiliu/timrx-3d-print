@@ -28,6 +28,7 @@ from backend.services.identity_service import require_identity
 from backend.services.job_service import (
     _update_job_status_failed,
     _update_job_status_ready,
+    create_internal_job_row,
     get_job_metadata,
     load_store,
     resolve_meshy_job_id,
@@ -127,6 +128,18 @@ def text_to_3d_start_mod():
     store[internal_job_id] = store_meta
     save_store(store)
 
+    # Persist job row so status polling works across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
     get_executor().submit(
         _dispatch_meshy_text_to_3d_async,
         internal_job_id,
@@ -217,6 +230,23 @@ def text_to_3d_refine_mod():
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
+
+    # Persist immediately so status polling can return queued while dispatch runs
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    # Persist job row so status polling works across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
 
     get_executor().submit(
         _dispatch_meshy_refine_async,
