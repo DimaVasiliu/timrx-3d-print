@@ -37,7 +37,7 @@ def mesh_remesh_mod():
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/remesh:incoming[mod]", body)
-    source, err = build_source_payload(body)
+    source, err = build_source_payload(body, identity_id=identity_id)
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
@@ -215,7 +215,7 @@ def mesh_retexture_mod():
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/retexture:incoming[mod]", body)
-    source, err = build_source_payload(body)
+    source, err = build_source_payload(body, identity_id=identity_id)
     if err:
         return jsonify({"error": err}), 400
 
@@ -390,7 +390,7 @@ def mesh_rigging_mod():
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/rigging:incoming[mod]", body)
-    source, err = build_source_payload(body)
+    source, err = build_source_payload(body, identity_id=identity_id)
     if err:
         return jsonify({"error": err}), 400
 
