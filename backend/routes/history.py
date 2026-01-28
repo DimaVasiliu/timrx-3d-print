@@ -26,7 +26,7 @@ from backend.services.history_service import (
     upsert_history_local,
 )
 from backend.services.s3_service import collect_s3_keys, ensure_s3_url_for_data_uri
-from backend.utils import log_db_continue
+from backend.utils import derive_display_title, log_db_continue
 
 bp = Blueprint("history", __name__)
 
@@ -150,6 +150,8 @@ def history_mod():
                                 stage = item.get("stage")
                                 title = item.get("title")
                                 prompt = item.get("prompt")
+                                if not title:
+                                    title = derive_display_title(prompt, None)
                                 root_prompt = item.get("root_prompt")
                                 thumbnail_url = item.get("thumbnail_url")
                                 glb_url = item.get("glb_url")
@@ -196,7 +198,13 @@ def history_mod():
                                            SET item_type = %s,
                                                status = COALESCE(%s, status),
                                                stage = COALESCE(%s, stage),
-                                               title = COALESCE(%s, title),
+                                               title = CASE
+                                                   WHEN %s IS NOT NULL
+                                                    AND %s <> ''
+                                                    AND %s NOT IN ('3D Model', 'Untitled')
+                                                   THEN %s
+                                                   ELSE title
+                                               END,
                                                prompt = COALESCE(%s, prompt),
                                                root_prompt = COALESCE(%s, root_prompt),
                                                identity_id = COALESCE(%s, identity_id),
@@ -210,6 +218,9 @@ def history_mod():
                                             item_type,
                                             status,
                                             stage,
+                                            title,
+                                            title,
+                                            title,
                                             title,
                                             prompt,
                                             root_prompt,
@@ -250,7 +261,13 @@ def history_mod():
                                            SET item_type = EXCLUDED.item_type,
                                                status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
                                                stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
-                                               title = COALESCE(EXCLUDED.title, {Tables.HISTORY_ITEMS}.title),
+                                               title = CASE
+                                                   WHEN EXCLUDED.title IS NOT NULL
+                                                    AND EXCLUDED.title <> ''
+                                                    AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                                   THEN EXCLUDED.title
+                                                   ELSE {Tables.HISTORY_ITEMS}.title
+                                               END,
                                                prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
                                                root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
                                                identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
@@ -360,6 +377,8 @@ def history_item_add_mod():
                             stage = item.get("stage")
                             title = item.get("title")
                             prompt = item.get("prompt")
+                            if not title:
+                                title = derive_display_title(prompt, None)
                             root_prompt = item.get("root_prompt")
                             thumbnail_url = item.get("thumbnail_url")
                             glb_url = item.get("glb_url")
@@ -406,7 +425,13 @@ def history_item_add_mod():
                                        SET item_type = %s,
                                            status = COALESCE(%s, status),
                                            stage = COALESCE(%s, stage),
-                                           title = COALESCE(%s, title),
+                                           title = CASE
+                                               WHEN %s IS NOT NULL
+                                                AND %s <> ''
+                                                AND %s NOT IN ('3D Model', 'Untitled')
+                                               THEN %s
+                                               ELSE title
+                                           END,
                                            prompt = COALESCE(%s, prompt),
                                            root_prompt = COALESCE(%s, root_prompt),
                                            identity_id = COALESCE(%s, identity_id),
@@ -420,6 +445,9 @@ def history_item_add_mod():
                                         item_type,
                                         status,
                                         stage,
+                                        title,
+                                        title,
+                                        title,
                                         title,
                                         prompt,
                                         root_prompt,
@@ -486,7 +514,13 @@ def history_item_add_mod():
                                        SET item_type = EXCLUDED.item_type,
                                            status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
                                            stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
-                                           title = COALESCE(EXCLUDED.title, {Tables.HISTORY_ITEMS}.title),
+                                           title = CASE
+                                               WHEN EXCLUDED.title IS NOT NULL
+                                                AND EXCLUDED.title <> ''
+                                                AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                               THEN EXCLUDED.title
+                                               ELSE {Tables.HISTORY_ITEMS}.title
+                                           END,
                                            prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
                                            root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
                                            identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
@@ -690,7 +724,13 @@ def history_item_update_mod(item_id: str):
                                        SET item_type = COALESCE(%s, item_type),
                                            status = COALESCE(%s, status),
                                            stage = COALESCE(%s, stage),
-                                           title = COALESCE(%s, title),
+                                           title = CASE
+                                               WHEN %s IS NOT NULL
+                                                AND %s <> ''
+                                                AND %s NOT IN ('3D Model', 'Untitled')
+                                               THEN %s
+                                               ELSE title
+                                           END,
                                            prompt = COALESCE(%s, prompt),
                                            thumbnail_url = COALESCE(%s, thumbnail_url),
                                            glb_url = COALESCE(%s, glb_url),
@@ -702,6 +742,9 @@ def history_item_update_mod(item_id: str):
                                         item_type,
                                         status,
                                         stage,
+                                        title,
+                                        title,
+                                        title,
                                         title,
                                         prompt,
                                         thumbnail_url,
