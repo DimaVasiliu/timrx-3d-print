@@ -311,19 +311,17 @@ def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
     if not USE_DB:
         return
     try:
-        conn = get_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"""
-                UPDATE {Tables.JOBS}
-                SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
-                WHERE id = %s
-                """,
-                (upstream_job_id, job_id),
-            )
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (upstream_job_id, job_id),
+                )
             conn.commit()
-            conn.close()
             print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
     except Exception as e:
         print(f"[ASYNC] ERROR updating job {job_id}: {e}")
@@ -333,19 +331,17 @@ def update_job_status_failed(job_id: str, error_message: str):
     if not USE_DB:
         return
     try:
-        conn = get_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"""
-                UPDATE {Tables.JOBS}
-                SET status = 'failed', error_message = %s, updated_at = NOW()
-                WHERE id = %s
-                """,
-                (error_message[:500] if error_message else None, job_id),
-            )
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'failed', error_message = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (error_message[:500] if error_message else None, job_id),
+                )
             conn.commit()
-            conn.close()
             print(
                 "[JOB] Marked job %s as failed: %s"
                 % (job_id, error_message[:100] if error_message else "no message")
@@ -366,44 +362,42 @@ def update_job_status_ready(
     if not USE_DB:
         return
     try:
-        conn = get_conn()
-        if conn:
-            cursor = conn.cursor()
-            meta_updates = {"progress": progress}
-            if model_id:
-                meta_updates["model_id"] = model_id
-            if image_id:
-                meta_updates["image_id"] = image_id
-            if glb_url:
-                meta_updates["glb_url"] = glb_url
-            if image_url:
-                meta_updates["image_url"] = image_url
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                meta_updates = {"progress": progress}
+                if model_id:
+                    meta_updates["model_id"] = model_id
+                if image_id:
+                    meta_updates["image_id"] = image_id
+                if glb_url:
+                    meta_updates["glb_url"] = glb_url
+                if image_url:
+                    meta_updates["image_url"] = image_url
 
-            if upstream_job_id:
-                cursor.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'ready',
-                        upstream_job_id = COALESCE(upstream_job_id, %s),
-                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (upstream_job_id, json.dumps(meta_updates), job_id),
-                )
-            else:
-                cursor.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'ready',
-                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (json.dumps(meta_updates), job_id),
-                )
+                if upstream_job_id:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = 'ready',
+                            upstream_job_id = COALESCE(upstream_job_id, %s),
+                            meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (upstream_job_id, json.dumps(meta_updates), job_id),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = 'ready',
+                            meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (json.dumps(meta_updates), job_id),
+                    )
             conn.commit()
-            conn.close()
             print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
