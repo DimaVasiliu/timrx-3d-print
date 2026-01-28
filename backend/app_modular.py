@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 
-from flask import Flask, g
+from flask import Flask, g, jsonify
 from flask_cors import CORS
 
 from backend.config import config
@@ -40,6 +40,57 @@ def create_app() -> Flask:
     from backend.routes import register_blueprints
 
     register_blueprints(app)
+
+    # ─────────────────────────────────────────────────────────────
+    # Legacy compat: /api/wallet (same as /api/credits/wallet)
+    # This matches the legacy app.py route exactly
+    # ─────────────────────────────────────────────────────────────
+    @app.route("/api/wallet", methods=["GET"])
+    def api_wallet_compat():
+        """Legacy /api/wallet endpoint for backward compatibility."""
+        from backend.services.identity_service import IdentityService
+        from backend.services.wallet_service import WalletService
+
+        # Get session from cookie
+        from flask import request
+
+        session_id = IdentityService.get_session_id_from_request(request)
+        if not session_id:
+            return jsonify({
+                "error": {
+                    "code": "UNAUTHORIZED",
+                    "message": "No valid session",
+                }
+            }), 401
+
+        # Validate session
+        identity = IdentityService.validate_session(session_id)
+        if not identity:
+            return jsonify({
+                "error": {
+                    "code": "UNAUTHORIZED",
+                    "message": "Invalid or expired session",
+                }
+            }), 401
+
+        identity_id = str(identity["id"])
+
+        # Get balance
+        try:
+            balance = WalletService.get_balance(identity_id) if WalletService else 0
+            return jsonify({
+                "identity_id": identity_id,
+                "credits_balance": balance,
+            })
+        except Exception as e:
+            print(f"[WALLET] Error fetching balance: {e}")
+            return jsonify({
+                "error": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "Failed to fetch wallet balance",
+                }
+            }), 500
+
     return app
 
 
