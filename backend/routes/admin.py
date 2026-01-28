@@ -25,9 +25,9 @@ Environment variables:
 
 from flask import Blueprint, request, jsonify, g
 
-from middleware import require_admin
-from admin_service import AdminService
-from db import DatabaseError
+from backend.middleware import require_admin
+from backend.admin_service import AdminService
+from backend.db import DatabaseError
 
 bp = Blueprint("admin", __name__)
 
