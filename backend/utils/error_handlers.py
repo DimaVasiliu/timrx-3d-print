@@ -19,7 +19,7 @@ Source: app.py lines ~977-1065
 Estimated lines: ~80
 
 Usage after migration:
-    from utils.error_handlers import register_error_handlers
+    from backend.utils.error_handlers import register_error_handlers
     register_error_handlers(app)
 """
 
