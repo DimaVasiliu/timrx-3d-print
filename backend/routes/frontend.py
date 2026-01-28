@@ -21,7 +21,7 @@ Note: These serve static frontend files from the Frontend directory.
 Consider using nginx/CDN for production static file serving.
 
 Usage after migration:
-    from routes.frontend import bp as frontend_bp
+    from backend.routes.frontend import bp as frontend_bp
     app.register_blueprint(frontend_bp)  # No prefix - serves at root
 """
 
