@@ -31,7 +31,7 @@ from backend.db import (
     hash_string,
 )
 import config as cfg
-from emailer import send_magic_code, notify_restore_request
+from backend.emailer import send_magic_code, notify_restore_request
 
 
 class MagicCodeService:
