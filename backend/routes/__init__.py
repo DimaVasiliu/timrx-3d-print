@@ -42,10 +42,12 @@ def register_blueprints(app):
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
 
-    # Also register history under /api for backward compatibility
+    # Also register under /api for backward compatibility (cached frontend)
     app.register_blueprint(history_bp, url_prefix="/api", name="history_compat")
+    app.register_blueprint(text_to_3d_bp, url_prefix="/api", name="text_to_3d_compat")
+    app.register_blueprint(image_to_3d_bp, url_prefix="/api", name="image_to_3d_compat")
 
     print(
         "[ROUTES] Registered blueprints: /api/me, /api/billing, /api/auth, /api/admin, /api/jobs, /api/credits, "
-        "/api/_mod/*, /api/history"
+        "/api/_mod/*, /api/history, /api/text-to-3d, /api/image-to-3d"
     )
