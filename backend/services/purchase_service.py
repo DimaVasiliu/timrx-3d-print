@@ -22,7 +22,7 @@ from datetime import datetime
 import json
 
 from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
-from backend import config as cfg
+import backend.config as cfg
 from backend.emailer import send_purchase_receipt, notify_purchase
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService, LedgerEntryType
@@ -33,7 +33,7 @@ stripe = None
 STRIPE_AVAILABLE = False
 
 # Check PAYMENTS_PROVIDER directly (avoids property issues on some deployments)
-_payments_provider = getattr(cfg, 'PAYMENTS_PROVIDER', 'mollie').lower()
+_payments_provider = getattr(cfg.config, 'PAYMENTS_PROVIDER', 'mollie').lower()
 _use_stripe = _payments_provider in ('stripe', 'both')
 
 if _use_stripe:
@@ -185,11 +185,11 @@ class PurchaseService:
 
         # Verify webhook signature (REQUIRED in production)
         try:
-            if cfg.config.STRIPE_WEBHOOK_SECRET:
+            if cfg.STRIPE_WEBHOOK_SECRET:
                 event = stripe.Webhook.construct_event(
-                    payload, signature, cfg.config.STRIPE_WEBHOOK_SECRET
+                    payload, signature, cfg.STRIPE_WEBHOOK_SECRET
                 )
-            elif cfg.config.IS_DEV:
+            elif cfg.IS_DEV:
                 # Dev only: allow unverified webhooks for local testing
                 print("[PURCHASE] WARNING: Webhook signature not verified (dev mode, no secret)")
                 event = stripe.Event.construct_from(
