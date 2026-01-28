@@ -1046,6 +1046,7 @@ def verify_job_ownership(job_id: str, identity_id: str) -> bool:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Check active_jobs, history_items, AND timrx_billing.jobs tables
                 cur.execute(
                     f"""
                     SELECT identity_id FROM {Tables.ACTIVE_JOBS} WHERE upstream_job_id = %s
@@ -1053,9 +1054,12 @@ def verify_job_ownership(job_id: str, identity_id: str) -> bool:
                     SELECT identity_id FROM {Tables.HISTORY_ITEMS} WHERE id::text = %s
                        OR payload->>'original_job_id' = %s
                        OR payload->>'job_id' = %s
+                    UNION
+                    SELECT identity_id FROM {Tables.JOBS} WHERE id::text = %s
+                       OR upstream_job_id = %s
                     LIMIT 1
                     """,
-                    (job_id, job_id, job_id, job_id),
+                    (job_id, job_id, job_id, job_id, job_id, job_id),
                 )
                 row = cur.fetchone()
 
