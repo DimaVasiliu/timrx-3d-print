@@ -330,421 +330,412 @@ def save_image_to_normalized_db(
         print("[DB] USE_DB is False, skipping save_image_to_normalized_db")
         return False
 
-    conn = get_conn()
-    if not conn:
-        print("[DB] Could not get DB connection for save_image_to_normalized_db")
-        return False
-
     try:
-        with conn, conn.cursor() as cur:
-            existing_history_id = None
-            if user_id:
-                cur.execute(
-                    f"""
-                    SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
-                    WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
-                    LIMIT 1
-                    """,
-                    (image_id, image_id, user_id),
-                )
-            else:
-                cur.execute(
-                    f"""
-                    SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
-                    WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id IS NULL
-                    LIMIT 1
-                    """,
-                    (image_id, image_id),
-                )
-            existing = cur.fetchone()
-            if existing:
-                existing_history_id = str(existing[0])
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                existing_history_id = None
+                if user_id:
+                    cur.execute(
+                        f"""
+                        SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
+                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (image_id, image_id, user_id),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
+                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id IS NULL
+                        LIMIT 1
+                        """,
+                        (image_id, image_id),
+                    )
+                existing = cur.fetchone()
+                if existing:
+                    existing_history_id = str(existing[0])
 
-            title = (prompt[:50] if prompt else "Generated Image")
-            s3_slug = sanitize_filename(title or prompt or "image") or "image"
-            s3_slug = s3_slug[:60]
-            s3_user_id = str(user_id) if user_id else "public"
-            job_key = sanitize_filename(str(image_id)) or "image"
-            image_key_base = f"images/{s3_user_id}/{job_key}/{s3_slug}"
+                title = (prompt[:50] if prompt else "Generated Image")
+                s3_slug = sanitize_filename(title or prompt or "image") or "image"
+                s3_slug = s3_slug[:60]
+                s3_user_id = str(user_id) if user_id else "public"
+                job_key = sanitize_filename(str(image_id)) or "image"
+                image_key_base = f"images/{s3_user_id}/{job_key}/{s3_slug}"
 
-            image_content_hash = None
-            image_s3_key_from_upload = None
-            image_reused = None
-            original_image_url = image_url
-            uploaded_url_cache: dict[str, str] = {}
-            if image_url:
-                upload_result = safe_upload_to_s3(
-                    image_url,
-                    "image/png",
-                    "images",
-                    image_id,
-                    user_id=user_id,
-                    key_base=image_key_base,
-                    return_hash=True,
-                    provider="openai",
-                )
-                image_url, image_content_hash, image_s3_key_from_upload, image_reused = unpack_upload_result(upload_result)
-                if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
-                    print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
-                    image_url = None
-                if original_image_url:
-                    uploaded_url_cache[original_image_url] = image_url
+                image_content_hash = None
+                image_s3_key_from_upload = None
+                image_reused = None
+                original_image_url = image_url
+                uploaded_url_cache: dict[str, str] = {}
                 if image_url:
-                    uploaded_url_cache[image_url] = image_url
-            if image_urls:
-                normalized_urls = []
-                for i, url in enumerate(image_urls):
-                    if not url:
-                        normalized_urls.append(url)
-                        continue
-                    if url in uploaded_url_cache:
-                        normalized_urls.append(uploaded_url_cache[url])
-                        continue
-                    s3_url = safe_upload_to_s3(
-                        url,
+                    upload_result = safe_upload_to_s3(
+                        image_url,
                         "image/png",
                         "images",
-                        f"{image_id}_{i}",
+                        image_id,
                         user_id=user_id,
-                        key_base=f"{image_key_base}_{i}",
+                        key_base=image_key_base,
+                        return_hash=True,
                         provider="openai",
                     )
-                    uploaded_url_cache[url] = s3_url
-                    normalized_urls.append(s3_url)
-                image_urls = normalized_urls
-            image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
-            thumbnail_s3_key = get_s3_key_from_url(image_url)
+                    image_url, image_content_hash, image_s3_key_from_upload, image_reused = unpack_upload_result(upload_result)
+                    if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
+                        print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
+                        image_url = None
+                    if original_image_url:
+                        uploaded_url_cache[original_image_url] = image_url
+                    if image_url:
+                        uploaded_url_cache[image_url] = image_url
+                if image_urls:
+                    normalized_urls = []
+                    for i, url in enumerate(image_urls):
+                        if not url:
+                            normalized_urls.append(url)
+                            continue
+                        if url in uploaded_url_cache:
+                            normalized_urls.append(uploaded_url_cache[url])
+                            continue
+                        s3_url = safe_upload_to_s3(
+                            url,
+                            "image/png",
+                            "images",
+                            f"{image_id}_{i}",
+                            user_id=user_id,
+                            key_base=f"{image_key_base}_{i}",
+                            provider="openai",
+                        )
+                        uploaded_url_cache[url] = s3_url
+                        normalized_urls.append(s3_url)
+                    image_urls = normalized_urls
+                image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
+                thumbnail_s3_key = get_s3_key_from_url(image_url)
 
-            width, height = 1024, 1024
-            if size and "x" in size:
-                parts = size.split("x")
-                try:
-                    width, height = int(parts[0]), int(parts[1])
-                except ValueError:
-                    pass
+                width, height = 1024, 1024
+                if size and "x" in size:
+                    parts = size.split("x")
+                    try:
+                        width, height = int(parts[0]), int(parts[1])
+                    except ValueError:
+                        pass
 
-            history_uuid = existing_history_id or str(uuid.uuid4())
-            image_uuid = str(uuid.uuid4())
-            upstream_id = image_id if image_id else None
+                history_uuid = existing_history_id or str(uuid.uuid4())
+                image_uuid = str(uuid.uuid4())
+                upstream_id = image_id if image_id else None
 
-            payload = {
-                "original_id": image_id,
-                "ai_model": ai_model,
-                "size": size,
-                "image_urls": image_urls or [image_url],
-                "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
-                "image_url": image_url,
-                "thumbnail_url": image_url,
-            }
-
-            image_meta = json.dumps(
-                {
-                    "prompt": prompt,
+                payload = {
+                    "original_id": image_id,
                     "ai_model": ai_model,
                     "size": size,
-                    "format": "png",
                     "image_urls": image_urls or [image_url],
+                    "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
+                    "image_url": image_url,
+                    "thumbnail_url": image_url,
                 }
-            )
 
-            existing_by_hash_id = None
-            if image_content_hash:
-                cur.execute(
-                    f"""
-                    SELECT id FROM {Tables.IMAGES}
-                    WHERE provider = %s AND content_hash = %s
-                    LIMIT 1
-                    """,
-                    ("openai", image_content_hash),
+                image_meta = json.dumps(
+                    {
+                        "prompt": prompt,
+                        "ai_model": ai_model,
+                        "size": size,
+                        "format": "png",
+                        "image_urls": image_urls or [image_url],
+                    }
                 )
-                row = cur.fetchone()
-                if row:
-                    existing_by_hash_id = row[0]
 
-            s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
-            if existing_by_hash_id:
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.IMAGES}
-                    SET identity_id = COALESCE(%s, identity_id),
-                        title = COALESCE(%s, title),
-                        prompt = COALESCE(%s, prompt),
-                        upstream_id = COALESCE(upstream_id, %s),
-                        status = %s,
-                        s3_bucket = COALESCE(%s, s3_bucket),
-                        image_url = COALESCE(%s, image_url),
-                        thumbnail_url = COALESCE(%s, thumbnail_url),
-                        image_s3_key = COALESCE(%s, image_s3_key),
-                        thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
-                        width = COALESCE(%s, width),
-                        height = COALESCE(%s, height),
-                        content_hash = COALESCE(%s, content_hash),
-                        meta = %s,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    RETURNING id
-                    """,
-                    (
-                        user_id,
-                        title,
-                        prompt,
-                        upstream_id,
-                        "ready",
-                        s3_bucket,
-                        image_url,
-                        image_url,
-                        image_s3_key,
-                        thumbnail_s3_key,
-                        width,
-                        height,
-                        image_content_hash,
-                        image_meta,
-                        existing_by_hash_id,
-                    ),
-                )
-            elif upstream_id:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.IMAGES} (
-                        id, identity_id,
-                        title, prompt,
-                        provider, upstream_id, status,
-                        s3_bucket,
-                        image_url, thumbnail_url,
-                        image_s3_key, thumbnail_s3_key,
-                        width, height,
-                        content_hash,
-                        meta
-                    ) VALUES (
-                        %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s,
-                        %s, %s,
-                        %s, %s,
-                        %s,
-                        %s
+                existing_by_hash_id = None
+                if image_content_hash:
+                    cur.execute(
+                        f"""
+                        SELECT id FROM {Tables.IMAGES}
+                        WHERE provider = %s AND content_hash = %s
+                        LIMIT 1
+                        """,
+                        ("openai", image_content_hash),
                     )
-                    ON CONFLICT (provider, upstream_id) DO UPDATE
-                    SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
-                        title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
-                        prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
-                        status = EXCLUDED.status,
-                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
-                        image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
-                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
-                        image_s3_key = COALESCE(EXCLUDED.image_s3_key, {Tables.IMAGES}.image_s3_key),
-                        thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.IMAGES}.thumbnail_s3_key),
-                        width = COALESCE(EXCLUDED.width, {Tables.IMAGES}.width),
-                        height = COALESCE(EXCLUDED.height, {Tables.IMAGES}.height),
-                        content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
-                        meta = EXCLUDED.meta,
-                        updated_at = NOW()
-                    RETURNING id
-                    """,
-                    (
-                        image_uuid,
-                        user_id,
-                        title,
-                        prompt,
-                        "openai",
-                        upstream_id,
-                        "ready",
-                        s3_bucket,
-                        image_url,
-                        image_url,
-                        image_s3_key,
-                        thumbnail_s3_key,
-                        width,
-                        height,
-                        image_content_hash,
-                        image_meta,
-                    ),
-                )
-            elif image_url:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.IMAGES} (
-                        id, identity_id,
-                        title, prompt,
-                        provider, upstream_id, status,
-                        image_url, thumbnail_url,
-                        width, height,
-                        content_hash,
-                        meta
-                    ) VALUES (
-                        %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        %s,
-                        %s
-                    )
-                    ON CONFLICT (provider, image_url) WHERE upstream_id IS NULL AND image_url IS NOT NULL DO UPDATE
-                    SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
-                        title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
-                        prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
-                        status = EXCLUDED.status,
-                        image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
-                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
-                        width = COALESCE(EXCLUDED.width, {Tables.IMAGES}.width),
-                        height = COALESCE(EXCLUDED.height, {Tables.IMAGES}.height),
-                        content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
-                        meta = EXCLUDED.meta,
-                        updated_at = NOW()
-                    RETURNING id
-                    """,
-                    (
-                        image_uuid,
-                        user_id,
-                        title,
-                        prompt,
-                        "openai",
-                        None,
-                        "ready",
-                        image_url,
-                        image_url,
-                        width,
-                        height,
-                        image_content_hash,
-                        image_meta,
-                    ),
-                )
-            else:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.IMAGES} (
-                        id, identity_id,
-                        title, prompt,
-                        provider, upstream_id, status,
-                        image_url, thumbnail_url,
-                        width, height,
-                        content_hash,
-                        meta
-                    ) VALUES (
-                        %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        %s,
-                        %s
-                    )
-                    RETURNING id
-                    """,
-                    (
-                        image_uuid,
-                        user_id,
-                        title,
-                        prompt,
-                        "openai",
-                        None,
-                        "ready",
-                        None,
-                        None,
-                        width,
-                        height,
-                        image_content_hash,
-                        image_meta,
-                    ),
-                )
+                    row = cur.fetchone()
+                    if row:
+                        existing_by_hash_id = row[0]
 
-            image_row = cur.fetchone()
-            if not image_row:
-                raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
-            returned_image_id = image_row[0]
-            print(f"[DB] image persisted: image_id={returned_image_id} image_url={image_url} thumb={image_url}")
-
-            if existing_history_id:
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.HISTORY_ITEMS}
-                    SET item_type = %s,
-                        status = COALESCE(%s, status),
-                        stage = COALESCE(%s, stage),
-                        title = COALESCE(%s, title),
-                        prompt = COALESCE(%s, prompt),
-                        root_prompt = COALESCE(%s, root_prompt),
-                        identity_id = COALESCE(%s, identity_id),
-                        thumbnail_url = COALESCE(%s, thumbnail_url),
-                        image_url = COALESCE(%s, image_url),
-                        image_id = %s,
-                        payload = %s,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (
-                        "image",
-                        "finished",
-                        "image",
-                        title,
-                        prompt,
-                        None,
-                        user_id,
-                        image_url,
-                        image_url,
-                        returned_image_id,
-                        json.dumps(payload),
-                        history_uuid,
-                    ),
-                )
-            else:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.HISTORY_ITEMS} (
-                        id, identity_id, item_type, status, stage,
-                        title, prompt, root_prompt,
-                        thumbnail_url, image_url,
-                        image_id,
-                        payload
-                    ) VALUES (
-                        %s, %s, %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s,
-                        %s,
-                        %s
+                s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
+                if existing_by_hash_id:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.IMAGES}
+                        SET identity_id = COALESCE(%s, identity_id),
+                            title = COALESCE(%s, title),
+                            prompt = COALESCE(%s, prompt),
+                            upstream_id = COALESCE(upstream_id, %s),
+                            status = %s,
+                            s3_bucket = COALESCE(%s, s3_bucket),
+                            image_url = COALESCE(%s, image_url),
+                            thumbnail_url = COALESCE(%s, thumbnail_url),
+                            image_s3_key = COALESCE(%s, image_s3_key),
+                            thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
+                            width = COALESCE(%s, width),
+                            height = COALESCE(%s, height),
+                            content_hash = COALESCE(%s, content_hash),
+                            meta = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING id
+                        """,
+                        (
+                            user_id,
+                            title,
+                            prompt,
+                            upstream_id,
+                            "ready",
+                            s3_bucket,
+                            image_url,
+                            image_url,
+                            image_s3_key,
+                            thumbnail_s3_key,
+                            width,
+                            height,
+                            image_content_hash,
+                            image_meta,
+                            existing_by_hash_id,
+                        ),
                     )
-                    ON CONFLICT (id) DO UPDATE
-                    SET item_type = EXCLUDED.item_type,
-                        status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
-                        stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
-                        title = COALESCE(EXCLUDED.title, {Tables.HISTORY_ITEMS}.title),
-                        prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
-                        root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
-                        identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
-                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
-                        image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
-                        image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
-                        payload = EXCLUDED.payload,
-                        updated_at = NOW()
-                    """,
-                    (
-                        history_uuid,
-                        user_id,
-                        "image",
-                        "finished",
-                        "image",
-                        title,
-                        prompt,
-                        None,
-                        image_url,
-                        image_url,
-                        returned_image_id,
-                        json.dumps(payload),
-                    ),
-                )
+                elif upstream_id:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.IMAGES} (
+                            id, identity_id,
+                            title, prompt,
+                            provider, upstream_id, status,
+                            s3_bucket,
+                            image_url, thumbnail_url,
+                            image_s3_key, thumbnail_s3_key,
+                            width, height,
+                            content_hash,
+                            meta
+                        ) VALUES (
+                            %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s, %s, %s,
+                            %s,
+                            %s, %s,
+                            %s, %s,
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT (provider, upstream_id) DO UPDATE
+                        SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
+                            title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
+                            prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
+                            status = EXCLUDED.status,
+                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
+                            image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
+                            image_s3_key = COALESCE(EXCLUDED.image_s3_key, {Tables.IMAGES}.image_s3_key),
+                            thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.IMAGES}.thumbnail_s3_key),
+                            width = COALESCE(EXCLUDED.width, {Tables.IMAGES}.width),
+                            height = COALESCE(EXCLUDED.height, {Tables.IMAGES}.height),
+                            content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
+                            meta = EXCLUDED.meta,
+                            updated_at = NOW()
+                        RETURNING id
+                        """,
+                        (
+                            image_uuid,
+                            user_id,
+                            title,
+                            prompt,
+                            "openai",
+                            upstream_id,
+                            "ready",
+                            s3_bucket,
+                            image_url,
+                            image_url,
+                            image_s3_key,
+                            thumbnail_s3_key,
+                            width,
+                            height,
+                            image_content_hash,
+                            image_meta,
+                        ),
+                    )
+                elif image_url:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.IMAGES} (
+                            id, identity_id,
+                            title, prompt,
+                            provider, upstream_id, status,
+                            image_url, thumbnail_url,
+                            width, height,
+                            content_hash,
+                            meta
+                        ) VALUES (
+                            %s, %s,
+                            %s, %s,
+                            %s, %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT (provider, image_url) WHERE upstream_id IS NULL AND image_url IS NOT NULL DO UPDATE
+                        SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
+                            title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
+                            prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
+                            status = EXCLUDED.status,
+                            image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
+                            width = COALESCE(EXCLUDED.width, {Tables.IMAGES}.width),
+                            height = COALESCE(EXCLUDED.height, {Tables.IMAGES}.height),
+                            content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
+                            meta = EXCLUDED.meta,
+                            updated_at = NOW()
+                        RETURNING id
+                        """,
+                        (
+                            image_uuid,
+                            user_id,
+                            title,
+                            prompt,
+                            "openai",
+                            None,
+                            "ready",
+                            image_url,
+                            image_url,
+                            width,
+                            height,
+                            image_content_hash,
+                            image_meta,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.IMAGES} (
+                            id, identity_id,
+                            title, prompt,
+                            provider, upstream_id, status,
+                            image_url, thumbnail_url,
+                            width, height,
+                            content_hash,
+                            meta
+                        ) VALUES (
+                            %s, %s,
+                            %s, %s,
+                            %s, %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s,
+                            %s
+                        )
+                        RETURNING id
+                        """,
+                        (
+                            image_uuid,
+                            user_id,
+                            title,
+                            prompt,
+                            "openai",
+                            None,
+                            "ready",
+                            None,
+                            None,
+                            width,
+                            height,
+                            image_content_hash,
+                            image_meta,
+                        ),
+                    )
 
-        conn.close()
+                image_row = cur.fetchone()
+                if not image_row:
+                    raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
+                returned_image_id = image_row[0]
+                print(f"[DB] image persisted: image_id={returned_image_id} image_url={image_url} thumb={image_url}")
+
+                if existing_history_id:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.HISTORY_ITEMS}
+                        SET item_type = %s,
+                            status = COALESCE(%s, status),
+                            stage = COALESCE(%s, stage),
+                            title = COALESCE(%s, title),
+                            prompt = COALESCE(%s, prompt),
+                            root_prompt = COALESCE(%s, root_prompt),
+                            identity_id = COALESCE(%s, identity_id),
+                            thumbnail_url = COALESCE(%s, thumbnail_url),
+                            image_url = COALESCE(%s, image_url),
+                            image_id = %s,
+                            payload = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            "image",
+                            "finished",
+                            "image",
+                            title,
+                            prompt,
+                            None,
+                            user_id,
+                            image_url,
+                            image_url,
+                            returned_image_id,
+                            json.dumps(payload),
+                            history_uuid,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.HISTORY_ITEMS} (
+                            id, identity_id, item_type, status, stage,
+                            title, prompt, root_prompt,
+                            thumbnail_url, image_url,
+                            image_id,
+                            payload
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            %s, %s, %s,
+                            %s, %s,
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT (id) DO UPDATE
+                        SET item_type = EXCLUDED.item_type,
+                            status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
+                            stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
+                            title = COALESCE(EXCLUDED.title, {Tables.HISTORY_ITEMS}.title),
+                            prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
+                            root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
+                            identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
+                            image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
+                            image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
+                            payload = EXCLUDED.payload,
+                            updated_at = NOW()
+                        """,
+                        (
+                            history_uuid,
+                            user_id,
+                            "image",
+                            "finished",
+                            "image",
+                            title,
+                            prompt,
+                            None,
+                            image_url,
+                            image_url,
+                            returned_image_id,
+                            json.dumps(payload),
+                        ),
+                    )
+            conn.commit()
         print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
         return None
 
 
@@ -762,13 +753,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         print("[DB] USE_DB is False, skipping save_finished_job_to_normalized_db")
         return False
 
-    conn = get_conn()
-    if not conn:
-        print("[DB] Could not get DB connection for save_finished_job_to_normalized_db")
-        return False
-
     try:
-        with conn, conn.cursor(row_factory=dict_row) as cur:
+        with get_conn() as conn:
+            cur = conn.cursor(row_factory=dict_row)
             db_errors: list[dict[str, str]] = []
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
             thumbnail_url = status_data.get("thumbnail_url")
@@ -846,7 +833,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 asset_url = existing_history.get("image_url") if asset_type == "image" else existing_history.get("glb_url")
                 if existing_history.get("status") == "finished" and is_s3_url(asset_url):
                     print(f"[DB] save_finished_job skipped: already finished with S3 (job_id={job_id}, stage={final_stage})")
-                    conn.close()
+                    cur.close()
                     return {"success": True, "db_ok": True, "skipped": True}
 
             try:
@@ -864,7 +851,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     print(
                         f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})"
                     )
-                    conn.close()
+                    cur.close()
                     return {"success": True, "db_ok": len(db_errors) == 0, "db_errors": db_errors or None, "skipped": True}
             except Exception as e:
                 log_db_continue("asset_saves_precheck", e)
@@ -1404,7 +1391,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 else:
                     print(f"[S3] cleanup skipped; keys={cleanup_keys}")
 
-        conn.close()
+            cur.close()
+            conn.commit()
         if db_save_ok and history_item_id:
             if model_id:
                 print(f"[DB] model persisted: model_id={model_id} glb_url={final_glb_url} history_item_id={history_item_id}")
@@ -1444,10 +1432,6 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} thumbnail_url={final_thumbnail_url}")
         if image_url and is_s3_url(image_url):
             print(f"[DB] ERROR: S3 upload succeeded but DB save failed job_id={job_id} image_url={image_url}")
-        try:
-            conn.close()
-        except Exception:
-            pass
         return None
 
 
