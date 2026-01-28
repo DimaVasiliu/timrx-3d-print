@@ -28,7 +28,7 @@ import requests
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-import config as cfg
+from backend import config as cfg
 from backend.services.pricing_service import PricingService
 
 
@@ -411,7 +411,7 @@ class MollieService:
 
             # Fetch current wallet balance to return in response
             # This allows frontend to update UI immediately without polling /api/me
-            from wallet_service import WalletService
+            from backend.services.wallet_service import WalletService
             wallet = WalletService.get_or_create_wallet(identity_id)
             balance_credits = wallet.get("balance_credits", 0) if wallet else 0
             reserved_credits = wallet.get("reserved_credits", 0) if wallet else 0
@@ -453,7 +453,7 @@ class MollieService:
             Dict with purchase info, or None on failure
         """
         # Import here to avoid circular import
-        from purchase_service import PurchaseService
+        from backend.services.purchase_service import PurchaseService
 
         payment_id = payment.get("id")
         metadata = payment.get("metadata", {})
@@ -508,7 +508,7 @@ class MollieService:
                 # Emails are non-blocking - failures are logged as warnings only
                 if not was_existing and customer_email:
                     try:
-                        from emailer import send_purchase_receipt, notify_purchase
+                        from backend.emailer import send_purchase_receipt, notify_purchase
                         send_purchase_receipt(
                             to_email=customer_email,
                             plan_name=plan_name,
@@ -553,9 +553,9 @@ class MollieService:
         Returns:
             Dict with refund info, or None on failure
         """
-        from db import fetch_one, transaction, Tables
-        from wallet_service import LedgerEntryType
-        from purchase_service import PurchaseService
+        from backend.db import fetch_one, transaction, Tables
+        from backend.services.wallet_service import LedgerEntryType
+        from backend.services.purchase_service import PurchaseService
 
         payment_id = payment.get("id")
         status = payment.get("status")  # 'refunded' or 'charged_back'
@@ -701,9 +701,9 @@ class MollieService:
 
         This is similar to PurchaseService.record_purchase but uses 'mollie' as provider.
         """
-        from db import fetch_one, transaction, Tables
-        from wallet_service import LedgerEntryType
-        from purchase_service import PurchaseStatus, PurchaseService
+        from backend.db import fetch_one, transaction, Tables
+        from backend.services.wallet_service import LedgerEntryType
+        from backend.services.purchase_service import PurchaseStatus, PurchaseService
 
         with transaction() as cur:
             # 1. Create purchase record (idempotent via ON CONFLICT DO NOTHING)
@@ -872,4 +872,3 @@ class MollieService:
 
         except requests.RequestException:
             return None
-           
