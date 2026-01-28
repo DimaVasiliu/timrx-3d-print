@@ -30,7 +30,7 @@ from backend.db import (
     Tables,
     hash_string,
 )
-import config as cfg
+from backend import config as cfg
 from backend.emailer import send_magic_code, notify_restore_request
 
 
