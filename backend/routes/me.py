@@ -11,7 +11,7 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from middleware import with_session, require_session, no_cache
+from backend.middleware import with_session, require_session, no_cache
 from identity_service import IdentityService
 from wallet_service import WalletService
 
