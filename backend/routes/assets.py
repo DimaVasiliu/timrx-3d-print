@@ -19,7 +19,7 @@ from backend.config import (
     AWS_SECRET_ACCESS_KEY,
     PROXY_ALLOWED_HOSTS,
 )
-from backend.db import USE_DB, get_conn
+from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
 from backend.services.identity_service import require_identity
 
@@ -44,9 +44,15 @@ def _extract_s3_key_from_url(url: str | None) -> str | None:
 
 
 @bp.route("/proxy-glb", methods=["GET", "OPTIONS"])
+@with_session
 def proxy_glb_mod():
     if request.method == "OPTIONS":
         return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
     u = request.args.get("u", "").strip()
     if not u:
         return jsonify({"ok": False, "error": {"code": "MISSING_URL", "message": "u query param required"}}), 400
@@ -58,18 +64,58 @@ def proxy_glb_mod():
     if host not in PROXY_ALLOWED_HOSTS:
         return jsonify({"ok": False, "error": {"code": "HOST_NOT_ALLOWED", "message": "Host not allowed"}}), 400
 
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    s3_key = _extract_s3_key_from_url(u)
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if s3_key:
+                    cur.execute(
+                        f"""
+                        SELECT 1
+                        FROM {Tables.MODELS}
+                        WHERE identity_id = %s AND (glb_s3_key = %s OR thumbnail_s3_key = %s)
+                        UNION
+                        SELECT 1
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
+                        LIMIT 1
+                        """,
+                        (identity_id, s3_key, s3_key, identity_id, u, u),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT 1
+                        FROM {Tables.MODELS}
+                        WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
+                        UNION
+                        SELECT 1
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
+                        LIMIT 1
+                        """,
+                        (identity_id, u, u, identity_id, u, u),
+                    )
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}}), 404
+    except Exception as e:
+        print(f"[proxy-glb][mod] ownership check failed: {e}")
+        return jsonify({"ok": False, "error": {"code": "DB_ERROR", "message": "Ownership check failed"}}), 500
+
     # If the URL is our S3 bucket, use a presigned URL to avoid 403 on private objects.
-    if AWS_BUCKET_MODELS and host.startswith(AWS_BUCKET_MODELS.lower()):
-        s3_key = _extract_s3_key_from_url(u)
-        if s3_key:
-            try:
-                u = _s3.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": AWS_BUCKET_MODELS, "Key": s3_key},
-                    ExpiresIn=3600,
-                )
-            except Exception as e:
-                print(f"[proxy-glb][mod] Failed to presign S3 URL: {e}")
+    if AWS_BUCKET_MODELS and host.startswith(AWS_BUCKET_MODELS.lower()) and s3_key:
+        try:
+            u = _s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": AWS_BUCKET_MODELS, "Key": s3_key},
+                ExpiresIn=3600,
+            )
+        except Exception as e:
+            print(f"[proxy-glb][mod] Failed to presign S3 URL: {e}")
 
     try:
         r = requests.get(u, stream=True, timeout=60)
