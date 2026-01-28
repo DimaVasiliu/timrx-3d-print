@@ -40,14 +40,14 @@ from backend.db import (
     DatabaseError,
     DatabaseIntegrityError,
 )
-import backend.config as cfg
+from backend.config import config
 from backend.emailer import notify_new_identity
 
 # Debug flag for verbose cookie logging (set SESSION_DEBUG=1 to enable)
 SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 
 # Production safety warning (one-time at startup)
-if SESSION_DEBUG and cfg.IS_PROD:
+if SESSION_DEBUG and config.IS_PROD:
     print(
         "[WARN] SESSION_DEBUG enabled in production - "
         "disable after troubleshooting (set SESSION_DEBUG=0 or remove env var)"
@@ -76,7 +76,7 @@ class IdentityService:
         if not raw_cookie:
             return []
 
-        cookie_name = cfg.SESSION_COOKIE_NAME
+        cookie_name = config.SESSION_COOKIE_NAME
         # Pattern: timrx_sid=<value> where value continues until ; or end
         # Cookie values are typically alphanumeric + hyphens (UUIDs)
         pattern = rf'{re.escape(cookie_name)}=([a-fA-F0-9\-]+)'
@@ -137,7 +137,7 @@ class IdentityService:
 
         if not candidates:
             # Fallback to Flask's parsed value (in case our regex missed something)
-            flask_sid = request.cookies.get(cfg.SESSION_COOKIE_NAME)
+            flask_sid = request.cookies.get(config.SESSION_COOKIE_NAME)
             if flask_sid:
                 candidates = [flask_sid]
 
@@ -217,12 +217,12 @@ class IdentityService:
         """
         # Determine if we're in production mode
         # Force prod detection: if we see timrx.live in any form, treat as prod
-        is_prod = cfg.IS_PROD
+        is_prod = config.IS_PROD
 
         # PRODUCTION: Canonical cookie settings (NEVER deviate)
         if is_prod:
             # Always use .timrx.live domain in production, regardless of config
-            canonical_domain = cfg.SESSION_COOKIE_DOMAIN or ".timrx.live"
+            canonical_domain = config.SESSION_COOKIE_DOMAIN or ".timrx.live"
             canonical_samesite = "None"
             canonical_secure = True
         else:
@@ -249,7 +249,7 @@ class IdentityService:
             # This removes any cookie that was set without a Domain attribute,
             # which would be scoped to exactly the response host (e.g., 3d.timrx.live)
             response.set_cookie(
-                cfg.SESSION_COOKIE_NAME,
+                config.SESSION_COOKIE_NAME,
                 "",  # Empty value
                 max_age=0,
                 expires=0,
@@ -267,7 +267,7 @@ class IdentityService:
         # SET CANONICAL COOKIE with proper domain
         # ─────────────────────────────────────────────────────────────
         cookie_kwargs = {
-            "max_age": cfg.SESSION_TTL_SECONDS,
+            "max_age": config.SESSION_TTL_SECONDS,
             "httponly": True,  # Always httponly
             "secure": canonical_secure,
             "samesite": canonical_samesite,
@@ -277,13 +277,13 @@ class IdentityService:
         if canonical_domain:
             cookie_kwargs["domain"] = canonical_domain
 
-        response.set_cookie(cfg.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
+        response.set_cookie(config.SESSION_COOKIE_NAME, session_id, **cookie_kwargs)
 
         # Debug logging for Set-Cookie header inspection (only when SESSION_DEBUG=1)
         if SESSION_DEBUG:
             set_cookie_headers = response.headers.getlist('Set-Cookie')
             print(
-                f"[SESSION] Cookie set: name={cfg.SESSION_COOKIE_NAME}, "
+                f"[SESSION] Cookie set: name={config.SESSION_COOKIE_NAME}, "
                 f"session_id={session_id[:8]}..., "
                 f"domain={canonical_domain!r}, secure={canonical_secure}, "
                 f"samesite={canonical_samesite}, is_prod={is_prod}"
@@ -304,9 +304,9 @@ class IdentityService:
         1. Host-only cookie (scoped to current host)
         2. Canonical cookie (Domain=.timrx.live, shared across subdomains)
         """
-        is_prod = cfg.IS_PROD
-        cookie_name = cfg.SESSION_COOKIE_NAME
-        canonical_domain = cfg.SESSION_COOKIE_DOMAIN or (".timrx.live" if is_prod else None)
+        is_prod = config.IS_PROD
+        cookie_name = config.SESSION_COOKIE_NAME
+        canonical_domain = config.SESSION_COOKIE_DOMAIN or (".timrx.live" if is_prod else None)
 
         if is_prod:
             # 1. Clear host-only cookie (no domain = current host only)
@@ -356,7 +356,7 @@ class IdentityService:
             identity_id = str(identity["id"])
 
             # Create wallet with initial balance
-            initial_balance = cfg.FREE_CREDITS_ON_SIGNUP
+            initial_balance = config.FREE_CREDITS_ON_SIGNUP
             cur.execute(
                 f"""
                 INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
@@ -547,7 +547,7 @@ class IdentityService:
             DatabaseError: On database failure
         """
         session_id = str(uuid.uuid4())
-        expires_at = now_utc() + timedelta(days=cfg.SESSION_TTL_DAYS)
+        expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
 
         ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
@@ -665,8 +665,8 @@ class IdentityService:
             DatabaseError: On database failure
         """
         session_id = str(uuid.uuid4())
-        expires_at = now_utc() + timedelta(days=cfg.SESSION_TTL_DAYS)
-        initial_balance = cfg.FREE_CREDITS_ON_SIGNUP
+        expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
+        initial_balance = config.FREE_CREDITS_ON_SIGNUP
 
         ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
