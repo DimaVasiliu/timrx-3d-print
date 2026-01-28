@@ -119,14 +119,14 @@ def finalize_job_credits(reservation_id: str, job_id: str | None = None) -> None
     try:
         result = ReservationService.finalize_reservation(reservation_id)
         if result.get("not_found"):
-            print(f"[CREDITS] Finalize: reservation not found (idempotent): {reservation_id} job_id={internal_job_id}")
+            print(f"[CREDITS] Finalize: reservation not found (idempotent): {reservation_id} job_id={job_id}")
         elif result.get("was_already_finalized"):
-            print(f"[CREDITS] Already finalized: reservation={reservation_id} job_id={internal_job_id}")
+            print(f"[CREDITS] Already finalized: reservation={reservation_id} job_id={job_id}")
         elif result.get("was_already_released"):
-            print(f"[CREDITS] Finalize skipped (already released): reservation={reservation_id} job_id={internal_job_id}")
+            print(f"[CREDITS] Finalize skipped (already released): reservation={reservation_id} job_id={job_id}")
         else:
-            print(f"[CREDITS] Finalized: reservation={reservation_id} job_id={internal_job_id}")
-            print(f"[JOB] credits_captured job_id={internal_job_id} reservation_id={reservation_id}")
+            print(f"[CREDITS] Finalized: reservation={reservation_id} job_id={job_id}")
+            print(f"[JOB] credits_captured job_id={job_id} reservation_id={reservation_id}")
     except Exception as e:
         print(f"[CREDITS] Finalize error {reservation_id}: {e}")
 
@@ -139,13 +139,13 @@ def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id:
     try:
         result = ReservationService.release_reservation(reservation_id, reason)
         if result.get("not_found"):
-            print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={internal_job_id}")
+            print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={job_id}")
         elif result.get("was_already_released"):
-            print(f"[CREDITS] Already released: reservation={reservation_id} job_id={internal_job_id} reason={reason}")
+            print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
         elif result.get("was_already_finalized"):
-            print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={internal_job_id}")
+            print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={job_id}")
         else:
-            print(f"[CREDITS] Released: reservation={reservation_id} job_id={internal_job_id} reason={reason}")
+            print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
     except Exception as e:
         print(f"[CREDITS] Release error {reservation_id}: {e}")
 
