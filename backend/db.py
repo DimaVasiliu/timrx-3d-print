@@ -40,7 +40,7 @@ except ImportError:
 
 def _get_config():
     """Lazy import of config to avoid circular imports."""
-    from config import config
+    from backend.config import config
     return config
 
 
