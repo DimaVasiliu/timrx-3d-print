@@ -595,6 +595,10 @@ class Config:
 # ─────────────────────────────────────────────────────────────
 try:
     config = Config()
+    # Backwards-compat: some older modules expect `config.config` to exist
+    # (treating the Config instance like a module). Keep this alias to avoid
+    # AttributeError during deployment mismatches.
+    setattr(config, "config", config)
     print(f"[CONFIG] Loaded successfully (IS_DEV={config.IS_DEV}, IS_RENDER={config.IS_RENDER})")
 except Exception as e:
     print(f"[CONFIG] FATAL: Failed to load config: {repr(e)}")
