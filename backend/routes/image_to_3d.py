@@ -117,6 +117,7 @@ def image_to_3d_status_mod(job_id: str):
     identity_id = g.identity_id
     meshy_job_id = job_id
     internal_job = None
+    ownership_verified = False  # Track if we already verified ownership via DB
 
     if USE_DB:
         try:
@@ -134,6 +135,7 @@ def image_to_3d_status_mod(job_id: str):
                     internal_job = cur.fetchone()
 
             if internal_job:
+                ownership_verified = True  # Found in jobs table with matching identity_id
                 if internal_job["status"] == "queued":
                     return jsonify({
                         "status": "queued",
@@ -163,7 +165,8 @@ def image_to_3d_status_mod(job_id: str):
         except Exception as e:
             print(f"[STATUS][mod] Error checking internal job {job_id}: {e}")
 
-    if not verify_job_ownership(meshy_job_id, identity_id):
+    # Skip verify_job_ownership if we already verified via timrx_billing.jobs query
+    if not ownership_verified and not verify_job_ownership(meshy_job_id, identity_id):
         return jsonify({"error": "Job not found or access denied"}), 404
 
     try:
