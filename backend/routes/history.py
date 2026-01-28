@@ -48,6 +48,7 @@ def history_mod():
         if request.method == "GET":
             items = []
             db_source = False
+            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}")
 
             if USE_DB:
                 conn = get_conn()
