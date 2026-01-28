@@ -122,6 +122,11 @@ def text_to_3d_start_mod():
         "internal_job_id": internal_job_id,
     }
 
+    # Persist immediately so status polling can return queued while dispatch runs
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
     get_executor().submit(
         _dispatch_meshy_text_to_3d_async,
         internal_job_id,
@@ -405,6 +410,28 @@ def text_to_3d_status_mod(job_id: str):
                     })
         except Exception as e:
             print(f"[STATUS][mod] Error checking internal job {job_id}: {e}")
+
+    # If still not verified, check local store for queued jobs (before dispatch finishes)
+    if not ownership_verified:
+        store = load_store()
+        store_meta = store.get(job_id) or {}
+        if store_meta:
+            job_user_id = store_meta.get("identity_id") or store_meta.get("user_id")
+            if identity_id and job_user_id and job_user_id != identity_id:
+                return jsonify({"error": "Job not found or access denied"}), 404
+
+            upstream_hint = store_meta.get("upstream_job_id") or store_meta.get("meshy_task_id")
+            stage_hint = store_meta.get("stage") or "preview"
+            if not upstream_hint:
+                return jsonify({
+                    "status": "queued",
+                    "pct": 0,
+                    "stage": stage_hint,
+                    "message": "Job is being dispatched to provider...",
+                    "job_id": job_id,
+                })
+            meshy_job_id = upstream_hint
+            ownership_verified = True
 
     # Skip verify_job_ownership if we already verified via timrx_billing.jobs query
     if not ownership_verified and not verify_job_ownership(meshy_job_id, identity_id):
