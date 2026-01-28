@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
 from backend.db import query_one, query_all, execute_returning, transaction, Tables
-from backend.wallet_service import WalletService
+from backend.services.wallet_service import WalletService
 
 
 class AdminService:
@@ -541,7 +541,7 @@ class AdminService:
         """
         Manually release a held reservation (returns credits to user).
         """
-        from reservation_service import ReservationService
+        from backend.services.reservation_service import ReservationService
         return ReservationService.release_reservation(reservation_id)
 
     # ─────────────────────────────────────────────────────────────
