@@ -393,7 +393,7 @@ class PricingService:
         Returns:
             Number of plans seeded/updated
         """
-        from db import is_available
+        from backend.db import is_available
 
         print("[PRICING] Starting plan seed...")
 
