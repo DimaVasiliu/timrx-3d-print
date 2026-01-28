@@ -51,11 +51,8 @@ def history_mod():
             print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}")
 
             if USE_DB:
-                conn = get_conn()
-                if not conn:
-                    print("[History][mod] GET: DB connection unavailable, returning local/empty")
-                else:
-                    try:
+                try:
+                    with get_conn() as conn:
                         with conn.cursor(row_factory=dict_row) as cur:
                             cur.execute(
                                 f"""
@@ -68,44 +65,39 @@ def history_mod():
                                 (identity_id,),
                             )
                             rows = cur.fetchall()
-                        conn.close()
-                        print(f"[History][mod] GET: Fetched {len(rows)} items from database")
-                        db_source = True
+                    print(f"[History][mod] GET: Fetched {len(rows)} items from database")
+                    db_source = True
 
-                        for r in rows:
-                            item = r["payload"] if r["payload"] else {}
-                            item["id"] = str(r["id"])
-                            item["type"] = r["item_type"]
-                            item["status"] = r["status"]
-                            if r["stage"]:
-                                item["stage"] = r["stage"]
-                            if r["title"]:
-                                item["title"] = r["title"]
-                            if r["prompt"]:
-                                item["prompt"] = r["prompt"]
-                            if r["thumbnail_url"]:
-                                item["thumbnail_url"] = r["thumbnail_url"]
-                            if r["glb_url"]:
-                                item["glb_url"] = r["glb_url"]
-                            if r["image_url"]:
-                                item["image_url"] = r["image_url"]
-                            if r["created_at"]:
-                                item["created_at"] = int(r["created_at"].timestamp() * 1000)
-                            items.append(item)
+                    for r in rows:
+                        item = r["payload"] if r["payload"] else {}
+                        item["id"] = str(r["id"])
+                        item["type"] = r["item_type"]
+                        item["status"] = r["status"]
+                        if r["stage"]:
+                            item["stage"] = r["stage"]
+                        if r["title"]:
+                            item["title"] = r["title"]
+                        if r["prompt"]:
+                            item["prompt"] = r["prompt"]
+                        if r["thumbnail_url"]:
+                            item["thumbnail_url"] = r["thumbnail_url"]
+                        if r["glb_url"]:
+                            item["glb_url"] = r["glb_url"]
+                        if r["image_url"]:
+                            item["image_url"] = r["image_url"]
+                        if r["created_at"]:
+                            item["created_at"] = int(r["created_at"].timestamp() * 1000)
+                        items.append(item)
 
-                        for i, item in enumerate(items[:3]):
-                            thumb = item.get("thumbnail_url")
-                            thumb_preview = (thumb[:60] + "...") if isinstance(thumb, str) else "None"
-                            print(f"[History][mod] Item {i}: title={item.get('title')}, thumbnail={thumb_preview}")
+                    for i, item in enumerate(items[:3]):
+                        thumb = item.get("thumbnail_url")
+                        thumb_preview = (thumb[:60] + "...") if isinstance(thumb, str) else "None"
+                        print(f"[History][mod] Item {i}: title={item.get('title')}, thumbnail={thumb_preview}")
 
-                        save_history_store(items)
-                    except Exception as e:
-                        print(f"[History][mod] DB read failed (returning local/empty): {e}")
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        # Fall through to return local history or empty array
+                    save_history_store(items)
+                except Exception as e:
+                    print(f"[History][mod] DB read failed (returning local/empty): {e}")
+                    # Fall through to return local history or empty array
 
             # If DB wasn't used or failed, try local history
             if not db_source:
