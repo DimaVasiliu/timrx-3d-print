@@ -832,9 +832,6 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
     """Persist active job metadata for recovery."""
     if not USE_DB:
         return False
-    conn = get_conn()
-    if not conn:
-        return False
     try:
         job_meta = metadata or {}
         if not user_id:
@@ -873,54 +870,51 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         payload["thumbnail_url"] = thumbnail_url
         payload["image_url"] = image_url
 
-        with conn, conn.cursor(row_factory=dict_row) as cur:
-            action_code = _map_action_code(job_type)
-            provider = _map_provider(job_type)
-            cur.execute(
-                f"""
-                SELECT id FROM {Tables.ACTIVE_JOBS}
-                WHERE upstream_job_id = %s
-                LIMIT 1
-                """,
-                (job_id,),
-            )
-            existing = cur.fetchone()
-            progress = int(job_meta.get("pct") or 0)
-            if existing:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                action_code = _map_action_code(job_type)
+                provider = _map_provider(job_type)
                 cur.execute(
                     f"""
-                    UPDATE {Tables.ACTIVE_JOBS}
-                    SET identity_id = COALESCE(%s, identity_id),
-                        provider = %s,
-                        action_code = %s,
-                        status = 'running',
-                        progress = %s,
-                        updated_at = NOW()
-                    WHERE id = %s
+                    SELECT id FROM {Tables.ACTIVE_JOBS}
+                    WHERE upstream_job_id = %s
+                    LIMIT 1
                     """,
-                    (user_id, provider, action_code, progress, existing["id"]),
+                    (job_id,),
                 )
-            else:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.ACTIVE_JOBS} (
-                        id, identity_id, provider, action_code, upstream_job_id,
-                        status, progress
-                    ) VALUES (
-                        %s, %s, %s, %s, %s,
-                        'running', %s
+                existing = cur.fetchone()
+                progress = int(job_meta.get("pct") or 0)
+                if existing:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.ACTIVE_JOBS}
+                        SET identity_id = COALESCE(%s, identity_id),
+                            provider = %s,
+                            action_code = %s,
+                            status = 'running',
+                            progress = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (user_id, provider, action_code, progress, existing["id"]),
                     )
-                    """,
-                    (str(uuid.uuid4()), user_id, provider, action_code, job_id, progress),
-                )
-        conn.close()
+                else:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.ACTIVE_JOBS} (
+                            id, identity_id, provider, action_code, upstream_job_id,
+                            status, progress
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            'running', %s
+                        )
+                        """,
+                        (str(uuid.uuid4()), user_id, provider, action_code, job_id, progress),
+                    )
+            conn.commit()
         return True
     except Exception as e:
         print(f"[DB] Failed to save active job {job_id}: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
         return False
 
 
@@ -942,77 +936,69 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
     if not USE_DB:
         return meta
 
-    conn = get_conn()
-    if not conn:
-        return meta
-
     try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                f"""
-                SELECT identity_id, related_history_id
-                FROM {Tables.ACTIVE_JOBS}
-                WHERE upstream_job_id = %s
-                LIMIT 1
-                """,
-                (job_id,),
-            )
-            active_job = cur.fetchone()
-            active_user_id = None
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT identity_id, related_history_id
+                    FROM {Tables.ACTIVE_JOBS}
+                    WHERE upstream_job_id = %s
+                    LIMIT 1
+                    """,
+                    (job_id,),
+                )
+                active_job = cur.fetchone()
+                active_user_id = None
+                if active_job:
+                    active_user_id = str(active_job["identity_id"]) if active_job["identity_id"] else None
+
+                row = None
+                if active_job and active_job.get("related_history_id"):
+                    cur.execute(
+                        f"""
+                        SELECT id, title, prompt, stage, payload, identity_id
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE id = %s
+                        LIMIT 1
+                        """,
+                        (active_job["related_history_id"],),
+                    )
+                    row = cur.fetchone()
+
+                if not row:
+                    cur.execute(
+                        f"""
+                        SELECT id, title, prompt, stage, payload, identity_id
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE payload->>'original_job_id' = %s
+                           OR payload->>'preview_task_id' = %s
+                           OR id::text = %s
+                        LIMIT 1
+                        """,
+                        (job_id, job_id, job_id),
+                    )
+                    row = cur.fetchone()
+
+            if row:
+                payload = row["payload"] if row["payload"] else {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = {}
+                return {
+                    "prompt": row["prompt"] or payload.get("prompt"),
+                    "title": row["title"] or payload.get("title"),
+                    "root_prompt": payload.get("root_prompt") or row["prompt"] or payload.get("prompt"),
+                    "art_style": payload.get("art_style"),
+                    "stage": row["stage"] or payload.get("stage"),
+                    "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
+                }
             if active_job:
-                active_user_id = str(active_job["identity_id"]) if active_job["identity_id"] else None
-
-            row = None
-            if active_job and active_job.get("related_history_id"):
-                cur.execute(
-                    f"""
-                    SELECT id, title, prompt, stage, payload, identity_id
-                    FROM {Tables.HISTORY_ITEMS}
-                    WHERE id = %s
-                    LIMIT 1
-                    """,
-                    (active_job["related_history_id"],),
-                )
-                row = cur.fetchone()
-
-            if not row:
-                cur.execute(
-                    f"""
-                    SELECT id, title, prompt, stage, payload, identity_id
-                    FROM {Tables.HISTORY_ITEMS}
-                    WHERE payload->>'original_job_id' = %s
-                       OR payload->>'preview_task_id' = %s
-                       OR id::text = %s
-                    LIMIT 1
-                    """,
-                    (job_id, job_id, job_id),
-                )
-                row = cur.fetchone()
-        conn.close()
-
-        if row:
-            payload = row["payload"] if row["payload"] else {}
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    payload = {}
-            return {
-                "prompt": row["prompt"] or payload.get("prompt"),
-                "title": row["title"] or payload.get("title"),
-                "root_prompt": payload.get("root_prompt") or row["prompt"] or payload.get("prompt"),
-                "art_style": payload.get("art_style"),
-                "stage": row["stage"] or payload.get("stage"),
-                "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
-            }
-        if active_job:
-            return {"user_id": active_user_id}
+                return {"user_id": active_user_id}
     except Exception as e:
         print(f"[Metadata] ERROR: Failed to get job metadata for {job_id}: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
     return meta
 
 
@@ -1023,9 +1009,8 @@ def resolve_meshy_job_id(input_id: str) -> str:
     if input_id in store:
         return input_id
     if USE_DB:
-        conn = get_conn()
-        if conn:
-            try:
+        try:
+            with get_conn() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
                     cur.execute(
                         f"""
@@ -1038,17 +1023,12 @@ def resolve_meshy_job_id(input_id: str) -> str:
                         (input_id,),
                     )
                     row = cur.fetchone()
-                conn.close()
                 if row:
                     original_id = row.get("original_job_id") or row.get("job_id_field")
                     if original_id:
                         return original_id
-            except Exception as e:
-                print(f"[Resolve] Error looking up original job ID: {e}")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        except Exception as e:
+            print(f"[Resolve] Error looking up original job ID: {e}")
     return input_id
 
 
@@ -1063,40 +1043,31 @@ def verify_job_ownership(job_id: str, identity_id: str) -> bool:
     if not USE_DB:
         return True
 
-    conn = get_conn()
-    if not conn:
-        print(f"[DB] verify_job_ownership: DB unavailable for {job_id}, denying access")
-        return False
-
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT identity_id FROM {Tables.ACTIVE_JOBS} WHERE upstream_job_id = %s
-                UNION
-                SELECT identity_id FROM {Tables.HISTORY_ITEMS} WHERE id::text = %s
-                   OR payload->>'original_job_id' = %s
-                   OR payload->>'job_id' = %s
-                LIMIT 1
-                """,
-                (job_id, job_id, job_id, job_id),
-            )
-            row = cur.fetchone()
-        conn.close()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT identity_id FROM {Tables.ACTIVE_JOBS} WHERE upstream_job_id = %s
+                    UNION
+                    SELECT identity_id FROM {Tables.HISTORY_ITEMS} WHERE id::text = %s
+                       OR payload->>'original_job_id' = %s
+                       OR payload->>'job_id' = %s
+                    LIMIT 1
+                    """,
+                    (job_id, job_id, job_id, job_id),
+                )
+                row = cur.fetchone()
 
-        if not row:
-            return False
+            if not row:
+                return False
 
-        job_user_id = str(row[0]) if row[0] else None
-        if identity_id:
-            return job_user_id == identity_id or job_user_id is None
-        return job_user_id is None
+            job_user_id = str(row[0]) if row[0] else None
+            if identity_id:
+                return job_user_id == identity_id or job_user_id is None
+            return job_user_id is None
     except Exception as e:
         print(f"[DB] verify_job_ownership failed for {job_id}: {e}")
-        try:
-            conn.close()
-        except Exception:
-            pass
         return True
 
 
@@ -1104,40 +1075,38 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
     if not USE_DB:
         return
     try:
-        conn = get_conn()
-        if conn:
-            cursor = conn.cursor()
-            meta_updates = {"progress": 100}
-            if model_id:
-                meta_updates["model_id"] = model_id
-            if glb_url:
-                meta_updates["glb_url"] = glb_url
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                meta_updates = {"progress": 100}
+                if model_id:
+                    meta_updates["model_id"] = model_id
+                if glb_url:
+                    meta_updates["glb_url"] = glb_url
 
-            if upstream_job_id:
-                cursor.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'ready',
-                        upstream_job_id = COALESCE(upstream_job_id, %s),
-                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (upstream_job_id, json.dumps(meta_updates), internal_job_id),
-                )
-            else:
-                cursor.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'ready',
-                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (json.dumps(meta_updates), internal_job_id),
-                )
+                if upstream_job_id:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = 'ready',
+                            upstream_job_id = COALESCE(upstream_job_id, %s),
+                            meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (upstream_job_id, json.dumps(meta_updates), internal_job_id),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = 'ready',
+                            meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (json.dumps(meta_updates), internal_job_id),
+                    )
             conn.commit()
-            conn.close()
     except Exception as e:
         print(f"[JOB] ERROR marking job {internal_job_id} as ready: {e}")
 
@@ -1146,18 +1115,16 @@ def _update_job_status_failed(internal_job_id, error_message):
     if not USE_DB:
         return
     try:
-        conn = get_conn()
-        if conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"""
-                UPDATE {Tables.JOBS}
-                SET status = 'failed', error_message = %s, updated_at = NOW()
-                WHERE id = %s
-                """,
-                (error_message[:500] if error_message else None, internal_job_id),
-            )
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'failed', error_message = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (error_message[:500] if error_message else None, internal_job_id),
+                )
             conn.commit()
-            conn.close()
     except Exception as e:
         print(f"[JOB] ERROR marking job {internal_job_id} as failed: {e}")
