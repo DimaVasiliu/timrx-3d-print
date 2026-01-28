@@ -40,7 +40,7 @@ from backend.db import (
     DatabaseError,
     DatabaseIntegrityError,
 )
-import backend.config as cfg
+from backend import config as cfg
 from backend.emailer import notify_new_identity
 
 # Debug flag for verbose cookie logging (set SESSION_DEBUG=1 to enable)
