@@ -34,7 +34,7 @@ from email.mime.multipart import MIMEMultipart
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 
-import backend.config as cfg
+from backend.config import config
 
 # Try to import boto3 for SES
 try:
@@ -67,11 +67,11 @@ class EmailService:
             return
         cls._config_logged = True
 
-        if not cfg.EMAIL_ENABLED:
+        if not config.EMAIL_ENABLED:
             print("[EMAIL] Email DISABLED (EMAIL_ENABLED=false) - emails will be logged only")
             return
 
-        provider = cfg.EMAIL_PROVIDER.lower()
+        provider = config.EMAIL_PROVIDER.lower()
 
         # SES provider
         if provider == "ses":
@@ -80,54 +80,54 @@ class EmailService:
                 print("[EMAIL] Emails will be logged only until boto3 is available")
                 return
 
-            if not cfg.EMAIL_CONFIGURED:
+            if not config.EMAIL_CONFIGURED:
                 missing = []
-                if not cfg.AWS_ACCESS_KEY_ID:
+                if not config.AWS_ACCESS_KEY_ID:
                     missing.append("AWS_ACCESS_KEY_ID")
-                if not cfg.AWS_SECRET_ACCESS_KEY:
+                if not config.AWS_SECRET_ACCESS_KEY:
                     missing.append("AWS_SECRET_ACCESS_KEY")
-                if not (cfg.SES_FROM_EMAIL or cfg.EMAIL_FROM_ADDRESS):
+                if not (config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS):
                     missing.append("SES_FROM_EMAIL or EMAIL_FROM_ADDRESS")
                 print(f"[EMAIL] WARNING: SES not configured - missing: {', '.join(missing)}")
                 print("[EMAIL] Emails will be logged only until configured")
                 return
 
-            from_email = cfg.SES_FROM_EMAIL or cfg.EMAIL_FROM_ADDRESS
+            from_email = config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
             print("[EMAIL] Email ENABLED via AWS SES")
-            print(f"[EMAIL] Region: {cfg.AWS_REGION}")
-            print(f"[EMAIL] From: {cfg.EMAIL_FROM_NAME} <{from_email}>")
+            print(f"[EMAIL] Region: {config.AWS_REGION}")
+            print(f"[EMAIL] From: {config.EMAIL_FROM_NAME} <{from_email}>")
             return
 
         # SMTP providers (neo, sendgrid, etc.)
-        if not cfg.EMAIL_CONFIGURED:
+        if not config.EMAIL_CONFIGURED:
             missing = []
-            if not cfg.SMTP_HOST:
+            if not config.SMTP_HOST:
                 missing.append("SMTP_HOST")
-            if not cfg.SMTP_USER:
+            if not config.SMTP_USER:
                 missing.append("SMTP_USER")
-            if not cfg.SMTP_PASSWORD:
+            if not config.SMTP_PASSWORD:
                 missing.append("SMTP_PASSWORD")
             print(f"[EMAIL] WARNING: Email not configured - missing: {', '.join(missing)}")
             print("[EMAIL] Emails will be logged only until configured")
             return
 
         # Mask credentials for logging
-        masked_user = cfg.SMTP_USER[:3] + "***" if len(cfg.SMTP_USER) > 3 else "(set)"
-        masked_pass = "***" + cfg.SMTP_PASSWORD[-4:] if len(cfg.SMTP_PASSWORD) > 4 else "(set)"
-        from_name, from_addr = cfg.SMTP_FROM_PARSED
+        masked_user = config.SMTP_USER[:3] + "***" if len(config.SMTP_USER) > 3 else "(set)"
+        masked_pass = "***" + config.SMTP_PASSWORD[-4:] if len(config.SMTP_PASSWORD) > 4 else "(set)"
+        from_name, from_addr = config.SMTP_FROM_PARSED
 
-        print(f"[EMAIL] Email ENABLED via {cfg.EMAIL_PROVIDER.upper()}")
-        print(f"[EMAIL] SMTP_HOST={cfg.SMTP_HOST!r} SMTP_PORT={cfg.SMTP_PORT} (TLS={cfg.SMTP_USE_TLS})")
+        print(f"[EMAIL] Email ENABLED via {config.EMAIL_PROVIDER.upper()}")
+        print(f"[EMAIL] SMTP_HOST={config.SMTP_HOST!r} SMTP_PORT={config.SMTP_PORT} (TLS={config.SMTP_USE_TLS})")
         print(f"[EMAIL] Auth: user={masked_user} pass={masked_pass}")
         print(f"[EMAIL] From: {from_name} <{from_addr}>")
 
         # Pre-check DNS resolution at startup
         try:
-            addr_info = socket.getaddrinfo(cfg.SMTP_HOST, cfg.SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM)
+            addr_info = socket.getaddrinfo(config.SMTP_HOST, config.SMTP_PORT, socket.AF_INET, socket.SOCK_STREAM)
             resolved_ips = [info[4][0] for info in addr_info]
-            print(f"[EMAIL] DNS check OK: {cfg.SMTP_HOST!r} -> {resolved_ips}")
+            print(f"[EMAIL] DNS check OK: {config.SMTP_HOST!r} -> {resolved_ips}")
         except socket.gaierror as e:
-            print(f"[EMAIL] DNS check FAILED: {cfg.SMTP_HOST!r} -> {e!r}")
+            print(f"[EMAIL] DNS check FAILED: {config.SMTP_HOST!r} -> {e!r}")
             print("[EMAIL] WARNING: Emails will fail until DNS resolves")
 
     @classmethod
@@ -157,17 +157,17 @@ class EmailService:
         cls._log_config()
 
         # If disabled, just log
-        if not cfg.EMAIL_ENABLED:
+        if not config.EMAIL_ENABLED:
             print(f"[EMAIL] DISABLED - Would send to {to}: {subject}")
             return EmailResult(success=True, message="Email disabled - logged only")
 
         # If not configured, log and return success (don't block flows)
-        if not cfg.EMAIL_CONFIGURED:
+        if not config.EMAIL_CONFIGURED:
             print(f"[EMAIL] NOT CONFIGURED - Would send to {to}: {subject}")
             return EmailResult(success=True, message="Email not configured - logged only")
 
         # Route to appropriate provider
-        provider = cfg.EMAIL_PROVIDER.lower()
+        provider = config.EMAIL_PROVIDER.lower()
         if provider == "ses":
             return cls._send_via_ses(to, subject, html, text, from_email, from_name)
 
@@ -190,17 +190,17 @@ class EmailService:
             return EmailResult(success=False, message="boto3 not available", error="ImportError")
 
         # Get from address
-        sender_addr = from_email or cfg.SES_FROM_EMAIL or cfg.EMAIL_FROM_ADDRESS
-        sender_name = from_name or cfg.EMAIL_FROM_NAME
+        sender_addr = from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
+        sender_name = from_name or config.EMAIL_FROM_NAME
         sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
 
         try:
             # Create SES client
             ses_client = boto3.client(
                 "ses",
-                region_name=cfg.AWS_REGION,
-                aws_access_key_id=cfg.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=cfg.AWS_SECRET_ACCESS_KEY,
+                region_name=config.AWS_REGION,
+                aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
             )
 
             # Build email body
@@ -248,7 +248,7 @@ class EmailService:
     ) -> EmailResult:
         """Send email via SMTP."""
         # Get from address
-        default_name, default_addr = cfg.SMTP_FROM_PARSED
+        default_name, default_addr = config.SMTP_FROM_PARSED
         sender_name = from_name or default_name
         sender_addr = from_email or default_addr
 
@@ -267,9 +267,9 @@ class EmailService:
             msg.attach(MIMEText(html, "html"))
 
             # Log connection attempt with debug info
-            smtp_host = cfg.SMTP_HOST
-            smtp_port = cfg.SMTP_PORT
-            print(f"[EMAIL] Connecting: host={smtp_host!r} port={smtp_port} (provider={cfg.EMAIL_PROVIDER})")
+            smtp_host = config.SMTP_HOST
+            smtp_port = config.SMTP_PORT
+            print(f"[EMAIL] Connecting: host={smtp_host!r} port={smtp_port} (provider={config.EMAIL_PROVIDER})")
 
             # Pre-resolve DNS to catch issues early and log IPs
             try:
@@ -285,10 +285,10 @@ class EmailService:
                 )
 
             # Send via SMTP with timeout
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=cfg.SMTP_TIMEOUT) as server:
-                if cfg.SMTP_USE_TLS:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=config.SMTP_TIMEOUT) as server:
+                if config.SMTP_USE_TLS:
                     server.starttls()
-                server.login(cfg.SMTP_USER, cfg.SMTP_PASSWORD)
+                server.login(config.SMTP_USER, config.SMTP_PASSWORD)
                 server.sendmail(sender_addr, to, msg.as_string())
 
             print(f"[EMAIL] SENT to {to}: {subject}")
@@ -326,13 +326,13 @@ class EmailService:
         """
         cls._log_config()
 
-        smtp_host = cfg.SMTP_HOST
-        smtp_port = cfg.SMTP_PORT
+        smtp_host = config.SMTP_HOST
+        smtp_port = config.SMTP_PORT
 
         result = {
-            "enabled": cfg.EMAIL_ENABLED,
-            "configured": cfg.EMAIL_CONFIGURED,
-            "provider": cfg.EMAIL_PROVIDER,
+            "enabled": config.EMAIL_ENABLED,
+            "configured": config.EMAIL_CONFIGURED,
+            "provider": config.EMAIL_PROVIDER,
             "smtp_host": smtp_host,
             "smtp_host_repr": repr(smtp_host),  # Debug: show exact value with quotes
             "smtp_port": smtp_port,
@@ -341,12 +341,12 @@ class EmailService:
             "error": None,
         }
 
-        if not cfg.EMAIL_ENABLED:
+        if not config.EMAIL_ENABLED:
             result["status"] = "disabled"
             result["message"] = "Email sending is disabled"
             return result
 
-        if not cfg.EMAIL_CONFIGURED:
+        if not config.EMAIL_CONFIGURED:
             result["status"] = "not_configured"
             result["message"] = "SMTP credentials not configured"
             return result
