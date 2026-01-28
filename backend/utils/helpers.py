@@ -66,6 +66,22 @@ def normalize_license(value: Any) -> str:
     return "cc-by-4" if raw.startswith("cc") else "private"
 
 
+def derive_display_title(prompt: str | None, explicit_title: str | None) -> str:
+    """
+    Derive a human-friendly display title for models/images/history items.
+
+    Rules:
+    - If explicit_title exists and non-empty -> use it
+    - Else if prompt exists and non-empty -> use prompt.strip() truncated to 100 chars
+    - Else -> "Untitled"
+    """
+    if isinstance(explicit_title, str) and explicit_title.strip():
+        return explicit_title.strip()
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()[:100]
+    return "Untitled"
+
+
 def sanitize_filename(name: str, max_length: int = 50) -> str:
     """
     Sanitize a string to be safe for use in keys/filenames.
