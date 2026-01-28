@@ -12,9 +12,10 @@ from flask import Blueprint, jsonify, request, g
 
 from backend.config import ACTION_KEYS, DEFAULT_MODEL_TITLE, MESHY_API_KEY
 from backend.middleware import with_session
+from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
-from backend.services.job_service import get_job_metadata, load_store, save_store, verify_job_ownership
+from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, save_store, verify_job_ownership
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -89,6 +90,18 @@ def mesh_remesh_mod():
     if credit_error:
         return credit_error
 
+    # Persist job row so status polling/ownership checks work across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=job_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
     try:
         resp = mesh_post("/openapi/v1/remesh", payload)
         log_event("mesh/remesh:meshy-resp[mod]", resp)
@@ -101,6 +114,9 @@ def mesh_remesh_mod():
         return jsonify({"ok": False, "error": str(e)}), 502
 
     finalize_job_credits(reservation_id, meshy_task_id)
+
+    # Update internal job with upstream id for ownership/status
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     store[meshy_task_id] = {
         "stage": "remesh",
@@ -232,6 +248,18 @@ def mesh_retexture_mod():
     if credit_error:
         return credit_error
 
+    # Persist job row so status polling/ownership checks work across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=job_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
     payload = {
         **source,
         "enable_original_uv": bool(body.get("enable_original_uv", True)),
@@ -257,6 +285,9 @@ def mesh_retexture_mod():
         return jsonify({"error": str(e)}), 502
 
     finalize_job_credits(reservation_id, meshy_task_id)
+
+    # Update internal job with upstream id for ownership/status
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     store[meshy_task_id] = {
         "stage": "texture",
@@ -395,6 +426,18 @@ def mesh_rigging_mod():
     if credit_error:
         return credit_error
 
+    # Persist job row so status polling/ownership checks work across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=job_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
     try:
         resp = mesh_post("/openapi/v1/rigging", payload)
         log_event("mesh/rigging:meshy-resp[mod]", resp)
@@ -407,6 +450,9 @@ def mesh_rigging_mod():
         return jsonify({"error": str(e)}), 502
 
     finalize_job_credits(reservation_id, meshy_task_id)
+
+    # Update internal job with upstream id for ownership/status
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     store[meshy_task_id] = {
         "stage": "rigging",
