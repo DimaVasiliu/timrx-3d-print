@@ -4,7 +4,7 @@ Middleware for TimrX Backend routes.
 Provides decorators and helpers for session/identity management in routes.
 
 Usage:
-    from middleware import with_session, require_session
+    from backend.middleware import with_session, require_session
 
     @app.route("/api/me")
     @with_session
@@ -38,7 +38,7 @@ def _log_session_debug(endpoint_name: str):
     Call this at the start of session-related middleware.
     """
     try:
-        from config import config
+        from backend.config import config
 
         # Use module-level SESSION_DEBUG constant
         session_debug = SESSION_DEBUG
@@ -59,7 +59,7 @@ def _log_session_debug(endpoint_name: str):
 
         # Get resolved session ID using our collision-aware logic
         try:
-            from identity_service import IdentityService
+            from backend.services.identity_service import IdentityService
             resolved_sid, candidates, reason = IdentityService.resolve_session_id(request)
         except Exception:
             resolved_sid, candidates, reason = None, [], "error"
@@ -106,13 +106,13 @@ def _log_session_debug(endpoint_name: str):
 
 def _get_identity_service():
     """Lazy import of IdentityService to avoid circular imports."""
-    from identity_service import IdentityService
+    from backend.services.identity_service import IdentityService
     return IdentityService
 
 
 def _get_database_error():
     """Lazy import of DatabaseError to avoid circular imports."""
-    from db import DatabaseError
+    from backend.db import DatabaseError
     return DatabaseError
 
 
@@ -377,7 +377,7 @@ def require_admin(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         # Lazy imports to avoid circular import at module load time
-        from config import config
+        from backend.config import config
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
