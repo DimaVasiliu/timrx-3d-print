@@ -16,9 +16,9 @@ Note: Logout is handled by /api/me/logout for consistency with other /me endpoin
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import with_session, require_admin
-from backend.magic_code_service import MagicCodeService
-from backend.identity_service import IdentityService
-from backend.wallet_service import WalletService
+from backend.services.magic_code_service import MagicCodeService
+from backend.services.identity_service import IdentityService
+from backend.services.wallet_service import WalletService
 
 bp = Blueprint("auth", __name__)
 
@@ -513,8 +513,8 @@ def verify_email():
 
     # Verify the code against magic_codes table
     code_hash = MagicCodeService.hash_code(code)
-    from db import query_one, transaction, Tables
-    import config as cfg
+    from backend.db import query_one, transaction, Tables
+    from backend import config as cfg
 
     # Find matching active code for this email
     code_record = query_one(
@@ -669,8 +669,8 @@ def auth_health():
         }
     }
     """
-    import config as cfg
-    from db import query_one, USE_DB
+    from backend import config as cfg
+    from backend.db import query_one, USE_DB
 
     checks = {}
 
