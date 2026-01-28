@@ -514,7 +514,7 @@ def verify_email():
     # Verify the code against magic_codes table
     code_hash = MagicCodeService.hash_code(code)
     from backend.db import query_one, transaction, Tables
-    from backend import config as cfg
+    import backend.config as cfg
 
     # Find matching active code for this email
     code_record = query_one(
@@ -538,7 +538,7 @@ def verify_email():
         return _get_redeem_error_response("Invalid or expired code")
 
     # Check max attempts
-    max_attempts = cfg.config.MAGIC_CODE_MAX_ATTEMPTS if hasattr(cfg, 'config') else 5
+    max_attempts = cfg.MAGIC_CODE_MAX_ATTEMPTS if hasattr(cfg, 'config') else 5
     if code_record["attempts"] >= max_attempts:
         print(f"[AUTH] verify_email failed: too many attempts for email={_mask_email(email)}")
         return _get_redeem_error_response("Too many failed attempts. Please request a new code")
@@ -669,7 +669,7 @@ def auth_health():
         }
     }
     """
-    from backend import config as cfg
+    import backend.config as cfg
     from backend.db import query_one, USE_DB
 
     checks = {}
@@ -677,16 +677,16 @@ def auth_health():
     # ── Email configuration ──
     try:
         email_check = {
-            "configured": cfg.config.EMAIL_CONFIGURED,
-            "enabled": cfg.config.EMAIL_ENABLED,
-            "provider": cfg.config.EMAIL_PROVIDER,
+            "configured": cfg.EMAIL_CONFIGURED,
+            "enabled": cfg.EMAIL_ENABLED,
+            "provider": cfg.EMAIL_PROVIDER,
         }
-        if cfg.config.EMAIL_PROVIDER == "ses":
-            email_check["region"] = cfg.config.AWS_REGION
-            email_check["from_email"] = cfg.config.SES_FROM_EMAIL or cfg.config.EMAIL_FROM_ADDRESS
+        if cfg.EMAIL_PROVIDER == "ses":
+            email_check["region"] = cfg.AWS_REGION
+            email_check["from_email"] = cfg.SES_FROM_EMAIL or cfg.EMAIL_FROM_ADDRESS
         else:
-            email_check["smtp_host"] = cfg.config.SMTP_HOST or "(not set)"
-            name, addr = cfg.config.SMTP_FROM_PARSED
+            email_check["smtp_host"] = cfg.SMTP_HOST or "(not set)"
+            name, addr = cfg.SMTP_FROM_PARSED
             email_check["from_email"] = addr
             email_check["from_name"] = name
         checks["email"] = email_check
