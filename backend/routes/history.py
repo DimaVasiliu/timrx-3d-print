@@ -46,64 +46,75 @@ def history_mod():
             }), 401
 
         if request.method == "GET":
+            items = []
+            db_source = False
+
             if USE_DB:
                 conn = get_conn()
                 if not conn:
-                    return jsonify({"error": "db_unavailable"}), 503
-                try:
-                    with conn.cursor(row_factory=dict_row) as cur:
-                        cur.execute(
-                            f"""
-                            SELECT id, item_type, status, stage, title, prompt,
-                                   thumbnail_url, glb_url, image_url, payload, created_at
-                            FROM {Tables.HISTORY_ITEMS}
-                            WHERE identity_id = %s
-                            ORDER BY created_at DESC;
-                            """,
-                            (identity_id,),
-                        )
-                        rows = cur.fetchall()
-                    conn.close()
-                    print(f"[History][mod] GET: Fetched {len(rows)} items from database")
-
-                    items = []
-                    for r in rows:
-                        item = r["payload"] if r["payload"] else {}
-                        item["id"] = str(r["id"])
-                        item["type"] = r["item_type"]
-                        item["status"] = r["status"]
-                        if r["stage"]:
-                            item["stage"] = r["stage"]
-                        if r["title"]:
-                            item["title"] = r["title"]
-                        if r["prompt"]:
-                            item["prompt"] = r["prompt"]
-                        if r["thumbnail_url"]:
-                            item["thumbnail_url"] = r["thumbnail_url"]
-                        if r["glb_url"]:
-                            item["glb_url"] = r["glb_url"]
-                        if r["image_url"]:
-                            item["image_url"] = r["image_url"]
-                        if r["created_at"]:
-                            item["created_at"] = int(r["created_at"].timestamp() * 1000)
-                        items.append(item)
-
-                    for i, item in enumerate(items[:3]):
-                        thumb = item.get("thumbnail_url")
-                        thumb_preview = (thumb[:60] + "...") if isinstance(thumb, str) else "None"
-                        print(f"[History][mod] Item {i}: title={item.get('title')}, thumbnail={thumb_preview}")
-
-                    save_history_store(items)
-                    return jsonify(items)
-                except Exception as e:
-                    print(f"[History][mod] DB read failed: {e}")
+                    print("[History][mod] GET: DB connection unavailable, returning local/empty")
+                else:
                     try:
+                        with conn.cursor(row_factory=dict_row) as cur:
+                            cur.execute(
+                                f"""
+                                SELECT id, item_type, status, stage, title, prompt,
+                                       thumbnail_url, glb_url, image_url, payload, created_at
+                                FROM {Tables.HISTORY_ITEMS}
+                                WHERE identity_id = %s
+                                ORDER BY created_at DESC;
+                                """,
+                                (identity_id,),
+                            )
+                            rows = cur.fetchall()
                         conn.close()
-                    except Exception:
-                        pass
-                    return jsonify({"error": "db_query_failed"}), 503
+                        print(f"[History][mod] GET: Fetched {len(rows)} items from database")
+                        db_source = True
 
-            return jsonify(load_history_store())
+                        for r in rows:
+                            item = r["payload"] if r["payload"] else {}
+                            item["id"] = str(r["id"])
+                            item["type"] = r["item_type"]
+                            item["status"] = r["status"]
+                            if r["stage"]:
+                                item["stage"] = r["stage"]
+                            if r["title"]:
+                                item["title"] = r["title"]
+                            if r["prompt"]:
+                                item["prompt"] = r["prompt"]
+                            if r["thumbnail_url"]:
+                                item["thumbnail_url"] = r["thumbnail_url"]
+                            if r["glb_url"]:
+                                item["glb_url"] = r["glb_url"]
+                            if r["image_url"]:
+                                item["image_url"] = r["image_url"]
+                            if r["created_at"]:
+                                item["created_at"] = int(r["created_at"].timestamp() * 1000)
+                            items.append(item)
+
+                        for i, item in enumerate(items[:3]):
+                            thumb = item.get("thumbnail_url")
+                            thumb_preview = (thumb[:60] + "...") if isinstance(thumb, str) else "None"
+                            print(f"[History][mod] Item {i}: title={item.get('title')}, thumbnail={thumb_preview}")
+
+                        save_history_store(items)
+                    except Exception as e:
+                        print(f"[History][mod] DB read failed (returning local/empty): {e}")
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        # Fall through to return local history or empty array
+
+            # If DB wasn't used or failed, try local history
+            if not db_source:
+                local_items = load_history_store()
+                if isinstance(local_items, list):
+                    items = local_items
+                    print(f"[History][mod] GET: Returning {len(items)} items from local store")
+
+            # Always return 200 with items array (may be empty)
+            return jsonify({"ok": True, "items": items, "source": "modular"})
 
         try:
             payload = request.get_json(silent=True) or []
