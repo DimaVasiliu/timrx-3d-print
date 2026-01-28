@@ -113,8 +113,9 @@ def history_mod():
                     items = local_items
                     print(f"[History][mod] GET: Returning {len(items)} items from local store")
 
-            # Always return 200 with items array (may be empty)
-            return jsonify({"ok": True, "items": items, "source": "modular"})
+            # Always return 200 with bare array for frontend compatibility
+            # Frontend expects: Array.isArray(result.data) to be true
+            return jsonify(items)
 
         try:
             payload = request.get_json(silent=True) or []
