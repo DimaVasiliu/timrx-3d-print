@@ -28,7 +28,7 @@ import requests
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from backend import config as cfg
+import backend.config as cfg
 from backend.services.pricing_service import PricingService
 
 
@@ -40,10 +40,10 @@ class MollieCreateError(Exception):
 
 
 # Check if Mollie is configured
-MOLLIE_AVAILABLE = cfg.config.MOLLIE_CONFIGURED
+MOLLIE_AVAILABLE = cfg.MOLLIE_CONFIGURED
 
 if MOLLIE_AVAILABLE:
-    print(f"[MOLLIE] Mollie configured and ready (mode: {cfg.config.MOLLIE_MODE})")
+    print(f"[MOLLIE] Mollie configured and ready (mode: {cfg.MOLLIE_MODE})")
 else:
     print("[MOLLIE] Mollie not configured - Mollie payments disabled")
 
@@ -62,7 +62,7 @@ class MollieService:
     def _get_headers() -> Dict[str, str]:
         """Get headers for Mollie API requests."""
         return {
-            "Authorization": f"Bearer {cfg.config.MOLLIE_API_KEY}",
+            "Authorization": f"Bearer {cfg.MOLLIE_API_KEY}",
             "Content-Type": "application/json",
         }
 
@@ -111,10 +111,10 @@ class MollieService:
 
         # Build redirect URL - Mollie redirects user HERE after payment
         # MUST use FRONTEND_BASE_URL (timrx.live), NOT backend URL (3d.timrx.live)
-        frontend_url = cfg.config.FRONTEND_BASE_URL.rstrip("/") if cfg.config.FRONTEND_BASE_URL else ""
+        frontend_url = cfg.FRONTEND_BASE_URL.rstrip("/") if cfg.FRONTEND_BASE_URL else ""
         if not frontend_url:
             # Fallback to PUBLIC_BASE_URL for backward compatibility (not recommended)
-            frontend_url = cfg.config.PUBLIC_BASE_URL.rstrip("/") if cfg.config.PUBLIC_BASE_URL else ""
+            frontend_url = cfg.PUBLIC_BASE_URL.rstrip("/") if cfg.PUBLIC_BASE_URL else ""
             print("[MOLLIE] WARNING: FRONTEND_BASE_URL not set, using PUBLIC_BASE_URL for redirects")
 
         if not success_url:
@@ -122,7 +122,7 @@ class MollieService:
             success_url = f"{frontend_url}/hub.html?checkout=success"
 
         # Build webhook URL - MUST use backend API URL (3d.timrx.live)
-        backend_url = cfg.config.PUBLIC_BASE_URL.rstrip("/") if cfg.config.PUBLIC_BASE_URL else ""
+        backend_url = cfg.PUBLIC_BASE_URL.rstrip("/") if cfg.PUBLIC_BASE_URL else ""
         webhook_url = f"{backend_url}/api/billing/webhook/mollie"
 
         # Build metadata (stored with payment, returned in webhook)
