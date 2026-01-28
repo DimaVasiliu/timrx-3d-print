@@ -21,12 +21,12 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 import json
 
-from db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
+from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
 import config as cfg
-from emailer import send_purchase_receipt, notify_purchase
-from pricing_service import PricingService
-from wallet_service import WalletService, LedgerEntryType
-from identity_service import IdentityService
+from backend.emailer import send_purchase_receipt, notify_purchase
+from backend.pricing_service import PricingService
+from backend.wallet_service import WalletService, LedgerEntryType
+from backend.identity_service import IdentityService
 
 # Stripe import (only if enabled via PAYMENTS_PROVIDER)
 stripe = None
