@@ -10,21 +10,21 @@ __all__ = [
 
 def register_blueprints(app):
     """Register all blueprints with the Flask app."""
-    from .me import bp as me_bp
-    from .billing import bp as billing_bp
-    from .auth import bp as auth_bp
-    from .admin import bp as admin_bp
-    from .jobs import bp as jobs_bp
-    from .credits import bp as credits_bp
+    from backend.routes.me import bp as me_bp
+    from backend.routes.billing import bp as billing_bp
+    from backend.routes.auth import bp as auth_bp
+    from backend.routes.admin import bp as admin_bp
+    from backend.routes.jobs import bp as jobs_bp
+    from backend.routes.credits import bp as credits_bp
 
-    from .health import bp as health_bp
-    from .assets import bp as assets_bp
-    from .image_gen import bp as image_gen_bp
-    from .text_to_3d import bp as text_to_3d_bp
-    from .image_to_3d import bp as image_to_3d_bp
-    from .mesh_operations import bp as mesh_ops_bp
-    from .history import bp as history_bp
-    from .community import bp as community_bp
+    from backend.routes.health import bp as health_bp
+    from backend.routes.assets import bp as assets_bp
+    from backend.routes.image_gen import bp as image_gen_bp
+    from backend.routes.text_to_3d import bp as text_to_3d_bp
+    from backend.routes.image_to_3d import bp as image_to_3d_bp
+    from backend.routes.mesh_operations import bp as mesh_ops_bp
+    from backend.routes.history import bp as history_bp
+    from backend.routes.community import bp as community_bp
 
     app.register_blueprint(me_bp, url_prefix="/api/me")
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
