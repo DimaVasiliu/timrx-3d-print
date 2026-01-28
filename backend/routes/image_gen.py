@@ -16,12 +16,13 @@ import requests
 from flask import Blueprint, Response, jsonify, request
 
 from backend.config import OPENAI_API_KEY, config
-from backend.db import USE_DB, get_conn
+from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
+from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("image_gen", __name__)
@@ -228,7 +229,12 @@ def openai_image_status_mod(job_id: str):
 
 
 @bp.route("/proxy-image")
+@with_session
 def proxy_image_mod():
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
     url = request.args.get("u") or ""
     if not url:
         return jsonify({"error": "Missing url"}), 400
@@ -236,9 +242,56 @@ def proxy_image_mod():
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         return jsonify({"error": "Invalid scheme"}), 400
-    host = parsed.hostname or ""
-    if host not in ALLOWED_IMAGE_HOSTS:
+    host = (parsed.hostname or "").lower()
+    if host not in ALLOWED_IMAGE_HOSTS and (not config.AWS_BUCKET_MODELS or not host.startswith(config.AWS_BUCKET_MODELS.lower())):
         return jsonify({"error": "Host not allowed"}), 400
+
+    if not USE_DB:
+        return jsonify({"error": "db_unavailable"}), 503
+
+    s3_key = parse_s3_key(url) if is_s3_url(url) else None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if s3_key:
+                    cur.execute(
+                        f"""
+                        SELECT 1
+                        FROM {Tables.IMAGES}
+                        WHERE identity_id = %s AND (image_s3_key = %s OR thumbnail_s3_key = %s OR source_s3_key = %s)
+                        UNION
+                        SELECT 1
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s AND (image_url = %s OR thumbnail_url = %s)
+                        LIMIT 1
+                        """,
+                        (identity_id, s3_key, s3_key, s3_key, identity_id, url, url),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT 1
+                        FROM {Tables.IMAGES}
+                        WHERE identity_id = %s AND (image_url = %s OR thumbnail_url = %s)
+                        UNION
+                        SELECT 1
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s AND (image_url = %s OR thumbnail_url = %s)
+                        LIMIT 1
+                        """,
+                        (identity_id, url, url, identity_id, url, url),
+                    )
+                row = cur.fetchone()
+        if not row:
+            return jsonify({"error": "not_found"}), 404
+    except Exception as e:
+        print(f"[proxy-image][mod] ownership check failed: {e}")
+        return jsonify({"error": "ownership_check_failed"}), 500
+
+    if s3_key and config.AWS_BUCKET_MODELS:
+        signed = presign_s3_url(url)
+        if signed:
+            url = signed
 
     try:
         r = requests.get(url, stream=True, timeout=30)
