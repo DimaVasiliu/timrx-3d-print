@@ -258,7 +258,7 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
     }
 
 
-def build_source_payload(body: dict):
+def build_source_payload(body: dict, identity_id: str | None = None):
     """Validate and build the source payload for Meshy operations."""
     input_task_id = (body.get("input_task_id") or "").strip()
     model_url = (body.get("model_url") or "").strip()
@@ -268,7 +268,58 @@ def build_source_payload(body: dict):
         return None, "input_task_id or model_url required"
 
     if input_task_id:
-        # NOTE: resolve_meshy_job_id still lives in app.py for now.
-        # Routes can inject a resolver when they migrate.
-        return {"input_task_id": input_task_id}, None
+        # Resolve internal IDs to original Meshy task IDs when needed.
+        try:
+            from backend.services.job_service import resolve_meshy_job_id, verify_job_ownership
+            resolved = resolve_meshy_job_id(input_task_id)
+            if identity_id and not verify_job_ownership(resolved, identity_id):
+                return None, "Job not found or access denied"
+            return {"input_task_id": resolved}, None
+        except Exception:
+            return {"input_task_id": input_task_id}, None
+
+    # Normalize proxy URLs (our proxy includes `u` query param)
+    if model_url and ("/api/proxy-glb" in model_url or "/api/_mod/proxy-glb" in model_url):
+        try:
+            from urllib.parse import urlparse, parse_qs, unquote
+
+            parsed = urlparse(model_url)
+            params = parse_qs(parsed.query)
+            proxied = params.get("u", [None])[0]
+            if proxied:
+                model_url = unquote(proxied)
+        except Exception:
+            pass
+
+    # If model_url is our S3 bucket, ensure identity owns it and sign for Meshy access.
+    try:
+        from backend.db import USE_DB, get_conn, dict_row, Tables
+        from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
+
+        if model_url and is_s3_url(model_url) and identity_id and USE_DB:
+            s3_key = parse_s3_key(model_url)
+            with get_conn() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT 1
+                        FROM {Tables.MODELS}
+                        WHERE identity_id = %s AND (glb_s3_key = %s OR glb_url = %s)
+                        UNION
+                        SELECT 1
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s AND glb_url = %s
+                        LIMIT 1
+                        """,
+                        (identity_id, s3_key, model_url, identity_id, model_url),
+                    )
+                    row = cur.fetchone()
+            if not row:
+                return None, "Model URL not found or access denied"
+            signed = presign_s3_url(model_url)
+            if signed:
+                model_url = signed
+    except Exception as e:
+        print(f"[Meshy] build_source_payload ownership/sign check failed: {e}")
+
     return {"model_url": model_url}, None
