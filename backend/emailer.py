@@ -8,7 +8,7 @@ while delegating actual sending to EmailService in email_service.py.
 
 from typing import Optional, Dict, Any
 
-import config as cfg
+import backend.config as cfg
 
 # Import send_email from EmailService for actual sending
 # Try multiple import paths for flexibility (app.py adds services/ to sys.path)
