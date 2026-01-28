@@ -3,17 +3,28 @@
 
 Handles:
 - POST /api/jobs/create - Create a new job (reserve credits, dispatch to provider)
+- POST /api/jobs/save - Save active job to DB (legacy compat)
+- GET /api/jobs/active - Get active jobs (legacy compat)
 - GET /api/jobs/:id - Get job details
 - GET /api/jobs - List jobs for current identity
 - POST /api/jobs/:id/complete - Mark job as complete (user-initiated)
 - POST /api/jobs/:id/cancel - Cancel a job (user: queued only, admin: any)
+- DELETE /api/jobs/:id - Delete active job (legacy compat)
 - POST /api/jobs/callback - Internal callback for existing pipeline (by upstream_job_id)
 """
 
 from flask import Blueprint, request, jsonify, g
 
-from backend.middleware import require_session
-from backend.services.job_service import JobService, JobStatus, JobProvider
+from backend.middleware import require_session, with_session
+from backend.services.job_service import (
+    JobService,
+    JobStatus,
+    JobProvider,
+    save_active_job_to_db,
+    get_active_jobs_from_db,
+    mark_job_completed_in_db,
+    delete_active_job_from_db,
+)
 from backend.services.wallet_service import WalletService
 
 bp = Blueprint("jobs", __name__)
@@ -657,3 +668,69 @@ def job_callback():
                 "message": "Failed to process callback",
             }
         }), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# Legacy Compatibility Routes
+# These match the app.py.backup endpoints exactly
+# ─────────────────────────────────────────────────────────────
+
+
+@bp.route("/save", methods=["POST", "OPTIONS"])
+@with_session
+def save_active_job():
+    """
+    Legacy: Save active job to database.
+    POST /api/jobs/save
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        identity_id = g.identity_id
+        data = request.get_json() or {}
+        job_id = data.get("job_id")
+        job_type = data.get("job_type", "unknown")
+        stage = data.get("stage")
+        metadata = data.get("metadata", {})
+
+        if not job_id:
+            return jsonify({"error": "job_id required"}), 400
+
+        success = save_active_job_to_db(job_id, job_type, stage, metadata, identity_id)
+        return jsonify({"success": success, "job_id": job_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/active", methods=["GET", "OPTIONS"])
+@with_session
+def get_active_jobs():
+    """
+    Legacy: Get all active jobs for current user.
+    GET /api/jobs/active
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        identity_id = g.identity_id
+        jobs = get_active_jobs_from_db(identity_id)
+        return jsonify(jobs)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/<job_id>", methods=["DELETE", "OPTIONS"])
+@with_session
+def delete_active_job(job_id):
+    """
+    Legacy: Delete active job from database.
+    DELETE /api/jobs/<job_id>
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        identity_id = g.identity_id
+        delete_active_job_from_db(job_id, identity_id)
+        return jsonify({"success": True, "job_id": job_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
