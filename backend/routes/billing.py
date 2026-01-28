@@ -17,11 +17,11 @@ Handles:
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import require_session, require_email, no_cache
-from backend.pricing_service import PricingService
-from backend.wallet_service import WalletService
-from backend.reservation_service import ReservationService
-from backend.purchase_service import PurchaseService
-from backend.mollie_service import MollieService, MollieCreateError
+from backend.services.pricing_service import PricingService
+from backend.services.wallet_service import WalletService
+from backend.services.reservation_service import ReservationService
+from backend.services.purchase_service import PurchaseService
+from backend.services.mollie_service import MollieService, MollieCreateError
 
 bp = Blueprint("billing", __name__)
 
