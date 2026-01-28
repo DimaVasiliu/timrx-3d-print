@@ -29,6 +29,7 @@ from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 
 from backend.db import USE_DB, dict_row, get_conn, transaction, fetch_one, query_one, query_all, execute, Tables
+from backend.utils import derive_display_title
 from backend.services.reservation_service import ReservationService, ReservationStatus
 from backend.services.pricing_service import PricingService
 
@@ -848,7 +849,7 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
             history_id = str(uuid.uuid4())
 
         item_type = "image" if (job_type or "").lower() in ("image", "openai_image") else "model"
-        title = job_meta.get("title") or (job_meta.get("prompt", "")[:50] if job_meta.get("prompt") else None)
+        title = derive_display_title(job_meta.get("prompt"), job_meta.get("title"))
         prompt = job_meta.get("prompt")
         root_prompt = job_meta.get("root_prompt")
         thumbnail_url = job_meta.get("thumbnail_url")
