@@ -17,8 +17,8 @@ Usage:
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
-from db import query_one, query_all, execute_returning, transaction, Tables
-from wallet_service import WalletService
+from backend.db import query_one, query_all, execute_returning, transaction, Tables
+from backend.wallet_service import WalletService
 
 
 class AdminService:
