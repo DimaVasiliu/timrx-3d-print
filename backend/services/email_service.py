@@ -11,7 +11,7 @@ Features:
 - Detailed logging for debugging
 
 Usage:
-    from email_service import EmailService
+    from backend.services.email_service import EmailService
 
     # Send email (never throws)
     success = EmailService.send(to="user@example.com", subject="Hi", html="<p>Hello</p>")
@@ -34,7 +34,7 @@ from email.mime.multipart import MIMEMultipart
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 
-import config as cfg
+from backend import config as cfg
 
 # Try to import boto3 for SES
 try:
