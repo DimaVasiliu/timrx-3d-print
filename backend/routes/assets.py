@@ -58,6 +58,19 @@ def proxy_glb_mod():
     if host not in PROXY_ALLOWED_HOSTS:
         return jsonify({"ok": False, "error": {"code": "HOST_NOT_ALLOWED", "message": "Host not allowed"}}), 400
 
+    # If the URL is our S3 bucket, use a presigned URL to avoid 403 on private objects.
+    if AWS_BUCKET_MODELS and host.startswith(AWS_BUCKET_MODELS.lower()):
+        s3_key = _extract_s3_key_from_url(u)
+        if s3_key:
+            try:
+                u = _s3.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": AWS_BUCKET_MODELS, "Key": s3_key},
+                    ExpiresIn=3600,
+                )
+            except Exception as e:
+                print(f"[proxy-glb][mod] Failed to presign S3 URL: {e}")
+
     try:
         r = requests.get(u, stream=True, timeout=60)
     except Exception:
