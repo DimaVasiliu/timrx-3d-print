@@ -30,7 +30,14 @@ from backend.services.s3_service import (
     safe_upload_to_s3,
     collect_s3_keys,
 )
-from backend.utils import build_canonical_url, log_db_continue, normalize_epoch_ms, sanitize_filename, unpack_upload_result
+from backend.utils import (
+    build_canonical_url,
+    derive_display_title,
+    log_db_continue,
+    normalize_epoch_ms,
+    sanitize_filename,
+    unpack_upload_result,
+)
 
 
 # Dedicated S3 client for cleanup operations
@@ -356,7 +363,7 @@ def save_image_to_normalized_db(
                 if existing:
                     existing_history_id = str(existing[0])
 
-                title = (prompt[:50] if prompt else "Generated Image")
+                title = derive_display_title(prompt, None)
                 s3_slug = sanitize_filename(title or prompt or "image") or "image"
                 s3_slug = s3_slug[:60]
                 s3_user_id = str(user_id) if user_id else "public"
@@ -463,7 +470,13 @@ def save_image_to_normalized_db(
                         f"""
                         UPDATE {Tables.IMAGES}
                         SET identity_id = COALESCE(%s, identity_id),
-                            title = COALESCE(%s, title),
+                            title = CASE
+                                WHEN %s IS NOT NULL
+                                 AND %s <> ''
+                                 AND %s NOT IN ('3D Model', 'Untitled')
+                                THEN %s
+                                ELSE title
+                            END,
                             prompt = COALESCE(%s, prompt),
                             upstream_id = COALESCE(upstream_id, %s),
                             status = %s,
@@ -482,6 +495,9 @@ def save_image_to_normalized_db(
                         """,
                         (
                             user_id,
+                            title,
+                            title,
+                            title,
                             title,
                             prompt,
                             upstream_id,
@@ -522,14 +538,20 @@ def save_image_to_normalized_db(
                             %s,
                             %s
                         )
-                        ON CONFLICT (provider, upstream_id) DO UPDATE
-                        SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
-                            title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
-                            prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
-                            status = EXCLUDED.status,
-                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
-                            image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
-                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
+                    ON CONFLICT (provider, upstream_id) DO UPDATE
+                    SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
+                        title = CASE
+                            WHEN EXCLUDED.title IS NOT NULL
+                             AND EXCLUDED.title <> ''
+                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                            THEN EXCLUDED.title
+                            ELSE {Tables.IMAGES}.title
+                        END,
+                        prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
+                        status = EXCLUDED.status,
+                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
+                        image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
                             image_s3_key = COALESCE(EXCLUDED.image_s3_key, {Tables.IMAGES}.image_s3_key),
                             thumbnail_s3_key = COALESCE(EXCLUDED.thumbnail_s3_key, {Tables.IMAGES}.thumbnail_s3_key),
                             width = COALESCE(EXCLUDED.width, {Tables.IMAGES}.width),
@@ -578,13 +600,19 @@ def save_image_to_normalized_db(
                             %s,
                             %s
                         )
-                        ON CONFLICT (provider, image_url) WHERE upstream_id IS NULL AND image_url IS NOT NULL DO UPDATE
-                        SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
-                            title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
-                            prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
-                            status = EXCLUDED.status,
-                            image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
-                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
+                    ON CONFLICT (provider, image_url) WHERE upstream_id IS NULL AND image_url IS NOT NULL DO UPDATE
+                    SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
+                        title = CASE
+                            WHEN EXCLUDED.title IS NOT NULL
+                             AND EXCLUDED.title <> ''
+                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                            THEN EXCLUDED.title
+                            ELSE {Tables.IMAGES}.title
+                        END,
+                        prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
+                        status = EXCLUDED.status,
+                        image_url = COALESCE(EXCLUDED.image_url, {Tables.IMAGES}.image_url),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.IMAGES}.thumbnail_url),
                             width = COALESCE(EXCLUDED.width, {Tables.IMAGES}.width),
                             height = COALESCE(EXCLUDED.height, {Tables.IMAGES}.height),
                             content_hash = COALESCE(EXCLUDED.content_hash, {Tables.IMAGES}.content_hash),
@@ -660,7 +688,13 @@ def save_image_to_normalized_db(
                         SET item_type = %s,
                             status = COALESCE(%s, status),
                             stage = COALESCE(%s, stage),
-                            title = COALESCE(%s, title),
+                            title = CASE
+                                WHEN %s IS NOT NULL
+                                 AND %s <> ''
+                                 AND %s NOT IN ('3D Model', 'Untitled')
+                                THEN %s
+                                ELSE title
+                            END,
                             prompt = COALESCE(%s, prompt),
                             root_prompt = COALESCE(%s, root_prompt),
                             identity_id = COALESCE(%s, identity_id),
@@ -675,6 +709,9 @@ def save_image_to_normalized_db(
                             "image",
                             "finished",
                             "image",
+                            title,
+                            title,
+                            title,
                             title,
                             prompt,
                             None,
@@ -706,7 +743,13 @@ def save_image_to_normalized_db(
                         SET item_type = EXCLUDED.item_type,
                             status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
                             stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
-                            title = COALESCE(EXCLUDED.title, {Tables.HISTORY_ITEMS}.title),
+                            title = CASE
+                                WHEN EXCLUDED.title IS NOT NULL
+                                 AND EXCLUDED.title <> ''
+                                 AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                THEN EXCLUDED.title
+                                ELSE {Tables.HISTORY_ITEMS}.title
+                            END,
                             prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
                             root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
                             identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
@@ -1042,9 +1085,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             if final_thumbnail_url:
                 payload["thumbnail_url"] = final_thumbnail_url
 
-            final_title = job_meta.get("title") or (
-                (job_meta.get("prompt", "")[:50]) if job_meta.get("prompt") else "3D Model"
-            )
+            final_title = derive_display_title(job_meta.get("prompt"), job_meta.get("title"))
             glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
             thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
             image_s3_key = None
@@ -1092,7 +1133,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 f"""
                                 UPDATE {Tables.MODELS}
                                 SET identity_id = COALESCE(%s, identity_id),
-                                    title = COALESCE(%s, title),
+                                    title = CASE
+                                        WHEN %s IS NOT NULL
+                                         AND %s <> ''
+                                         AND %s NOT IN ('3D Model', 'Untitled')
+                                        THEN %s
+                                        ELSE title
+                                    END,
                                     prompt = COALESCE(%s, prompt),
                                     root_prompt = COALESCE(%s, root_prompt),
                                     upstream_job_id = COALESCE(upstream_job_id, %s),
@@ -1111,6 +1158,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 """,
                                 (
                                     user_id,
+                                    final_title,
+                                    final_title,
+                                    final_title,
                                     final_title,
                                     final_prompt,
                                     root_prompt,
@@ -1155,7 +1205,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 )
                                 ON CONFLICT (provider, upstream_job_id) DO UPDATE
                                 SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.MODELS}.identity_id),
-                                    title = COALESCE(EXCLUDED.title, {Tables.MODELS}.title),
+                                    title = CASE
+                                        WHEN EXCLUDED.title IS NOT NULL
+                                         AND EXCLUDED.title <> ''
+                                         AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                        THEN EXCLUDED.title
+                                        ELSE {Tables.MODELS}.title
+                                    END,
                                     prompt = COALESCE(EXCLUDED.prompt, {Tables.MODELS}.prompt),
                                     root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.MODELS}.root_prompt),
                                     status = 'ready',
@@ -1210,7 +1266,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 f"""
                                 UPDATE {Tables.MODELS}
                                 SET identity_id = COALESCE(%s, identity_id),
-                                    title = COALESCE(%s, title),
+                                    title = CASE
+                                        WHEN %s IS NOT NULL
+                                         AND %s <> ''
+                                         AND %s NOT IN ('3D Model', 'Untitled')
+                                        THEN %s
+                                        ELSE title
+                                    END,
                                     prompt = COALESCE(%s, prompt),
                                     root_prompt = COALESCE(%s, root_prompt),
                                     upstream_job_id = COALESCE(upstream_job_id, %s),
@@ -1229,6 +1291,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 """,
                                 (
                                     user_id,
+                                    final_title,
+                                    final_title,
+                                    final_title,
                                     final_title,
                                     final_prompt,
                                     root_prompt,
@@ -1384,7 +1449,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             )
                             ON CONFLICT (provider, upstream_id) DO UPDATE
                             SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.IMAGES}.identity_id),
-                                title = COALESCE(EXCLUDED.title, {Tables.IMAGES}.title),
+                                title = CASE
+                                    WHEN EXCLUDED.title IS NOT NULL
+                                     AND EXCLUDED.title <> ''
+                                     AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                    THEN EXCLUDED.title
+                                    ELSE {Tables.IMAGES}.title
+                                END,
                                 prompt = COALESCE(EXCLUDED.prompt, {Tables.IMAGES}.prompt),
                                 status = 'ready',
                                 s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.IMAGES}.s3_bucket),
@@ -1434,7 +1505,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 f"""
                                 UPDATE {Tables.IMAGES}
                                 SET identity_id = COALESCE(%s, identity_id),
-                                    title = COALESCE(%s, title),
+                                    title = CASE
+                                        WHEN %s IS NOT NULL
+                                         AND %s <> ''
+                                         AND %s NOT IN ('3D Model', 'Untitled')
+                                        THEN %s
+                                        ELSE title
+                                    END,
                                     prompt = COALESCE(%s, prompt),
                                     status = 'ready',
                                     s3_bucket = COALESCE(%s, s3_bucket),
@@ -1450,6 +1527,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 """,
                                 (
                                     user_id,
+                                    final_title,
+                                    final_title,
+                                    final_title,
                                     final_title,
                                     final_prompt,
                                     AWS_BUCKET_MODELS,
@@ -1538,7 +1618,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     ON CONFLICT (id) DO UPDATE
                     SET status = 'finished',
                         stage = EXCLUDED.stage,
-                        title = COALESCE(EXCLUDED.title, {Tables.HISTORY_ITEMS}.title),
+                        title = CASE
+                            WHEN EXCLUDED.title IS NOT NULL
+                             AND EXCLUDED.title <> ''
+                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                            THEN EXCLUDED.title
+                            ELSE {Tables.HISTORY_ITEMS}.title
+                        END,
                         prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
                         root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
                         identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
