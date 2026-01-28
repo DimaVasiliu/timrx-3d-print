@@ -918,6 +918,154 @@ def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadat
         return False
 
 
+def get_active_jobs_from_db(user_id: str = None):
+    """Retrieve active jobs from database, filtered by user_id if provided."""
+    if not USE_DB:
+        return []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if user_id:
+                    cur.execute(
+                        f"""
+                        SELECT aj.upstream_job_id AS job_id,
+                               aj.status,
+                               aj.progress,
+                               aj.action_code,
+                               aj.provider,
+                               aj.created_at,
+                               hi.stage,
+                               hi.payload
+                        FROM {Tables.ACTIVE_JOBS} aj
+                        LEFT JOIN {Tables.HISTORY_ITEMS} hi
+                            ON aj.related_history_id = hi.id
+                        WHERE aj.status IN ('queued', 'running')
+                          AND aj.identity_id = %s
+                        ORDER BY aj.created_at DESC
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    # Anonymous users only see jobs without user_id
+                    cur.execute(
+                        f"""
+                        SELECT aj.upstream_job_id AS job_id,
+                               aj.status,
+                               aj.progress,
+                               aj.action_code,
+                               aj.provider,
+                               aj.created_at,
+                               hi.stage,
+                               hi.payload
+                        FROM {Tables.ACTIVE_JOBS} aj
+                        LEFT JOIN {Tables.HISTORY_ITEMS} hi
+                            ON aj.related_history_id = hi.id
+                        WHERE aj.status IN ('queued', 'running')
+                          AND aj.identity_id IS NULL
+                        ORDER BY aj.created_at DESC
+                        """
+                    )
+                rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"] if row["payload"] else {}
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            results.append({
+                "job_id": row["job_id"],
+                "job_type": payload.get("job_type"),
+                "stage": row["stage"] or payload.get("stage"),
+                "metadata": payload,
+                "status": row["status"],
+                "progress": row["progress"],
+                "created_at": row["created_at"],
+            })
+        return results
+    except Exception as e:
+        print(f"[DB] Failed to get active jobs: {e}")
+        return []
+
+
+def mark_job_completed_in_db(job_id: str, user_id: str = None):
+    """Mark job as completed in database (only if user owns it or job has no user)."""
+    if not USE_DB:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if user_id:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.ACTIVE_JOBS}
+                        SET status = 'succeeded', updated_at = NOW()
+                        WHERE upstream_job_id = %s
+                          AND (identity_id = %s OR identity_id IS NULL)
+                        """,
+                        (job_id, user_id),
+                    )
+                else:
+                    # Anonymous can only complete jobs without user_id
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.ACTIVE_JOBS}
+                        SET status = 'succeeded', updated_at = NOW()
+                        WHERE upstream_job_id = %s AND identity_id IS NULL
+                        """,
+                        (job_id,),
+                    )
+                # Clean up old completed jobs (keep last 100 per user)
+                if user_id:
+                    cur.execute(
+                        f"""
+                        DELETE FROM {Tables.ACTIVE_JOBS}
+                        WHERE id IN (
+                            SELECT id FROM {Tables.ACTIVE_JOBS}
+                            WHERE status = 'succeeded' AND identity_id = %s
+                            ORDER BY updated_at DESC
+                            OFFSET 100
+                        )
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        DELETE FROM {Tables.ACTIVE_JOBS}
+                        WHERE id IN (
+                            SELECT id FROM {Tables.ACTIVE_JOBS}
+                            WHERE status = 'succeeded' AND identity_id IS NULL
+                            ORDER BY updated_at DESC
+                            OFFSET 100
+                        )
+                        """
+                    )
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] Failed to mark job completed {job_id}: {e}")
+
+
+def delete_active_job_from_db(job_id: str, user_id: str = None):
+    """Remove job from active jobs table (only if user owns it or job has no user)."""
+    if not USE_DB:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if user_id:
+                    cur.execute(
+                        f"DELETE FROM {Tables.ACTIVE_JOBS} WHERE upstream_job_id = %s AND (identity_id = %s OR identity_id IS NULL)",
+                        (job_id, user_id),
+                    )
+                else:
+                    cur.execute(
+                        f"DELETE FROM {Tables.ACTIVE_JOBS} WHERE upstream_job_id = %s AND identity_id IS NULL",
+                        (job_id,),
+                    )
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] Failed to delete active job {job_id}: {e}")
+
+
 def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
     """
     Look up job metadata from local store first, then fall back to database.
@@ -1073,6 +1221,76 @@ def verify_job_ownership(job_id: str, identity_id: str) -> bool:
     except Exception as e:
         print(f"[DB] verify_job_ownership failed for {job_id}: {e}")
         return True
+
+
+def create_internal_job_row(
+    internal_job_id: str,
+    identity_id: str,
+    provider: str,
+    action_key: str,
+    prompt: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    reservation_id: Optional[str] = None,
+    status: str = "queued",
+) -> bool:
+    """
+    Create or update a timrx_billing.jobs row for an internal job id.
+
+    This makes status polling resilient across workers (no in-memory dependency).
+    """
+    if not USE_DB:
+        return False
+    if not internal_job_id or not identity_id:
+        return False
+
+    # Map action_key -> DB action_code (must exist in action_costs)
+    action_code = PricingService.get_db_action_code(action_key)
+    if not action_code and hasattr(PricingService, "FRONTEND_ALIASES"):
+        action_code = PricingService.FRONTEND_ALIASES.get(action_key)
+    if not action_code:
+        action_code = PricingService.map_job_type_to_action(action_key)
+    if not action_code:
+        # Fallbacks by provider
+        if provider == "openai":
+            action_code = "OPENAI_IMAGE"
+        else:
+            action_code = "MESHY_TEXT_TO_3D"
+
+    cost_credits = PricingService.get_action_cost(action_key)
+    meta_json = json.dumps(meta or {})
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.JOBS}
+                        (id, identity_id, provider, action_code, status, cost_credits, reservation_id, prompt, meta)
+                    VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                    SET reservation_id = COALESCE(EXCLUDED.reservation_id, {Tables.JOBS}.reservation_id),
+                        prompt = COALESCE(EXCLUDED.prompt, {Tables.JOBS}.prompt),
+                        meta = COALESCE({Tables.JOBS}.meta, '{{}}'::jsonb) || COALESCE(EXCLUDED.meta, '{{}}'::jsonb),
+                        updated_at = NOW()
+                    """,
+                    (
+                        internal_job_id,
+                        identity_id,
+                        provider,
+                        action_code,
+                        status,
+                        max(0, int(cost_credits or 0)),
+                        reservation_id,
+                        prompt,
+                        meta_json,
+                    ),
+                )
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"[JOB] ERROR creating internal job row {internal_job_id}: {e}")
+        return False
 
 
 def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url):
