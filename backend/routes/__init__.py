@@ -26,6 +26,7 @@ def _print_route_map(app):
 
 def register_blueprints(app):
     """Register all blueprints with the Flask app."""
+    from backend.routes.frontend import bp as frontend_bp
     from backend.routes.me import bp as me_bp
     from backend.routes.billing import bp as billing_bp
     from backend.routes.auth import bp as auth_bp
@@ -41,6 +42,9 @@ def register_blueprints(app):
     from backend.routes.mesh_operations import bp as mesh_ops_bp
     from backend.routes.history import bp as history_bp
     from backend.routes.community import bp as community_bp
+
+    # Frontend routes (no prefix)
+    app.register_blueprint(frontend_bp)
 
     app.register_blueprint(me_bp, url_prefix="/api/me")
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
