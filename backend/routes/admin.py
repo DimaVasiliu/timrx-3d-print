@@ -26,7 +26,7 @@ Environment variables:
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_admin
-from backend.admin_service import AdminService
+from backend.services.admin_service import AdminService
 from backend.db import DatabaseError
 
 bp = Blueprint("admin", __name__)
@@ -321,7 +321,7 @@ def email_health():
     Returns detailed status for debugging.
     """
     try:
-        from email_service import EmailService
+        from backend.services.email_service import EmailService
         result = EmailService.healthcheck()
         return jsonify({"ok": result.get("status") == "healthy", **result})
     except ImportError:
@@ -364,7 +364,7 @@ def email_test():
                 "message": "Invalid email format"
             }), 400
 
-        from email_service import EmailService
+        from backend.services.email_service import EmailService
 
         admin_email = getattr(g, "admin_email", None)
         print(f"[ADMIN] Sending test email to {to_email} (requested by {admin_email or 'token'})")
