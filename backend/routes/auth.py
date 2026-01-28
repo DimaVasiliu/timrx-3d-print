@@ -15,10 +15,10 @@ Note: Logout is handled by /api/me/logout for consistency with other /me endpoin
 
 from flask import Blueprint, request, jsonify, g
 
-from middleware import with_session, require_admin
-from magic_code_service import MagicCodeService
-from identity_service import IdentityService
-from wallet_service import WalletService
+from backend.middleware import with_session, require_admin
+from backend.magic_code_service import MagicCodeService
+from backend.identity_service import IdentityService
+from backend.wallet_service import WalletService
 
 bp = Blueprint("auth", __name__)
 
