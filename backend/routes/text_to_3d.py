@@ -10,7 +10,8 @@ import uuid
 
 from flask import Blueprint, jsonify, request, g
 
-from backend.config import ACTION_KEYS, DEFAULT_MODEL_TITLE, MESHY_API_KEY
+from backend.config import ACTION_KEYS, MESHY_API_KEY
+from backend.utils import derive_display_title
 from backend.db import USE_DB, get_conn
 from backend.middleware import with_session
 from backend.services.async_dispatch import (
@@ -107,7 +108,7 @@ def text_to_3d_start_mod():
     store_meta = {
         "stage": "preview",
         "prompt": prompt,
-        "title": prompt[:50] if prompt else DEFAULT_MODEL_TITLE,
+        "title": derive_display_title(prompt, None),
         "root_prompt": prompt,
         "art_style": art_style or "realistic",
         "model": payload["ai_model"],
@@ -191,7 +192,7 @@ def text_to_3d_refine_mod():
     original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = preview_meta.get("root_prompt") or original_prompt
     texture_prompt = body.get("texture_prompt")
-    title = f"(refine) {original_prompt[:40]}" if original_prompt else body.get("title", DEFAULT_MODEL_TITLE)
+    title = f"(refine) {original_prompt[:40]}" if original_prompt else derive_display_title(body.get("prompt"), body.get("title"))
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-refine"]
