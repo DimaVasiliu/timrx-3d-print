@@ -273,7 +273,8 @@ def history_mod():
                                     (str(item_id), str(item_id), str(item_id), str(item_id), identity_id),
                                 )
                                 existing = cur.fetchone()
-                                existing_id = existing[0] if existing else None
+                                # Note: cursor returns dict due to connection's default row_factory=dict_row
+                                existing_id = existing["id"] if existing else None
 
                                 item_type = item.get("type") or item.get("item_type") or "model"
                                 status = item.get("status") or "pending"
@@ -500,7 +501,8 @@ def history_item_add_mod():
                                 (str(item_id), str(item_id), str(item_id), str(item_id), identity_id),
                             )
                             existing = cur.fetchone()
-                            existing_id = existing[0] if existing else None
+                            # Note: cursor returns dict due to connection's default row_factory=dict_row
+                            existing_id = existing["id"] if existing else None
 
                             item_type = item.get("type") or item.get("item_type") or "model"
                             status = item.get("status") or "pending"
