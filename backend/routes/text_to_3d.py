@@ -11,7 +11,7 @@ import uuid
 from flask import Blueprint, jsonify, request, g
 
 from backend.config import ACTION_KEYS, DEFAULT_MODEL_TITLE, MESHY_API_KEY
-from backend.db import USE_DB, dict_row, get_conn, Tables
+from backend.db import USE_DB
 from backend.middleware import with_session
 from backend.services.async_dispatch import (
     _dispatch_meshy_refine_async,
@@ -37,6 +37,7 @@ from backend.services.job_service import (
 )
 from backend.services.meshy_service import mesh_get, mesh_post, normalize_status
 from backend.services.s3_service import save_finished_job_to_normalized_db
+from backend.services.history_service import get_canonical_model_row
 from backend.utils.helpers import clamp_int, log_event, log_status_summary, normalize_license, now_s
 
 bp = Blueprint("text_to_3d", __name__)
@@ -529,28 +530,24 @@ def text_to_3d_status_mod(job_id: str):
     # If DB has the finalized model, prefer S3 URLs for frontend rendering.
     if USE_DB and identity_id:
         try:
-            with get_conn() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(
-                        f"""
-                        SELECT glb_url, thumbnail_url, model_urls, textured_model_urls
-                        FROM {Tables.MODELS}
-                        WHERE identity_id = %s AND upstream_job_id = %s
-                        ORDER BY updated_at DESC
-                        LIMIT 1
-                        """,
-                        (identity_id, str(job_id)),
-                    )
-                    row = cur.fetchone()
-            if row:
-                if row.get("glb_url"):
-                    out["glb_url"] = row["glb_url"]
-                if row.get("thumbnail_url"):
-                    out["thumbnail_url"] = row["thumbnail_url"]
-                if row.get("model_urls"):
-                    out["model_urls"] = row["model_urls"]
-                if row.get("textured_model_urls"):
-                    out["textured_model_urls"] = row["textured_model_urls"]
+            canonical = get_canonical_model_row(
+                identity_id,
+                upstream_job_id=job_id,
+                alt_upstream_job_id=meshy_job_id,
+            )
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                    if out.get("rigged_character_glb_url"):
+                        out["rigged_character_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
         except Exception as e:
             print(f"[text-to-3d][mod] DB lookup for finalized model failed: {e}")
 
