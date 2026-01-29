@@ -18,12 +18,45 @@ from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
-from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, save_store, verify_job_ownership
+from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.utils.helpers import log_event, log_status_summary, now_s
 
 bp = Blueprint("mesh_operations", __name__)
+
+
+def _resolve_and_validate_source_task(source_task_id_input: str, store: dict) -> tuple[str | None, dict | None]:
+    """
+    Resolve a source task ID to the actual Meshy task ID.
+    Returns (resolved_task_id, error_response) - if error_response is not None, return it.
+    """
+    import re
+
+    if not source_task_id_input:
+        return None, (jsonify({
+            "ok": False,
+            "error": "source_task_id or model_task_id required",
+            "code": "SOURCE_TASK_REQUIRED",
+        }), 400)
+
+    resolved_id = resolve_meshy_job_id(source_task_id_input)
+    print(f"[MeshOps] Resolved source_task_id: {source_task_id_input} -> {resolved_id}")
+
+    # Check if input looks like a UUID that wasn't resolved
+    uuid_pattern = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    if re.match(uuid_pattern, source_task_id_input) and resolved_id == source_task_id_input:
+        # Check if this might be a valid Meshy task ID directly
+        store_entry = store.get(source_task_id_input) or {}
+        if not store_entry.get("glb_url") and store_entry.get("status") != "done":
+            print(f"[MeshOps] ERROR: Could not resolve source_task_id {source_task_id_input} to Meshy task ID")
+            return None, (jsonify({
+                "ok": False,
+                "error": "Source task ID not found or not yet ready. Ensure the source task completed successfully.",
+                "code": "SOURCE_TASK_NOT_FOUND",
+            }), 400)
+
+    return resolved_id, None
 
 
 @bp.route("/mesh/remesh", methods=["POST", "OPTIONS"])
@@ -72,9 +105,15 @@ def mesh_remesh_mod():
     if body.get("convert_format_only") is not None:
         payload["convert_format_only"] = bool(body.get("convert_format_only"))
 
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    source_task_id_input = body.get("source_task_id") or body.get("model_task_id")
     store = load_store()
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+
+    # Resolve and validate source task ID before reserving credits
+    source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
+    if validation_error:
+        return validation_error
+
+    source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
     title = derive_display_title(original_prompt, body.get("title"))
@@ -84,7 +123,7 @@ def mesh_remesh_mod():
         "root_prompt": root_prompt,
         "title": title,
         "stage": "remesh",
-        "source_task_id": source_task_id,
+        "source_task_id": source_task_id,  # Use resolved ID
         "topology": topology,
         "target_polycount": payload.get("target_polycount"),
     }
@@ -250,9 +289,15 @@ def mesh_retexture_mod():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["retexture"]
 
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    source_task_id_input = body.get("source_task_id") or body.get("model_task_id")
     store = load_store()
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+
+    # Resolve and validate source task ID before reserving credits
+    source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
+    if validation_error:
+        return validation_error
+
+    source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
     title = derive_display_title(original_prompt, body.get("title"))
@@ -262,7 +307,7 @@ def mesh_retexture_mod():
         "root_prompt": root_prompt,
         "title": title,
         "stage": "texture",
-        "source_task_id": source_task_id,
+        "source_task_id": source_task_id,  # Use resolved ID
         "texture_prompt": prompt or None,
         "enable_pbr": bool(body.get("enable_pbr", False)),
     }
@@ -450,9 +495,15 @@ def mesh_rigging_mod():
     if tex_img:
         payload["texture_image_url"] = tex_img
 
-    source_task_id = body.get("source_task_id") or body.get("model_task_id")
+    source_task_id_input = body.get("source_task_id") or body.get("model_task_id")
     store = load_store()
-    source_meta = get_job_metadata(source_task_id, store) if source_task_id else {}
+
+    # Resolve and validate source task ID before reserving credits
+    source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
+    if validation_error:
+        return validation_error
+
+    source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
     title = derive_display_title(original_prompt, body.get("title"))
@@ -462,7 +513,7 @@ def mesh_rigging_mod():
         "root_prompt": root_prompt,
         "title": title,
         "stage": "rigging",
-        "source_task_id": source_task_id,
+        "source_task_id": source_task_id,  # Use resolved ID
     }
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
