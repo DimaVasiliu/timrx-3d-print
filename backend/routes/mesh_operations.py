@@ -15,6 +15,7 @@ from backend.middleware import with_session
 from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
+from backend.services.history_service import get_canonical_model_row
 from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, save_store, verify_job_ownership
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task
 from backend.services.s3_service import save_finished_job_to_normalized_db
@@ -198,6 +199,26 @@ def mesh_remesh_status_mod(job_id: str):
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
 
+    # If DB has the finalized model, prefer S3 URLs for frontend rendering.
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(identity_id, upstream_job_id=job_id)
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                    if out.get("rigged_character_glb_url"):
+                        out["rigged_character_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[mesh/remesh][mod] DB lookup for finalized model failed: {e}")
+
     return jsonify(out)
 
 
@@ -373,6 +394,26 @@ def mesh_retexture_status_mod(job_id: str):
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
 
+    # If DB has the finalized model, prefer S3 URLs for frontend rendering.
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(identity_id, upstream_job_id=job_id)
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                    if out.get("rigged_character_glb_url"):
+                        out["rigged_character_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[mesh/retexture][mod] DB lookup for finalized model failed: {e}")
+
     return jsonify(out)
 
 
@@ -535,5 +576,25 @@ def mesh_rigging_status_mod(job_id: str):
             if s3_result.get("db_ok") is False:
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
+
+    # If DB has the finalized model, prefer S3 URLs for frontend rendering.
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(identity_id, upstream_job_id=job_id)
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                    if out.get("rigged_character_glb_url"):
+                        out["rigged_character_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[mesh/rigging][mod] DB lookup for finalized model failed: {e}")
 
     return jsonify(out)
