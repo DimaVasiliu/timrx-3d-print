@@ -21,6 +21,8 @@ from backend.services.history_service import (
     _validate_history_item_asset_ids,
     delete_history_local,
     delete_s3_objects,
+    get_canonical_image_row,
+    get_canonical_model_row,
     load_history_store,
     save_history_store,
     upsert_history_local,
@@ -87,6 +89,89 @@ def history_mod():
                             item["image_url"] = r["image_url"]
                         if r["created_at"]:
                             item["created_at"] = int(r["created_at"].timestamp() * 1000)
+
+                        payload = item if isinstance(item, dict) else {}
+                        upstream_id = None
+                        if isinstance(payload, dict):
+                            upstream_id = (
+                                payload.get("original_job_id")
+                                or payload.get("preview_task_id")
+                                or payload.get("source_task_id")
+                            )
+
+                        model_row = None
+                        image_row = None
+                        if r.get("model_id"):
+                            model_row = get_canonical_model_row(
+                                identity_id,
+                                model_id=str(r["model_id"]),
+                                upstream_job_id=upstream_id,
+                            )
+                        elif upstream_id:
+                            model_row = get_canonical_model_row(
+                                identity_id,
+                                upstream_job_id=upstream_id,
+                            )
+                        if r.get("image_id"):
+                            image_row = get_canonical_image_row(
+                                identity_id,
+                                image_id=str(r["image_id"]),
+                                upstream_id=upstream_id,
+                            )
+                        elif upstream_id:
+                            image_row = get_canonical_image_row(
+                                identity_id,
+                                upstream_id=upstream_id,
+                            )
+
+                        if model_row:
+                            if model_row.get("glb_url"):
+                                item["glb_url"] = model_row["glb_url"]
+                                payload["glb_url"] = model_row["glb_url"]
+                            if model_row.get("thumbnail_url"):
+                                item["thumbnail_url"] = model_row["thumbnail_url"]
+                                payload["thumbnail_url"] = model_row["thumbnail_url"]
+                            if model_row.get("model_urls"):
+                                item["model_urls"] = model_row["model_urls"]
+                                payload["model_urls"] = model_row["model_urls"]
+                            if model_row.get("textured_model_urls"):
+                                item["textured_model_urls"] = model_row["textured_model_urls"]
+                                payload["textured_model_urls"] = model_row["textured_model_urls"]
+                            if model_row.get("title") and not item.get("title"):
+                                item["title"] = model_row["title"]
+                        if image_row:
+                            if image_row.get("image_url"):
+                                item["image_url"] = image_row["image_url"]
+                                payload["image_url"] = image_row["image_url"]
+                            if image_row.get("thumbnail_url"):
+                                item["thumbnail_url"] = image_row["thumbnail_url"]
+                                payload["thumbnail_url"] = image_row["thumbnail_url"]
+                            if image_row.get("title") and not item.get("title"):
+                                item["title"] = image_row["title"]
+
+                        for key in ("glb_url", "thumbnail_url", "image_url"):
+                            val = item.get(key)
+                            if isinstance(val, str) and "meshy.ai" in val:
+                                item[key] = None
+                                if isinstance(payload, dict):
+                                    payload[key] = None
+
+                        def _scrub_meshy_urls(value):
+                            if isinstance(value, dict):
+                                return {k: v for k, v in value.items() if not (isinstance(v, str) and "meshy.ai" in v)}
+                            if isinstance(value, list):
+                                return [v for v in value if not (isinstance(v, str) and "meshy.ai" in v)]
+                            return value
+
+                        for key in ("model_urls", "textured_model_urls", "texture_urls"):
+                            if key in item:
+                                item[key] = _scrub_meshy_urls(item.get(key))
+                            if isinstance(payload, dict) and key in payload:
+                                payload[key] = _scrub_meshy_urls(payload.get(key))
+
+                        if not item.get("title"):
+                            item["title"] = derive_display_title(item.get("prompt"), None)
+
                         items.append(item)
 
                     for i, item in enumerate(items[:3]):
@@ -719,18 +804,13 @@ def history_item_update_mod(item_id: str):
                                     updates["image_url"] = image_url
                                 existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url"}})
 
+                                title_to_set = title
                                 cur.execute(
                                     f"""UPDATE {Tables.HISTORY_ITEMS}
                                        SET item_type = COALESCE(%s, item_type),
                                            status = COALESCE(%s, status),
                                            stage = COALESCE(%s, stage),
-                                           title = CASE
-                                               WHEN %s::text IS NOT NULL
-                                                AND %s::text <> ''
-                                                AND %s::text NOT IN ('3D Model', 'Untitled')
-                                               THEN %s::text
-                                               ELSE title
-                                           END,
+                                           title = COALESCE(%s::text, title),
                                            prompt = COALESCE(%s, prompt),
                                            thumbnail_url = COALESCE(%s, thumbnail_url),
                                            glb_url = COALESCE(%s, glb_url),
@@ -742,10 +822,7 @@ def history_item_update_mod(item_id: str):
                                         item_type,
                                         status,
                                         stage,
-                                        title,
-                                        title,
-                                        title,
-                                        title,
+                                        title_to_set,
                                         prompt,
                                         thumbnail_url,
                                         glb_url,
