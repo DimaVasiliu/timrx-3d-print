@@ -43,6 +43,24 @@ def _extract_s3_key_from_url(url: str | None) -> str | None:
     return None
 
 
+def _extract_meshy_task_id(url: str | None) -> str | None:
+    """Extract Meshy task ID from assets.meshy.ai URLs."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or ""
+    except Exception:
+        return None
+    # Meshy URLs often include /tasks/<uuid>
+    import re
+
+    match = re.search(r"/tasks/([0-9a-fA-F-]{36})", path)
+    if match:
+        return match.group(1)
+    return None
+
+
 @bp.route("/proxy-glb", methods=["GET", "OPTIONS"])
 @with_session
 def proxy_glb_mod():
@@ -68,6 +86,7 @@ def proxy_glb_mod():
         return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
 
     s3_key = _extract_s3_key_from_url(u)
+    meshy_task_id = _extract_meshy_task_id(u)
     try:
         with get_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -84,6 +103,32 @@ def proxy_glb_mod():
                         LIMIT 1
                         """,
                         (identity_id, s3_key, s3_key, identity_id, u, u),
+                    )
+                elif meshy_task_id:
+                    cur.execute(
+                        f"""
+                        SELECT 1
+                        FROM {Tables.ACTIVE_JOBS}
+                        WHERE identity_id = %s AND upstream_job_id = %s
+                        UNION
+                        SELECT 1
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s
+                          AND (
+                            payload->>'original_job_id' = %s
+                            OR payload->>'preview_task_id' = %s
+                            OR payload->>'source_task_id' = %s
+                          )
+                        LIMIT 1
+                        """,
+                        (
+                            identity_id,
+                            meshy_task_id,
+                            identity_id,
+                            meshy_task_id,
+                            meshy_task_id,
+                            meshy_task_id,
+                        ),
                     )
                 else:
                     cur.execute(
