@@ -126,18 +126,23 @@ def proxy_glb_mod():
         with get_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 if s3_key:
+                    # For S3 URLs: check by key in models AND by full URL in both tables
+                    # This handles cases where glb_s3_key may not be populated (older data)
                     cur.execute(
                         f"""
                         SELECT 1
                         FROM {Tables.MODELS}
-                        WHERE identity_id = %s AND (glb_s3_key = %s OR thumbnail_s3_key = %s)
+                        WHERE identity_id = %s AND (
+                            glb_s3_key = %s OR thumbnail_s3_key = %s
+                            OR glb_url = %s OR thumbnail_url = %s
+                        )
                         UNION
                         SELECT 1
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
                         LIMIT 1
                         """,
-                        (identity_id, s3_key, s3_key, identity_id, u, u),
+                        (identity_id, s3_key, s3_key, u, u, identity_id, u, u),
                     )
                 elif meshy_task_id:
                     cur.execute(
@@ -181,6 +186,7 @@ def proxy_glb_mod():
                     )
                 row = cur.fetchone()
         if not row:
+            print(f"[proxy-glb][mod] ownership check failed: no row found for identity={identity_id}, url={u[:80]}...")
             return jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}}), 404
     except Exception as e:
         print(f"[proxy-glb][mod] ownership check failed: {e}")
