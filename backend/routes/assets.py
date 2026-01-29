@@ -7,6 +7,8 @@ Registered under /api/_mod.
 from __future__ import annotations
 
 from urllib.parse import urlparse
+import ipaddress
+import socket
 
 import boto3
 import requests
@@ -61,7 +63,35 @@ def _extract_meshy_task_id(url: str | None) -> str | None:
     return None
 
 
-@bp.route("/proxy-glb", methods=["GET", "OPTIONS"])
+def _is_private_ip(host: str) -> bool:
+    """Reject private/loopback/reserved IPs to prevent SSRF."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+    except ValueError:
+        return False
+
+
+def _host_is_allowed(host: str) -> bool:
+    allowed = {h.lower() for h in PROXY_ALLOWED_HOSTS}
+    if host.lower() not in allowed:
+        return False
+    # Extra safety: if host is an IP, ensure it's not private
+    if _is_private_ip(host):
+        return False
+    # Resolve DNS and block private ranges
+    try:
+        for res in socket.getaddrinfo(host, 443):
+            ip = res[4][0]
+            if _is_private_ip(ip):
+                return False
+    except Exception:
+        # If DNS fails, treat as not allowed
+        return False
+    return True
+
+
+@bp.route("/proxy-glb", methods=["GET", "OPTIONS", "HEAD"])
 @with_session
 def proxy_glb_mod():
     if request.method == "OPTIONS":
@@ -76,10 +106,10 @@ def proxy_glb_mod():
         return jsonify({"ok": False, "error": {"code": "MISSING_URL", "message": "u query param required"}}), 400
 
     p = urlparse(u)
-    if p.scheme not in ("http", "https"):
+    if p.scheme != "https":
         abort(400)
     host = (p.hostname or "").lower()
-    if host not in PROXY_ALLOWED_HOSTS:
+    if not _host_is_allowed(host):
         return jsonify({"ok": False, "error": {"code": "HOST_NOT_ALLOWED", "message": "Host not allowed"}}), 400
 
     if not USE_DB:
@@ -87,6 +117,11 @@ def proxy_glb_mod():
 
     s3_key = _extract_s3_key_from_url(u)
     meshy_task_id = _extract_meshy_task_id(u)
+    if host == "assets.meshy.ai" and not meshy_task_id:
+        return jsonify({
+            "ok": False,
+            "error": {"code": "INVALID_MESHY_URL", "message": "Meshy URL must include a task id"},
+        }), 400
     try:
         with get_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -162,15 +197,36 @@ def proxy_glb_mod():
         except Exception as e:
             print(f"[proxy-glb][mod] Failed to presign S3 URL: {e}")
 
+    timeout = (5, 30)
+    max_bytes = 100 * 1024 * 1024  # 100MB cap
+
+    if request.method == "HEAD":
+        try:
+            r = requests.head(u, allow_redirects=True, timeout=timeout)
+        except Exception:
+            abort(502)
+        headers = {
+            "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600",
+        }
+        return Response(status=r.status_code, headers=headers)
+
     try:
-        r = requests.get(u, stream=True, timeout=60)
+        r = requests.get(u, stream=True, timeout=timeout)
     except Exception:
         abort(502)
 
     def gen():
+        total = 0
         for chunk in r.iter_content(chunk_size=8192):
-            if chunk:
-                yield chunk
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                print(f"[proxy-glb][mod] Aborting stream: exceeded {max_bytes} bytes")
+                break
+            yield chunk
 
     headers = {
         "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
