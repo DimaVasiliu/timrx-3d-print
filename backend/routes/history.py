@@ -48,9 +48,19 @@ def history_mod():
             }), 401
 
         if request.method == "GET":
+            import time
+            start_time = time.time()
+
             items = []
             db_source = False
-            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}")
+
+            # Pagination parameters
+            limit = request.args.get("limit", type=int, default=100)
+            offset = request.args.get("offset", type=int, default=0)
+            limit = min(max(1, limit), 500)  # Clamp to 1-500
+            offset = max(0, offset)
+
+            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, offset={offset}")
 
             if USE_DB:
                 try:
@@ -59,15 +69,18 @@ def history_mod():
                             cur.execute(
                                 f"""
                                 SELECT id, item_type, status, stage, title, prompt,
-                                       thumbnail_url, glb_url, image_url, payload, created_at
+                                       thumbnail_url, glb_url, image_url, payload, created_at,
+                                       model_id, image_id
                                 FROM {Tables.HISTORY_ITEMS}
                                 WHERE identity_id = %s
-                                ORDER BY created_at DESC;
+                                ORDER BY created_at DESC
+                                LIMIT %s OFFSET %s;
                                 """,
-                                (identity_id,),
+                                (identity_id, limit, offset),
                             )
                             rows = cur.fetchall()
-                    print(f"[History][mod] GET: Fetched {len(rows)} items from database")
+                    query_time = time.time() - start_time
+                    print(f"[History][mod] GET: Fetched {len(rows)} items from database in {query_time:.3f}s")
                     db_source = True
 
                     for r in rows:
@@ -190,6 +203,10 @@ def history_mod():
                 if isinstance(local_items, list):
                     items = local_items
                     print(f"[History][mod] GET: Returning {len(items)} items from local store")
+
+            # Log total time including N+1 queries
+            total_time = time.time() - start_time
+            print(f"[History][mod] GET: Total response time {total_time:.3f}s for {len(items)} items")
 
             # Always return 200 with bare array for frontend compatibility
             # Frontend expects: Array.isArray(result.data) to be true
