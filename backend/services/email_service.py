@@ -139,6 +139,8 @@ class EmailService:
         text: Optional[str] = None,
         from_email: Optional[str] = None,
         from_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        reply_to_name: Optional[str] = None,
     ) -> EmailResult:
         """
         Send an email. Never throws - returns EmailResult.
@@ -148,8 +150,10 @@ class EmailService:
             subject: Email subject
             html: HTML body
             text: Plain text body (optional, auto-generated if not provided)
-            from_email: Override from address
+            from_email: Override from address (must be verified/authorized sender)
             from_name: Override from name
+            reply_to: Reply-To email address (for contact forms, use this instead of from_email)
+            reply_to_name: Reply-To display name
 
         Returns:
             EmailResult with success status and message
@@ -169,10 +173,10 @@ class EmailService:
         # Route to appropriate provider
         provider = config.EMAIL_PROVIDER.lower()
         if provider == "ses":
-            return cls._send_via_ses(to, subject, html, text, from_email, from_name)
+            return cls._send_via_ses(to, subject, html, text, from_email, from_name, reply_to, reply_to_name)
 
         # Default: SMTP providers (neo, sendgrid, etc.)
-        return cls._send_via_smtp(to, subject, html, text, from_email, from_name)
+        return cls._send_via_smtp(to, subject, html, text, from_email, from_name, reply_to, reply_to_name)
 
     @classmethod
     def _send_via_ses(
@@ -183,13 +187,15 @@ class EmailService:
         text: Optional[str] = None,
         from_email: Optional[str] = None,
         from_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        reply_to_name: Optional[str] = None,
     ) -> EmailResult:
         """Send email via AWS SES using boto3."""
         if not BOTO3_AVAILABLE:
             print(f"[EMAIL] SES ERROR: boto3 not available - cannot send to {to}")
             return EmailResult(success=False, message="boto3 not available", error="ImportError")
 
-        # Get from address
+        # Get from address (must be verified in SES)
         sender_addr = from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
         sender_name = from_name or config.EMAIL_FROM_NAME
         sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
@@ -208,15 +214,23 @@ class EmailService:
             if text:
                 body["Text"] = {"Charset": "UTF-8", "Data": text}
 
-            # Send email
-            response = ses_client.send_email(
-                Source=sender,
-                Destination={"ToAddresses": [to]},
-                Message={
+            # Build send_email params
+            send_params = {
+                "Source": sender,
+                "Destination": {"ToAddresses": [to]},
+                "Message": {
                     "Subject": {"Charset": "UTF-8", "Data": subject},
                     "Body": body,
                 },
-            )
+            }
+
+            # Add Reply-To if provided
+            if reply_to:
+                reply_to_formatted = f"{reply_to_name} <{reply_to}>" if reply_to_name else reply_to
+                send_params["ReplyToAddresses"] = [reply_to_formatted]
+
+            # Send email
+            response = ses_client.send_email(**send_params)
 
             message_id = response.get("MessageId", "unknown")
             print(f"[EMAIL] SES SENT to {to}: {subject} (MessageId: {message_id})")
@@ -245,12 +259,14 @@ class EmailService:
         text: Optional[str] = None,
         from_email: Optional[str] = None,
         from_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        reply_to_name: Optional[str] = None,
     ) -> EmailResult:
         """Send email via SMTP."""
-        # Get from address
+        # Get from address (use configured sender, not contact form sender)
         default_name, default_addr = config.SMTP_FROM_PARSED
         sender_name = from_name or default_name
-        sender_addr = from_email or default_addr
+        sender_addr = default_addr  # Always use configured sender for SMTP auth
 
         try:
             # Build message
@@ -258,6 +274,11 @@ class EmailService:
             msg["Subject"] = subject
             msg["From"] = f"{sender_name} <{sender_addr}>"
             msg["To"] = to
+
+            # Add Reply-To header if provided (for contact forms)
+            if reply_to:
+                reply_to_formatted = f"{reply_to_name} <{reply_to}>" if reply_to_name else reply_to
+                msg["Reply-To"] = reply_to_formatted
 
             # Attach text version
             if text:
@@ -422,6 +443,8 @@ def send_email(
     text_body: Optional[str] = None,
     from_email: Optional[str] = None,
     from_name: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    reply_to_name: Optional[str] = None,
 ) -> bool:
     """
     Send an email (backward compatible function).
@@ -434,6 +457,8 @@ def send_email(
         text=text_body,
         from_email=from_email,
         from_name=from_name,
+        reply_to=reply_to,
+        reply_to_name=reply_to_name,
     )
     return result.success
 
