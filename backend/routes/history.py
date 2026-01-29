@@ -199,10 +199,10 @@ def history_mod():
                                                status = COALESCE(%s, status),
                                                stage = COALESCE(%s, stage),
                                                title = CASE
-                                                   WHEN %s IS NOT NULL
-                                                    AND %s <> ''
-                                                    AND %s NOT IN ('3D Model', 'Untitled')
-                                                   THEN %s
+                                                   WHEN %s::text IS NOT NULL
+                                                    AND %s::text <> ''
+                                                    AND %s::text NOT IN ('3D Model', 'Untitled')
+                                                   THEN %s::text
                                                    ELSE title
                                                END,
                                                prompt = COALESCE(%s, prompt),
@@ -426,10 +426,10 @@ def history_item_add_mod():
                                            status = COALESCE(%s, status),
                                            stage = COALESCE(%s, stage),
                                            title = CASE
-                                               WHEN %s IS NOT NULL
-                                                AND %s <> ''
-                                                AND %s NOT IN ('3D Model', 'Untitled')
-                                               THEN %s
+                                               WHEN %s::text IS NOT NULL
+                                                AND %s::text <> ''
+                                                AND %s::text NOT IN ('3D Model', 'Untitled')
+                                               THEN %s::text
                                                ELSE title
                                            END,
                                            prompt = COALESCE(%s, prompt),
@@ -725,10 +725,10 @@ def history_item_update_mod(item_id: str):
                                            status = COALESCE(%s, status),
                                            stage = COALESCE(%s, stage),
                                            title = CASE
-                                               WHEN %s IS NOT NULL
-                                                AND %s <> ''
-                                                AND %s NOT IN ('3D Model', 'Untitled')
-                                               THEN %s
+                                               WHEN %s::text IS NOT NULL
+                                                AND %s::text <> ''
+                                                AND %s::text NOT IN ('3D Model', 'Untitled')
+                                               THEN %s::text
                                                ELSE title
                                            END,
                                            prompt = COALESCE(%s, prompt),
