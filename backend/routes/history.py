@@ -5,17 +5,17 @@ import json
 import uuid
 from flask import Blueprint, request, jsonify, g
 
-from config import USE_DB, LOCAL_DEV_MODE, APP_SCHEMA
+from backend.config import USE_DB, LOCAL_DEV_MODE, APP_SCHEMA
 from database import get_db_conn, dict_row, log_db_continue
-from utils.helpers import require_identity, now_s, clamp_int
-from services.history_service import (
+from backend.utils.helpers import require_identity, now_s, clamp_int
+from backend.services.history_service import (
     load_history_store, save_history_store, upsert_history_local, delete_history_local,
     validate_history_xor, lookup_asset_id_for_history
 )
-from services.s3_service import collect_s3_keys, delete_s3_objects
+from backend.services.s3_service import collect_s3_keys, delete_s3_objects
 
 try:
-    from middleware import with_session
+    from backend.middleware import with_session
 except ImportError:
     def with_session(f):
         return f
