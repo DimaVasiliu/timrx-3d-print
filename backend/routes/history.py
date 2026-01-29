@@ -21,8 +21,6 @@ from backend.services.history_service import (
     _validate_history_item_asset_ids,
     delete_history_local,
     delete_s3_objects,
-    get_canonical_image_row,
-    get_canonical_model_row,
     load_history_store,
     save_history_store,
     upsert_history_local,
@@ -66,25 +64,89 @@ def history_mod():
                 try:
                     with get_conn() as conn:
                         with conn.cursor(row_factory=dict_row) as cur:
+                            # Single optimized query with LEFT JOINs to avoid N+1 problem
+                            # This replaces the previous per-item get_canonical_model_row/get_canonical_image_row calls
                             cur.execute(
                                 f"""
-                                SELECT id, item_type, status, stage, title, prompt,
-                                       thumbnail_url, glb_url, image_url, payload, created_at,
-                                       model_id, image_id
-                                FROM {Tables.HISTORY_ITEMS}
-                                WHERE identity_id = %s
-                                ORDER BY created_at DESC
+                                SELECT
+                                    h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
+                                    h.thumbnail_url, h.glb_url, h.image_url, h.payload, h.created_at,
+                                    h.model_id, h.image_id,
+                                    -- Model data from joined models table
+                                    m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
+                                    m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
+                                    -- Image data from joined images table
+                                    i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
+                                    i.thumbnail_url AS i_thumbnail_url
+                                FROM {Tables.HISTORY_ITEMS} h
+                                LEFT JOIN {Tables.MODELS} m ON (
+                                    m.identity_id = %s AND (
+                                        -- Direct model_id lookup
+                                        (h.model_id IS NOT NULL AND h.model_id = m.id)
+                                        OR
+                                        -- Fallback: upstream_job_id lookup when no model_id
+                                        (h.model_id IS NULL AND m.upstream_job_id = COALESCE(
+                                            h.payload->>'original_job_id',
+                                            h.payload->>'preview_task_id',
+                                            h.payload->>'source_task_id'
+                                        ) AND COALESCE(
+                                            h.payload->>'original_job_id',
+                                            h.payload->>'preview_task_id',
+                                            h.payload->>'source_task_id'
+                                        ) IS NOT NULL)
+                                    )
+                                )
+                                LEFT JOIN {Tables.IMAGES} i ON (
+                                    i.identity_id = %s AND (
+                                        -- Direct image_id lookup
+                                        (h.image_id IS NOT NULL AND h.image_id = i.id)
+                                        OR
+                                        -- Fallback: upstream_id lookup when no image_id
+                                        (h.image_id IS NULL AND i.upstream_id = COALESCE(
+                                            h.payload->>'original_job_id',
+                                            h.payload->>'preview_task_id',
+                                            h.payload->>'source_task_id'
+                                        ) AND COALESCE(
+                                            h.payload->>'original_job_id',
+                                            h.payload->>'preview_task_id',
+                                            h.payload->>'source_task_id'
+                                        ) IS NOT NULL)
+                                    )
+                                )
+                                WHERE h.identity_id = %s
+                                ORDER BY h.created_at DESC
                                 LIMIT %s OFFSET %s;
                                 """,
-                                (identity_id, limit, offset),
+                                (identity_id, identity_id, identity_id, limit, offset),
                             )
                             rows = cur.fetchall()
                     query_time = time.time() - start_time
-                    print(f"[History][mod] GET: Fetched {len(rows)} items from database in {query_time:.3f}s")
+                    print(f"[History][mod] GET: Fetched {len(rows)} items from database in {query_time:.3f}s (single JOIN query)")
                     db_source = True
+
+                    def _scrub_meshy_urls(value):
+                        if isinstance(value, dict):
+                            return {k: v for k, v in value.items() if not (isinstance(v, str) and "meshy.ai" in v)}
+                        if isinstance(value, list):
+                            return [v for v in value if not (isinstance(v, str) and "meshy.ai" in v)]
+                        return value
+
+                    def _enrich_model_meta(meta):
+                        """Extract model_urls and textured_model_urls from meta JSONB."""
+                        if not meta:
+                            return {}, {}
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except Exception:
+                                return {}, {}
+                        if isinstance(meta, dict):
+                            return meta.get("model_urls", {}), meta.get("textured_model_urls", {})
+                        return {}, {}
 
                     for r in rows:
                         item = r["payload"] if r["payload"] else {}
+                        payload = item if isinstance(item, dict) else {}
                         item["id"] = str(r["id"])
                         item["type"] = r["item_type"]
                         item["status"] = r["status"]
@@ -103,78 +165,42 @@ def history_mod():
                         if r["created_at"]:
                             item["created_at"] = int(r["created_at"].timestamp() * 1000)
 
-                        payload = item if isinstance(item, dict) else {}
-                        upstream_id = None
-                        if isinstance(payload, dict):
-                            upstream_id = (
-                                payload.get("original_job_id")
-                                or payload.get("preview_task_id")
-                                or payload.get("source_task_id")
-                            )
+                        # Apply joined model data (from LEFT JOIN)
+                        if r.get("m_id"):
+                            if r.get("m_glb_url"):
+                                item["glb_url"] = r["m_glb_url"]
+                                payload["glb_url"] = r["m_glb_url"]
+                            if r.get("m_thumbnail_url"):
+                                item["thumbnail_url"] = r["m_thumbnail_url"]
+                                payload["thumbnail_url"] = r["m_thumbnail_url"]
+                            model_urls, textured_model_urls = _enrich_model_meta(r.get("m_meta"))
+                            if model_urls:
+                                item["model_urls"] = model_urls
+                                payload["model_urls"] = model_urls
+                            if textured_model_urls:
+                                item["textured_model_urls"] = textured_model_urls
+                                payload["textured_model_urls"] = textured_model_urls
+                            if r.get("m_title") and not item.get("title"):
+                                item["title"] = r["m_title"]
 
-                        model_row = None
-                        image_row = None
-                        if r.get("model_id"):
-                            model_row = get_canonical_model_row(
-                                identity_id,
-                                model_id=str(r["model_id"]),
-                                upstream_job_id=upstream_id,
-                            )
-                        elif upstream_id:
-                            model_row = get_canonical_model_row(
-                                identity_id,
-                                upstream_job_id=upstream_id,
-                            )
-                        if r.get("image_id"):
-                            image_row = get_canonical_image_row(
-                                identity_id,
-                                image_id=str(r["image_id"]),
-                                upstream_id=upstream_id,
-                            )
-                        elif upstream_id:
-                            image_row = get_canonical_image_row(
-                                identity_id,
-                                upstream_id=upstream_id,
-                            )
+                        # Apply joined image data (from LEFT JOIN)
+                        if r.get("i_id"):
+                            if r.get("i_image_url"):
+                                item["image_url"] = r["i_image_url"]
+                                payload["image_url"] = r["i_image_url"]
+                            if r.get("i_thumbnail_url"):
+                                item["thumbnail_url"] = r["i_thumbnail_url"]
+                                payload["thumbnail_url"] = r["i_thumbnail_url"]
+                            if r.get("i_title") and not item.get("title"):
+                                item["title"] = r["i_title"]
 
-                        if model_row:
-                            if model_row.get("glb_url"):
-                                item["glb_url"] = model_row["glb_url"]
-                                payload["glb_url"] = model_row["glb_url"]
-                            if model_row.get("thumbnail_url"):
-                                item["thumbnail_url"] = model_row["thumbnail_url"]
-                                payload["thumbnail_url"] = model_row["thumbnail_url"]
-                            if model_row.get("model_urls"):
-                                item["model_urls"] = model_row["model_urls"]
-                                payload["model_urls"] = model_row["model_urls"]
-                            if model_row.get("textured_model_urls"):
-                                item["textured_model_urls"] = model_row["textured_model_urls"]
-                                payload["textured_model_urls"] = model_row["textured_model_urls"]
-                            if model_row.get("title") and not item.get("title"):
-                                item["title"] = model_row["title"]
-                        if image_row:
-                            if image_row.get("image_url"):
-                                item["image_url"] = image_row["image_url"]
-                                payload["image_url"] = image_row["image_url"]
-                            if image_row.get("thumbnail_url"):
-                                item["thumbnail_url"] = image_row["thumbnail_url"]
-                                payload["thumbnail_url"] = image_row["thumbnail_url"]
-                            if image_row.get("title") and not item.get("title"):
-                                item["title"] = image_row["title"]
-
+                        # Scrub any remaining meshy.ai URLs (we only want S3 URLs)
                         for key in ("glb_url", "thumbnail_url", "image_url"):
                             val = item.get(key)
                             if isinstance(val, str) and "meshy.ai" in val:
                                 item[key] = None
                                 if isinstance(payload, dict):
                                     payload[key] = None
-
-                        def _scrub_meshy_urls(value):
-                            if isinstance(value, dict):
-                                return {k: v for k, v in value.items() if not (isinstance(v, str) and "meshy.ai" in v)}
-                            if isinstance(value, list):
-                                return [v for v in value if not (isinstance(v, str) and "meshy.ai" in v)]
-                            return value
 
                         for key in ("model_urls", "textured_model_urls", "texture_urls"):
                             if key in item:
@@ -195,6 +221,8 @@ def history_mod():
                     save_history_store(items)
                 except Exception as e:
                     print(f"[History][mod] DB read failed (returning local/empty): {e}")
+                    import traceback
+                    traceback.print_exc()
                     # Fall through to return local history or empty array
 
             # If DB wasn't used or failed, try local history
