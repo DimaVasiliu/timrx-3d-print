@@ -45,6 +45,21 @@ def _extract_s3_key_from_url(url: str | None) -> str | None:
     return None
 
 
+def _is_our_s3_bucket(url: str) -> bool:
+    """Check if URL is from our S3 bucket (timrx-3d-models)."""
+    if not url or not AWS_BUCKET_MODELS:
+        return False
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    # Match patterns: timrx-3d-models.s3.*.amazonaws.com or s3.*.amazonaws.com/timrx-3d-models
+    bucket_lower = AWS_BUCKET_MODELS.lower()
+    return (
+        host.startswith(f"{bucket_lower}.s3.")
+        or f"/{bucket_lower}/" in url.lower()
+        or host == f"{bucket_lower}.s3.amazonaws.com"
+    )
+
+
 def _extract_meshy_task_id(url: str | None) -> str | None:
     """Extract Meshy task ID from assets.meshy.ai URLs."""
     if not url:
@@ -94,8 +109,24 @@ def _host_is_allowed(host: str) -> bool:
 @bp.route("/proxy-glb", methods=["GET", "OPTIONS", "HEAD"])
 @with_session
 def proxy_glb_mod():
+    """
+    Proxy GLB files with ownership verification.
+
+    Behavior:
+    - S3 URLs (our bucket): Return 302 redirect to presigned URL (no proxying)
+    - Meshy URLs: Proxy the content after ownership check (CORS blocked at source)
+    - Other allowed hosts: Proxy after ownership check
+    """
+    # CORS headers for all responses
+    cors_headers = {
+        "Access-Control-Allow-Origin": "https://timrx.live",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Max-Age": "3600",
+    }
+
     if request.method == "OPTIONS":
-        return ("", 204)
+        return Response("", status=204, headers=cors_headers)
 
     identity_id, auth_error = require_identity()
     if auth_error:
@@ -103,31 +134,43 @@ def proxy_glb_mod():
 
     u = request.args.get("u", "").strip()
     if not u:
-        return jsonify({"ok": False, "error": {"code": "MISSING_URL", "message": "u query param required"}}), 400
+        resp = jsonify({"ok": False, "error": {"code": "MISSING_URL", "message": "u query param required"}})
+        resp.headers.update(cors_headers)
+        return resp, 400
 
     p = urlparse(u)
     if p.scheme != "https":
-        abort(400)
+        resp = jsonify({"ok": False, "error": {"code": "INVALID_SCHEME", "message": "Only HTTPS URLs allowed"}})
+        resp.headers.update(cors_headers)
+        return resp, 400
+
     host = (p.hostname or "").lower()
-    if not _host_is_allowed(host):
-        return jsonify({"ok": False, "error": {"code": "HOST_NOT_ALLOWED", "message": "Host not allowed"}}), 400
+    s3_key = _extract_s3_key_from_url(u)
+    is_our_s3 = _is_our_s3_bucket(u)
+    meshy_task_id = _extract_meshy_task_id(u)
+
+    # For non-S3 URLs, check if host is in allowed list
+    if not is_our_s3 and not _host_is_allowed(host):
+        resp = jsonify({"ok": False, "error": {"code": "HOST_NOT_ALLOWED", "message": "Host not allowed"}})
+        resp.headers.update(cors_headers)
+        return resp, 400
+
+    if host == "assets.meshy.ai" and not meshy_task_id:
+        resp = jsonify({"ok": False, "error": {"code": "INVALID_MESHY_URL", "message": "Meshy URL must include a task id"}})
+        resp.headers.update(cors_headers)
+        return resp, 400
 
     if not USE_DB:
-        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+        resp = jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}})
+        resp.headers.update(cors_headers)
+        return resp, 503
 
-    s3_key = _extract_s3_key_from_url(u)
-    meshy_task_id = _extract_meshy_task_id(u)
-    if host == "assets.meshy.ai" and not meshy_task_id:
-        return jsonify({
-            "ok": False,
-            "error": {"code": "INVALID_MESHY_URL", "message": "Meshy URL must include a task id"},
-        }), 400
+    # Ownership check
     try:
         with get_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 if s3_key:
                     # For S3 URLs: check by key in models AND by full URL in both tables
-                    # This handles cases where glb_s3_key may not be populated (older data)
                     cur.execute(
                         f"""
                         SELECT 1
@@ -145,10 +188,15 @@ def proxy_glb_mod():
                         (identity_id, s3_key, s3_key, u, u, identity_id, u, u),
                     )
                 elif meshy_task_id:
+                    # Check multiple tables where Meshy task ID might be stored
                     cur.execute(
                         f"""
                         SELECT 1
                         FROM {Tables.ACTIVE_JOBS}
+                        WHERE identity_id = %s AND upstream_job_id = %s
+                        UNION
+                        SELECT 1
+                        FROM {Tables.JOBS}
                         WHERE identity_id = %s AND upstream_job_id = %s
                         UNION
                         SELECT 1
@@ -162,12 +210,9 @@ def proxy_glb_mod():
                         LIMIT 1
                         """,
                         (
-                            identity_id,
-                            meshy_task_id,
-                            identity_id,
-                            meshy_task_id,
-                            meshy_task_id,
-                            meshy_task_id,
+                            identity_id, meshy_task_id,
+                            identity_id, meshy_task_id,
+                            identity_id, meshy_task_id, meshy_task_id, meshy_task_id,
                         ),
                     )
                 else:
@@ -187,41 +232,66 @@ def proxy_glb_mod():
                 row = cur.fetchone()
         if not row:
             print(f"[proxy-glb][mod] ownership check failed: no row found for identity={identity_id}, url={u[:80]}...")
-            return jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}}), 404
+            resp = jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}})
+            resp.headers.update(cors_headers)
+            return resp, 404
     except Exception as e:
         print(f"[proxy-glb][mod] ownership check failed: {e}")
-        return jsonify({"ok": False, "error": {"code": "DB_ERROR", "message": "Ownership check failed"}}), 500
+        resp = jsonify({"ok": False, "error": {"code": "DB_ERROR", "message": "Ownership check failed"}})
+        resp.headers.update(cors_headers)
+        return resp, 500
 
-    # If the URL is our S3 bucket, use a presigned URL to avoid 403 on private objects.
-    if AWS_BUCKET_MODELS and host.startswith(AWS_BUCKET_MODELS.lower()) and s3_key:
+    # === S3 URLs: Redirect to presigned URL (no proxying needed) ===
+    if is_our_s3 and s3_key:
         try:
-            u = _s3.generate_presigned_url(
+            presigned_url = _s3.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": AWS_BUCKET_MODELS, "Key": s3_key},
                 ExpiresIn=3600,
             )
+            # For HEAD requests, return 200 with headers (no body)
+            if request.method == "HEAD":
+                headers = {
+                    **cors_headers,
+                    "Content-Type": "model/gltf-binary",
+                    "Cache-Control": "public, max-age=3600",
+                }
+                return Response("", status=200, headers=headers)
+
+            # For GET requests, redirect to presigned URL
+            headers = {
+                **cors_headers,
+                "Location": presigned_url,
+                "Cache-Control": "private, max-age=3600",
+            }
+            return Response("", status=302, headers=headers)
         except Exception as e:
             print(f"[proxy-glb][mod] Failed to presign S3 URL: {e}")
+            # Fall through to proxy if presigning fails
 
+    # === Meshy/other URLs: Proxy the content ===
     timeout = (5, 30)
     max_bytes = 100 * 1024 * 1024  # 100MB cap
 
     if request.method == "HEAD":
         try:
             r = requests.head(u, allow_redirects=True, timeout=timeout)
-        except Exception:
-            abort(502)
+        except Exception as e:
+            print(f"[proxy-glb][mod] HEAD request failed: {e}")
+            return Response("Bad Gateway", status=502, headers=cors_headers)
         headers = {
+            **cors_headers,
             "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
-            "Access-Control-Allow-Origin": "*",
+            "Content-Length": r.headers.get("Content-Length", "0"),
             "Cache-Control": "public, max-age=3600",
         }
-        return Response(status=r.status_code, headers=headers)
+        return Response("", status=r.status_code, headers=headers)
 
     try:
         r = requests.get(u, stream=True, timeout=timeout)
-    except Exception:
-        abort(502)
+    except Exception as e:
+        print(f"[proxy-glb][mod] GET request failed: {e}")
+        return Response("Bad Gateway", status=502, headers=cors_headers)
 
     def gen():
         total = 0
@@ -235,8 +305,8 @@ def proxy_glb_mod():
             yield chunk
 
     headers = {
+        **cors_headers,
         "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
-        "Access-Control-Allow-Origin": "*",
         "Cache-Control": "public, max-age=3600",
     }
     return Response(gen(), status=r.status_code, headers=headers)
