@@ -1840,6 +1840,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             "texture_s3_urls": texture_s3_urls,
             "model_urls": model_urls,
             "textured_model_urls": textured_model_urls,
+            "model_id": model_id,
+            "image_id": image_id,
+            "history_item_id": history_item_id,
         }
     except Exception as e:
         print(f"[DB] Failed to save finished job {job_id}: {e}")
