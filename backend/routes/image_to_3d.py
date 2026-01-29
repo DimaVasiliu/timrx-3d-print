@@ -10,7 +10,8 @@ import uuid
 
 from flask import Blueprint, jsonify, request, g
 
-from backend.config import ACTION_KEYS, DEFAULT_MODEL_TITLE, MESHY_API_KEY
+from backend.config import ACTION_KEYS, MESHY_API_KEY
+from backend.utils import derive_display_title
 from backend.db import USE_DB, get_conn
 from backend.middleware import with_session
 from backend.services.async_dispatch import _dispatch_meshy_image_to_3d_async, get_executor
@@ -57,7 +58,7 @@ def image_to_3d_start_mod():
     job_meta = {
         "prompt": prompt,
         "root_prompt": prompt,
-        "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
+        "title": derive_display_title(prompt, None),
         "stage": "image3d",
     }
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
@@ -76,7 +77,7 @@ def image_to_3d_start_mod():
         "created_at": now_s() * 1000,
         "prompt": prompt,
         "root_prompt": prompt,
-        "title": f"(image2-3d) {prompt[:40]}" if prompt else f"(image2-3d) {DEFAULT_MODEL_TITLE}",
+        "title": derive_display_title(prompt, None),
         "original_image_url": image_url,
         "ai_model": payload.get("ai_model"),
         "user_id": identity_id,
@@ -232,7 +233,7 @@ def image_to_3d_status_mod(job_id: str):
 
         if not meta.get("title"):
             prompt_for_title = meta.get("prompt") or ""
-            meta["title"] = f"(image-to-3d) {prompt_for_title[:40]}" if prompt_for_title else f"(image-to-3d) {DEFAULT_MODEL_TITLE}"
+            meta["title"] = derive_display_title(prompt_for_title, None)
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type="image-to-3d", user_id=user_id)
