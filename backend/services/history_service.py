@@ -1855,4 +1855,6 @@ __all__ = [
     "save_finished_job_to_normalized_db",
     "collect_s3_keys",
     "delete_s3_objects",
+    "get_canonical_model_row",
+    "get_canonical_image_row",
 ]
