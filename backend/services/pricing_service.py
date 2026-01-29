@@ -82,6 +82,8 @@ class PricingService:
         "openai-image": "OPENAI_IMAGE",
         # Alternative names
         "remesh": "MESHY_REFINE",      # remesh uses same cost as refine (10c)
+        "retexture": "MESHY_RETEXTURE",  # retexture operation (15c)
+        "texture": "MESHY_RETEXTURE",    # texture alias (15c)
         "rigging": "MESHY_RIG",        # rigging alias for rig (25c)
         "upscale": "MESHY_REFINE",     # upscale is same as refine (10c)
         "image_generate": "OPENAI_IMAGE",  # Legacy key
