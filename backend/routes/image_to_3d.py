@@ -25,6 +25,7 @@ from backend.services.job_service import (
     save_store,
     verify_job_ownership,
 )
+from backend.services.history_service import get_canonical_model_row
 from backend.services.meshy_service import mesh_get, normalize_meshy_task
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -260,6 +261,28 @@ def image_to_3d_status_mod(job_id: str):
                     model_id=s3_result.get("model_id"),
                     glb_url=s3_result.get("glb_url"),
                 )
+
+    # If DB has the finalized model, prefer S3 URLs for frontend rendering.
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(
+                identity_id,
+                upstream_job_id=meshy_job_id,
+                alt_upstream_job_id=job_id,
+            )
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[image-to-3d][mod] DB lookup for finalized model failed: {e}")
 
     if out["status"] == "failed":
         reservation_id = meta.get("reservation_id")
