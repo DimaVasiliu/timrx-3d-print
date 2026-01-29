@@ -42,6 +42,7 @@ def register_blueprints(app):
     from backend.routes.mesh_operations import bp as mesh_ops_bp
     from backend.routes.history import bp as history_bp
     from backend.routes.community import bp as community_bp
+    from backend.routes.contact import bp as contact_bp
 
     # Frontend routes (no prefix)
     app.register_blueprint(frontend_bp)
@@ -61,6 +62,7 @@ def register_blueprints(app):
     app.register_blueprint(mesh_ops_bp, url_prefix="/api/_mod")
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
+    app.register_blueprint(contact_bp, url_prefix="/api")
 
     # Also register under /api for backward compatibility (cached frontend)
     # These must match the legacy app.py routes exactly
