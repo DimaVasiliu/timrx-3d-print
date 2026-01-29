@@ -20,6 +20,7 @@ from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async
 from backend.services.credits_helper import get_current_balance, start_paid_job
+from backend.services.history_service import get_canonical_image_row
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
 from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
@@ -198,6 +199,18 @@ def openai_image_status_mod(job_id: str):
                 if job["status"] == "ready":
                     image_url = meta.get("image_url") or job_meta.get("image_url")
                     image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
+
+                    canonical = get_canonical_image_row(
+                        identity_id,
+                        upstream_id=job_id,
+                        alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
+                    )
+                    if canonical:
+                        if canonical.get("image_url"):
+                            image_url = canonical["image_url"]
+                            image_urls = [image_url]
+                        if canonical.get("thumbnail_url"):
+                            meta["thumbnail_url"] = canonical["thumbnail_url"]
                     return jsonify({
                         "ok": True,
                         "status": "done",
@@ -213,6 +226,17 @@ def openai_image_status_mod(job_id: str):
             print(f"[STATUS][mod] Error checking OpenAI job {job_id}: {e}")
 
     if meta.get("status") == "done":
+        canonical = get_canonical_image_row(
+            identity_id,
+            upstream_id=job_id,
+            alt_upstream_id=meta.get("image_id"),
+        )
+        if canonical:
+            if canonical.get("image_url"):
+                meta["image_url"] = canonical["image_url"]
+                meta["image_urls"] = [canonical["image_url"]]
+            if canonical.get("thumbnail_url"):
+                meta["thumbnail_url"] = canonical["thumbnail_url"]
         return jsonify({
             "ok": True,
             "status": "done",
