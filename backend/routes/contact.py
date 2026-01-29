@@ -191,8 +191,8 @@ Reply to this email to respond to {name}.
             subject=email_subject,
             html=html_body,
             text=text_body,
-            from_email=email,  # Reply-to will be sender's email
-            from_name=name
+            reply_to=email,  # Reply-To header for easy response
+            reply_to_name=name
         )
 
         if result.success:
@@ -202,12 +202,15 @@ Reply to this email to respond to {name}.
                 "message": "Your message has been sent successfully. I'll get back to you within 24-48 hours."
             })
         else:
-            # Log the error but still return success to user (email is logged)
-            print(f"[CONTACT] Email send failed but logged: {result.error}")
+            # Email failed - inform user to try again or use alternative contact
+            print(f"[CONTACT] Email send failed: {result.error}")
             return jsonify({
-                "ok": True,
-                "message": "Your message has been received. I'll get back to you within 24-48 hours."
-            })
+                "ok": False,
+                "error": {
+                    "code": "EMAIL_FAILED",
+                    "message": "Failed to send message. Please try again or email directly at admin@timrx.live"
+                }
+            }), 500
 
     except Exception as e:
         print(f"[CONTACT] Error processing form: {e}")
