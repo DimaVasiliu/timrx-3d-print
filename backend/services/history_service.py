@@ -79,7 +79,12 @@ def get_canonical_model_row(
     upstream_job_id: str | None = None,
     alt_upstream_job_id: str | None = None,
 ):
-    """Return canonical model row for this identity (if any)."""
+    """
+    Return canonical model row for this identity (if any).
+
+    Note: model_urls and textured_model_urls are stored in the `meta` JSONB column,
+    not as separate columns. This function extracts them for backwards compatibility.
+    """
     if not USE_DB or not identity_id:
         return None
     try:
@@ -88,7 +93,7 @@ def get_canonical_model_row(
                 if model_id:
                     cur.execute(
                         f"""
-                        SELECT id, title, glb_url, thumbnail_url, model_urls, textured_model_urls
+                        SELECT id, title, glb_url, thumbnail_url, meta
                         FROM {Tables.MODELS}
                         WHERE id = %s AND identity_id = %s
                         LIMIT 1
@@ -97,13 +102,13 @@ def get_canonical_model_row(
                     )
                     row = cur.fetchone()
                     if row:
-                        return row
+                        return _enrich_model_row(row)
                 for candidate in (upstream_job_id, alt_upstream_job_id):
                     if not candidate:
                         continue
                     cur.execute(
                         f"""
-                        SELECT id, title, glb_url, thumbnail_url, model_urls, textured_model_urls
+                        SELECT id, title, glb_url, thumbnail_url, meta
                         FROM {Tables.MODELS}
                         WHERE identity_id = %s AND upstream_job_id = %s
                         ORDER BY updated_at DESC
@@ -113,10 +118,32 @@ def get_canonical_model_row(
                     )
                     row = cur.fetchone()
                     if row:
-                        return row
+                        return _enrich_model_row(row)
     except Exception as e:
         log_db_continue("get_canonical_model_row", e)
     return None
+
+
+def _enrich_model_row(row: dict | None) -> dict | None:
+    """
+    Extract model_urls and textured_model_urls from meta JSONB column
+    and add them to the row dict for backwards compatibility.
+    """
+    if not row:
+        return None
+    result = dict(row)
+    meta = result.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if isinstance(meta, dict):
+        if "model_urls" in meta:
+            result["model_urls"] = meta["model_urls"]
+        if "textured_model_urls" in meta:
+            result["textured_model_urls"] = meta["textured_model_urls"]
+    return result
 
 
 def get_canonical_image_row(
