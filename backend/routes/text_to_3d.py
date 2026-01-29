@@ -11,7 +11,7 @@ import uuid
 from flask import Blueprint, jsonify, request, g
 
 from backend.config import ACTION_KEYS, DEFAULT_MODEL_TITLE, MESHY_API_KEY
-from backend.db import USE_DB
+from backend.db import USE_DB, get_conn
 from backend.middleware import with_session
 from backend.services.async_dispatch import (
     _dispatch_meshy_refine_async,
