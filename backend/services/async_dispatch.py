@@ -308,23 +308,38 @@ def dispatch_openai_image_async(
 
 
 def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
+    """Update job with upstream provider ID. Returns True if updated, False otherwise."""
     if not USE_DB:
-        return
+        return False
+    if not job_id or not upstream_job_id:
+        print(f"[ASYNC] ERROR: update_job_with_upstream_id called with empty id(s): job_id={job_id}, upstream={upstream_job_id}")
+        return False
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cursor:
+                # Use id::text for consistent comparison (job_id is always a string)
                 cursor.execute(
                     f"""
                     UPDATE {Tables.JOBS}
                     SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
-                    WHERE id = %s
+                    WHERE id::text = %s
+                    RETURNING id
                     """,
                     (upstream_job_id, job_id),
                 )
+                result = cursor.fetchone()
             conn.commit()
-            print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
+
+            if result:
+                print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
+                return True
+            else:
+                print(f"[ASYNC] WARNING: No job row found to update for job_id={job_id}")
+                return False
     except Exception as e:
         print(f"[ASYNC] ERROR updating job {job_id}: {e}")
+        return False
 
 
 def update_job_status_failed(job_id: str, error_message: str):
@@ -337,7 +352,7 @@ def update_job_status_failed(job_id: str, error_message: str):
                     f"""
                     UPDATE {Tables.JOBS}
                     SET status = 'failed', error_message = %s, updated_at = NOW()
-                    WHERE id = %s
+                    WHERE id::text = %s
                     """,
                     (error_message[:500] if error_message else None, job_id),
                 )
@@ -382,7 +397,7 @@ def update_job_status_ready(
                             upstream_job_id = COALESCE(upstream_job_id, %s),
                             meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                             updated_at = NOW()
-                        WHERE id = %s
+                        WHERE id::text = %s
                         """,
                         (upstream_job_id, json.dumps(meta_updates), job_id),
                     )
@@ -393,7 +408,7 @@ def update_job_status_ready(
                         SET status = 'ready',
                             meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                             updated_at = NOW()
-                        WHERE id = %s
+                        WHERE id::text = %s
                         """,
                         (json.dumps(meta_updates), job_id),
                     )
