@@ -72,6 +72,100 @@ def load_history_store() -> list:
         return []
 
 
+def get_canonical_model_row(
+    identity_id: str | None,
+    *,
+    model_id: str | None = None,
+    upstream_job_id: str | None = None,
+    alt_upstream_job_id: str | None = None,
+):
+    """Return canonical model row for this identity (if any)."""
+    if not USE_DB or not identity_id:
+        return None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if model_id:
+                    cur.execute(
+                        f"""
+                        SELECT id, title, glb_url, thumbnail_url, model_urls, textured_model_urls
+                        FROM {Tables.MODELS}
+                        WHERE id = %s AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (model_id, identity_id),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row
+                for candidate in (upstream_job_id, alt_upstream_job_id):
+                    if not candidate:
+                        continue
+                    cur.execute(
+                        f"""
+                        SELECT id, title, glb_url, thumbnail_url, model_urls, textured_model_urls
+                        FROM {Tables.MODELS}
+                        WHERE identity_id = %s AND upstream_job_id = %s
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (identity_id, str(candidate)),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row
+    except Exception as e:
+        log_db_continue("get_canonical_model_row", e)
+    return None
+
+
+def get_canonical_image_row(
+    identity_id: str | None,
+    *,
+    image_id: str | None = None,
+    upstream_id: str | None = None,
+    alt_upstream_id: str | None = None,
+):
+    """Return canonical image row for this identity (if any)."""
+    if not USE_DB or not identity_id:
+        return None
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if image_id:
+                    cur.execute(
+                        f"""
+                        SELECT id, title, image_url, thumbnail_url
+                        FROM {Tables.IMAGES}
+                        WHERE id = %s AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (image_id, identity_id),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row
+                for candidate in (upstream_id, alt_upstream_id):
+                    if not candidate:
+                        continue
+                    cur.execute(
+                        f"""
+                        SELECT id, title, image_url, thumbnail_url
+                        FROM {Tables.IMAGES}
+                        WHERE identity_id = %s AND upstream_id = %s
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (identity_id, str(candidate)),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return row
+    except Exception as e:
+        log_db_continue("get_canonical_image_row", e)
+    return None
+
+
 def save_history_store(arr: list) -> None:
     """
     DEV ONLY: Save history to local JSON file.
