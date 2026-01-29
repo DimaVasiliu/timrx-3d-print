@@ -571,3 +571,50 @@ def sql_in_clause(values: List[Any]) -> tuple:
 # These mirror the old API for gradual migration
 get_connection = get_conn  # Alias
 get_db = get_conn  # Alias
+
+
+# ─────────────────────────────────────────────────────────────
+# Module exports (explicit __all__ for clarity)
+# ─────────────────────────────────────────────────────────────
+__all__ = [
+    # Re-export psycopg's dict_row for convenience
+    "dict_row",
+    # Connection state
+    "USE_DB",
+    "PSYCOPG_AVAILABLE",
+    # Exceptions
+    "DatabaseError",
+    "DatabaseNotConfiguredError",
+    "DatabaseConnectionError",
+    "DatabaseQueryError",
+    "DatabaseIntegrityError",
+    # Connection management
+    "get_conn",
+    "get_connection",
+    "get_db",
+    "transaction",
+    # Time helpers
+    "now_utc",
+    "now_utc_iso",
+    # Cursor helpers
+    "fetch_one",
+    "fetch_all",
+    "fetch_scalar",
+    # Standalone query helpers
+    "query_one",
+    "query_all",
+    "execute",
+    "execute_returning",
+    "execute_returning_all",
+    "execute_many",
+    # Schema-aware tables
+    "Tables",
+    # Utilities
+    "hash_string",
+    "is_available",
+    "verify_connection",
+    "require_db",
+    "init_db",
+    "ensure_schema",
+    "sql_in_clause",
+]
