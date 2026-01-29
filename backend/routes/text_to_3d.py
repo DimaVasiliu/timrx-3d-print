@@ -18,6 +18,7 @@ from backend.services.async_dispatch import (
     _dispatch_meshy_refine_async,
     _dispatch_meshy_text_to_3d_async,
     get_executor,
+    update_job_with_upstream_id,
 )
 from backend.services.credits_helper import (
     finalize_job_credits,
@@ -185,6 +186,29 @@ def text_to_3d_refine_mod():
     preview_task_id = resolve_meshy_job_id(preview_task_id_input)
     print(f"[Refine][mod] Resolved preview_task_id: {preview_task_id_input} -> {preview_task_id}")
 
+    # Validate that we have a proper Meshy task ID
+    # If the input looked like an internal UUID but wasn't resolved, fail early
+    def _looks_like_internal_uuid(val: str) -> bool:
+        # Internal UUIDs are hyphenated, Meshy task IDs are also UUIDs but may differ
+        # If we received a UUID and it wasn't resolved to something different, it's likely missing
+        import re
+        return bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', val))
+
+    # If the input is a UUID and resolution returned the same value, the upstream ID is missing
+    if _looks_like_internal_uuid(preview_task_id_input) and preview_task_id == preview_task_id_input:
+        # Check if this might be a Meshy task ID directly (could be valid)
+        # Look in store to see if we have any record of this ID
+        store = load_store()
+        store_entry = store.get(preview_task_id_input) or {}
+        if not store_entry.get("glb_url") and not store_entry.get("status") == "done":
+            # No record of completion - this is likely an internal ID that wasn't resolved
+            print(f"[Refine][mod] ERROR: Could not resolve preview_task_id {preview_task_id_input} to Meshy task ID")
+            return jsonify({
+                "ok": False,
+                "error": "Preview task ID not found or not yet ready. Ensure the preview completed successfully before refining.",
+                "code": "PREVIEW_TASK_NOT_FOUND",
+            }), 400
+
     store = load_store()
     preview_meta = get_job_metadata(preview_task_id_input, store)
     if not preview_meta.get("prompt"):
@@ -312,10 +336,11 @@ def text_to_3d_remesh_start_mod():
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
 
+    title = derive_display_title(prompt, None)
     job_meta = {
         "prompt": prompt,
         "root_prompt": prompt,
-        "title": prompt[:50] if prompt else None,
+        "title": title,
         "stage": "preview",
         "art_style": payload.get("art_style"),
         "model": payload.get("ai_model"),
@@ -343,10 +368,11 @@ def text_to_3d_remesh_start_mod():
 
     finalize_job_credits(reservation_id, meshy_task_id)
 
-    store = load_store()
-    store[meshy_task_id] = {
+    store_meta = {
         "stage": "preview",
         "prompt": prompt,
+        "root_prompt": prompt,
+        "title": title,
         "art_style": payload["art_style"],
         "model": payload["ai_model"],
         "created_at": now_s() * 1000,
@@ -360,13 +386,33 @@ def text_to_3d_remesh_start_mod():
         "identity_id": identity_id,
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
+        "upstream_job_id": meshy_task_id,
     }
+
+    store = load_store()
+    store[meshy_task_id] = store_meta
+    store[internal_job_id] = store_meta  # Also index by internal ID for status lookup
     save_store(store)
+
+    # Persist job row so status polling works across workers
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="processing",
+    )
+    # Update with upstream job ID since we have it immediately (synchronous call)
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     balance_info = get_current_balance(identity_id)
     return jsonify({
         "ok": True,
         "job_id": meshy_task_id,
+        "internal_job_id": internal_job_id,
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "source": "modular",
