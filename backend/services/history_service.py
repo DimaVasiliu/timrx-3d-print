@@ -482,7 +482,8 @@ def save_image_to_normalized_db(
                     )
                 existing = cur.fetchone()
                 if existing:
-                    existing_history_id = str(existing[0])
+                    # existing is a dict due to connection's default row_factory=dict_row
+                    existing_history_id = str(existing["id"])
 
                 title = derive_display_title(prompt, None)
                 s3_slug = sanitize_filename(title or prompt or "image") or "image"
@@ -583,7 +584,8 @@ def save_image_to_normalized_db(
                     )
                     row = cur.fetchone()
                     if row:
-                        existing_by_hash_id = row[0]
+                        # row is a dict due to connection's default row_factory=dict_row
+                        existing_by_hash_id = row["id"]
 
                 s3_bucket = AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None
                 if existing_by_hash_id:
@@ -799,7 +801,8 @@ def save_image_to_normalized_db(
                 image_row = cur.fetchone()
                 if not image_row:
                     raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
-                returned_image_id = image_row[0]
+                # image_row is a dict due to connection's default row_factory=dict_row
+                returned_image_id = image_row["id"]
                 print(f"[DB] image persisted: image_id={returned_image_id} image_url={image_url} thumb={image_url}")
 
                 if existing_history_id:
