@@ -1724,6 +1724,25 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             "hash": image_content_hash,
                             "reused": bool(image_reused),
                         }
+
+                # Determine lineage_origin_id for grouping related models
+                lineage_origin_id = None
+                source_task_id = job_meta.get("source_task_id") or job_meta.get("preview_task_id") or payload.get("source_task_id") or payload.get("preview_task_id")
+                if source_task_id:
+                    # This is a derived model - look up source's lineage_origin_id
+                    cur.execute(
+                        f"""
+                        SELECT lineage_origin_id, id FROM {Tables.HISTORY_ITEMS}
+                        WHERE id::text = %s OR payload->>'original_job_id' = %s
+                        LIMIT 1
+                        """,
+                        (str(source_task_id), str(source_task_id)),
+                    )
+                    source_row = cur.fetchone()
+                    if source_row:
+                        # Use source's lineage_origin_id, or fall back to source's id if not set
+                        lineage_origin_id = source_row.get("lineage_origin_id") or source_row.get("id")
+
                 cur.execute(
                     f"""
                     INSERT INTO {Tables.HISTORY_ITEMS} (
@@ -1731,12 +1750,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         title, prompt, root_prompt,
                         thumbnail_url, glb_url, image_url,
                         model_id, image_id,
+                        lineage_origin_id,
                         payload
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
+                        %s,
                         %s
                     )
                     ON CONFLICT (id) DO UPDATE
@@ -1757,6 +1778,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         image_url = EXCLUDED.image_url,
                         model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
                         image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
+                        lineage_origin_id = COALESCE(EXCLUDED.lineage_origin_id, {Tables.HISTORY_ITEMS}.lineage_origin_id),
                         payload = EXCLUDED.payload,
                         updated_at = NOW()
                     RETURNING id
@@ -1775,6 +1797,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         image_url if item_type == "image" else None,
                         model_id,
                         image_id,
+                        lineage_origin_id,
                         json.dumps(payload),
                     ),
                 )
@@ -1782,6 +1805,18 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if not history_row:
                     raise RuntimeError("[DB] Failed to upsert history_items row (no id returned)")
                 history_item_id = history_row["id"]
+
+                # For new preview models (no source), set lineage_origin_id to self
+                if not lineage_origin_id:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.HISTORY_ITEMS}
+                        SET lineage_origin_id = %s
+                        WHERE id = %s AND lineage_origin_id IS NULL
+                        """,
+                        (history_item_id, history_item_id),
+                    )
+
                 cur.execute("RELEASE SAVEPOINT normalized_save")
             except Exception as e:
                 db_save_ok = False
