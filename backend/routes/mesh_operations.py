@@ -105,13 +105,20 @@ def mesh_remesh_mod():
     if body.get("convert_format_only") is not None:
         payload["convert_format_only"] = bool(body.get("convert_format_only"))
 
-    source_task_id_input = body.get("source_task_id") or body.get("model_task_id")
+    # Check for source task ID in various field names (frontend sends input_task_id)
+    source_task_id_input = body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id")
     store = load_store()
 
-    # Resolve and validate source task ID before reserving credits
-    source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
-    if validation_error:
-        return validation_error
+    # Only validate source_task_id if not using model_url (model_url is the source itself)
+    source_task_id = None
+    if source.get("model_url"):
+        # When using model_url, we don't need a source_task_id for Meshy
+        source_task_id = source_task_id_input  # May be None, that's OK
+    else:
+        # Resolve and validate source task ID before reserving credits
+        source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
+        if validation_error:
+            return validation_error
 
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
@@ -289,13 +296,20 @@ def mesh_retexture_mod():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["retexture"]
 
-    source_task_id_input = body.get("source_task_id") or body.get("model_task_id")
+    # Check for source task ID in various field names (frontend sends input_task_id)
+    source_task_id_input = body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id")
     store = load_store()
 
-    # Resolve and validate source task ID before reserving credits
-    source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
-    if validation_error:
-        return validation_error
+    # Only validate source_task_id if not using model_url (model_url is the source itself)
+    source_task_id = None
+    if source.get("model_url"):
+        # When using model_url, we don't need a source_task_id for Meshy
+        source_task_id = source_task_id_input  # May be None, that's OK
+    else:
+        # Resolve and validate source task ID before reserving credits
+        source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
+        if validation_error:
+            return validation_error
 
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
@@ -495,13 +509,20 @@ def mesh_rigging_mod():
     if tex_img:
         payload["texture_image_url"] = tex_img
 
-    source_task_id_input = body.get("source_task_id") or body.get("model_task_id")
+    # Check for source task ID in various field names (frontend sends input_task_id)
+    source_task_id_input = body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id")
     store = load_store()
 
-    # Resolve and validate source task ID before reserving credits
-    source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
-    if validation_error:
-        return validation_error
+    # Only validate source_task_id if not using model_url (model_url is the source itself)
+    source_task_id = None
+    if source.get("model_url"):
+        # When using model_url, we don't need a source_task_id for Meshy
+        source_task_id = source_task_id_input  # May be None, that's OK
+    else:
+        # Resolve and validate source task ID before reserving credits
+        source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
+        if validation_error:
+            return validation_error
 
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
