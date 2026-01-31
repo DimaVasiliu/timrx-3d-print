@@ -55,10 +55,12 @@ def image_to_3d_start_mod():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["image-to-3d"]
     prompt = (body.get("prompt") or "").strip()
+    # For image-to-3d, use prompt if available, otherwise use a descriptive fallback
+    title = derive_display_title(prompt, None) if prompt else "Image to 3D Model"
     job_meta = {
         "prompt": prompt,
         "root_prompt": prompt,
-        "title": derive_display_title(prompt, None),
+        "title": title,
         "stage": "image3d",
     }
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
@@ -77,7 +79,7 @@ def image_to_3d_start_mod():
         "created_at": now_s() * 1000,
         "prompt": prompt,
         "root_prompt": prompt,
-        "title": derive_display_title(prompt, None),
+        "title": title,
         "original_image_url": image_url,
         "ai_model": payload.get("ai_model"),
         "user_id": identity_id,
@@ -233,7 +235,7 @@ def image_to_3d_status_mod(job_id: str):
 
         if not meta.get("title"):
             prompt_for_title = meta.get("prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None)
+            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else "Image to 3D Model"
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type="image-to-3d", user_id=user_id)
