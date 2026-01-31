@@ -123,7 +123,10 @@ def mesh_remesh_mod():
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    title = derive_display_title(original_prompt, body.get("title"))
+    # Use explicit title, or derive from prompt, or fall back to source model's title
+    title = body.get("title") or derive_display_title(original_prompt, None) if original_prompt else source_meta.get("title")
+    if not title or title == "Untitled":
+        title = source_meta.get("title") or "Remeshed Model"
 
     job_meta = {
         "prompt": original_prompt,
@@ -231,7 +234,7 @@ def mesh_remesh_status_mod(job_id: str):
 
         if not meta.get("title"):
             prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None)
+            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else "Remeshed Model"
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="remesh", user_id=user_id)
@@ -314,7 +317,10 @@ def mesh_retexture_mod():
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    title = derive_display_title(original_prompt, body.get("title"))
+    # Use explicit title, or derive from prompt, or fall back to source model's title
+    title = body.get("title") or derive_display_title(original_prompt, None) if original_prompt else source_meta.get("title")
+    if not title or title == "Untitled":
+        title = source_meta.get("title") or "Textured Model"
 
     job_meta = {
         "prompt": original_prompt,
@@ -435,7 +441,7 @@ def mesh_retexture_status_mod(job_id: str):
 
         if not meta.get("title"):
             prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None)
+            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else source_meta.get("title") or "Textured Model"
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="texture", user_id=user_id)
@@ -527,7 +533,10 @@ def mesh_rigging_mod():
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    title = derive_display_title(original_prompt, body.get("title"))
+    # Use explicit title, or derive from prompt, or fall back to source model's title
+    title = body.get("title") or derive_display_title(original_prompt, None) if original_prompt else source_meta.get("title")
+    if not title or title == "Untitled":
+        title = source_meta.get("title") or "Rigged Model"
 
     job_meta = {
         "prompt": original_prompt,
@@ -631,7 +640,7 @@ def mesh_rigging_status_mod(job_id: str):
 
         if not meta.get("title"):
             prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None)
+            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else source_meta.get("title") or "Rigged Model"
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="rig", user_id=user_id)
