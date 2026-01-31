@@ -300,6 +300,8 @@ def build_source_payload(body: dict, identity_id: str | None = None):
             s3_key = parse_s3_key(model_url)
             with get_conn() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
+                    # Check ownership in MODELS table (direct columns)
+                    # AND in HISTORY_ITEMS table (both direct glb_url column and payload->>'glb_url')
                     cur.execute(
                         f"""
                         SELECT 1
@@ -308,10 +310,14 @@ def build_source_payload(body: dict, identity_id: str | None = None):
                         UNION
                         SELECT 1
                         FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s AND glb_url = %s
+                        WHERE identity_id = %s AND (
+                            glb_url = %s
+                            OR payload->>'glb_url' = %s
+                            OR payload->>'model_url' = %s
+                        )
                         LIMIT 1
                         """,
-                        (identity_id, s3_key, model_url, identity_id, model_url),
+                        (identity_id, s3_key, model_url, identity_id, model_url, model_url, model_url),
                     )
                     row = cur.fetchone()
             if not row:
