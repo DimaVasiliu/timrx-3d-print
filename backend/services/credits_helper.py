@@ -177,4 +177,8 @@ ACTION_KEYS = CONFIG_ACTION_KEYS or {
     "image-studio": "image_studio_generate",
     "openai-image": "image_studio_generate",
     "image_generate": "image_studio_generate",
+    "video": "video",
+    "video-generate": "video",
+    "text2video": "video",
+    "image2video": "video",
 }
