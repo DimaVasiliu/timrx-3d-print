@@ -65,12 +65,11 @@ def openai_image_mod():
         return jsonify({"error": "prompt required"}), 400
 
     size_raw = (body.get("size") or body.get("resolution") or "1024x1024").lower()
+    # GPT Image 1 supported sizes (gpt-image-1)
     size_map = {
-        "256x256": "256x256",
-        "512x512": "512x512",
         "1024x1024": "1024x1024",
-        "1024x1792": "1024x1792",
-        "1792x1024": "1792x1024",
+        "1024x1536": "1024x1536",
+        "1536x1024": "1536x1024",
     }
     size = "1024x1024"
     for key in size_map:
