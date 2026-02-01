@@ -22,6 +22,11 @@ from backend.services.job_service import load_store, save_active_job_to_db, save
 from backend.services.meshy_service import mesh_post
 from backend.services.openai_service import openai_image_generate
 from backend.services.s3_service import safe_upload_to_s3
+from backend.services.gemini_video_service import (
+    gemini_text_to_video,
+    gemini_image_to_video,
+    gemini_video_status,
+)
 
 # Shared executor for background tasks
 _background_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="job_worker")
@@ -443,3 +448,225 @@ def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, p
     return dispatch_openai_image_async(
         internal_job_id, identity_id, reservation_id, prompt, size, model, n, response_format, store_meta
     )
+
+
+def dispatch_gemini_video_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+):
+    """
+    Dispatch Gemini video generation asynchronously.
+
+    Handles both text-to-video and image-to-video tasks.
+    """
+    start_time = time.time()
+    task = payload.get("task", "text2video")
+    print(f"[ASYNC] Starting Gemini {task} dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=gemini action={task} reservation_id={reservation_id}")
+
+    try:
+        # Call appropriate Gemini API based on task
+        if task == "image2video":
+            resp = gemini_image_to_video(
+                image_data=payload.get("image_data", ""),
+                motion_prompt=payload.get("motion") or payload.get("prompt", ""),
+                duration_sec=payload.get("duration_sec", 5),
+                fps=payload.get("fps", 24),
+                aspect_ratio=payload.get("aspect_ratio", "16:9"),
+                resolution=payload.get("resolution", "1080p"),
+                audio=payload.get("audio", False),
+                loop_seamlessly=payload.get("loop_seamlessly", False),
+            )
+        else:  # text2video
+            resp = gemini_text_to_video(
+                prompt=payload.get("prompt", ""),
+                duration_sec=payload.get("duration_sec", 5),
+                fps=payload.get("fps", 24),
+                aspect_ratio=payload.get("aspect_ratio", "16:9"),
+                resolution=payload.get("resolution", "1080p"),
+                audio=payload.get("audio", False),
+                loop_seamlessly=payload.get("loop_seamlessly", False),
+            )
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        operation_name = resp.get("operation_name")
+
+        if operation_name:
+            # Long-running operation - need to poll for status
+            print(f"[ASYNC] Gemini returned operation_name={operation_name} for job {internal_job_id} in {duration_ms}ms")
+            print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={operation_name} status=processing")
+
+            # Update job with operation name
+            update_job_with_upstream_id(internal_job_id, operation_name)
+
+            # Store operation name for polling
+            store = load_store()
+            store_meta["operation_name"] = operation_name
+            store_meta["status"] = "processing"
+            store[internal_job_id] = store_meta
+            save_store(store)
+
+            # Poll for completion (Gemini video gen can take a while)
+            _poll_gemini_video_completion(
+                internal_job_id,
+                identity_id,
+                reservation_id,
+                operation_name,
+                store_meta,
+            )
+        else:
+            # Immediate result (unexpected for video)
+            video_url = resp.get("video_url")
+            if video_url:
+                _finalize_video_success(
+                    internal_job_id, identity_id, reservation_id, video_url, store_meta
+                )
+            else:
+                raise RuntimeError("Gemini returned no operation_name or video_url")
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini {task} call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_api_error", internal_job_id)
+        update_job_status_failed(internal_job_id, str(e))
+
+
+def _poll_gemini_video_completion(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    operation_name: str,
+    store_meta: dict,
+    max_polls: int = 120,  # 10 minutes at 5s intervals
+    poll_interval: int = 5,
+):
+    """
+    Poll Gemini for video generation completion.
+
+    This runs in the background thread and updates job status.
+    """
+    print(f"[ASYNC] Starting poll for Gemini operation {operation_name}")
+
+    for poll_num in range(1, max_polls + 1):
+        try:
+            time.sleep(poll_interval)
+
+            status_resp = gemini_video_status(operation_name)
+            status = status_resp.get("status", "unknown")
+
+            print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id}: status={status}")
+
+            # Update progress in store
+            if status == "processing":
+                progress = status_resp.get("progress", 0)
+                store = load_store()
+                store_meta["progress"] = progress
+                store_meta["status"] = "processing"
+                store[internal_job_id] = store_meta
+                save_store(store)
+
+                # Update DB job status
+                if USE_DB:
+                    try:
+                        with get_conn() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    f"""
+                                    UPDATE {Tables.JOBS}
+                                    SET status = 'processing',
+                                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                                        updated_at = NOW()
+                                    WHERE id::text = %s
+                                    """,
+                                    (json.dumps({"progress": progress}), internal_job_id),
+                                )
+                            conn.commit()
+                    except Exception as e:
+                        print(f"[ASYNC] Error updating progress for {internal_job_id}: {e}")
+
+            elif status == "done":
+                video_url = status_resp.get("video_url")
+                if video_url:
+                    _finalize_video_success(
+                        internal_job_id, identity_id, reservation_id, video_url, store_meta
+                    )
+                else:
+                    raise RuntimeError("Gemini returned done but no video_url")
+                return
+
+            elif status in ("failed", "error"):
+                error_msg = status_resp.get("error", "Video generation failed")
+                print(f"[ASYNC] Gemini video failed for job {internal_job_id}: {error_msg}")
+                if reservation_id:
+                    release_job_credits(reservation_id, "gemini_video_failed", internal_job_id)
+                update_job_status_failed(internal_job_id, error_msg)
+                return
+
+        except Exception as e:
+            print(f"[ASYNC] Error polling Gemini for job {internal_job_id}: {e}")
+            # Continue polling unless it's a fatal error
+
+    # Timeout - max polls reached
+    print(f"[ASYNC] Timeout: Gemini video job {internal_job_id} did not complete after {max_polls * poll_interval}s")
+    if reservation_id:
+        release_job_credits(reservation_id, "gemini_timeout", internal_job_id)
+    update_job_status_failed(internal_job_id, "Video generation timed out")
+
+
+def _finalize_video_success(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    video_url: str,
+    store_meta: dict,
+):
+    """
+    Finalize a successful video generation.
+    """
+    print(f"[ASYNC] Gemini video completed for job {internal_job_id}: {video_url}")
+
+    # Update store
+    store = load_store()
+    store_meta["status"] = "done"
+    store_meta["video_url"] = video_url
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    # Finalize credits
+    if reservation_id:
+        finalize_job_credits(reservation_id, internal_job_id)
+        print(f"[ASYNC] Credits captured for Gemini video job {internal_job_id}")
+
+    # Update job status
+    update_job_status_ready(
+        internal_job_id,
+        upstream_job_id=store_meta.get("operation_name"),
+    )
+
+    # Also update meta with video_url
+    if USE_DB:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
+                        WHERE id::text = %s
+                        """,
+                        (json.dumps({"video_url": video_url, "progress": 100}), internal_job_id),
+                    )
+                conn.commit()
+        except Exception as e:
+            print(f"[ASYNC] Error updating video_url for {internal_job_id}: {e}")
+
+    print(f"[ASYNC] Gemini video job {internal_job_id} completed successfully")
+
+
+def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
+    """Adapter for video dispatch (monolith-compatible name)."""
+    return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
