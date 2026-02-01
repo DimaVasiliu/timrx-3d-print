@@ -1,27 +1,40 @@
 """
 Gemini Video Generation Service.
 
-Handles video generation via Google's Gemini API (Veo model).
-Supports both text-to-video and image-to-video generation.
+Uses the Gemini Developer API (AI Studio) for video generation.
+Authentication: GEMINI_API_KEY only (no GCP project, OAuth, or service accounts).
+
+Supports:
+- Text-to-video generation via Veo model
+- Image-to-video generation via Veo model
 """
 
 from __future__ import annotations
 
 import time
 import base64
+import os
 import requests
 from requests.exceptions import Timeout, ConnectionError as RequestsConnectionError
 from typing import Optional, Dict, Any
 
 from backend.config import config
 
-# Gemini video generation can take significant time
-GEMINI_TIMEOUT = (15, 300)  # (connect_timeout, read_timeout) - 5 minutes for generation
+# Timeouts for video generation (can take a while)
+GEMINI_TIMEOUT = (15, 300)  # (connect_timeout, read_timeout)
 MAX_RETRIES = 3
-BASE_RETRY_DELAY = 2  # seconds (exponential backoff: 2s, 4s, 8s)
+BASE_RETRY_DELAY = 2  # seconds (exponential backoff)
 
-# Gemini API base URL
+# Gemini Developer API base URL
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# Video generation model
+VEO_MODEL = "veo-2.0-generate-001"
+
+
+class GeminiAuthError(Exception):
+    """Raised when Gemini authentication fails."""
+    pass
 
 
 class GeminiServerError(Exception):
@@ -32,11 +45,33 @@ class GeminiServerError(Exception):
 
 
 def _get_api_key() -> str:
-    """Get the Google API key from config."""
-    key = getattr(config, 'GOOGLE_API_KEY', None) or ""
+    """
+    Get the Gemini API key from config/environment.
+
+    Raises:
+        GeminiAuthError: If GEMINI_API_KEY is not configured.
+    """
+    # Try config first, then environment
+    key = getattr(config, 'GEMINI_API_KEY', None) or os.getenv("GEMINI_API_KEY") or ""
+
     if not key:
-        raise RuntimeError("GOOGLE_API_KEY not configured")
+        raise GeminiAuthError(
+            "GEMINI_API_KEY is not set. "
+            "Get your API key from https://aistudio.google.com/apikey"
+        )
     return key
+
+
+def validate_api_key() -> bool:
+    """
+    Validate that GEMINI_API_KEY is configured.
+    Call this at startup for fail-fast behavior.
+
+    Returns:
+        True if configured, raises otherwise.
+    """
+    _get_api_key()
+    return True
 
 
 def gemini_text_to_video(
@@ -53,51 +88,40 @@ def gemini_text_to_video(
 
     Args:
         prompt: Text description of the video to generate
-        duration_sec: Video duration in seconds (5 or 10)
-        fps: Frames per second (24, 30, or 60)
+        duration_sec: Video duration in seconds (5 or 8)
+        fps: Frames per second (24)
         aspect_ratio: Aspect ratio ("16:9", "9:16", or "1:1")
-        resolution: Video resolution ("720p", "1080p", or "4K")
-        audio: Whether to generate audio
+        resolution: Video resolution ("720p", "1080p")
+        audio: Whether to generate audio (not yet supported)
         loop_seamlessly: Whether video should loop seamlessly
 
     Returns:
-        Dict with video_url, task_id, and other metadata
+        Dict with operation_name for polling, or error
     """
     api_key = _get_api_key()
 
-    # Build the request for Gemini's video generation
-    url = f"{GEMINI_API_BASE}/models/veo-2.0-generate-001:predictLongRunning"
+    # Veo supports 5s or 8s videos
+    if duration_sec > 6:
+        duration_sec = 8
+    else:
+        duration_sec = 5
+
+    # Build API URL with key parameter
+    url = f"{GEMINI_API_BASE}/models/{VEO_MODEL}:predictLongRunning?key={api_key}"
 
     headers = {
         "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
     }
-
-    # Map resolution to dimensions
-    resolution_map = {
-        "720p": {"width": 1280, "height": 720},
-        "1080p": {"width": 1920, "height": 1080},
-        "4K": {"width": 3840, "height": 2160},
-    }
-    dims = resolution_map.get(resolution, resolution_map["1080p"])
-
-    # Adjust dimensions for aspect ratio
-    if aspect_ratio == "9:16":
-        dims = {"width": dims["height"], "height": dims["width"]}
-    elif aspect_ratio == "1:1":
-        size = min(dims["width"], dims["height"])
-        dims = {"width": size, "height": size}
 
     payload = {
         "instances": [{
             "prompt": prompt,
         }],
         "parameters": {
-            "sampleCount": 1,
-            "durationSeconds": duration_sec,
-            "fps": fps,
             "aspectRatio": aspect_ratio,
             "personGeneration": "allow_adult",
+            "durationSeconds": duration_sec,
+            "enhancePrompt": True,
         }
     }
 
@@ -118,7 +142,7 @@ def gemini_image_to_video(
     Generate a video from an image using Gemini Veo.
 
     Args:
-        image_data: Base64-encoded image data or URL
+        image_data: Base64-encoded image data or data URL
         motion_prompt: Description of motion/camera movement
         duration_sec: Video duration in seconds
         fps: Frames per second
@@ -128,50 +152,68 @@ def gemini_image_to_video(
         loop_seamlessly: Whether video should loop seamlessly
 
     Returns:
-        Dict with video_url, task_id, and other metadata
+        Dict with operation_name for polling, or error
     """
     api_key = _get_api_key()
 
-    url = f"{GEMINI_API_BASE}/models/veo-2.0-generate-001:predictLongRunning"
+    # Handle image data - extract base64
+    image_bytes = ""
+    mime_type = "image/png"
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
-
-    # Handle image data - could be base64 or URL
-    image_content = {}
     if image_data.startswith("data:"):
         # Data URL - extract base64
         parts = image_data.split(",", 1)
         if len(parts) == 2:
-            mime_type = parts[0].split(";")[0].replace("data:", "")
-            image_content = {
-                "bytesBase64Encoded": parts[1],
-                "mimeType": mime_type or "image/png",
-            }
+            header = parts[0]
+            image_bytes = parts[1]
+            if "image/jpeg" in header or "image/jpg" in header:
+                mime_type = "image/jpeg"
+            elif "image/png" in header:
+                mime_type = "image/png"
+            elif "image/webp" in header:
+                mime_type = "image/webp"
     elif image_data.startswith("http"):
-        # URL - Gemini might support direct URLs
-        image_content = {
-            "fileUri": image_data,
-        }
+        # URL - download and convert to base64
+        try:
+            resp = requests.get(image_data, timeout=30)
+            if resp.ok:
+                image_bytes = base64.b64encode(resp.content).decode('utf-8')
+                content_type = resp.headers.get('content-type', 'image/png')
+                if 'jpeg' in content_type or 'jpg' in content_type:
+                    mime_type = "image/jpeg"
+        except Exception as e:
+            raise RuntimeError(f"Failed to download image from URL: {e}")
     else:
         # Assume raw base64
-        image_content = {
-            "bytesBase64Encoded": image_data,
-            "mimeType": "image/png",
-        }
+        image_bytes = image_data
+
+    if not image_bytes:
+        raise RuntimeError("No valid image data provided")
+
+    # Veo supports 5s or 8s videos
+    if duration_sec > 6:
+        duration_sec = 8
+    else:
+        duration_sec = 5
+
+    # Build API URL with key parameter
+    url = f"{GEMINI_API_BASE}/models/{VEO_MODEL}:predictLongRunning?key={api_key}"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
 
     payload = {
         "instances": [{
-            "prompt": motion_prompt or "Animate this image with natural motion",
-            "image": image_content,
+            "prompt": motion_prompt or "Animate this image with natural, smooth motion",
+            "image": {
+                "bytesBase64Encoded": image_bytes,
+                "mimeType": mime_type,
+            }
         }],
         "parameters": {
-            "sampleCount": 1,
-            "durationSeconds": duration_sec,
-            "fps": fps,
             "aspectRatio": aspect_ratio,
+            "durationSeconds": duration_sec,
         }
     }
 
@@ -190,11 +232,15 @@ def gemini_video_status(operation_name: str) -> Dict[str, Any]:
     """
     api_key = _get_api_key()
 
+    # Build status URL
     # Operation name format: operations/{operation_id}
-    url = f"{GEMINI_API_BASE}/{operation_name}"
+    if operation_name.startswith("operations/"):
+        url = f"{GEMINI_API_BASE}/{operation_name}?key={api_key}"
+    else:
+        url = f"{GEMINI_API_BASE}/operations/{operation_name}?key={api_key}"
 
     headers = {
-        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
     }
 
     try:
@@ -202,36 +248,65 @@ def gemini_video_status(operation_name: str) -> Dict[str, Any]:
         r = requests.get(url, headers=headers, timeout=GEMINI_TIMEOUT)
 
         if not r.ok:
+            error_text = r.text[:200] if r.text else "No error details"
+
+            # Check for auth errors
+            if r.status_code == 401 or r.status_code == 403:
+                print(f"[Gemini] Authentication failed – check GEMINI_API_KEY")
+                return {
+                    "status": "failed",
+                    "error": "Gemini authentication failed – check GEMINI_API_KEY",
+                }
+
             if 400 <= r.status_code < 500:
                 return {
                     "status": "failed",
-                    "error": f"Gemini API error {r.status_code}: {r.text[:200]}",
+                    "error": f"Gemini API error {r.status_code}: {error_text}",
                 }
             raise GeminiServerError(r.status_code, f"Gemini server error {r.status_code}")
 
         result = r.json()
+        print(f"[Gemini] Operation response: {result}")
 
         # Parse the operation response
         if result.get("done"):
             if "error" in result:
+                error_info = result["error"]
+                error_msg = error_info.get("message", "Unknown error")
                 return {
                     "status": "failed",
-                    "error": result["error"].get("message", "Unknown error"),
+                    "error": error_msg,
                 }
 
             # Extract video from response
             response = result.get("response", {})
-            predictions = response.get("predictions", [])
 
-            if predictions and len(predictions) > 0:
+            # Veo returns generated videos in different formats
+            generated_samples = response.get("generatedSamples", [])
+            if generated_samples:
+                video_data = generated_samples[0]
+                video_uri = video_data.get("video", {}).get("uri")
+                video_gcs = video_data.get("video", {}).get("gcsUri")
+
+                video_url = video_uri or video_gcs
+                if video_url:
+                    return {
+                        "status": "done",
+                        "video_url": video_url,
+                        "metadata": video_data.get("video", {}),
+                    }
+
+            # Alternative response format
+            predictions = response.get("predictions", [])
+            if predictions:
                 video_data = predictions[0]
                 video_url = video_data.get("videoUri") or video_data.get("video", {}).get("uri")
-
-                return {
-                    "status": "done",
-                    "video_url": video_url,
-                    "metadata": video_data.get("metadata", {}),
-                }
+                if video_url:
+                    return {
+                        "status": "done",
+                        "video_url": video_url,
+                        "metadata": video_data,
+                    }
 
             return {
                 "status": "failed",
@@ -253,6 +328,7 @@ def gemini_video_status(operation_name: str) -> Dict[str, Any]:
             "error": f"Connection error: {str(e)}",
         }
     except Exception as e:
+        print(f"[Gemini] Error checking status: {e}")
         return {
             "status": "error",
             "error": str(e),
@@ -275,17 +351,29 @@ def _execute_gemini_request(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"[Gemini] Attempt {attempt}/{MAX_RETRIES}: {action} (timeout={GEMINI_TIMEOUT[1]}s)")
+            print(f"[Gemini] Attempt {attempt}/{MAX_RETRIES}: {action}")
             r = requests.post(url, headers=headers, json=payload, timeout=GEMINI_TIMEOUT)
 
             if not r.ok:
-                # Don't retry 4xx errors
+                error_text = r.text[:500] if r.text else "No error details"
+                print(f"[Gemini] Error response: {error_text}")
+
+                # Check for auth errors - don't retry these
+                if r.status_code == 401 or r.status_code == 403:
+                    print(f"[Gemini] Authentication failed – check GEMINI_API_KEY")
+                    raise GeminiAuthError("Gemini authentication failed – check GEMINI_API_KEY")
+
+                # Don't retry other 4xx errors
                 if 400 <= r.status_code < 500:
-                    error_detail = r.text[:500]
-                    print(f"[Gemini] Client error {r.status_code}: {error_detail}")
-                    raise RuntimeError(f"Gemini API error {r.status_code}: {error_detail}")
+                    try:
+                        error_json = r.json()
+                        error_msg = error_json.get("error", {}).get("message", error_text)
+                    except:
+                        error_msg = error_text
+                    raise RuntimeError(f"Gemini API error {r.status_code}: {error_msg}")
+
                 # Retry 5xx errors
-                raise GeminiServerError(r.status_code, f"Gemini server error {r.status_code}: {r.text[:200]}")
+                raise GeminiServerError(r.status_code, f"Gemini server error {r.status_code}: {error_text}")
 
             result = r.json()
             print(f"[Gemini] Request successful on attempt {attempt}")
@@ -300,6 +388,9 @@ def _execute_gemini_request(
             # Immediate result (unlikely for video)
             return result
 
+        except GeminiAuthError:
+            # Don't retry auth errors
+            raise
         except (Timeout, RequestsConnectionError, GeminiServerError) as e:
             last_error = e
             if attempt < MAX_RETRIES:
