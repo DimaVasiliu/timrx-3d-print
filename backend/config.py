@@ -460,6 +460,7 @@ class Config:
     MESHY_API_KEY: str = field(default_factory=lambda: _get_env("MESHY_API_KEY"))
     MESHY_API_BASE: str = field(default_factory=lambda: _get_env("MESHY_API_BASE", "https://api.meshy.ai").rstrip("/"))
     OPENAI_API_KEY: str = field(default_factory=lambda: _get_env("OPENAI_API_KEY"))
+    GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY"))
 
     # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
@@ -656,6 +657,7 @@ AWS_SECRET_ACCESS_KEY = config.AWS_SECRET_ACCESS_KEY
 MESHY_API_KEY = config.MESHY_API_KEY
 MESHY_API_BASE = config.MESHY_API_BASE
 OPENAI_API_KEY = config.OPENAI_API_KEY
+GEMINI_API_KEY = config.GEMINI_API_KEY
 DEFAULT_MODEL_TITLE = config.DEFAULT_MODEL_TITLE
 ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS
