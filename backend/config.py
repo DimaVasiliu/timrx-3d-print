@@ -460,7 +460,8 @@ class Config:
     MESHY_API_KEY: str = field(default_factory=lambda: _get_env("MESHY_API_KEY"))
     MESHY_API_BASE: str = field(default_factory=lambda: _get_env("MESHY_API_BASE", "https://api.meshy.ai").rstrip("/"))
     OPENAI_API_KEY: str = field(default_factory=lambda: _get_env("OPENAI_API_KEY"))
-    GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY"))
+    # GEMINI_API_KEY with fallback to GOOGLE_API_KEY for backward compatibility
+    GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY"))
 
     # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
