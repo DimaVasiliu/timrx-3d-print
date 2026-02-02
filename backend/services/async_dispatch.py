@@ -17,7 +17,7 @@ from typing import Optional
 from backend.config import AWS_BUCKET_MODELS
 from backend.db import USE_DB, get_conn, Tables
 from backend.services.credits_helper import finalize_job_credits, release_job_credits
-from backend.services.history_service import save_image_to_normalized_db
+from backend.services.history_service import save_image_to_normalized_db, save_video_to_normalized_db
 from backend.services.job_service import load_store, save_active_job_to_db, save_store
 from backend.services.meshy_service import mesh_post
 from backend.services.openai_service import openai_image_generate
@@ -754,13 +754,36 @@ def _finalize_video_success(
         finalize_job_credits(reservation_id, internal_job_id)
         print(f"[ASYNC] Credits captured for Veo video job {internal_job_id}")
 
+    # Save to normalized tables (videos + history_items)
+    # This creates the video row and history_items row with video_id
+    prompt = store_meta.get("prompt", "")
+    duration_seconds = store_meta.get("duration_seconds")
+    if duration_seconds:
+        try:
+            duration_seconds = int(duration_seconds)
+        except (ValueError, TypeError):
+            duration_seconds = None
+
+    save_video_to_normalized_db(
+        video_id=internal_job_id,
+        video_url=str(final_video_url) if final_video_url else "",
+        prompt=prompt,
+        duration_seconds=duration_seconds,
+        resolution=store_meta.get("resolution"),
+        aspect_ratio=store_meta.get("aspect_ratio"),
+        thumbnail_url=None,  # Veo doesn't provide thumbnails
+        user_id=identity_id,
+        provider="google",
+        s3_video_url=str(s3_video_url) if s3_video_url else None,
+    )
+
     # Update job status
     update_job_status_ready(
         internal_job_id,
         upstream_job_id=store_meta.get("operation_name"),
     )
 
-    # Also update meta with video_url
+    # Also update meta with video_url in jobs table
     if USE_DB:
         try:
             meta_update = {
