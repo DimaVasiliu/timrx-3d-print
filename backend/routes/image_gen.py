@@ -45,6 +45,326 @@ ALLOWED_IMAGE_HOSTS = {
 }
 
 
+@bp.route("/image/generate", methods=["POST", "OPTIONS"])
+@with_session
+def image_generate_unified():
+    """
+    Unified image generation endpoint that routes based on provider.
+
+    Request body:
+    {
+        "provider": "google" | "openai",  # Default: "openai"
+        "prompt": "A beautiful sunset...",
+        "aspect_ratio": "16:9",           # For Google: "1:1", "3:4", "4:3", "9:16", "16:9"
+        "image_size": "1K",               # For Google: "1K" or "2K"
+        "size": "1024x1024",              # For OpenAI
+        "model": "gpt-image-1",           # For OpenAI
+        "n": 1                            # Number of images
+    }
+
+    Response (success):
+    {
+        "ok": true,
+        "image_url": "...",
+        "image_id": "uuid",
+        "job_id": "uuid",
+        "provider": "google" | "openai"
+    }
+
+    Response (error):
+    {
+        "error": "<machine_code>",
+        "message": "<human readable>",
+        "details": {...}
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    body = request.get_json(silent=True) or {}
+    provider = (body.get("provider") or "openai").lower()
+
+    if provider == "google":
+        # Route to Gemini Imagen
+        return _handle_gemini_image_generate(body)
+    elif provider == "openai":
+        # Route to OpenAI (via existing endpoint logic)
+        return _handle_openai_image_generate(body)
+    else:
+        return jsonify({
+            "error": "invalid_provider",
+            "message": f"Unknown image provider: {provider}",
+            "allowed": ["google", "openai"]
+        }), 400
+
+
+def _handle_gemini_image_generate(body: dict):
+    """Handle Gemini Imagen image generation."""
+    # Fail-fast: Check if Gemini is configured
+    is_configured, config_error = check_gemini_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "gemini_not_configured",
+            "message": "Gemini image provider is not configured. Set GEMINI_API_KEY.",
+            "details": {"hint": config_error}
+        }), 500
+
+    # Require authentication
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({
+            "error": "invalid_params",
+            "message": "prompt is required",
+            "field": "prompt"
+        }), 400
+
+    # Parse options with defaults
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
+    image_size = body.get("image_size") or body.get("imageSize") or "1K"
+    sample_count = int(body.get("sample_count") or body.get("sampleCount") or body.get("n") or 1)
+
+    # Validate aspect_ratio
+    if aspect_ratio not in ALLOWED_ASPECT_RATIOS:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid aspect_ratio: {aspect_ratio}",
+            "field": "aspect_ratio",
+            "allowed": list(ALLOWED_ASPECT_RATIOS)
+        }), 400
+
+    # Validate image_size
+    if image_size not in ALLOWED_IMAGE_SIZES:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid image_size: {image_size}",
+            "field": "image_size",
+            "allowed": list(ALLOWED_IMAGE_SIZES)
+        }), 400
+
+    # Generate job ID
+    internal_job_id = str(uuid.uuid4())
+
+    # Reserve credits
+    action_key = "image-studio"
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "model": "imagen-4.0", "provider": "google"},
+    )
+    if credit_error:
+        return credit_error
+
+    try:
+        # Generate image synchronously (Imagen is reasonably fast)
+        result = gemini_generate_image(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            sample_count=sample_count,
+        )
+
+        # Save to history (creates both images row and history_items row)
+        save_image_to_normalized_db(
+            image_id=internal_job_id,
+            image_url=result["image_url"],
+            prompt=prompt,
+            ai_model="imagen-4.0",
+            size=f"{aspect_ratio}@{image_size}",
+            image_urls=result.get("image_urls", [result["image_url"]]),
+            user_id=identity_id,
+            provider="google",
+        )
+
+        # Finalize credits
+        from backend.services.credits_helper import finalize_job_credits
+        if reservation_id:
+            finalize_job_credits(reservation_id, internal_job_id)
+
+        log_event("image/generate:gemini", {"job_id": internal_job_id, "model": "imagen-4.0"})
+
+        balance_info = get_current_balance(identity_id) if identity_id else None
+        return jsonify({
+            "ok": True,
+            "image_url": result["image_url"],
+            "image_base64": result.get("image_base64"),
+            "image_urls": result.get("image_urls", []),
+            "image_id": internal_job_id,
+            "job_id": internal_job_id,
+            "new_balance": balance_info["available"] if balance_info else None,
+            "model": "imagen-4.0",
+            "provider": "google",
+            "status": "done",
+        })
+
+    except GeminiConfigError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
+        return jsonify({
+            "error": "gemini_not_configured",
+            "message": f"Gemini image failed: {e}"
+        }), 500
+
+    except GeminiValidationError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Gemini image failed: {e.message}",
+            "field": e.field,
+            "allowed": e.allowed
+        }), 400
+
+    except GeminiAuthError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
+        return jsonify({
+            "error": "gemini_auth_failed",
+            "message": f"Gemini image failed: {e}"
+        }), 401
+
+    except RuntimeError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
+        error_str = str(e)
+        print(f"[Gemini Imagen] Error: {error_str}")
+
+        if error_str.startswith("gemini_"):
+            parts = error_str.split(":", 1)
+            error_code = parts[0]
+            error_msg = parts[1].strip() if len(parts) > 1 else error_str
+        else:
+            error_code = "gemini_image_failed"
+            error_msg = error_str
+
+        return jsonify({
+            "error": error_code,
+            "message": f"Gemini image failed: {error_msg}"
+        }), 500
+
+    except Exception as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
+        print(f"[Gemini Imagen] Unexpected error: {e}")
+        return jsonify({
+            "error": "gemini_image_failed",
+            "message": f"Gemini image failed: {e}"
+        }), 500
+
+
+def _handle_openai_image_generate(body: dict):
+    """Handle OpenAI image generation (async, returns job_id for polling)."""
+    if not OPENAI_API_KEY:
+        return jsonify({
+            "error": "openai_not_configured",
+            "message": "OpenAI image provider is not configured. Set OPENAI_API_KEY."
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({
+            "error": "invalid_params",
+            "message": "prompt required",
+            "field": "prompt"
+        }), 400
+
+    size_raw = (body.get("size") or body.get("resolution") or "1024x1024").lower()
+    size_map = {
+        "1024x1024": "1024x1024",
+        "1024x1536": "1024x1536",
+        "1536x1024": "1536x1024",
+    }
+    size = "1024x1024"
+    for key in size_map:
+        if key in size_raw:
+            size = size_map[key]
+            break
+
+    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1").strip()
+    n = int(body.get("n") or 1)
+    response_format = (body.get("response_format") or "url").strip()
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = "image-studio"
+
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "n": n, "model": model, "size": size, "provider": "openai"},
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": model,
+        "size": size,
+        "n": n,
+        "response_format": response_format,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "openai",
+    }
+
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="openai",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    get_executor().submit(
+        _dispatch_openai_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        {"prompt": prompt, "size": size, "model": model, "n": n, "response_format": response_format},
+        store_meta,
+    )
+
+    log_event("image/generate:openai", {"internal_job_id": internal_job_id})
+
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": model,
+        "size": size,
+        "provider": "openai",
+    })
+
+
 @bp.route("/image/gemini", methods=["POST", "OPTIONS"])
 @with_session
 def gemini_image_mod():
@@ -156,6 +476,7 @@ def gemini_image_mod():
             size=f"{aspect_ratio}@{image_size}",
             image_urls=result.get("image_urls", [result["image_url"]]),
             user_id=identity_id,
+            provider="google",
         )
 
         # Finalize credits
