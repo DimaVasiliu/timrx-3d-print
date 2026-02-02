@@ -1,11 +1,17 @@
 """
-Video Generation Routes Blueprint.
+Video Generation Routes Blueprint (Veo 3.1).
 ----------------------------------
 Registered under /api/_mod and /api for compatibility.
 
 Endpoints:
 - POST /video/generate - Start video generation (text2video or image2video)
 - GET /video/generate/status/<job_id> - Poll job status
+
+Veo 3.1 Constraints:
+- aspectRatio: ONLY "16:9" or "9:16" (NO "1:1" for video)
+- resolution: "720p", "1080p", "4k" (lowercase 4k)
+- durationSeconds: "4", "6", "8"
+- CRITICAL: 1080p/4k requires durationSeconds="8"
 """
 
 from __future__ import annotations
@@ -20,49 +26,77 @@ from backend.services.async_dispatch import get_executor
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
+from backend.services.gemini_video_service import (
+    check_gemini_configured,
+    validate_video_params,
+    GeminiValidationError,
+    ALLOWED_VIDEO_ASPECT_RATIOS,
+    ALLOWED_RESOLUTIONS,
+    ALLOWED_DURATIONS,
+)
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("video", __name__)
+
+
+# Map UI duration values to Veo allowed values
+DURATION_MAP = {
+    4: "4", 5: "4", 6: "6", 7: "6", 8: "8", 10: "8",
+    "4": "4", "5": "4", "6": "6", "7": "6", "8": "8", "10": "8",
+}
 
 
 @bp.route("/video/generate", methods=["POST", "OPTIONS"])
 @with_session
 def generate_video():
     """
-    Start a video generation job.
+    Start a video generation job using Gemini Veo 3.1.
 
     Request body:
     {
-        "provider": "google",           # Provider: google, openai, etc.
-        "task": "text2video",           # Task type: text2video or image2video
+        "provider": "google",           # Provider (only google supported)
+        "task": "text2video",           # "text2video" or "image2video"
         "prompt": "A serene forest...", # Required for text2video
-        "image_data": "base64...",      # Required for image2video (base64 or data URL)
-        "duration_sec": 5,              # Video duration: 5 or 10
-        "fps": 24,                      # Frames per second: 24, 30, 60
-        "aspect_ratio": "16:9",         # Aspect ratio: 16:9, 9:16, 1:1
-        "resolution": "1080p",          # Resolution: 720p, 1080p, 4K
+        "image_data": "base64...",      # Required for image2video
+        "duration_sec": 6,              # Duration: 4, 6, or 8 seconds
+        "aspect_ratio": "16:9",         # "16:9" or "9:16" (NO "1:1")
+        "resolution": "720p",           # "720p", "1080p", "4k"
         "motion": "Camera slowly...",   # Motion description (for image2video)
-        "audio": false,                 # Generate audio
-        "loop_seamlessly": false        # Loop seamlessly
+        "negative_prompt": "...",       # Optional: what to avoid
+        "seed": 12345                   # Optional: random seed
     }
 
-    Response:
+    CRITICAL CONSTRAINTS:
+    - Video aspect_ratio must be "16:9" or "9:16" (1:1 not supported)
+    - Resolution "1080p" or "4k" REQUIRES duration of 8 seconds
+    - For shorter videos (4s, 6s), use resolution "720p"
+
+    Response (success):
     {
         "ok": true,
         "job_id": "uuid",
-        "video_id": "uuid",
-        "reservation_id": "uuid",
         "status": "queued",
         "new_balance": 100
+    }
+
+    Response (error):
+    {
+        "error": "<machine_code>",
+        "message": "<human readable>",
+        "details": {...}
     }
     """
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # Check API key configuration
-    google_api_key = getattr(config, 'GOOGLE_API_KEY', None)
-    if not google_api_key:
-        return jsonify({"error": "GOOGLE_API_KEY not configured"}), 503
+    # Fail-fast: Check if Gemini is configured
+    is_configured, config_error = check_gemini_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "gemini_not_configured",
+            "message": "Set GEMINI_API_KEY environment variable",
+            "details": {"hint": config_error}
+        }), 500
 
     # Require authentication
     identity_id, auth_error = require_identity()
@@ -77,44 +111,60 @@ def generate_video():
 
     # Validate task type
     if task not in ("text2video", "image2video"):
-        return jsonify({"error": "Invalid task type. Must be 'text2video' or 'image2video'"}), 400
+        return jsonify({
+            "error": "invalid_params",
+            "message": "task must be 'text2video' or 'image2video'",
+            "field": "task",
+            "allowed": ["text2video", "image2video"]
+        }), 400
 
-    # Get common parameters with defaults
-    duration_sec = int(body.get("duration_sec") or 5)
-    fps = int(body.get("fps") or 24)
-    aspect_ratio = body.get("aspect_ratio") or "16:9"
-    resolution = body.get("resolution") or "1080p"
+    # Get parameters from request
+    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or 6
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
+    resolution = body.get("resolution") or "720p"
     motion = (body.get("motion") or "").strip()
-    audio = bool(body.get("audio"))
-    loop_seamlessly = bool(body.get("loop_seamlessly"))
+    negative_prompt = (body.get("negative_prompt") or body.get("negativePrompt") or "").strip()
+    seed = body.get("seed")
 
-    # Validate duration
-    if duration_sec not in (5, 10):
-        duration_sec = 5
+    # Map UI duration to Veo allowed values
+    duration_seconds = DURATION_MAP.get(raw_duration, "6")
 
-    # Validate fps
-    if fps not in (24, 30, 60):
-        fps = 24
+    # Normalize resolution (4K -> 4k)
+    if resolution == "4K":
+        resolution = "4k"
 
-    # Validate aspect ratio
-    if aspect_ratio not in ("16:9", "9:16", "1:1"):
-        aspect_ratio = "16:9"
-
-    # Validate resolution
-    if resolution not in ("720p", "1080p", "4K"):
-        resolution = "1080p"
+    # Validate video parameters BEFORE reserving credits
+    try:
+        aspect_ratio, resolution, duration_seconds = validate_video_params(
+            aspect_ratio, resolution, duration_seconds
+        )
+    except GeminiValidationError as e:
+        return jsonify({
+            "error": "invalid_params",
+            "message": e.message,
+            "field": e.field,
+            "allowed": e.allowed
+        }), 400
 
     # Task-specific validation
     if task == "text2video":
         prompt = (body.get("prompt") or "").strip()
         if not prompt:
-            return jsonify({"error": "prompt is required for text2video"}), 400
+            return jsonify({
+                "error": "invalid_params",
+                "message": "prompt is required for text2video",
+                "field": "prompt"
+            }), 400
         image_data = None
     else:  # image2video
         image_data = body.get("image_data") or body.get("image") or ""
         if not image_data:
-            return jsonify({"error": "image_data is required for image2video"}), 400
-        prompt = motion  # Use motion as the prompt for image-to-video
+            return jsonify({
+                "error": "invalid_params",
+                "message": "image_data is required for image2video",
+                "field": "image_data"
+            }), 400
+        prompt = motion or "Animate this image with natural, smooth motion"
 
     # Generate internal job ID
     internal_job_id = str(uuid.uuid4())
@@ -131,7 +181,7 @@ def generate_video():
             "task": task,
             "provider": provider,
             "prompt": prompt[:100] if prompt else None,
-            "duration_sec": duration_sec,
+            "duration_seconds": duration_seconds,
             "resolution": resolution,
         },
     )
@@ -145,13 +195,12 @@ def generate_video():
         "task": task,
         "provider": provider,
         "prompt": prompt,
-        "duration_sec": duration_sec,
-        "fps": fps,
+        "duration_seconds": duration_seconds,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "motion": motion,
-        "audio": audio,
-        "loop_seamlessly": loop_seamlessly,
+        "negative_prompt": negative_prompt,
+        "seed": seed,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -181,13 +230,12 @@ def generate_video():
         "task": task,
         "prompt": prompt,
         "image_data": image_data,
-        "duration_sec": duration_sec,
-        "fps": fps,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
+        "duration_seconds": duration_seconds,
         "motion": motion,
-        "audio": audio,
-        "loop_seamlessly": loop_seamlessly,
+        "negative_prompt": negative_prompt,
+        "seed": seed,
     }
 
     # Import here to avoid circular imports
@@ -206,7 +254,7 @@ def generate_video():
     log_event("video/generate:dispatched", {"internal_job_id": internal_job_id, "task": task})
 
     # Return response
-    balance_info = get_current_balance(identity_id)
+    balance_info = get_current_balance(identity_id) if identity_id else None
     return jsonify({
         "ok": True,
         "job_id": internal_job_id,
@@ -216,6 +264,11 @@ def generate_video():
         "status": "queued",
         "task": task,
         "provider": provider,
+        "params": {
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "duration_seconds": duration_seconds,
+        },
         "source": "modular",
     })
 
@@ -241,8 +294,7 @@ def video_status(job_id: str):
         "status": "done",
         "job_id": "uuid",
         "video_id": "uuid",
-        "video_url": "https://...",
-        "thumbnail_url": "https://..."
+        "video_url": "https://..."
     }
 
     Response (failed):
@@ -250,7 +302,8 @@ def video_status(job_id: str):
         "ok": false,
         "status": "failed",
         "job_id": "uuid",
-        "error": "Error message"
+        "error": "<machine_code>",
+        "message": "<human readable>"
     }
     """
     if request.method == "OPTIONS":
@@ -308,11 +361,20 @@ def video_status(job_id: str):
                     })
 
                 if job["status"] == "failed":
+                    error_msg = job.get("error_message", "Video generation failed")
+                    # Parse error code if present
+                    error_code = "gemini_video_failed"
+                    if error_msg and error_msg.startswith("gemini_"):
+                        parts = error_msg.split(":", 1)
+                        error_code = parts[0]
+                        error_msg = parts[1].strip() if len(parts) > 1 else error_msg
+
                     return jsonify({
                         "ok": False,
                         "status": "failed",
                         "job_id": job_id,
-                        "error": job.get("error_message", "Video generation failed"),
+                        "error": error_code,
+                        "message": error_msg,
                     })
 
                 if job["status"] == "ready":
@@ -326,8 +388,9 @@ def video_status(job_id: str):
                         "video_id": job_id,
                         "video_url": video_url,
                         "thumbnail_url": thumbnail_url,
-                        "duration_sec": meta.get("duration_sec") or job_meta.get("duration_sec"),
+                        "duration_seconds": meta.get("duration_seconds") or job_meta.get("duration_seconds"),
                         "resolution": meta.get("resolution") or job_meta.get("resolution"),
+                        "provider": "google",
                     })
 
         except Exception as e:
@@ -342,16 +405,20 @@ def video_status(job_id: str):
             "video_id": job_id,
             "video_url": meta.get("video_url"),
             "thumbnail_url": meta.get("thumbnail_url"),
-            "duration_sec": meta.get("duration_sec"),
+            "duration_seconds": meta.get("duration_seconds"),
             "resolution": meta.get("resolution"),
+            "provider": "google",
         })
 
     if meta.get("status") == "failed":
+        error_msg = meta.get("error", "Video generation failed")
+        error_code = meta.get("error_code", "gemini_video_failed")
         return jsonify({
             "ok": False,
             "status": "failed",
             "job_id": job_id,
-            "error": meta.get("error", "Video generation failed"),
+            "error": error_code,
+            "message": error_msg,
         })
 
     if meta.get("status") in ("queued", "processing"):
@@ -363,4 +430,7 @@ def video_status(job_id: str):
             "message": "Generating video...",
         })
 
-    return jsonify({"error": "Job not found"}), 404
+    return jsonify({
+        "error": "job_not_found",
+        "message": f"No video job found with ID: {job_id}"
+    }), 404
