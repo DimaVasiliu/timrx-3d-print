@@ -10,18 +10,6 @@ This module owns:
 """
 
 from __future__ import annotations
-"""
-History Service - History Item Management
-------------------------------------------
-Migration Status: COMPLETE
-
-This module owns:
-- local history store (dev-only)
-- history item validation and lookup
-- normalized DB persistence for images/models/history
-"""
-
-from __future__ import annotations
 
 import json
 import os
