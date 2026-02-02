@@ -453,6 +453,7 @@ def save_image_to_normalized_db(
     size: str,
     image_urls: list | None = None,
     user_id: str | None = None,
+    provider: str = "openai",
 ):
     if not USE_DB:
         print("[DB] USE_DB is False, skipping save_image_to_normalized_db")
@@ -580,7 +581,7 @@ def save_image_to_normalized_db(
                         WHERE provider = %s AND content_hash = %s
                         LIMIT 1
                         """,
-                        ("openai", image_content_hash),
+                        (provider, image_content_hash),
                     )
                     row = cur.fetchone()
                     if row:
@@ -689,7 +690,7 @@ def save_image_to_normalized_db(
                             user_id,
                             title,
                             prompt,
-                            "openai",
+                            provider,
                             upstream_id,
                             "ready",
                             s3_bucket,
@@ -748,7 +749,7 @@ def save_image_to_normalized_db(
                             user_id,
                             title,
                             prompt,
-                            "openai",
+                            provider,
                             None,
                             "ready",
                             image_url,
@@ -786,7 +787,7 @@ def save_image_to_normalized_db(
                             user_id,
                             title,
                             prompt,
-                            "openai",
+                            provider,
                             None,
                             "ready",
                             None,
@@ -903,6 +904,252 @@ def save_image_to_normalized_db(
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
+        return None
+
+
+def save_video_to_normalized_db(
+    video_id: str,
+    video_url: str,
+    prompt: str,
+    *,
+    duration_seconds: int | None = None,
+    resolution: str | None = None,
+    aspect_ratio: str | None = None,
+    thumbnail_url: str | None = None,
+    user_id: str | None = None,
+    provider: str = "google",
+    s3_video_url: str | None = None,
+):
+    """
+    Save video to normalized tables (videos, history_items).
+
+    Args:
+        video_id: Unique ID for this video (usually job_id)
+        video_url: URL to the video file
+        prompt: Text prompt used to generate the video
+        duration_seconds: Video duration in seconds
+        resolution: Resolution (720p, 1080p, 4k)
+        aspect_ratio: Aspect ratio (16:9, 9:16)
+        thumbnail_url: Optional thumbnail URL
+        user_id: Identity ID of the user
+        provider: Provider name (default: google)
+        s3_video_url: S3 URL if video was uploaded to S3
+
+    Returns:
+        video UUID from videos table, or None on error
+    """
+    if not USE_DB:
+        print("[DB] USE_DB is False, skipping save_video_to_normalized_db")
+        return None
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Check for existing history item
+                existing_history_id = None
+                if user_id:
+                    cur.execute(
+                        f"""
+                        SELECT id, video_id FROM {Tables.HISTORY_ITEMS}
+                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (video_id, video_id, user_id),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT id, video_id FROM {Tables.HISTORY_ITEMS}
+                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id IS NULL
+                        LIMIT 1
+                        """,
+                        (video_id, video_id),
+                    )
+                existing = cur.fetchone()
+                if existing:
+                    existing_history_id = str(existing["id"])
+
+                title = derive_display_title(prompt, None)
+                history_uuid = existing_history_id or str(uuid.uuid4())
+                video_uuid = str(uuid.uuid4())
+                upstream_id = video_id
+
+                # Use S3 URL if available, otherwise use original
+                final_video_url = s3_video_url or video_url
+                video_s3_key = get_s3_key_from_url(final_video_url) if final_video_url else None
+
+                video_meta = json.dumps({
+                    "prompt": prompt,
+                    "duration_seconds": duration_seconds,
+                    "resolution": resolution,
+                    "aspect_ratio": aspect_ratio,
+                    "provider": provider,
+                })
+
+                payload = {
+                    "original_id": video_id,
+                    "duration_seconds": duration_seconds,
+                    "resolution": resolution,
+                    "aspect_ratio": aspect_ratio,
+                    "video_url": final_video_url,
+                    "thumbnail_url": thumbnail_url,
+                    "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
+                    "provider": provider,
+                }
+
+                # Insert into videos table
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.VIDEOS} (
+                        id, identity_id,
+                        title, prompt,
+                        provider, upstream_id, status,
+                        s3_bucket, video_s3_key,
+                        video_url, thumbnail_url,
+                        duration_seconds, resolution, aspect_ratio,
+                        meta
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s
+                    )
+                    ON CONFLICT (provider, upstream_id) WHERE upstream_id IS NOT NULL DO UPDATE
+                    SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.VIDEOS}.identity_id),
+                        title = CASE
+                            WHEN EXCLUDED.title IS NOT NULL AND EXCLUDED.title <> ''
+                            THEN EXCLUDED.title
+                            ELSE {Tables.VIDEOS}.title
+                        END,
+                        prompt = COALESCE(EXCLUDED.prompt, {Tables.VIDEOS}.prompt),
+                        status = EXCLUDED.status,
+                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.VIDEOS}.s3_bucket),
+                        video_s3_key = COALESCE(EXCLUDED.video_s3_key, {Tables.VIDEOS}.video_s3_key),
+                        video_url = COALESCE(EXCLUDED.video_url, {Tables.VIDEOS}.video_url),
+                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.VIDEOS}.thumbnail_url),
+                        duration_seconds = COALESCE(EXCLUDED.duration_seconds, {Tables.VIDEOS}.duration_seconds),
+                        resolution = COALESCE(EXCLUDED.resolution, {Tables.VIDEOS}.resolution),
+                        aspect_ratio = COALESCE(EXCLUDED.aspect_ratio, {Tables.VIDEOS}.aspect_ratio),
+                        meta = EXCLUDED.meta,
+                        updated_at = NOW()
+                    RETURNING id
+                    """,
+                    (
+                        video_uuid,
+                        user_id,
+                        title,
+                        prompt,
+                        provider,
+                        upstream_id,
+                        "ready",
+                        AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
+                        video_s3_key,
+                        final_video_url,
+                        thumbnail_url,
+                        duration_seconds,
+                        resolution,
+                        aspect_ratio,
+                        video_meta,
+                    ),
+                )
+
+                video_row = cur.fetchone()
+                if not video_row:
+                    raise RuntimeError("[DB] Failed to upsert videos row (no id returned)")
+                returned_video_id = video_row["id"]
+                print(f"[DB] video persisted: video_id={returned_video_id} video_url={final_video_url}")
+
+                # Insert or update history_items
+                if existing_history_id:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.HISTORY_ITEMS}
+                        SET item_type = %s,
+                            status = %s,
+                            stage = %s,
+                            title = CASE
+                                WHEN %s IS NOT NULL AND %s <> ''
+                                THEN %s
+                                ELSE title
+                            END,
+                            prompt = COALESCE(%s, prompt),
+                            identity_id = COALESCE(%s, identity_id),
+                            thumbnail_url = COALESCE(%s, thumbnail_url),
+                            video_id = %s,
+                            payload = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            "video",
+                            "finished",
+                            "video",
+                            title,
+                            title,
+                            title,
+                            prompt,
+                            user_id,
+                            thumbnail_url,
+                            returned_video_id,
+                            json.dumps(payload),
+                            history_uuid,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.HISTORY_ITEMS} (
+                            id, identity_id, item_type, status, stage,
+                            title, prompt,
+                            thumbnail_url,
+                            video_id,
+                            payload
+                        ) VALUES (
+                            %s, %s, %s, %s, %s,
+                            %s, %s,
+                            %s,
+                            %s,
+                            %s
+                        )
+                        ON CONFLICT (id) DO UPDATE
+                        SET item_type = EXCLUDED.item_type,
+                            status = EXCLUDED.status,
+                            stage = EXCLUDED.stage,
+                            title = CASE
+                                WHEN EXCLUDED.title IS NOT NULL AND EXCLUDED.title <> ''
+                                THEN EXCLUDED.title
+                                ELSE {Tables.HISTORY_ITEMS}.title
+                            END,
+                            prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
+                            identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
+                            video_id = COALESCE(EXCLUDED.video_id, {Tables.HISTORY_ITEMS}.video_id),
+                            payload = EXCLUDED.payload,
+                            updated_at = NOW()
+                        """,
+                        (
+                            history_uuid,
+                            user_id,
+                            "video",
+                            "finished",
+                            "video",
+                            title,
+                            prompt,
+                            thumbnail_url,
+                            returned_video_id,
+                            json.dumps(payload),
+                        ),
+                    )
+            conn.commit()
+        print(f"[DB] Saved video {video_id} -> {history_uuid} to normalized tables (user_id={user_id})")
+        return returned_video_id
+    except Exception as e:
+        print(f"[DB] Failed to save video {video_id}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
