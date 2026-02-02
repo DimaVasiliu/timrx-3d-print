@@ -20,7 +20,16 @@ from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async
 from backend.services.credits_helper import get_current_balance, start_paid_job
-from backend.services.history_service import get_canonical_image_row
+from backend.services.gemini_image_service import (
+    gemini_generate_image,
+    check_gemini_configured,
+    GeminiAuthError,
+    GeminiConfigError,
+    GeminiValidationError,
+    ALLOWED_ASPECT_RATIOS,
+    ALLOWED_IMAGE_SIZES,
+)
+from backend.services.history_service import get_canonical_image_row, save_image_to_normalized_db
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
 from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
@@ -36,14 +45,202 @@ ALLOWED_IMAGE_HOSTS = {
 }
 
 
-@bp.route("/nano/image", methods=["POST", "OPTIONS"])
-def nano_image_mod():
-    return jsonify({"error": "NanoBanana disabled"}), 410
+@bp.route("/image/gemini", methods=["POST", "OPTIONS"])
+@with_session
+def gemini_image_mod():
+    """
+    Generate an image using Gemini Imagen 4.0.
+
+    Request body:
+    {
+        "prompt": "A beautiful sunset over mountains",
+        "aspect_ratio": "16:9",     # "1:1", "3:4", "4:3", "9:16", "16:9"
+        "image_size": "1K",         # "1K" or "2K"
+        "sample_count": 1           # Number of images (1-4)
+    }
+
+    Response (success):
+    {
+        "ok": true,
+        "image_url": "data:image/png;base64,...",
+        "image_base64": "...",
+        "image_id": "uuid",
+        "provider": "google"
+    }
+
+    Response (error):
+    {
+        "error": "<machine_code>",
+        "message": "<human readable>",
+        "details": {...}
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    # Fail-fast: Check if Gemini is configured
+    is_configured, config_error = check_gemini_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "gemini_not_configured",
+            "message": "Set GEMINI_API_KEY environment variable",
+            "details": {"hint": config_error}
+        }), 500
+
+    # Require authentication
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({
+            "error": "invalid_params",
+            "message": "prompt is required",
+            "field": "prompt"
+        }), 400
+
+    # Parse options with defaults
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
+    image_size = body.get("image_size") or body.get("imageSize") or "1K"
+    sample_count = int(body.get("sample_count") or body.get("sampleCount") or 1)
+
+    # Validate aspect_ratio
+    if aspect_ratio not in ALLOWED_ASPECT_RATIOS:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid aspect_ratio: {aspect_ratio}",
+            "field": "aspect_ratio",
+            "allowed": list(ALLOWED_ASPECT_RATIOS)
+        }), 400
+
+    # Validate image_size
+    if image_size not in ALLOWED_IMAGE_SIZES:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid image_size: {image_size}",
+            "field": "image_size",
+            "allowed": list(ALLOWED_IMAGE_SIZES)
+        }), 400
+
+    # Generate job ID
+    internal_job_id = str(uuid.uuid4())
+
+    # Reserve credits
+    action_key = "image-studio"
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "model": "imagen-4.0", "provider": "google"},
+    )
+    if credit_error:
+        return credit_error
+
+    try:
+        # Generate image synchronously (Imagen is reasonably fast)
+        result = gemini_generate_image(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            sample_count=sample_count,
+        )
+
+        # Save to history
+        save_image_to_normalized_db(
+            image_id=internal_job_id,
+            image_url=result["image_url"],
+            prompt=prompt,
+            ai_model="imagen-4.0",
+            size=f"{aspect_ratio}@{image_size}",
+            image_urls=result.get("image_urls", [result["image_url"]]),
+            user_id=identity_id,
+        )
+
+        # Finalize credits
+        from backend.services.credits_helper import finalize_job_credits
+        if reservation_id:
+            finalize_job_credits(reservation_id, internal_job_id)
+
+        log_event("image/gemini:generated", {"job_id": internal_job_id, "model": "imagen-4.0"})
+
+        balance_info = get_current_balance(identity_id) if identity_id else None
+        return jsonify({
+            "ok": True,
+            "image_url": result["image_url"],
+            "image_base64": result.get("image_base64"),
+            "image_urls": result.get("image_urls", []),
+            "image_id": internal_job_id,
+            "job_id": internal_job_id,
+            "new_balance": balance_info["available"] if balance_info else None,
+            "model": "imagen-4.0",
+            "provider": "google",
+        })
+
+    except GeminiConfigError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
+        return jsonify({
+            "error": "gemini_not_configured",
+            "message": str(e)
+        }), 500
+
+    except GeminiValidationError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
+        return jsonify({
+            "error": "invalid_params",
+            "message": e.message,
+            "field": e.field,
+            "allowed": e.allowed
+        }), 400
+
+    except GeminiAuthError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
+        return jsonify({
+            "error": "gemini_auth_failed",
+            "message": str(e)
+        }), 401
+
+    except RuntimeError as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
+        error_str = str(e)
+        print(f"[Gemini Imagen] Error: {error_str}")
+
+        # Parse error code from message if present
+        if error_str.startswith("gemini_"):
+            parts = error_str.split(":", 1)
+            error_code = parts[0]
+            error_msg = parts[1].strip() if len(parts) > 1 else error_str
+        else:
+            error_code = "gemini_image_failed"
+            error_msg = error_str
+
+        return jsonify({
+            "error": error_code,
+            "message": error_msg
+        }), 500
+
+    except Exception as e:
+        from backend.services.credits_helper import release_job_credits
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
+        print(f"[Gemini Imagen] Unexpected error: {e}")
+        return jsonify({
+            "error": "gemini_image_failed",
+            "message": str(e)
+        }), 500
 
 
-@bp.route("/nano/image/<job_id>", methods=["GET", "OPTIONS"])
-def nano_image_status_mod(job_id: str):
-    return jsonify({"error": "NanoBanana disabled"}), 410
+# NOTE: Image editing endpoint removed - Imagen 4.0 is text-to-image only.
+# For image editing, consider using a different model or workflow.
 
 
 @bp.route("/image/openai", methods=["POST", "OPTIONS"])
