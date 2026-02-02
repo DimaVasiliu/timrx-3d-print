@@ -26,6 +26,10 @@ from backend.services.gemini_video_service import (
     gemini_text_to_video,
     gemini_image_to_video,
     gemini_video_status,
+    download_video_bytes,
+    GeminiAuthError,
+    GeminiConfigError,
+    GeminiValidationError,
 )
 
 # Shared executor for background tasks
@@ -458,37 +462,57 @@ def dispatch_gemini_video_async(
     store_meta: dict,
 ):
     """
-    Dispatch Gemini video generation asynchronously.
+    Dispatch Gemini Veo 3.1 video generation asynchronously.
 
     Handles both text-to-video and image-to-video tasks.
+
+    Payload parameters:
+    - task: "text2video" or "image2video"
+    - prompt: Text prompt for video generation
+    - image_data: Base64 image for image2video
+    - aspect_ratio: "16:9" or "9:16"
+    - resolution: "720p", "1080p", or "4k"
+    - duration_seconds: "4", "6", or "8"
+    - negative_prompt: Optional things to avoid
+    - seed: Optional random seed
     """
     start_time = time.time()
     task = payload.get("task", "text2video")
-    print(f"[ASYNC] Starting Gemini {task} dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=gemini action={task} reservation_id={reservation_id}")
+    print(f"[ASYNC] Starting Gemini Veo {task} dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=google action={task} reservation_id={reservation_id}")
 
     try:
+        # Extract parameters (use new names, fallback to old for compatibility)
+        aspect_ratio = payload.get("aspect_ratio", "16:9")
+        resolution = payload.get("resolution", "720p")
+        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", "6")
+        negative_prompt = payload.get("negative_prompt", "")
+        seed = payload.get("seed")
+
+        # Ensure duration_seconds is a string
+        duration_seconds = str(duration_seconds)
+
+        print(f"[ASYNC] Veo params: aspect_ratio={aspect_ratio}, resolution={resolution}, duration={duration_seconds}s")
+
         # Call appropriate Gemini API based on task
         if task == "image2video":
             resp = gemini_image_to_video(
                 image_data=payload.get("image_data", ""),
                 motion_prompt=payload.get("motion") or payload.get("prompt", ""),
-                duration_sec=payload.get("duration_sec", 5),
-                fps=payload.get("fps", 24),
-                aspect_ratio=payload.get("aspect_ratio", "16:9"),
-                resolution=payload.get("resolution", "1080p"),
-                audio=payload.get("audio", False),
-                loop_seamlessly=payload.get("loop_seamlessly", False),
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                duration_seconds=duration_seconds,
+                negative_prompt=negative_prompt,
+                seed=seed,
             )
         else:  # text2video
             resp = gemini_text_to_video(
                 prompt=payload.get("prompt", ""),
-                duration_sec=payload.get("duration_sec", 5),
-                fps=payload.get("fps", 24),
-                aspect_ratio=payload.get("aspect_ratio", "16:9"),
-                resolution=payload.get("resolution", "1080p"),
-                audio=payload.get("audio", False),
-                loop_seamlessly=payload.get("loop_seamlessly", False),
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                duration_seconds=duration_seconds,
+                negative_prompt=negative_prompt,
+                seed=seed,
             )
 
         duration_ms = int((time.time() - start_time) * 1000)
@@ -496,7 +520,7 @@ def dispatch_gemini_video_async(
 
         if operation_name:
             # Long-running operation - need to poll for status
-            print(f"[ASYNC] Gemini returned operation_name={operation_name} for job {internal_job_id} in {duration_ms}ms")
+            print(f"[ASYNC] Veo returned operation_name={operation_name} for job {internal_job_id} in {duration_ms}ms")
             print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={operation_name} status=processing")
 
             # Update job with operation name
@@ -509,7 +533,7 @@ def dispatch_gemini_video_async(
             store[internal_job_id] = store_meta
             save_store(store)
 
-            # Poll for completion (Gemini video gen can take a while)
+            # Poll for completion (Veo video gen can take 1-3 minutes)
             _poll_gemini_video_completion(
                 internal_job_id,
                 identity_id,
@@ -525,14 +549,43 @@ def dispatch_gemini_video_async(
                     internal_job_id, identity_id, reservation_id, video_url, store_meta
                 )
             else:
-                raise RuntimeError("Gemini returned no operation_name or video_url")
+                raise RuntimeError("gemini_video_failed: No operation_name or video_url in response")
+
+    except GeminiConfigError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini not configured for job {internal_job_id}: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_not_configured", internal_job_id)
+        update_job_status_failed(internal_job_id, f"gemini_not_configured: {e}")
+
+    except GeminiValidationError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Validation error for job {internal_job_id}: {e.message}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"invalid_params: {e.message}")
+
+    except GeminiAuthError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini auth failed for job {internal_job_id}: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_auth_failed", internal_job_id)
+        update_job_status_failed(internal_job_id, f"gemini_auth_failed: {e}")
+
+    except RuntimeError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        error_str = str(e)
+        print(f"[ASYNC] ERROR: Gemini {task} failed for job {internal_job_id} after {duration_ms}ms: {error_str}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_video_failed", internal_job_id)
+        update_job_status_failed(internal_job_id, error_str)
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Gemini {task} call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[ASYNC] ERROR: Unexpected error for job {internal_job_id} after {duration_ms}ms: {e}")
         if reservation_id:
-            release_job_credits(reservation_id, "gemini_api_error", internal_job_id)
-        update_job_status_failed(internal_job_id, str(e))
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"gemini_video_failed: {e}")
 
 
 def _poll_gemini_video_completion(
@@ -541,15 +594,19 @@ def _poll_gemini_video_completion(
     reservation_id: Optional[str],
     operation_name: str,
     store_meta: dict,
-    max_polls: int = 120,  # 10 minutes at 5s intervals
-    poll_interval: int = 5,
+    max_polls: int = 60,  # 3 minutes at 3s intervals (Veo is usually fast)
+    poll_interval: int = 3,
 ):
     """
-    Poll Gemini for video generation completion.
+    Poll Gemini Veo for video generation completion.
 
     This runs in the background thread and updates job status.
+    Veo typically completes in 1-2 minutes for standard videos.
     """
-    print(f"[ASYNC] Starting poll for Gemini operation {operation_name}")
+    print(f"[ASYNC] Starting poll for Veo operation {operation_name}")
+
+    consecutive_errors = 0
+    max_consecutive_errors = 5
 
     for poll_num in range(1, max_polls + 1):
         try:
@@ -559,6 +616,9 @@ def _poll_gemini_video_completion(
             status = status_resp.get("status", "unknown")
 
             print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id}: status={status}")
+
+            # Reset error counter on successful poll
+            consecutive_errors = 0
 
             # Update progress in store
             if status == "processing":
@@ -595,26 +655,36 @@ def _poll_gemini_video_completion(
                         internal_job_id, identity_id, reservation_id, video_url, store_meta
                     )
                 else:
-                    raise RuntimeError("Gemini returned done but no video_url")
+                    raise RuntimeError("gemini_video_failed: Operation done but no video_url")
                 return
 
             elif status in ("failed", "error"):
-                error_msg = status_resp.get("error", "Video generation failed")
-                print(f"[ASYNC] Gemini video failed for job {internal_job_id}: {error_msg}")
+                error_code = status_resp.get("error", "gemini_video_failed")
+                error_msg = status_resp.get("message", "Video generation failed")
+                print(f"[ASYNC] Veo video failed for job {internal_job_id}: {error_code} - {error_msg}")
                 if reservation_id:
-                    release_job_credits(reservation_id, "gemini_video_failed", internal_job_id)
-                update_job_status_failed(internal_job_id, error_msg)
+                    release_job_credits(reservation_id, error_code, internal_job_id)
+                update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
                 return
 
         except Exception as e:
-            print(f"[ASYNC] Error polling Gemini for job {internal_job_id}: {e}")
-            # Continue polling unless it's a fatal error
+            consecutive_errors += 1
+            print(f"[ASYNC] Error polling Veo for job {internal_job_id} (attempt {consecutive_errors}): {e}")
+
+            # If too many consecutive errors, fail the job
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"[ASYNC] Too many consecutive poll errors for job {internal_job_id}, failing")
+                if reservation_id:
+                    release_job_credits(reservation_id, "gemini_poll_error", internal_job_id)
+                update_job_status_failed(internal_job_id, f"gemini_poll_error: {e}")
+                return
 
     # Timeout - max polls reached
-    print(f"[ASYNC] Timeout: Gemini video job {internal_job_id} did not complete after {max_polls * poll_interval}s")
+    timeout_seconds = max_polls * poll_interval
+    print(f"[ASYNC] Timeout: Veo video job {internal_job_id} did not complete after {timeout_seconds}s")
     if reservation_id:
         release_job_credits(reservation_id, "gemini_timeout", internal_job_id)
-    update_job_status_failed(internal_job_id, "Video generation timed out")
+    update_job_status_failed(internal_job_id, f"gemini_timeout: Video generation did not complete within {timeout_seconds} seconds")
 
 
 def _finalize_video_success(
@@ -626,20 +696,63 @@ def _finalize_video_success(
 ):
     """
     Finalize a successful video generation.
+
+    1. Download video from Gemini
+    2. Upload to S3 (if configured)
+    3. Update job status and store
+    4. Finalize credits
     """
-    print(f"[ASYNC] Gemini video completed for job {internal_job_id}: {video_url}")
+    print(f"[ASYNC] Veo video completed for job {internal_job_id}: {video_url[:100]}...")
+
+    final_video_url = video_url
+    s3_video_url = None
+
+    # Try to download and upload to S3 for persistence
+    if AWS_BUCKET_MODELS:
+        try:
+            print(f"[ASYNC] Downloading video from Gemini for S3 upload...")
+            video_bytes, content_type = download_video_bytes(video_url)
+
+            # Determine file extension
+            ext = ".mp4"
+            if "webm" in content_type:
+                ext = ".webm"
+
+            # Upload to S3
+            s3_video_url = safe_upload_to_s3(
+                f"data:{content_type};base64,{__import__('base64').b64encode(video_bytes).decode('utf-8')}",
+                content_type,
+                "videos",
+                f"veo_{internal_job_id}",
+                user_id=identity_id,
+                key_base=f"videos/{identity_id or 'public'}/{internal_job_id}{ext}",
+                provider="google",
+            )
+
+            if s3_video_url:
+                print(f"[ASYNC] Uploaded video to S3: {s3_video_url}")
+                final_video_url = s3_video_url
+            else:
+                print(f"[ASYNC] S3 upload returned no URL, using original Gemini URL")
+
+        except Exception as e:
+            print(f"[ASYNC] Failed to upload video to S3: {e}, using original Gemini URL")
+            # Continue with original URL - video is still available
 
     # Update store
     store = load_store()
     store_meta["status"] = "done"
-    store_meta["video_url"] = video_url
+    store_meta["video_url"] = final_video_url
+    if s3_video_url:
+        store_meta["s3_video_url"] = s3_video_url
+        store_meta["gemini_video_url"] = video_url  # Keep original for reference
     store[internal_job_id] = store_meta
     save_store(store)
 
     # Finalize credits
     if reservation_id:
         finalize_job_credits(reservation_id, internal_job_id)
-        print(f"[ASYNC] Credits captured for Gemini video job {internal_job_id}")
+        print(f"[ASYNC] Credits captured for Veo video job {internal_job_id}")
 
     # Update job status
     update_job_status_ready(
@@ -650,6 +763,14 @@ def _finalize_video_success(
     # Also update meta with video_url
     if USE_DB:
         try:
+            meta_update = {
+                "video_url": final_video_url,
+                "progress": 100,
+                "provider": "google",
+            }
+            if s3_video_url:
+                meta_update["s3_video_url"] = s3_video_url
+
             with get_conn() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
@@ -658,13 +779,13 @@ def _finalize_video_success(
                         SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
                         WHERE id::text = %s
                         """,
-                        (json.dumps({"video_url": video_url, "progress": 100}), internal_job_id),
+                        (json.dumps(meta_update), internal_job_id),
                     )
                 conn.commit()
         except Exception as e:
             print(f"[ASYNC] Error updating video_url for {internal_job_id}: {e}")
 
-    print(f"[ASYNC] Gemini video job {internal_job_id} completed successfully")
+    print(f"[ASYNC] Veo video job {internal_job_id} completed successfully")
 
 
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
