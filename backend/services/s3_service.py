@@ -39,7 +39,29 @@ _s3 = boto3.client(
 
 
 def build_hash_s3_key(prefix: str, provider: str | None, content_hash: str, content_type: str) -> str:
-    safe_provider = sanitize_filename(provider or "unknown") or "unknown"
+    """
+    Build S3 key with content hash for deduplication.
+
+    Key format: {prefix}/{provider}/{content_hash}{ext}
+    Example: images/google/abc123def456.png
+
+    IMPORTANT: Always pass the correct provider to organize assets properly:
+    - "openai" for OpenAI/GPT images
+    - "google" for Gemini Imagen images
+    - "meshy" for Meshy 3D models
+    - "user" for user-uploaded source images
+    """
+    # Normalize provider - default to "unknown" if not provided
+    KNOWN_PROVIDERS = {"openai", "google", "meshy", "user", "unknown"}
+    raw_provider = (provider or "").lower().strip()
+    safe_provider = sanitize_filename(raw_provider) if raw_provider else "unknown"
+
+    # Warn if provider is not in the known list
+    if safe_provider and safe_provider not in KNOWN_PROVIDERS:
+        print(f"[S3] Warning: unrecognized provider '{provider}', using as-is: {safe_provider}")
+
+    safe_provider = safe_provider or "unknown"
+
     if prefix == "models":
         ext = ".glb"
     else:
@@ -376,15 +398,34 @@ def upload_model_to_s3(url, job_id, filename_hint=None, content_type=None) -> di
     return {"url": u, "hash": h, "key": k, "reused": bool(reused)}
 
 
-def upload_image_to_s3(url, job_id, filename_hint=None) -> dict:
-    """Upload an image URL/data URI to S3 with deterministic hashing."""
+def upload_image_to_s3(url, job_id, filename_hint=None, provider: str = "openai") -> dict:
+    """
+    Upload an image URL/data URI to S3 with deterministic hashing.
+
+    Args:
+        url: Image URL or data URI
+        job_id: Job identifier
+        filename_hint: Optional filename hint
+        provider: Provider name for S3 key path ("openai", "google", etc.)
+                  IMPORTANT: Pass the correct provider to avoid mixing images
+                  from different providers in the same S3 folder.
+
+    Returns:
+        Dict with url, hash, key, reused
+    """
+    # Safeguard: normalize provider to known values
+    safe_provider = provider.lower() if provider else "unknown"
+    if safe_provider not in ("openai", "google", "meshy", "user"):
+        print(f"[S3] Warning: unknown provider '{provider}', using 'unknown' folder")
+        safe_provider = "unknown"
+
     result = safe_upload_to_s3(
         url,
         "image/png",
         "images",
         filename_hint or f"image_{job_id}",
         user_id=job_id,
-        provider="openai",
+        provider=safe_provider,
         return_hash=True,
     )
     u, h, k, reused = unpack_upload_result(result)
