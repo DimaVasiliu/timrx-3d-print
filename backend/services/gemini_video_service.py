@@ -632,3 +632,87 @@ def download_video_bytes(video_url: str) -> Tuple[bytes, str]:
 
     except Exception as e:
         raise RuntimeError(f"gemini_video_failed: Failed to download video: {e}")
+
+
+def extract_video_thumbnail(video_bytes: bytes, timestamp_sec: float = 1.0) -> Optional[bytes]:
+    """
+    Extract a thumbnail frame from video bytes using ffmpeg.
+
+    Args:
+        video_bytes: The video file bytes
+        timestamp_sec: Time in seconds to extract the frame (default 1.0)
+
+    Returns:
+        JPEG image bytes, or None if extraction fails
+    """
+    import subprocess
+    import tempfile
+    import os
+
+    temp_video = None
+    temp_thumb = None
+
+    try:
+        # Write video to temp file
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(video_bytes)
+            temp_video = f.name
+
+        # Create temp file for thumbnail
+        temp_thumb = tempfile.mktemp(suffix=".jpg")
+
+        # Extract frame using ffmpeg
+        # -ss before -i for faster seeking
+        # -vframes 1 to get single frame
+        # -q:v 2 for high quality JPEG
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-ss", str(timestamp_sec),
+            "-i", temp_video,
+            "-vframes", "1",
+            "-q:v", "2",
+            "-vf", "scale='min(640,iw)':'-1'",  # Max width 640px, preserve aspect
+            temp_thumb
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            print(f"[Thumbnail] ffmpeg failed: {result.stderr.decode('utf-8', errors='ignore')[:200]}")
+            return None
+
+        # Read thumbnail
+        if os.path.exists(temp_thumb) and os.path.getsize(temp_thumb) > 0:
+            with open(temp_thumb, "rb") as f:
+                thumb_bytes = f.read()
+            print(f"[Thumbnail] Extracted {len(thumb_bytes)} bytes at {timestamp_sec}s")
+            return thumb_bytes
+
+        return None
+
+    except subprocess.TimeoutExpired:
+        print("[Thumbnail] ffmpeg timed out")
+        return None
+    except FileNotFoundError:
+        print("[Thumbnail] ffmpeg not found - install ffmpeg for video thumbnails")
+        return None
+    except Exception as e:
+        print(f"[Thumbnail] Error: {e}")
+        return None
+    finally:
+        # Cleanup temp files
+        if temp_video and os.path.exists(temp_video):
+            try:
+                os.unlink(temp_video)
+            except:
+                pass
+        if temp_thumb and os.path.exists(temp_thumb):
+            try:
+                os.unlink(temp_thumb)
+            except:
+                pass
