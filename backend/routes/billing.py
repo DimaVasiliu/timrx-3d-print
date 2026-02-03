@@ -122,6 +122,8 @@ def get_action_costs():
                 {"action_key": "texture", "credits": 10},
                 {"action_key": "rig", "credits": 10},
                 {"action_key": "image_studio_generate", "credits": 12},
+                {"action_key": "video", "credits": 60},
+                {"action_key": "video_generate", "credits": 60},
             ],
         })
 
