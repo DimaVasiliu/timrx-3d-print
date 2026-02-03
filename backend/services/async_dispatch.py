@@ -27,6 +27,7 @@ from backend.services.gemini_video_service import (
     gemini_image_to_video,
     gemini_video_status,
     download_video_bytes,
+    extract_video_thumbnail,
     GeminiAuthError,
     GeminiConfigError,
     GeminiValidationError,
@@ -713,6 +714,7 @@ def _finalize_video_success(
 
     final_video_url = video_url
     s3_video_url = None
+    s3_thumbnail_url = None
 
     # Try to download and upload to S3 for persistence
     if AWS_BUCKET_MODELS:
@@ -739,6 +741,25 @@ def _finalize_video_success(
             if s3_video_url:
                 print(f"[ASYNC] Uploaded video to S3: {s3_video_url}")
                 final_video_url = s3_video_url
+
+                # Extract and upload thumbnail
+                try:
+                    thumb_bytes = extract_video_thumbnail(video_bytes, timestamp_sec=1.0)
+                    if thumb_bytes:
+                        thumb_b64 = f"data:image/jpeg;base64,{__import__('base64').b64encode(thumb_bytes).decode('utf-8')}"
+                        s3_thumbnail_url = safe_upload_to_s3(
+                            thumb_b64,
+                            "image/jpeg",
+                            "thumbnails",
+                            f"veo_thumb_{internal_job_id}",
+                            user_id=identity_id,
+                            key_base=f"thumbnails/{identity_id or 'public'}/{internal_job_id}.jpg",
+                            provider="google",
+                        )
+                        if s3_thumbnail_url:
+                            print(f"[ASYNC] Uploaded thumbnail to S3: {s3_thumbnail_url}")
+                except Exception as thumb_err:
+                    print(f"[ASYNC] Thumbnail extraction failed: {thumb_err}")
             else:
                 print(f"[ASYNC] S3 upload returned no URL, using original Gemini URL")
 
@@ -753,6 +774,8 @@ def _finalize_video_success(
     if s3_video_url:
         store_meta["s3_video_url"] = s3_video_url
         store_meta["gemini_video_url"] = video_url  # Keep original for reference
+    if s3_thumbnail_url:
+        store_meta["thumbnail_url"] = s3_thumbnail_url
     store[internal_job_id] = store_meta
     save_store(store)
 
@@ -778,7 +801,7 @@ def _finalize_video_success(
         duration_seconds=duration_seconds,
         resolution=store_meta.get("resolution"),
         aspect_ratio=store_meta.get("aspect_ratio"),
-        thumbnail_url=None,  # Veo doesn't provide thumbnails
+        thumbnail_url=str(s3_thumbnail_url) if s3_thumbnail_url else None,
         user_id=identity_id,
         provider="google",
         s3_video_url=str(s3_video_url) if s3_video_url else None,
