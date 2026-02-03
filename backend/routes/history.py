@@ -70,14 +70,18 @@ def history_mod():
                                 f"""
                                 SELECT
                                     h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
-                                    h.thumbnail_url, h.glb_url, h.image_url, h.payload, h.created_at,
-                                    h.model_id, h.image_id,
+                                    h.thumbnail_url, h.glb_url, h.image_url, h.video_url, h.payload, h.created_at,
+                                    h.model_id, h.image_id, h.video_id,
                                     -- Model data from joined models table
                                     m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
                                     m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
                                     -- Image data from joined images table
                                     i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
-                                    i.thumbnail_url AS i_thumbnail_url
+                                    i.thumbnail_url AS i_thumbnail_url,
+                                    -- Video data from joined videos table
+                                    v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
+                                    v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
+                                    v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio
                                 FROM {Tables.HISTORY_ITEMS} h
                                 LEFT JOIN {Tables.MODELS} m ON (
                                     m.identity_id = %s AND (
@@ -113,11 +117,26 @@ def history_mod():
                                         ) IS NOT NULL)
                                     )
                                 )
+                                LEFT JOIN {Tables.VIDEOS} v ON (
+                                    v.identity_id = %s AND (
+                                        -- Direct video_id lookup
+                                        (h.video_id IS NOT NULL AND h.video_id = v.id)
+                                        OR
+                                        -- Fallback: upstream_id lookup when no video_id
+                                        (h.video_id IS NULL AND v.upstream_id = COALESCE(
+                                            h.payload->>'original_id',
+                                            h.payload->>'original_job_id'
+                                        ) AND COALESCE(
+                                            h.payload->>'original_id',
+                                            h.payload->>'original_job_id'
+                                        ) IS NOT NULL)
+                                    )
+                                )
                                 WHERE h.identity_id = %s
                                 ORDER BY h.created_at DESC
                                 LIMIT %s OFFSET %s;
                                 """,
-                                (identity_id, identity_id, identity_id, limit, offset),
+                                (identity_id, identity_id, identity_id, identity_id, limit, offset),
                             )
                             rows = cur.fetchall()
                     query_time = time.time() - start_time
@@ -162,6 +181,8 @@ def history_mod():
                             item["glb_url"] = r["glb_url"]
                         if r["image_url"]:
                             item["image_url"] = r["image_url"]
+                        if r.get("video_url"):
+                            item["video_url"] = r["video_url"]
                         if r["created_at"]:
                             item["created_at"] = int(r["created_at"].timestamp() * 1000)
 
@@ -193,6 +214,26 @@ def history_mod():
                                 payload["thumbnail_url"] = r["i_thumbnail_url"]
                             if r.get("i_title") and not item.get("title"):
                                 item["title"] = r["i_title"]
+
+                        # Apply joined video data (from LEFT JOIN)
+                        if r.get("v_id"):
+                            if r.get("v_video_url"):
+                                item["video_url"] = r["v_video_url"]
+                                payload["video_url"] = r["v_video_url"]
+                            if r.get("v_thumbnail_url"):
+                                item["thumbnail_url"] = r["v_thumbnail_url"]
+                                payload["thumbnail_url"] = r["v_thumbnail_url"]
+                            if r.get("v_title") and not item.get("title"):
+                                item["title"] = r["v_title"]
+                            if r.get("v_duration_seconds"):
+                                item["duration_seconds"] = r["v_duration_seconds"]
+                                payload["duration_seconds"] = r["v_duration_seconds"]
+                            if r.get("v_resolution"):
+                                item["resolution"] = r["v_resolution"]
+                                payload["resolution"] = r["v_resolution"]
+                            if r.get("v_aspect_ratio"):
+                                item["aspect_ratio"] = r["v_aspect_ratio"]
+                                payload["aspect_ratio"] = r["v_aspect_ratio"]
 
                         # Scrub any remaining meshy.ai URLs (we only want S3 URLs)
                         for key in ("glb_url", "thumbnail_url", "image_url"):
@@ -734,7 +775,7 @@ def history_item_update_mod(item_id: str):
                         with conn.cursor(row_factory=dict_row) as cur:
                             cur.execute(
                                 f"""
-                                SELECT id, item_type, model_id, image_id, thumbnail_url, glb_url, image_url, payload
+                                SELECT id, item_type, model_id, image_id, video_id, thumbnail_url, glb_url, image_url, video_url, payload
                                 FROM {Tables.HISTORY_ITEMS}
                                 WHERE id::text = %s AND identity_id = %s
                                 LIMIT 1
@@ -747,6 +788,7 @@ def history_item_update_mod(item_id: str):
 
                         model_id = row["model_id"]
                         image_id = row["image_id"]
+                        video_id = row["video_id"]
                         payload = row["payload"] if row["payload"] else {}
                         if isinstance(payload, str):
                             try:
@@ -770,6 +812,8 @@ def history_item_update_mod(item_id: str):
                                 cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s", (model_id,))
                             if image_id:
                                 cur.execute(f"DELETE FROM {Tables.IMAGES} WHERE id = %s", (image_id,))
+                            if video_id:
+                                cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s", (video_id,))
                         conn.commit()
                         db_ok = True
 
@@ -826,8 +870,9 @@ def history_item_update_mod(item_id: str):
                                 thumbnail_url = updates.get("thumbnail_url")
                                 glb_url = updates.get("glb_url")
                                 image_url = updates.get("image_url")
+                                video_url = updates.get("video_url")
 
-                                provider = "openai" if item_type == "image" else "meshy"
+                                provider = "google" if item_type == "video" else ("openai" if item_type == "image" else "meshy")
                                 s3_user_id = identity_id
                                 if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
                                     thumbnail_url = ensure_s3_url_for_data_uri(
@@ -849,7 +894,7 @@ def history_item_update_mod(item_id: str):
                                         provider=provider,
                                     )
                                     updates["image_url"] = image_url
-                                existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url"}})
+                                existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url", "video_url"}})
 
                                 title_to_set = title
                                 cur.execute(
@@ -862,6 +907,7 @@ def history_item_update_mod(item_id: str):
                                            thumbnail_url = COALESCE(%s, thumbnail_url),
                                            glb_url = COALESCE(%s, glb_url),
                                            image_url = COALESCE(%s, image_url),
+                                           video_url = COALESCE(%s, video_url),
                                            payload = %s,
                                            updated_at = NOW()
                                        WHERE id = %s AND identity_id = %s;""",
@@ -874,6 +920,7 @@ def history_item_update_mod(item_id: str):
                                         thumbnail_url,
                                         glb_url,
                                         image_url,
+                                        video_url,
                                         json.dumps(existing),
                                         actual_id,
                                         identity_id,
