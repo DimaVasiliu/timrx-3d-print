@@ -284,8 +284,9 @@ def dispatch_openai_image_async(
             size=size,
             image_urls=urls,
             user_id=identity_id,
+            provider="openai",  # Explicit: saves to images/openai/{hash}.png
         )
-        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id}")
+        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=openai")
 
         store = load_store()
         store_meta["status"] = "done"
