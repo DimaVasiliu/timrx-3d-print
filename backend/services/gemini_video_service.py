@@ -444,6 +444,8 @@ def gemini_video_status(operation_name: str) -> Dict[str, Any]:
 
     Args:
         operation_name: The operation name returned from generate call
+                        Format: "models/veo-3.1-generate-preview/operations/XYZ"
+                        or just "operations/XYZ"
 
     Returns:
         Dict with:
@@ -453,18 +455,33 @@ def gemini_video_status(operation_name: str) -> Dict[str, Any]:
         - error: error message (if failed)
     """
     # Build status URL
-    if operation_name.startswith("operations/"):
+    # Gemini returns operation names like "models/veo-3.1-generate-preview/operations/XYZ"
+    # or sometimes just "operations/XYZ" - we need to handle both correctly
+    if operation_name.startswith("models/") or operation_name.startswith("operations/"):
+        # Full path - just prepend base URL
         url = f"{GEMINI_API_BASE}/{operation_name}"
     else:
+        # Just the operation ID - need to add operations/ prefix
         url = f"{GEMINI_API_BASE}/operations/{operation_name}"
 
     try:
         print(f"[Gemini Veo] Polling operation: {operation_name}")
+        print(f"[Gemini Veo] Poll URL: {url}")
         r = requests.get(url, headers=_get_headers(), timeout=GEMINI_TIMEOUT)
 
         if not r.ok:
             error_text = r.text[:300] if r.text else "No error details"
             print(f"[Gemini Veo] Poll failed: {r.status_code} - {error_text}")
+            print(f"[Gemini Veo] Failed poll URL was: {url}")
+
+            if r.status_code == 404:
+                # 404 usually means wrong URL format or operation doesn't exist
+                print(f"[Gemini Veo] 404 Not Found - operation_name={operation_name}")
+                return {
+                    "status": "failed",
+                    "error": "gemini_video_failed",
+                    "message": f"Gemini API error 404: Operation not found. URL: {url}",
+                }
 
             if r.status_code in (401, 403):
                 return {
