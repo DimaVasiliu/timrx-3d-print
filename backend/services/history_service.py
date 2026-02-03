@@ -970,7 +970,9 @@ def save_video_to_normalized_db(
                     existing_history_id = str(existing["id"])
 
                 title = derive_display_title(prompt, None)
-                history_uuid = existing_history_id or str(uuid.uuid4())
+                # Use video_id (job_id) directly as history_items.id to ensure
+                # frontend can PATCH /api/_mod/history/item/<jobId> without 404
+                history_uuid = existing_history_id or video_id
                 video_uuid = str(uuid.uuid4())
                 upstream_id = video_id
 
