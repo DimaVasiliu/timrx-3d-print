@@ -472,7 +472,7 @@ def dispatch_gemini_video_async(
     - image_data: Base64 image for image2video
     - aspect_ratio: "16:9" or "9:16"
     - resolution: "720p", "1080p", or "4k"
-    - duration_seconds: "4", "6", or "8"
+    - duration_seconds: 4, 6, or 8 (integer, NOT string!)
     - negative_prompt: Optional things to avoid
     - seed: Optional random seed
     """
@@ -485,14 +485,20 @@ def dispatch_gemini_video_async(
         # Extract parameters (use new names, fallback to old for compatibility)
         aspect_ratio = payload.get("aspect_ratio", "16:9")
         resolution = payload.get("resolution", "720p")
-        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", "6")
+        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 6)
         negative_prompt = payload.get("negative_prompt", "")
         seed = payload.get("seed")
 
-        # Ensure duration_seconds is a string
-        duration_seconds = str(duration_seconds)
+        # CRITICAL: Ensure duration_seconds is an integer (Gemini API requires number, not string!)
+        try:
+            if isinstance(duration_seconds, str):
+                duration_seconds = int(duration_seconds.replace("s", "").replace("sec", "").strip())
+            else:
+                duration_seconds = int(duration_seconds)
+        except (ValueError, TypeError):
+            duration_seconds = 6  # Safe default
 
-        print(f"[ASYNC] Veo params: aspect_ratio={aspect_ratio}, resolution={resolution}, duration={duration_seconds}s")
+        print(f"[ASYNC] Veo params: aspect_ratio={aspect_ratio}, resolution={resolution}, duration_seconds={duration_seconds} (type={type(duration_seconds).__name__})")
 
         # Call appropriate Gemini API based on task
         if task == "image2video":
