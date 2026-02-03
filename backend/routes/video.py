@@ -10,8 +10,8 @@ Endpoints:
 Veo 3.1 Constraints:
 - aspectRatio: ONLY "16:9" or "9:16" (NO "1:1" for video)
 - resolution: "720p", "1080p", "4k" (lowercase 4k)
-- durationSeconds: "4", "6", "8"
-- CRITICAL: 1080p/4k requires durationSeconds="8"
+- durationSeconds: 4, 6, 8 (integers, NOT strings!)
+- CRITICAL: 1080p/4k requires durationSeconds=8
 """
 
 from __future__ import annotations
@@ -39,10 +39,10 @@ from backend.utils.helpers import now_s, log_event
 bp = Blueprint("video", __name__)
 
 
-# Map UI duration values to Veo allowed values
+# Map UI duration values to Veo allowed values (integers!)
 DURATION_MAP = {
-    4: "4", 5: "4", 6: "6", 7: "6", 8: "8", 10: "8",
-    "4": "4", "5": "4", "6": "6", "7": "6", "8": "8", "10": "8",
+    4: 4, 5: 4, 6: 6, 7: 6, 8: 8, 10: 8,
+    "4": 4, "5": 4, "6": 6, "7": 6, "8": 8, "10": 8,
 }
 
 
@@ -126,8 +126,8 @@ def generate_video():
     negative_prompt = (body.get("negative_prompt") or body.get("negativePrompt") or "").strip()
     seed = body.get("seed")
 
-    # Map UI duration to Veo allowed values
-    duration_seconds = DURATION_MAP.get(raw_duration, "6")
+    # Map UI duration to Veo allowed values (must be integer!)
+    duration_seconds = DURATION_MAP.get(raw_duration, 6)
 
     # Normalize resolution (4K -> 4k)
     if resolution == "4K":
