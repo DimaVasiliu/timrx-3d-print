@@ -16,7 +16,7 @@ CURL Test Examples:
       -H 'Content-Type: application/json' \
       -d '{
         "instances": [{"prompt": "A cat walking on a beach at sunset"}],
-        "parameters": {"aspectRatio": "16:9", "resolution": "720p", "durationSeconds": "6"}
+        "parameters": {"aspectRatio": "16:9", "resolution": "720p", "durationSeconds": 6}
       }'
 
 2) Poll operation status:
@@ -27,8 +27,8 @@ CURL Test Examples:
 CRITICAL CONSTRAINTS:
 - aspectRatio: ONLY "16:9" or "9:16" (NO "1:1" for video!)
 - resolution: ONLY "720p", "1080p", "4k" (lowercase 4k, NOT "4K")
-- durationSeconds: ONLY "4", "6", "8" (as strings)
-- If resolution is "1080p" or "4k", durationSeconds MUST be "8"
+- durationSeconds: ONLY 4, 6, 8 (as integers, NOT strings!)
+- If resolution is "1080p" or "4k", durationSeconds MUST be 8
 
 NOTE: Requires Gemini API Paid tier. Get your key from https://aistudio.google.com/apikey
 """
@@ -58,7 +58,7 @@ VEO_MODEL = "veo-3.1-generate-preview"
 # Allowed parameter values - STRICT validation
 ALLOWED_VIDEO_ASPECT_RATIOS = {"16:9", "9:16"}  # NO "1:1" for video!
 ALLOWED_RESOLUTIONS = {"720p", "1080p", "4k"}  # lowercase 4k
-ALLOWED_DURATIONS = {"4", "6", "8"}  # as strings
+ALLOWED_DURATIONS = {4, 6, 8}  # as integers (NOT strings!)
 
 # Resolution constraint: 1080p/4k REQUIRE 8 seconds
 HIGH_RES_REQUIRES_8S = {"1080p", "4k"}
@@ -128,22 +128,38 @@ def check_gemini_configured() -> Tuple[bool, Optional[str]]:
 def validate_video_params(
     aspect_ratio: str,
     resolution: str,
-    duration_seconds: str,
-) -> Tuple[str, str, str]:
+    duration_seconds: Any,
+) -> Tuple[str, str, int]:
     """
     Validate and normalize Veo video parameters.
 
     Returns normalized (aspect_ratio, resolution, duration_seconds).
     Raises GeminiValidationError if invalid.
 
-    CRITICAL: 1080p/4k requires 8 seconds duration.
+    CRITICAL:
+    - durationSeconds MUST be an integer (4, 6, or 8), NOT a string!
+    - 1080p/4k requires 8 seconds duration.
     """
     # Normalize resolution (handle uppercase 4K -> 4k)
     if resolution == "4K":
         resolution = "4k"
 
-    # Normalize duration to string
-    duration_seconds = str(duration_seconds)
+    # Normalize duration to integer (parse from string if needed)
+    try:
+        # Handle "4 sec", "4s", "4", 4, etc.
+        if isinstance(duration_seconds, str):
+            # Strip common suffixes
+            duration_str = duration_seconds.lower().replace("sec", "").replace("s", "").strip()
+            duration_int = int(duration_str)
+        else:
+            duration_int = int(duration_seconds)
+    except (ValueError, TypeError):
+        raise GeminiValidationError(
+            "durationSeconds",
+            duration_seconds,
+            list(ALLOWED_DURATIONS),
+            f"Duration must be a number (4, 6, or 8). Got: {duration_seconds} (type: {type(duration_seconds).__name__})"
+        )
 
     # Validate aspect ratio
     if aspect_ratio not in ALLOWED_VIDEO_ASPECT_RATIOS:
@@ -165,32 +181,32 @@ def validate_video_params(
         )
 
     # Validate duration
-    if duration_seconds not in ALLOWED_DURATIONS:
+    if duration_int not in ALLOWED_DURATIONS:
         raise GeminiValidationError(
             "durationSeconds",
-            duration_seconds,
+            duration_int,
             list(ALLOWED_DURATIONS),
-            f"Duration must be 4, 6, or 8 seconds. Got: {duration_seconds}"
+            f"Duration must be 4, 6, or 8 seconds. Got: {duration_int}"
         )
 
     # CRITICAL CONSTRAINT: 1080p/4k requires 8 seconds
-    if resolution in HIGH_RES_REQUIRES_8S and duration_seconds != "8":
+    if resolution in HIGH_RES_REQUIRES_8S and duration_int != 8:
         raise GeminiValidationError(
             "durationSeconds",
-            duration_seconds,
-            ["8"],
+            duration_int,
+            [8],
             f"Resolution {resolution} requires 8 seconds duration. "
-            f"Either choose 720p for {duration_seconds}s, or use 8s for {resolution}."
+            f"Either choose 720p for {duration_int}s, or use 8s for {resolution}."
         )
 
-    return aspect_ratio, resolution, duration_seconds
+    return aspect_ratio, resolution, duration_int
 
 
 def gemini_text_to_video(
     prompt: str,
     aspect_ratio: str = "16:9",
     resolution: str = "720p",
-    duration_seconds: str = "6",
+    duration_seconds: Any = 6,
     negative_prompt: Optional[str] = None,
     seed: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -201,7 +217,7 @@ def gemini_text_to_video(
         prompt: Text description of the video to generate
         aspect_ratio: "16:9" or "9:16" (NO "1:1" for video)
         resolution: "720p", "1080p", or "4k" (lowercase)
-        duration_seconds: "4", "6", or "8" (1080p/4k requires "8")
+        duration_seconds: 4, 6, or 8 (integer, 1080p/4k requires 8)
         negative_prompt: Things to avoid (if supported)
         seed: Random seed for reproducibility (if supported)
 
@@ -214,21 +230,21 @@ def gemini_text_to_video(
         GeminiAuthError: If authentication fails
         RuntimeError: For other API errors
     """
-    # Validate and normalize parameters
-    aspect_ratio, resolution, duration_seconds = validate_video_params(
+    # Validate and normalize parameters (ensures duration_seconds is int)
+    aspect_ratio, resolution, duration_int = validate_video_params(
         aspect_ratio, resolution, duration_seconds
     )
 
     # Build API URL
     url = f"{GEMINI_API_BASE}/models/{VEO_MODEL}:predictLongRunning"
 
-    # Build payload
+    # Build payload - durationSeconds MUST be an integer
     payload = {
         "instances": [{"prompt": prompt}],
         "parameters": {
             "aspectRatio": aspect_ratio,
             "resolution": resolution,
-            "durationSeconds": duration_seconds,
+            "durationSeconds": duration_int,  # integer, not string!
         }
     }
 
@@ -238,7 +254,10 @@ def gemini_text_to_video(
     if seed is not None:
         payload["parameters"]["seed"] = int(seed)
 
-    print(f"[Gemini Veo] Starting text-to-video: aspectRatio={aspect_ratio}, resolution={resolution}, duration={duration_seconds}s")
+    # Debug log: show payload types to verify durationSeconds is int
+    print(f"[Gemini Veo] text-to-video payload types: "
+          f"durationSeconds={duration_int} (type={type(duration_int).__name__}), "
+          f"aspectRatio={aspect_ratio}, resolution={resolution}")
 
     return _execute_video_start_request(url, payload, "text-to-video")
 
@@ -248,7 +267,7 @@ def gemini_image_to_video(
     motion_prompt: str = "",
     aspect_ratio: str = "16:9",
     resolution: str = "720p",
-    duration_seconds: str = "6",
+    duration_seconds: Any = 6,
     negative_prompt: Optional[str] = None,
     seed: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -260,15 +279,15 @@ def gemini_image_to_video(
         motion_prompt: Description of motion/camera movement
         aspect_ratio: "16:9" or "9:16"
         resolution: "720p", "1080p", or "4k"
-        duration_seconds: "4", "6", or "8"
+        duration_seconds: 4, 6, or 8 (integer)
         negative_prompt: Things to avoid
         seed: Random seed for reproducibility
 
     Returns:
         Dict with operation_name for polling
     """
-    # Validate and normalize parameters
-    aspect_ratio, resolution, duration_seconds = validate_video_params(
+    # Validate and normalize parameters (ensures duration_seconds is int)
+    aspect_ratio, resolution, duration_int = validate_video_params(
         aspect_ratio, resolution, duration_seconds
     )
 
@@ -280,7 +299,7 @@ def gemini_image_to_video(
     # Build API URL
     url = f"{GEMINI_API_BASE}/models/{VEO_MODEL}:predictLongRunning"
 
-    # Build payload with image
+    # Build payload with image - durationSeconds MUST be an integer
     payload = {
         "instances": [{
             "prompt": motion_prompt or "Animate this image with natural, smooth motion",
@@ -292,7 +311,7 @@ def gemini_image_to_video(
         "parameters": {
             "aspectRatio": aspect_ratio,
             "resolution": resolution,
-            "durationSeconds": duration_seconds,
+            "durationSeconds": duration_int,  # integer, not string!
         }
     }
 
@@ -302,7 +321,10 @@ def gemini_image_to_video(
     if seed is not None:
         payload["parameters"]["seed"] = int(seed)
 
-    print(f"[Gemini Veo] Starting image-to-video: aspectRatio={aspect_ratio}, resolution={resolution}, duration={duration_seconds}s")
+    # Debug log: show payload types to verify durationSeconds is int
+    print(f"[Gemini Veo] image-to-video payload types: "
+          f"durationSeconds={duration_int} (type={type(duration_int).__name__}), "
+          f"aspectRatio={aspect_ratio}, resolution={resolution}")
 
     return _execute_video_start_request(url, payload, "image-to-video")
 
