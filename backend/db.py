@@ -414,9 +414,11 @@ class Tables:
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
     IMAGES = f"{_APP_SCHEMA}.images"
+    VIDEOS = f"{_APP_SCHEMA}.videos"
     HISTORY_ITEMS = f"{_APP_SCHEMA}.history_items"
     ACTIVE_JOBS = f"{_APP_SCHEMA}.active_jobs"
     ACTIVITY_LOGS = f"{_APP_SCHEMA}.activity_logs"
+    PROVIDER_OPERATIONS = f"{_APP_SCHEMA}.provider_operations"
 
 
 # ─────────────────────────────────────────────────────────────
