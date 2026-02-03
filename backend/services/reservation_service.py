@@ -189,8 +189,10 @@ class ReservationService:
         # Get the cost for this action
         if amount_override is not None:
             cost_credits = amount_override
+            print(f"[RESERVATION] Using override cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
         else:
             cost_credits = PricingService.get_action_cost(action_key)
+            print(f"[RESERVATION] Looked up cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
             if cost_credits == 0:
                 raise ValueError(f"Unknown action: {action_key}")
 
@@ -249,7 +251,9 @@ class ReservationService:
 
             # 3. Check available balance
             available = balance - current_reserved
+            print(f"[RESERVATION] Credit check: action={action_key}, required={cost_credits}, balance={balance}, reserved={current_reserved}, available={available}")
             if available < cost_credits:
+                print(f"[RESERVATION] REJECTED: insufficient credits for {action_key} (need {cost_credits}, have {available})")
                 raise ValueError(
                     f"INSUFFICIENT_CREDITS:required={cost_credits}:balance={balance}:reserved={current_reserved}:available={available}"
                 )
