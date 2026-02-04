@@ -30,6 +30,40 @@ if not EMAIL_SERVICE_AVAILABLE:
 
 
 # ─────────────────────────────────────────────────────────────
+# Logo loader (self-contained — no external dependency)
+# ─────────────────────────────────────────────────────────────
+_logo_bytes: Optional[bytes] = None
+_logo_loaded = False
+
+
+def _load_logo() -> Optional[bytes]:
+    """Load TimrX logo PNG from local paths. Cached after first call."""
+    global _logo_bytes, _logo_loaded
+    if _logo_loaded:
+        return _logo_bytes
+    _logo_loaded = True
+
+    candidates = [
+        config.APP_DIR / "backend" / "assets" / "logo.png",
+        config.APP_DIR / "assets" / "logo.png",
+        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo (1).png",
+        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo.png",
+    ]
+    for p in candidates:
+        try:
+            resolved = p.resolve()
+            if resolved.is_file():
+                _logo_bytes = resolved.read_bytes()
+                print(f"[EMAIL] Logo loaded from {resolved} ({len(_logo_bytes)} bytes)")
+                return _logo_bytes
+        except Exception:
+            continue
+
+    print("[EMAIL] Logo not found at any candidate path")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
 # Core Email Function
 # ─────────────────────────────────────────────────────────────
 def send_email(
@@ -68,17 +102,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
     subject = "Your TimrX Access Code"
 
     # Load logo for inline CID embedding
-    try:
-        from backend.services.invoicing_service import _load_logo
-        logo_bytes = _load_logo()
-    except Exception as e:
-        print(f"[EMAIL] send_magic_code: failed to load logo: {e}")
-        logo_bytes = None
-
-    if logo_bytes:
-        print(f"[EMAIL] send_magic_code: logo loaded ({len(logo_bytes)} bytes)")
-    else:
-        print("[EMAIL] send_magic_code: no logo available, sending without logo")
+    logo_bytes = _load_logo()
 
     # Logo tag: CID if logo available, hidden otherwise
     logo_img_tag = ""
@@ -199,11 +223,7 @@ def send_purchase_receipt(
     paid_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
     # Load logo for inline CID embedding
-    try:
-        from backend.services.invoicing_service import _load_logo
-        logo_bytes = _load_logo()
-    except Exception:
-        logo_bytes = None
+    logo_bytes = _load_logo()
 
     logo_img_tag = ""
     if logo_bytes:
@@ -347,13 +367,9 @@ def send_invoice_email(
     subject = f"TimrX Receipt — {plan_name}"
     paid_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
-    # If no logo_bytes passed in, try loading it
+    # If no logo_bytes passed in, load it locally
     if not logo_bytes:
-        try:
-            from backend.services.invoicing_service import _load_logo
-            logo_bytes = _load_logo()
-        except Exception:
-            pass
+        logo_bytes = _load_logo()
 
     logo_img_tag = ""
     if logo_bytes:
@@ -532,11 +548,7 @@ def send_blog_update(
     subject = f"TimrX Update — {title}"
 
     # Load logo + blog icon for inline CID embedding
-    try:
-        from backend.services.invoicing_service import _load_logo
-        logo_bytes = _load_logo()
-    except Exception:
-        logo_bytes = None
+    logo_bytes = _load_logo()
 
     blog_icon_bytes = None
     try:
