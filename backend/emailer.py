@@ -229,7 +229,7 @@ def send_purchase_receipt(
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 3px; width: auto;" />'
+            'style="height: 8px; width: auto;" />'
         )
 
     # Build header: logo + TimrX text, or just text
