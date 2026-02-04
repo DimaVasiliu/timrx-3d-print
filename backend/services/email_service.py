@@ -31,7 +31,10 @@ import smtplib
 import socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import Optional, Dict, Any, Tuple
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email import encoders
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 
 from backend.config import config
@@ -249,6 +252,122 @@ class EmailService:
         except Exception as e:
             print(f"[EMAIL] SES ERROR: Unexpected - {e}")
             return EmailResult(success=False, message="Unexpected SES error", error=str(e))
+
+    @classmethod
+    def send_raw(
+        cls,
+        to: str,
+        subject: str,
+        html: str,
+        text: Optional[str] = None,
+        from_email: Optional[str] = None,
+        from_name: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        inline_images: Optional[List[Dict[str, Any]]] = None,
+    ) -> EmailResult:
+        """
+        Send an email with attachments and/or inline images via SES send_raw_email.
+
+        attachments: [{"filename": "invoice.pdf", "data": bytes, "content_type": "application/pdf"}]
+        inline_images: [{"cid": "logo", "data": bytes, "content_type": "image/png"}]
+
+        Falls back to simple send() if no attachments/inline_images provided.
+        Never throws - returns EmailResult.
+        """
+        cls._log_config()
+
+        # If no attachments, use the simpler send() path
+        if not attachments and not inline_images:
+            return cls.send(to=to, subject=subject, html=html, text=text,
+                            from_email=from_email, from_name=from_name)
+
+        if not config.EMAIL_ENABLED:
+            print(f"[EMAIL] DISABLED - Would send raw to {to}: {subject}")
+            return EmailResult(success=True, message="Email disabled - logged only")
+
+        if not config.EMAIL_CONFIGURED:
+            print(f"[EMAIL] NOT CONFIGURED - Would send raw to {to}: {subject}")
+            return EmailResult(success=True, message="Email not configured - logged only")
+
+        if not BOTO3_AVAILABLE:
+            print(f"[EMAIL] send_raw ERROR: boto3 not available")
+            return EmailResult(success=False, message="boto3 not available", error="ImportError")
+
+        sender_addr = from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
+        sender_name = from_name or config.EMAIL_FROM_NAME
+        sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
+
+        try:
+            # Build MIME structure:
+            # mixed
+            #   related
+            #     alternative
+            #       text/plain
+            #       text/html
+            #     inline images (cid)
+            #   attachments (pdf, etc.)
+
+            msg_mixed = MIMEMultipart("mixed")
+            msg_mixed["Subject"] = subject
+            msg_mixed["From"] = sender
+            msg_mixed["To"] = to
+
+            msg_related = MIMEMultipart("related")
+
+            msg_alt = MIMEMultipart("alternative")
+            if text:
+                msg_alt.attach(MIMEText(text, "plain", "utf-8"))
+            msg_alt.attach(MIMEText(html, "html", "utf-8"))
+
+            msg_related.attach(msg_alt)
+
+            # Inline images (CID)
+            for img in (inline_images or []):
+                mime_img = MIMEImage(img["data"], _subtype=img.get("content_type", "image/png").split("/")[-1])
+                mime_img.add_header("Content-ID", f"<{img['cid']}>")
+                mime_img.add_header("Content-Disposition", "inline", filename=f"{img['cid']}.png")
+                msg_related.attach(mime_img)
+
+            msg_mixed.attach(msg_related)
+
+            # File attachments
+            for att in (attachments or []):
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(att["data"])
+                encoders.encode_base64(part)
+                ct = att.get("content_type", "application/octet-stream")
+                maintype, subtype = ct.split("/", 1) if "/" in ct else ("application", "octet-stream")
+                part.replace_header("Content-Type", ct)
+                part.add_header("Content-Disposition", "attachment", filename=att["filename"])
+                msg_mixed.attach(part)
+
+            # Send via SES raw
+            ses_client = boto3.client(
+                "ses",
+                region_name=config.AWS_REGION,
+                aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            )
+
+            response = ses_client.send_raw_email(
+                Source=sender,
+                Destinations=[to],
+                RawMessage={"Data": msg_mixed.as_string()},
+            )
+
+            message_id = response.get("MessageId", "unknown")
+            att_count = len(attachments or [])
+            img_count = len(inline_images or [])
+            print(
+                f"[EMAIL] SES RAW SENT to {to}: {subject} "
+                f"({att_count} attachment(s), {img_count} inline image(s), "
+                f"MessageId: {message_id})"
+            )
+            return EmailResult(success=True, message=f"Email sent via SES raw (MessageId: {message_id})")
+
+        except Exception as e:
+            print(f"[EMAIL] SES RAW ERROR: {e}")
+            return EmailResult(success=False, message="SES raw send error", error=str(e))
 
     @classmethod
     def _send_via_smtp(
