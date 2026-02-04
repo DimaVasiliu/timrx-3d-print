@@ -410,6 +410,8 @@ class Tables:
     PLANS = f"{_BILLING_SCHEMA}.plans"
     JOBS = f"{_BILLING_SCHEMA}.jobs"
     DAILY_LIMITS = f"{_BILLING_SCHEMA}.daily_limits"
+    SUBSCRIPTIONS = f"{_BILLING_SCHEMA}.subscriptions"
+    SUBSCRIPTION_CYCLES = f"{_BILLING_SCHEMA}.subscription_cycles"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
