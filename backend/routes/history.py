@@ -745,7 +745,7 @@ def history_item_add_mod():
     return _inner()
 
 
-@bp.route("/history/item/<item_id>", methods=["PATCH", "DELETE", "OPTIONS"])
+@bp.route("/history/item/<item_id>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
 def history_item_update_mod(item_id: str):
     @with_session
     def _inner(item_id: str):
@@ -765,6 +765,78 @@ def history_item_update_mod(item_id: str):
             uuid.UUID(str(item_id))
         except (ValueError, TypeError):
             pass
+
+        # ── GET: Return single history item ──────────────────
+        if request.method == "GET":
+            if not USE_DB:
+                return jsonify({"ok": False, "error": "not_available"}), 503
+            try:
+                with get_conn() as conn:
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(
+                            f"""
+                            SELECT
+                                h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
+                                h.thumbnail_url, h.glb_url, h.image_url, h.video_url,
+                                h.payload, h.created_at,
+                                h.model_id, h.image_id, h.video_id,
+                                v.video_url  AS v_video_url,
+                                v.thumbnail_url AS v_thumbnail_url,
+                                v.duration_seconds AS v_duration_seconds,
+                                v.resolution AS v_resolution,
+                                v.aspect_ratio AS v_aspect_ratio
+                            FROM {Tables.HISTORY_ITEMS} h
+                            LEFT JOIN {Tables.VIDEOS} v ON h.video_id = v.id
+                            WHERE h.id::text = %s AND h.identity_id = %s
+                            LIMIT 1
+                            """,
+                            (str(item_id), identity_id),
+                        )
+                        row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "not_found"}), 404
+
+                item = {
+                    "id": str(row["id"]),
+                    "type": row["item_type"],
+                    "status": row["status"],
+                    "stage": row.get("stage"),
+                    "title": row.get("title"),
+                    "prompt": row.get("prompt"),
+                    "thumbnail_url": row.get("thumbnail_url"),
+                    "glb_url": row.get("glb_url"),
+                    "image_url": row.get("image_url"),
+                    "video_url": row.get("video_url") or row.get("v_video_url"),
+                    "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                    "model_id": str(row["model_id"]) if row.get("model_id") else None,
+                    "image_id": str(row["image_id"]) if row.get("image_id") else None,
+                    "video_id": str(row["video_id"]) if row.get("video_id") else None,
+                }
+                # Enrich video data
+                if row.get("v_video_url"):
+                    item["video_url"] = row["v_video_url"]
+                if row.get("v_thumbnail_url"):
+                    item["thumbnail_url"] = row["v_thumbnail_url"]
+                if row.get("v_duration_seconds"):
+                    item["duration_seconds"] = row["v_duration_seconds"]
+                if row.get("v_resolution"):
+                    item["resolution"] = row["v_resolution"]
+                if row.get("v_aspect_ratio"):
+                    item["aspect_ratio"] = row["v_aspect_ratio"]
+                # Include payload fields
+                payload = row.get("payload") or {}
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except Exception:
+                        payload = {}
+                if isinstance(payload, dict):
+                    item["payload"] = payload
+
+                return jsonify({"ok": True, "item": item})
+            except Exception as e:
+                log_db_continue("history_item_get", e)
+                return jsonify({"ok": False, "error": str(e)}), 500
 
         if request.method == "DELETE":
             db_ok = False
