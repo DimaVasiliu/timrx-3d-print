@@ -68,23 +68,69 @@ def send_magic_code(to_email: str, code: str) -> bool:
     subject = "Your TimrX Access Code"
 
     html_body = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2 style="color: #333;">Your Access Code</h2>
-        <p>Use this code to restore access to your TimrX account:</p>
-        <div style="background: #f5f5f5; padding: 20px; text-align: center; margin: 20px 0;">
-            <span style="font-size: 32px; font-weight: bold; letter-spacing: 4px; color: #333;">{code}</span>
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
+                background: #ffffff; border-radius: 12px; overflow: hidden;
+                border: 1px solid #e8e8e8;">
+
+        <!-- Header with logo -->
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 28px 32px; text-align: center;">
+            <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
+                <tr>
+                    <td style="vertical-align: middle; padding-right: 12px;">
+                        <img src="https://timrx.live/logo.png" alt="TimrX"
+                             style="height: 36px; width: auto; display: block;" />
+                    </td>
+                    <td style="vertical-align: middle;">
+                        <span style="font-size: 24px; font-weight: 700; color: #ffffff;
+                                     letter-spacing: 1px;">TimrX</span>
+                    </td>
+                </tr>
+            </table>
         </div>
-        <p style="color: #666; font-size: 14px;">This code expires in 15 minutes.</p>
-        <p style="color: #666; font-size: 14px;">If you didn't request this code, you can safely ignore this email.</p>
-        <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
-        <p style="color: #999; font-size: 12px;">TimrX - 3D Print Hub</p>
+
+        <!-- Body -->
+        <div style="padding: 36px 32px 28px;">
+            <h2 style="color: #1a1a2e; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
+                Your Access Code
+            </h2>
+            <p style="color: #555; font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
+                Use the code below to access your TimrX account:
+            </p>
+
+            <!-- Code box -->
+            <div style="background: #f0f4ff; border: 2px dashed #c0cfff; border-radius: 10px;
+                        padding: 24px; text-align: center; margin: 0 0 24px;">
+                <span style="font-size: 36px; font-weight: 700; letter-spacing: 8px;
+                             color: #1a1a2e; font-family: 'Courier New', monospace;">{code}</span>
+            </div>
+
+            <p style="color: #777; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
+                This code expires in <strong style="color: #555;">15 minutes</strong>.
+            </p>
+            <p style="color: #999; font-size: 13px; line-height: 1.5; margin: 0;">
+                If you didn't request this code, you can safely ignore this email.
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <div style="background: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+                    text-align: center;">
+            <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
+                TimrX &mdash; 3D Print Hub
+            </p>
+            <p style="color: #aaa; font-size: 11px; margin: 0;">
+                Need help? Contact us at
+                <a href="mailto:support@timrx.live"
+                   style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
+            </p>
+        </div>
     </div>
     """
 
-    text_body = f"""
-Your TimrX Access Code
+    text_body = f"""Your TimrX Access Code
 
-Use this code to restore access to your account:
+Use the code below to access your TimrX account:
 
 {code}
 
@@ -92,8 +138,10 @@ This code expires in 15 minutes.
 
 If you didn't request this code, you can safely ignore this email.
 
-- TimrX
-    """
+---
+TimrX - 3D Print Hub
+Need help? Contact us at support@timrx.live
+"""
 
     return send_email(to_email, subject, html_body, text_body)
 
