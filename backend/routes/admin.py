@@ -387,3 +387,19 @@ def email_test():
     except Exception as e:
         print(f"[ADMIN] Email test error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/run_grants", methods=["POST"])
+@require_admin
+def run_subscription_grants():
+    """
+    Admin endpoint: run pending subscription credit grants.
+
+    Finds active subscriptions that haven't had credits granted for the
+    current period and grants them.  Safe to call repeatedly (idempotent).
+
+    Response: { ok: true, granted: 3 }
+    """
+    from backend.services.subscription_service import SubscriptionService
+    granted = SubscriptionService.run_pending_grants()
+    return jsonify({"ok": True, "granted": granted})
