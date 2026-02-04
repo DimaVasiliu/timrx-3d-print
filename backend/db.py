@@ -412,6 +412,9 @@ class Tables:
     DAILY_LIMITS = f"{_BILLING_SCHEMA}.daily_limits"
     SUBSCRIPTIONS = f"{_BILLING_SCHEMA}.subscriptions"
     SUBSCRIPTION_CYCLES = f"{_BILLING_SCHEMA}.subscription_cycles"
+    INVOICES = f"{_BILLING_SCHEMA}.invoices"
+    INVOICE_ITEMS = f"{_BILLING_SCHEMA}.invoice_items"
+    RECEIPTS = f"{_BILLING_SCHEMA}.receipts"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
