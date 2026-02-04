@@ -560,12 +560,38 @@ class EmailService:
             to=to,
             subject="TimrX Email Test",
             html="""
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                <h2 style="color: #333;">Email Test Successful!</h2>
-                <p>This is a test email from TimrX to verify your email configuration is working.</p>
-                <p style="color: #666; font-size: 14px;">If you received this email, your SMTP settings are correct.</p>
-                <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
-                <p style="color: #999; font-size: 12px;">TimrX - 3D Print Hub</p>
+            <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                        max-width: 600px; margin: 0 auto; background-color: #000000; border-radius: 12px; overflow: hidden;">
+                <div style="padding: 20px 24px 16px;">
+                    <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                        <tr>
+                            <td>
+                                <table cellpadding="0" cellspacing="0" border="0">
+                                    <tr>
+                                        <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
+                                            <img src="https://timrx.live/img/logo.png" alt="TimrX" height="32"
+                                                 style="height:32px; width:auto; display:block;" />
+                                        </td>
+                                        <td style="vertical-align: middle;">
+                                            <span style="font-size: 18px; font-weight: 800; color: #ffffff;
+                                                         letter-spacing: 0.5px;">TimrX</span>
+                                        </td>
+                                    </tr>
+                                </table>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+                <div style="padding: 24px 24px 28px;">
+                    <h2 style="color: #ffffff; margin: 0 0 12px; font-size: 20px; font-weight: 600;">Email Test Successful!</h2>
+                    <p style="color: #aaa; font-size: 14px; line-height: 1.5; margin: 0 0 8px;">This is a test email from TimrX to verify your email configuration is working.</p>
+                    <p style="color: #888; font-size: 13px; line-height: 1.5; margin: 0;">If you received this email, your settings are correct.</p>
+                </div>
+                <div style="border-top: 1px solid #222; padding: 16px 24px; text-align: center;">
+                    <p style="color: #555; font-size: 11px; margin: 0;">TimrX &mdash; 3D Print Hub</p>
+                </div>
+            </div>
             </div>
             """,
             text="Email Test Successful!\n\nThis is a test email from TimrX to verify your email configuration is working.\n\nIf you received this email, your SMTP settings are correct.\n\n- TimrX",
