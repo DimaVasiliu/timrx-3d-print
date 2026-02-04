@@ -528,6 +528,21 @@ def gemini_video_status(operation_name: str) -> Dict[str, Any]:
                     "video_url": video_url,
                 }
             else:
+                # Check for RAI content filtering (provider safety rejection)
+                response = result.get("response", {})
+                video_response = response.get("generateVideoResponse", {})
+                filtered_reasons = video_response.get("raiMediaFilteredReasons", [])
+
+                if filtered_reasons:
+                    reasons_str = ", ".join(str(r) for r in filtered_reasons)
+                    print(f"[Gemini Veo] Content filtered by RAI policy: {reasons_str}")
+                    return {
+                        "status": "failed",
+                        "error": "provider_filtered_third_party",
+                        "message": "Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
+                        "filtered_reasons": filtered_reasons,
+                    }
+
                 print(f"[Gemini Veo] No video URL found in response: {result}")
                 return {
                     "status": "failed",
