@@ -458,6 +458,10 @@ class MollieService:
         payment_id = payment.get("id")
         metadata = payment.get("metadata", {})
 
+        # Subscription payments are handled separately
+        if metadata.get("type") == "subscription":
+            return MollieService._handle_subscription_paid(payment)
+
         # Extract metadata
         identity_id = metadata.get("identity_id")
         plan_code = metadata.get("plan_code")
@@ -872,3 +876,183 @@ class MollieService:
 
         except requests.RequestException:
             return None
+
+    # ─────────────────────────────────────────────────────────────
+    # Subscription Payment Handling
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _handle_subscription_paid(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle a paid subscription payment — create subscription row,
+        grant first period credits.
+
+        Idempotent via the unique index on (provider, provider_subscription_id).
+        """
+        from backend.services.subscription_service import SubscriptionService
+        from backend.services.purchase_service import PurchaseService
+        from datetime import datetime, timezone, timedelta
+
+        payment_id = payment.get("id")
+        metadata = payment.get("metadata", {})
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        cadence = metadata.get("cadence", "monthly")
+        customer_email = metadata.get("email")
+
+        if not identity_id or not plan_code:
+            print(f"[MOLLIE] Subscription payment {payment_id}: missing identity_id or plan_code in metadata")
+            return None
+
+        # Idempotency: check if subscription already created for this payment
+        existing_sub = SubscriptionService.get_subscription_by_provider_id("mollie", payment_id)
+        if existing_sub:
+            print(f"[MOLLIE] Subscription already exists for payment {payment_id}")
+            return {"purchase_id": str(existing_sub["id"]), "was_existing": True}
+
+        # Also check for existing purchase (credit bundle idempotency)
+        existing_purchase = PurchaseService.get_purchase_by_provider_id(payment_id)
+        if existing_purchase:
+            print(f"[MOLLIE] Purchase already exists for payment {payment_id}")
+            return {"purchase_id": existing_purchase["id"], "was_existing": True}
+
+        now = datetime.now(timezone.utc)
+        if cadence == "yearly":
+            period_end = now + timedelta(days=365)
+        else:
+            period_end = now + timedelta(days=30)
+
+        # Create subscription
+        sub = SubscriptionService.create_subscription(
+            identity_id=identity_id,
+            plan_code=plan_code,
+            provider="mollie",
+            provider_subscription_id=payment_id,
+            period_start=now,
+            period_end=period_end,
+        )
+
+        if not sub:
+            print(f"[MOLLIE] Failed to create subscription for payment {payment_id}")
+            return None
+
+        sub_id = str(sub["id"])
+
+        # Grant first period credits immediately
+        cycle_id = SubscriptionService.grant_subscription_credits(
+            sub_id, now, period_end if cadence == "monthly" else now + timedelta(days=30),
+        )
+
+        if cycle_id:
+            print(f"[MOLLIE] Subscription {sub_id} activated + credits granted for payment {payment_id}")
+        else:
+            print(f"[MOLLIE] Subscription {sub_id} activated but credit grant skipped (already granted or error)")
+
+        # Attach email to identity if not already set
+        if customer_email:
+            try:
+                from backend.services.identity_service import IdentityService
+                IdentityService.attach_email_if_missing(identity_id, customer_email)
+            except Exception as e:
+                print(f"[MOLLIE] Warning: could not attach email: {e}")
+
+        return {"purchase_id": sub_id, "was_existing": False}
+
+    # ─────────────────────────────────────────────────────────────
+    # Subscription Checkout
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def create_subscription_checkout(
+        identity_id: str,
+        plan_code: str,
+        email: str,
+        success_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a Mollie one-off payment for a subscription plan.
+
+        We use a single payment (not Mollie Subscriptions API) so the
+        webhook can activate + grant credits.  Recurring billing can be
+        added later by converting to Mollie mandates/subscriptions.
+
+        Returns: { checkout_url, payment_id }
+        """
+        if not MOLLIE_AVAILABLE:
+            raise ValueError("Mollie is not configured")
+
+        from backend.services.subscription_service import SubscriptionService, SUBSCRIPTION_PLANS
+
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if not plan:
+            raise ValueError(f"Unknown subscription plan: {plan_code}")
+
+        price_gbp = plan["price_gbp"]
+        plan_name = plan["name"]
+        cadence = plan["cadence"]
+        credits = plan["credits_per_month"]
+
+        description = f"{plan_name} Subscription ({cadence.title()}) - {credits} credits/mo"
+
+        frontend_url = config.FRONTEND_BASE_URL.rstrip("/") if config.FRONTEND_BASE_URL else ""
+        if not frontend_url:
+            frontend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+
+        if not success_url:
+            success_url = f"{frontend_url}/hub.html?checkout=success&type=subscription&plan={plan_code}"
+
+        backend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        webhook_url = f"{backend_url}/api/billing/webhook/mollie"
+
+        metadata = {
+            "identity_id": identity_id,
+            "type": "subscription",
+            "plan_code": plan_code,
+            "cadence": cadence,
+            "credits_per_month": str(credits),
+            "email": email,
+        }
+
+        payment_data = {
+            "amount": {
+                "currency": "GBP",
+                "value": f"{price_gbp:.2f}",
+            },
+            "description": description,
+            "redirectUrl": success_url,
+            "webhookUrl": webhook_url,
+            "metadata": metadata,
+            "locale": "en_GB",
+        }
+
+        try:
+            response = requests.post(
+                f"{MollieService.MOLLIE_API_BASE}/payments",
+                headers=MollieService._get_headers(),
+                json=payment_data,
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 201):
+                error_data = response.json() if response.content else {}
+                error_detail = error_data.get("detail", response.text)
+                print(f"[MOLLIE] API error creating subscription payment: {response.status_code} - {error_detail}")
+                raise MollieCreateError(error_detail)
+
+            payment = response.json()
+            payment_id = payment["id"]
+            checkout_url = payment["_links"]["checkout"]["href"]
+
+            print(
+                f"[MOLLIE] Subscription payment created: payment_id={payment_id}, "
+                f"identity={identity_id}, plan={plan_code}"
+            )
+
+            return {
+                "checkout_url": checkout_url,
+                "payment_id": payment_id,
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Request error creating subscription payment: {e}")
+            raise ValueError(f"Payment service error: {str(e)}")
