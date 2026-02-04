@@ -188,45 +188,124 @@ def send_purchase_receipt(
     """Send a purchase confirmation receipt."""
     subject = f"TimrX Purchase Receipt - {plan_name}"
 
+    # Load logo for inline CID embedding
+    try:
+        from backend.services.invoicing_service import _load_logo
+        logo_bytes = _load_logo()
+    except Exception:
+        logo_bytes = None
+
+    logo_img_tag = ""
+    if logo_bytes:
+        logo_img_tag = (
+            '<img src="cid:timrx_logo" alt="TimrX" '
+            'style="height: 36px; width: auto; display: block;" />'
+        )
+
     html_body = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <h2 style="color: #333;">Purchase Confirmed!</h2>
-        <p>Thank you for your purchase. Here are your details:</p>
-        <div style="background: #f5f5f5; padding: 20px; margin: 20px 0;">
-            <table style="width: 100%;">
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
+                background: #ffffff; border-radius: 12px; overflow: hidden;
+                border: 1px solid #e8e8e8;">
+
+        <!-- Header with logo -->
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 28px 32px; text-align: center;">
+            <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
                 <tr>
-                    <td style="padding: 8px 0; color: #666;">Plan:</td>
-                    <td style="padding: 8px 0; font-weight: bold;">{plan_name}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; color: #666;">Credits Added:</td>
-                    <td style="padding: 8px 0; font-weight: bold;">{credits:,}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; color: #666;">Amount Paid:</td>
-                    <td style="padding: 8px 0; font-weight: bold;">&pound;{amount_gbp:.2f}</td>
+                    <td style="vertical-align: middle; padding-right: 12px;">
+                        {logo_img_tag}
+                    </td>
+                    <td style="vertical-align: middle;">
+                        <span style="font-size: 24px; font-weight: 700; color: #ffffff;
+                                     letter-spacing: 1px;">TimrX</span>
+                    </td>
                 </tr>
             </table>
         </div>
-        <p style="color: #666;">Your credits are now available in your account.</p>
-        <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
-        <p style="color: #999; font-size: 12px;">TimrX - 3D Print Hub</p>
+
+        <!-- Body -->
+        <div style="padding: 36px 32px 28px;">
+            <h2 style="color: #1a1a2e; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
+                Purchase Confirmed
+            </h2>
+            <p style="color: #555; font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
+                Thank you for your purchase. Here are your details:
+            </p>
+
+            <!-- Details box -->
+            <div style="background: #f0f4ff; border: 1px solid #e0e8ff; border-radius: 10px;
+                        padding: 20px 24px; margin: 0 0 24px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr>
+                        <td style="padding: 10px 0; color: #777; font-size: 14px;">Plan</td>
+                        <td style="padding: 10px 0; font-weight: 700; text-align: right; color: #1a1a2e;">{plan_name}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #dde4f7;">
+                        <td style="padding: 10px 0; color: #777; font-size: 14px;">Credits Added</td>
+                        <td style="padding: 10px 0; font-weight: 700; text-align: right; color: #1a1a2e;">{credits:,}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #dde4f7;">
+                        <td style="padding: 10px 0; color: #777; font-size: 14px;">Amount Paid</td>
+                        <td style="padding: 10px 0; font-weight: 700; font-size: 18px; text-align: right; color: #1a1a2e;">
+                            &pound;{amount_gbp:.2f}
+                        </td>
+                    </tr>
+                </table>
+            </div>
+
+            <p style="color: #777; font-size: 14px; line-height: 1.5; margin: 0;">
+                Your credits are now available in your account.
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <div style="background: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+                    text-align: center;">
+            <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
+                TimrX &mdash; 3D Print Hub
+            </p>
+            <p style="color: #aaa; font-size: 11px; margin: 0;">
+                Need help? Contact us at
+                <a href="mailto:support@timrx.live"
+                   style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
+            </p>
+        </div>
     </div>
     """
 
-    text_body = f"""
-Purchase Confirmed!
+    text_body = f"""Purchase Confirmed - {plan_name}
 
 Thank you for your purchase. Here are your details:
 
 Plan: {plan_name}
 Credits Added: {credits:,}
-Amount Paid: {amount_gbp:.2f} GBP
+Amount Paid: £{amount_gbp:.2f}
 
 Your credits are now available in your account.
 
-- TimrX
-    """
+---
+TimrX - 3D Print Hub
+Need help? Contact us at support@timrx.live
+"""
+
+    # Use send_raw with inline logo if logo available, otherwise simple send
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            return result.success
+        except Exception as e:
+            print(f"[EMAIL] send_purchase_receipt send_raw error: {e}, falling back to simple send")
 
     return send_email(to_email, subject, html_body, text_body)
 
@@ -253,58 +332,101 @@ def send_invoice_email(
     """
     subject = f"TimrX Purchase Receipt — {plan_name}"
 
+    # If no logo_bytes passed in, try loading it
+    if not logo_bytes:
+        try:
+            from backend.services.invoicing_service import _load_logo
+            logo_bytes = _load_logo()
+        except Exception:
+            pass
+
     # Logo CID reference (only if logo bytes available)
     logo_img_tag = ""
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height:32px; width:auto; margin-bottom:16px;" /><br>'
+            'style="height: 36px; width: auto; display: block;" />'
         )
 
     html_body = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background: #fafafa; padding: 32px; border-radius: 8px;">
-        {logo_img_tag}
-        <h2 style="color: #222; margin-top: 0;">Payment Confirmed</h2>
-        <p style="color: #555;">Thank you for your purchase. Your invoice and receipt are attached to this email.</p>
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
+                background: #ffffff; border-radius: 12px; overflow: hidden;
+                border: 1px solid #e8e8e8;">
 
-        <div style="background: #fff; border: 1px solid #e5e5e5; border-radius: 6px;
-                    padding: 20px; margin: 20px 0;">
-            <table style="width: 100%; border-collapse: collapse;">
+        <!-- Header with logo -->
+        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    padding: 28px 32px; text-align: center;">
+            <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
                 <tr>
-                    <td style="padding: 8px 0; color: #888; font-size: 14px;">Plan</td>
-                    <td style="padding: 8px 0; font-weight: bold; text-align: right;">{plan_name}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 8px 0; color: #888; font-size: 14px;">Credits</td>
-                    <td style="padding: 8px 0; font-weight: bold; text-align: right;">{credits:,}</td>
-                </tr>
-                <tr style="border-top: 1px solid #eee;">
-                    <td style="padding: 10px 0 4px; color: #888; font-size: 14px;">Amount Paid</td>
-                    <td style="padding: 10px 0 4px; font-weight: bold; font-size: 18px; text-align: right;">
-                        &pound;{amount_gbp:.2f}
+                    <td style="vertical-align: middle; padding-right: 12px;">
+                        {logo_img_tag}
+                    </td>
+                    <td style="vertical-align: middle;">
+                        <span style="font-size: 24px; font-weight: 700; color: #ffffff;
+                                     letter-spacing: 1px;">TimrX</span>
                     </td>
                 </tr>
             </table>
         </div>
 
-        <p style="color: #555; font-size: 13px;">
-            <strong>Invoice:</strong> {invoice_number}<br>
-            <strong>Receipt:</strong> {receipt_number}
-        </p>
+        <!-- Body -->
+        <div style="padding: 36px 32px 28px;">
+            <h2 style="color: #1a1a2e; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
+                Payment Confirmed
+            </h2>
+            <p style="color: #555; font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
+                Thank you for your purchase. Your invoice and receipt are attached to this email.
+            </p>
 
-        <p style="color: #999; font-size: 12px; margin-top: 24px;">
-            Your credits are now available in your account.
-        </p>
+            <!-- Details box -->
+            <div style="background: #f0f4ff; border: 1px solid #e0e8ff; border-radius: 10px;
+                        padding: 20px 24px; margin: 0 0 20px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <tr>
+                        <td style="padding: 10px 0; color: #777; font-size: 14px;">Plan</td>
+                        <td style="padding: 10px 0; font-weight: 700; text-align: right; color: #1a1a2e;">{plan_name}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #dde4f7;">
+                        <td style="padding: 10px 0; color: #777; font-size: 14px;">Credits</td>
+                        <td style="padding: 10px 0; font-weight: 700; text-align: right; color: #1a1a2e;">{credits:,}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid #dde4f7;">
+                        <td style="padding: 10px 0; color: #777; font-size: 14px;">Amount Paid</td>
+                        <td style="padding: 10px 0; font-weight: 700; font-size: 18px; text-align: right; color: #1a1a2e;">
+                            &pound;{amount_gbp:.2f}
+                        </td>
+                    </tr>
+                </table>
+            </div>
 
-        <hr style="border: none; border-top: 1px solid #e5e5e5; margin: 24px 0 16px;">
-        <p style="color: #aaa; font-size: 11px; text-align: center;">
-            TimrX &mdash; 3D Print Hub &nbsp;|&nbsp; timrx.live &nbsp;|&nbsp; support@timrx.live
-        </p>
+            <p style="color: #777; font-size: 13px; line-height: 1.5; margin: 0 0 4px;">
+                <strong style="color: #555;">Invoice:</strong> {invoice_number}
+            </p>
+            <p style="color: #777; font-size: 13px; line-height: 1.5; margin: 0 0 16px;">
+                <strong style="color: #555;">Receipt:</strong> {receipt_number}
+            </p>
+
+            <p style="color: #777; font-size: 14px; line-height: 1.5; margin: 0;">
+                Your credits are now available in your account.
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <div style="background: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+                    text-align: center;">
+            <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
+                TimrX &mdash; 3D Print Hub
+            </p>
+            <p style="color: #aaa; font-size: 11px; margin: 0;">
+                Need help? Contact us at
+                <a href="mailto:support@timrx.live"
+                   style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
+            </p>
+        </div>
     </div>
     """
 
-    text_body = f"""Payment Confirmed — {plan_name}
+    text_body = f"""Payment Confirmed - {plan_name}
 
 Thank you for your purchase.
 
@@ -318,7 +440,9 @@ Receipt: {receipt_number}
 Your credits are now available in your account.
 Your invoice and receipt PDFs are attached.
 
-— TimrX · 3D Print Hub · support@timrx.live
+---
+TimrX - 3D Print Hub
+Need help? Contact us at support@timrx.live
 """
 
     # Build attachments list
