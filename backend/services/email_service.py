@@ -289,11 +289,17 @@ class EmailService:
             print(f"[EMAIL] NOT CONFIGURED - Would send raw to {to}: {subject}")
             return EmailResult(success=True, message="Email not configured - logged only")
 
-        if not BOTO3_AVAILABLE:
-            print(f"[EMAIL] send_raw ERROR: boto3 not available")
-            return EmailResult(success=False, message="boto3 not available", error="ImportError")
+        provider = config.EMAIL_PROVIDER.lower()
 
-        sender_addr = from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
+        if provider == "ses":
+            if not BOTO3_AVAILABLE:
+                print(f"[EMAIL] send_raw ERROR: boto3 not available for SES provider")
+                return EmailResult(success=False, message="boto3 not available", error="ImportError")
+            sender_addr = from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS
+        else:
+            default_name, default_addr = config.SMTP_FROM_PARSED
+            sender_addr = default_addr
+
         sender_name = from_name or config.EMAIL_FROM_NAME
         sender = f"{sender_name} <{sender_addr}>" if sender_name else sender_addr
 
@@ -341,33 +347,48 @@ class EmailService:
                 part.add_header("Content-Disposition", "attachment", filename=att["filename"])
                 msg_mixed.attach(part)
 
-            # Send via SES raw
-            ses_client = boto3.client(
-                "ses",
-                region_name=config.AWS_REGION,
-                aws_access_key_id=config.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
-            )
-
-            response = ses_client.send_raw_email(
-                Source=sender,
-                Destinations=[to],
-                RawMessage={"Data": msg_mixed.as_string()},
-            )
-
-            message_id = response.get("MessageId", "unknown")
             att_count = len(attachments or [])
             img_count = len(inline_images or [])
-            print(
-                f"[EMAIL] SES RAW SENT to {to}: {subject} "
-                f"({att_count} attachment(s), {img_count} inline image(s), "
-                f"MessageId: {message_id})"
-            )
-            return EmailResult(success=True, message=f"Email sent via SES raw (MessageId: {message_id})")
+
+            # Route to provider
+            if provider == "ses":
+                ses_client = boto3.client(
+                    "ses",
+                    region_name=config.AWS_REGION,
+                    aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+                    aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+                )
+                response = ses_client.send_raw_email(
+                    Source=sender,
+                    Destinations=[to],
+                    RawMessage={"Data": msg_mixed.as_string()},
+                )
+                message_id = response.get("MessageId", "unknown")
+                print(
+                    f"[EMAIL] SES RAW SENT to {to}: {subject} "
+                    f"({att_count} attachment(s), {img_count} inline image(s), "
+                    f"MessageId: {message_id})"
+                )
+                return EmailResult(success=True, message=f"Email sent via SES raw (MessageId: {message_id})")
+            else:
+                # Send via SMTP (neo, sendgrid, etc.)
+                smtp_host = config.SMTP_HOST
+                smtp_port = config.SMTP_PORT
+                print(f"[EMAIL] send_raw SMTP connecting: host={smtp_host!r} port={smtp_port}")
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=config.SMTP_TIMEOUT) as server:
+                    if config.SMTP_USE_TLS:
+                        server.starttls()
+                    server.login(config.SMTP_USER, config.SMTP_PASSWORD)
+                    server.sendmail(sender_addr, to, msg_mixed.as_string())
+                print(
+                    f"[EMAIL] SMTP RAW SENT to {to}: {subject} "
+                    f"({att_count} attachment(s), {img_count} inline image(s))"
+                )
+                return EmailResult(success=True, message="Email sent via SMTP raw")
 
         except Exception as e:
-            print(f"[EMAIL] SES RAW ERROR: {e}")
-            return EmailResult(success=False, message="SES raw send error", error=str(e))
+            print(f"[EMAIL] RAW SEND ERROR ({provider}): {e}")
+            return EmailResult(success=False, message=f"{provider} raw send error", error=str(e))
 
     @classmethod
     def _send_via_smtp(
