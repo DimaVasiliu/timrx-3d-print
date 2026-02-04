@@ -508,19 +508,39 @@ class MollieService:
                 purchase_id = result["purchase"]["id"]
                 was_existing = result.get("was_existing", False)
 
-                # Only send emails for NEW purchases (not duplicates)
+                # Only send emails / invoices for NEW purchases (not duplicates)
                 # Emails are non-blocking - failures are logged as warnings only
                 if not was_existing and customer_email:
+                    # Invoice pipeline: create invoice + receipt, generate PDFs,
+                    # upload to S3, send email with attachments
                     try:
-                        from backend.emailer import send_purchase_receipt, notify_purchase
-                        send_purchase_receipt(
-                            to_email=customer_email,
+                        from backend.services.invoicing_service import InvoicingService
+                        InvoicingService.process_purchase_invoice(
+                            purchase_id=purchase_id,
+                            identity_id=identity_id,
+                            plan_code=plan_code,
                             plan_name=plan_name,
                             credits=credits,
                             amount_gbp=amount_gbp,
+                            customer_email=customer_email,
                         )
+                    except Exception as inv_err:
+                        print(f"[MOLLIE] WARNING: Invoice pipeline failed for payment {payment_id}: {inv_err}")
+                        # Fallback to simple receipt email (no PDF attachments)
+                        try:
+                            from backend.emailer import send_purchase_receipt
+                            send_purchase_receipt(
+                                to_email=customer_email,
+                                plan_name=plan_name,
+                                credits=credits,
+                                amount_gbp=amount_gbp,
+                            )
+                        except Exception as email_err:
+                            print(f"[MOLLIE] WARNING: Fallback email also failed: {email_err} (credits already granted)")
 
-                        # Send admin notification
+                    # Admin notification (always, independent of invoice)
+                    try:
+                        from backend.emailer import notify_purchase
                         notify_purchase(
                             identity_id=identity_id,
                             email=customer_email,
@@ -528,9 +548,8 @@ class MollieService:
                             credits=credits,
                             amount_gbp=amount_gbp,
                         )
-                    except Exception as email_err:
-                        # Never fail payment due to email errors
-                        print(f"[MOLLIE] WARNING: Email failed for payment {payment_id}: {email_err} (credits already granted)")
+                    except Exception as admin_err:
+                        print(f"[MOLLIE] WARNING: Admin notification failed: {admin_err}")
 
                 return {
                     "purchase_id": purchase_id,
