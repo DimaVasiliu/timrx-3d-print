@@ -494,6 +494,170 @@ Need help? Contact us at support@timrx.live
 
 
 # ─────────────────────────────────────────────────────────────
+# Blog / Updates Email
+# ─────────────────────────────────────────────────────────────
+def send_blog_update(
+    to_email: str,
+    title: str,
+    summary: str,
+    blog_url: Optional[str] = None,
+) -> bool:
+    """
+    Send a blog/updates email to a user.
+
+    Args:
+        to_email: Recipient email address
+        title: Blog post or update title
+        summary: Short summary or excerpt (supports HTML)
+        blog_url: Optional link to the full post
+    """
+    subject = f"TimrX Update — {title}"
+
+    # Load logo + blog icon for inline CID embedding
+    try:
+        from backend.services.invoicing_service import _load_logo
+        logo_bytes = _load_logo()
+    except Exception:
+        logo_bytes = None
+
+    blog_icon_bytes = None
+    try:
+        from backend.config import config as _cfg
+        for _bp in [
+            _cfg.APP_DIR / "backend" / "assets" / "blogs.png",  # server
+            _cfg.APP_DIR / "assets" / "blogs.png",               # local alt
+        ]:
+            resolved = _bp.resolve()
+            if resolved.is_file():
+                blog_icon_bytes = resolved.read_bytes()
+                break
+    except Exception:
+        pass
+
+    logo_img_tag = ""
+    if logo_bytes:
+        logo_img_tag = (
+            '<img src="cid:timrx_logo" alt="TimrX" '
+            'style="height: 36px; width: auto; display: block;" />'
+        )
+
+    blog_icon_tag = ""
+    if blog_icon_bytes:
+        blog_icon_tag = (
+            '<img src="cid:blog_icon" alt="" '
+            'style="height: 48px; width: auto; display: block; margin: 0 auto 16px;" />'
+        )
+
+    # CTA button (only if blog_url provided)
+    cta_html = ""
+    if blog_url:
+        cta_html = f"""
+            <div style="text-align: center; margin: 24px 0 0;">
+                <a href="{blog_url}"
+                   style="display: inline-block; background-color: #5b7cfa; color: #ffffff;
+                          font-size: 14px; font-weight: 600; text-decoration: none;
+                          padding: 12px 28px; border-radius: 6px;">
+                    Read More
+                </a>
+            </div>
+        """
+
+    html_body = f"""
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
+                background-color: #ffffff; border-radius: 12px; overflow: hidden;
+                border: 1px solid #e8e8e8;">
+
+        <!-- Header with logo -->
+        <div style="background-color: #1a1a2e; padding: 28px 32px; text-align: center;">
+            <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
+                <tr>
+                    <td style="vertical-align: middle; padding-right: 12px;">
+                        {logo_img_tag}
+                    </td>
+                    <td style="vertical-align: middle;">
+                        <span style="font-size: 24px; font-weight: 700; color: #ffffff;
+                                     letter-spacing: 1px;">TimrX</span>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <!-- Body -->
+        <div style="padding: 36px 32px 28px;">
+            <div style="text-align: center;">
+                {blog_icon_tag}
+            </div>
+            <h2 style="color: #1a1a2e; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
+                {title}
+            </h2>
+            <div style="color: #555; font-size: 15px; line-height: 1.6; margin: 0 0 8px;">
+                {summary}
+            </div>
+            {cta_html}
+        </div>
+
+        <!-- Footer -->
+        <div style="background-color: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+                    text-align: center;">
+            <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
+                TimrX &mdash; 3D Print Hub
+            </p>
+            <p style="color: #aaa; font-size: 11px; margin: 0;">
+                Need help? Contact us at
+                <a href="mailto:support@timrx.live"
+                   style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
+            </p>
+        </div>
+    </div>
+    """
+
+    # Plain text version
+    cta_text = f"\nRead more: {blog_url}\n" if blog_url else ""
+
+    text_body = f"""{title}
+
+{summary}
+{cta_text}
+---
+TimrX - 3D Print Hub
+Need help? Contact us at support@timrx.live
+"""
+
+    # Build inline images list
+    inline_images = []
+    if logo_bytes:
+        inline_images.append({
+            "cid": "timrx_logo",
+            "data": logo_bytes,
+            "content_type": "image/png",
+        })
+    if blog_icon_bytes:
+        inline_images.append({
+            "cid": "blog_icon",
+            "data": blog_icon_bytes,
+            "content_type": "image/png",
+        })
+
+    if inline_images:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=inline_images,
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_blog_update send_raw failed: {result.message}, falling back to simple send")
+        except Exception as e:
+            print(f"[EMAIL] send_blog_update send_raw error: {e}, falling back to simple send")
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
+# ─────────────────────────────────────────────────────────────
 # Admin Notifications
 # ─────────────────────────────────────────────────────────────
 def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None) -> bool:
