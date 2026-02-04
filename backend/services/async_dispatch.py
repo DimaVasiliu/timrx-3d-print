@@ -454,6 +454,118 @@ def update_job_status_ready(
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
 
+def _update_job_meta(job_id: str, meta_patch: dict):
+    """Merge a dict into the jobs.meta JSONB column."""
+    if not USE_DB or not meta_patch:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                    """,
+                    (json.dumps(meta_patch), job_id),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[JOB] ERROR updating meta for {job_id}: {e}")
+
+
+def _redispatch_to_runway(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: str | None,
+    store_meta: dict,
+):
+    """
+    Re-dispatch a filtered Gemini job to Runway.
+
+    Reuses the same job_id and credit reservation (no double-charge).
+    The original payload is reconstructed from store_meta.
+    """
+    runway = video_router.get_provider("runway")
+    if not runway:
+        print(f"[ASYNC] Runway provider not found for fallback of {internal_job_id}")
+        if reservation_id:
+            release_job_credits(reservation_id, "provider_filtered_third_party", internal_job_id)
+        update_job_status_failed(
+            internal_job_id,
+            "provider_filtered_third_party: Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
+        )
+        return
+
+    task = store_meta.get("task", "text2video")
+    route_params = dict(
+        aspect_ratio=store_meta.get("aspect_ratio", "16:9"),
+        resolution=store_meta.get("resolution", "720p"),
+        duration_seconds=store_meta.get("duration_seconds", 6),
+        negative_prompt=store_meta.get("negative_prompt", ""),
+        seed=store_meta.get("seed"),
+    )
+
+    try:
+        if task == "image2video":
+            resp = runway.start_image_to_video(
+                image_data=store_meta.get("image_data", ""),
+                prompt=store_meta.get("motion") or store_meta.get("prompt", ""),
+                **route_params,
+            )
+        else:
+            resp = runway.start_text_to_video(
+                prompt=store_meta.get("prompt", ""),
+                **route_params,
+            )
+
+        upstream_id = resp.get("task_id") or resp.get("operation_name")
+        if not upstream_id:
+            raise RuntimeError("Runway returned no task_id")
+
+        print(f"[ASYNC] Runway fallback started for {internal_job_id}: upstream_id={upstream_id}")
+
+        update_job_with_upstream_id(internal_job_id, upstream_id)
+
+        store = load_store()
+        store_meta["upstream_id"] = upstream_id
+        store_meta["operation_name"] = upstream_id
+        store_meta["status"] = "processing"
+        store_meta["provider"] = "runway"
+        store[internal_job_id] = store_meta
+        save_store(store)
+
+        _poll_video_completion(
+            internal_job_id,
+            identity_id,
+            reservation_id,
+            upstream_id,
+            "runway",
+            store_meta,
+        )
+
+    except Exception as e:
+        print(f"[ASYNC] Runway fallback failed for {internal_job_id}: {e}")
+        # Store user-friendly error in meta
+        _update_job_meta(internal_job_id, {
+            "error_code": "provider_filtered_third_party",
+            "user_message": "Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
+        })
+        store = load_store()
+        store_meta["status"] = "failed"
+        store_meta["error"] = "Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters."
+        store_meta["error_code"] = "provider_filtered_third_party"
+        store[internal_job_id] = store_meta
+        save_store(store)
+        if reservation_id:
+            release_job_credits(reservation_id, "provider_filtered_third_party", internal_job_id)
+        update_job_status_failed(
+            internal_job_id,
+            "provider_filtered_third_party: Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
+        )
+
+
 # --- Monolith-compatible adapter names (Phase 4) ---
 
 
@@ -729,6 +841,43 @@ def _poll_gemini_video_completion(
                 error_code = status_resp.get("error", "gemini_video_failed")
                 error_msg = status_resp.get("message", "Video generation failed")
                 print(f"[ASYNC] Veo video failed for job {internal_job_id}: {error_code} - {error_msg}")
+
+                # ── Provider content filtering — attempt Runway fallback ──
+                if error_code == "provider_filtered_third_party" and not store_meta.get("fallback_attempted"):
+                    runway_provider = video_router.get_provider("runway")
+                    runway_ok = runway_provider and runway_provider.is_configured()[0] if runway_provider else False
+
+                    if runway_ok:
+                        print(f"[ASYNC] Gemini filtered for job {internal_job_id}, attempting Runway fallback…")
+                        store_meta["fallback_attempted"] = True
+                        store_meta["original_provider"] = "google"
+                        store_meta["filter_reason"] = error_code
+
+                        _update_job_meta(internal_job_id, {
+                            "fallback_attempted": True,
+                            "original_provider": "google",
+                            "filter_reason": error_code,
+                            "provider": "runway",
+                        })
+
+                        _redispatch_to_runway(
+                            internal_job_id, identity_id, reservation_id, store_meta,
+                        )
+                        return
+
+                # Store user-friendly error details in meta + store
+                if error_code == "provider_filtered_third_party":
+                    _update_job_meta(internal_job_id, {
+                        "error_code": error_code,
+                        "user_message": error_msg,
+                    })
+                    store = load_store()
+                    store_meta["status"] = "failed"
+                    store_meta["error"] = error_msg
+                    store_meta["error_code"] = error_code
+                    store[internal_job_id] = store_meta
+                    save_store(store)
+
                 if reservation_id:
                     release_job_credits(reservation_id, error_code, internal_job_id)
                 update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
