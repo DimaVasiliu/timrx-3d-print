@@ -110,7 +110,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 8px; width: auto; display: block;" />'
+            'style="height: 3px; width: auto; display: block;" />'
         )
 
     html_body = f"""
@@ -229,7 +229,7 @@ def send_purchase_receipt(
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 8px; width: auto;" />'
+            'style="height: 3px; width: auto;" />'
         )
 
     # Build header: logo + TimrX text, or just text
@@ -376,7 +376,7 @@ def send_invoice_email(
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 8px; width: auto;" />'
+            'style="height: 3px; width: auto;" />'
         )
 
     # Build header: logo + TimrX text, or just text
