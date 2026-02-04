@@ -694,13 +694,19 @@ def _video_status_handler(job_id: str):
                             error_code = candidate
                             error_msg = parts[1].strip()
 
-                    return jsonify({
+                    # Surface user-friendly message for filtered errors
+                    user_message = job_meta.get("user_message") if error_code == "provider_filtered_third_party" else None
+
+                    resp = {
                         "ok": False,
                         "status": "failed",
                         "job_id": job_id,
                         "error": error_code,
-                        "message": error_msg,
-                    })
+                        "message": user_message or error_msg,
+                    }
+                    if user_message:
+                        resp["user_message"] = user_message
+                    return jsonify(resp)
 
                 if job["status"] == "ready":
                     video_url = meta.get("video_url") or job_meta.get("video_url")
@@ -738,13 +744,16 @@ def _video_status_handler(job_id: str):
     if meta.get("status") == "failed":
         error_msg = meta.get("error", "Video generation failed")
         error_code = meta.get("error_code", "gemini_video_failed")
-        return jsonify({
+        resp = {
             "ok": False,
             "status": "failed",
             "job_id": job_id,
             "error": error_code,
             "message": error_msg,
-        })
+        }
+        if error_code == "provider_filtered_third_party":
+            resp["user_message"] = error_msg
+        return jsonify(resp)
 
     if meta.get("status") == "quota_queued":
         return jsonify({
