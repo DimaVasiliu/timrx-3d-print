@@ -37,30 +37,23 @@ _logo_loaded = False
 
 
 def _load_logo() -> Optional[bytes]:
-    """Load TimrX logo PNG from local paths. Cached only on successful load."""
+    """Load TimrX email logo from backend/assets/logo-email.png. Cached on success."""
     global _logo_bytes, _logo_loaded
     if _logo_loaded:
         return _logo_bytes
 
-    candidates = [
-        config.APP_DIR / "backend" / "assets" / "logo.png",
-        config.APP_DIR / "assets" / "logo.png",
-        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo (1).png",
-        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo.png",
-    ]
-    for p in candidates:
-        try:
-            resolved = p.resolve()
-            if resolved.is_file():
-                _logo_bytes = resolved.read_bytes()
-                _logo_loaded = True  # only cache when actually found
-                print(f"[EMAIL] Logo loaded from {resolved} ({len(_logo_bytes)} bytes)")
-                return _logo_bytes
-        except Exception as exc:
-            print(f"[EMAIL] Logo candidate {p} failed: {exc}")
-            continue
+    logo_path = config.APP_DIR / "backend" / "assets" / "logo-email.png"
+    try:
+        resolved = logo_path.resolve()
+        if resolved.is_file():
+            _logo_bytes = resolved.read_bytes()
+            _logo_loaded = True
+            print(f"[EMAIL] Logo loaded from {resolved} ({len(_logo_bytes)} bytes)")
+            return _logo_bytes
+    except Exception as exc:
+        print(f"[EMAIL] Logo load failed: {exc}")
 
-    print(f"[EMAIL] Logo not found at any candidate path (APP_DIR={config.APP_DIR})")
+    print(f"[EMAIL] Logo not found at {logo_path}")
     return None
 
 
@@ -109,11 +102,12 @@ def send_magic_code(to_email: str, code: str) -> bool:
     logo_img_tag = ""
     if logo_bytes:
         logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" height="24" '
-            'style="height:24px; width:auto; display:block;" />'
+            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
+            'style="height:32px; width:auto; display:block;" />'
         )
 
     html_body = f"""
+    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
                 background-color: #000000; border-radius: 12px; overflow: hidden;">
 
@@ -128,7 +122,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
                                     {logo_img_tag}
                                 </td>
                                 <td style="vertical-align: middle;">
-                                    <span style="font-size: 20px; font-weight: 800; color: #ffffff;
+                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
                                                  letter-spacing: 0.5px;">TimrX</span>
                                 </td>
                             </tr>
@@ -174,6 +168,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
                    style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
             </p>
         </div>
+    </div>
     </div>
     """
 
@@ -234,32 +229,35 @@ def send_purchase_receipt(
     logo_img_tag = ""
     if logo_bytes:
         logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 8px; width: auto;" />'
+            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
+            'style="height:32px; width:auto; display:block;" />'
         )
 
-    # Build header: logo + TimrX text, or just text
-    header_html = f"""
-        <table cellpadding="0" cellspacing="0" border="0">
-            <tr>
-                <td style="vertical-align: middle; padding-right: 8px;">{logo_img_tag}</td>
-                <td style="vertical-align: middle;">
-                    <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
-                </td>
-            </tr>
-        </table>
-    """ if logo_bytes else """
-        <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
-    """
-
     html_body = f"""
+    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
                 max-width: 600px; margin: 0 auto; color: #ffffff; padding: 0 16px;
                 background-color: #000000; border-radius: 12px;">
 
-        <!-- Logo -->
+        <!-- Header with logo -->
         <div style="padding: 20px 0 16px;">
-            {header_html}
+            <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                <tr>
+                    <td>
+                        <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
+                                    {logo_img_tag}
+                                </td>
+                                <td style="vertical-align: middle;">
+                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
+                                                 letter-spacing: 0.5px;">TimrX</span>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
         </div>
 
         <!-- Amount section -->
@@ -304,6 +302,7 @@ def send_purchase_receipt(
             </p>
             <p style="color: #444; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
         </div>
+    </div>
     </div>
     """
 
@@ -381,32 +380,35 @@ def send_invoice_email(
     logo_img_tag = ""
     if logo_bytes:
         logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 3px; width: auto;" />'
+            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
+            'style="height:32px; width:auto; display:block;" />'
         )
 
-    # Build header: logo + TimrX text, or just text
-    header_html = f"""
-        <table cellpadding="0" cellspacing="0" border="0">
-            <tr>
-                <td style="vertical-align: middle; padding-right: 8px;">{logo_img_tag}</td>
-                <td style="vertical-align: middle;">
-                    <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
-                </td>
-            </tr>
-        </table>
-    """ if logo_bytes else """
-        <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
-    """
-
     html_body = f"""
+    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
                 max-width: 600px; margin: 0 auto; color: #ffffff; padding: 0 16px;
                 background-color: #000000; border-radius: 12px;">
 
-        <!-- Logo -->
+        <!-- Header with logo -->
         <div style="padding: 20px 0 16px;">
-            {header_html}
+            <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                <tr>
+                    <td>
+                        <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
+                                    {logo_img_tag}
+                                </td>
+                                <td style="vertical-align: middle;">
+                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
+                                                 letter-spacing: 0.5px;">TimrX</span>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
         </div>
 
         <!-- Amount section -->
@@ -470,6 +472,7 @@ def send_invoice_email(
             </p>
             <p style="color: #444; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
         </div>
+    </div>
     </div>
     """
 
@@ -548,18 +551,49 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
     data_html = ""
     if data:
         rows = "".join(
-            f"<tr><td style='padding: 4px 8px; color: #666;'>{k}:</td><td style='padding: 4px 8px;'>{v}</td></tr>"
+            f"<tr><td style='padding: 6px 10px; color: #888; font-size: 13px;'>{k}:</td>"
+            f"<td style='padding: 6px 10px; color: #ffffff; font-size: 13px;'>{v}</td></tr>"
             for k, v in data.items()
         )
-        data_html = f"<table style='margin-top: 15px;'>{rows}</table>"
+        data_html = f"<table style='margin-top: 12px; border: 1px solid #222; border-radius: 8px; overflow: hidden;'>{rows}</table>"
 
     html_body = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px;">
-        <h3 style="color: #333;">{subject}</h3>
-        <p>{message}</p>
-        {data_html}
-        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-        <p style="color: #999; font-size: 11px;">TimrX Admin Notification</p>
+    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+                max-width: 600px; margin: 0 auto; background-color: #000000; border-radius: 12px; overflow: hidden;">
+
+        <!-- Header with logo -->
+        <div style="padding: 20px 24px 16px;">
+            <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                <tr>
+                    <td>
+                        <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
+                                    <img src="https://timrx.live/img/logo.png" alt="TimrX" height="32"
+                                         style="height:32px; width:auto; display:block;" />
+                                </td>
+                                <td style="vertical-align: middle;">
+                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
+                                                 letter-spacing: 0.5px;">TimrX</span>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <div style="padding: 24px 24px 28px;">
+            <h3 style="color: #ffffff; margin: 0 0 12px; font-size: 18px; font-weight: 600;">{subject}</h3>
+            <p style="color: #aaa; font-size: 14px; line-height: 1.5; margin: 0 0 16px;">{message}</p>
+            {data_html}
+        </div>
+
+        <div style="border-top: 1px solid #222; padding: 16px 24px; text-align: center;">
+            <p style="color: #555; font-size: 11px; margin: 0;">TimrX Admin Notification</p>
+        </div>
+    </div>
     </div>
     """
 
