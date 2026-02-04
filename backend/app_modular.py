@@ -91,6 +91,20 @@ def create_app() -> Flask:
                 }
             }), 500
 
+    # ─────────────────────────────────────────────────────────────
+    # Startup seeding: ensure action_costs & plans exist in DB
+    # ─────────────────────────────────────────────────────────────
+    from backend.db import USE_DB
+
+    if USE_DB:
+        try:
+            from backend.services.pricing_service import PricingService
+
+            PricingService.seed_action_costs()
+            PricingService.seed_plans()
+        except Exception as e:
+            print(f"[APP] Warning: Failed to seed pricing data: {e}")
+
     return app
 
 
