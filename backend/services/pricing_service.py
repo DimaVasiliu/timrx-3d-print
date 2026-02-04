@@ -23,6 +23,18 @@ from backend.db import query_one, query_all, execute, Tables
 
 
 # Default plans to seed into the database
+DEFAULT_ACTION_COSTS = [
+    {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
+    {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
+    {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
+    {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_RIG", "cost_credits": 25, "provider": "meshy"},
+    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},
+    {"action_code": "VIDEO_GENERATE", "cost_credits": 60, "provider": "video"},
+    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 60, "provider": "video"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 60, "provider": "video"},
+]
+
 DEFAULT_PLANS = [
     {
         "code": "starter_80",
@@ -468,4 +480,55 @@ class PricingService:
                 traceback.print_exc()
 
         print(f"[PRICING] Plans seed complete: {seeded}/{len(DEFAULT_PLANS)}")
+        return seeded
+
+    @staticmethod
+    def seed_action_costs() -> int:
+        """
+        Seed default action costs into the database.
+        Uses INSERT ... ON CONFLICT DO NOTHING (idempotent).
+        Safe to call multiple times — existing rows are never overwritten.
+
+        Returns:
+            Number of action costs seeded (new rows only)
+        """
+        from backend.db import is_available
+
+        print("[PRICING] Starting action_costs seed...")
+
+        if not is_available():
+            print("[PRICING] Database not available, skipping action_costs seed")
+            return 0
+
+        try:
+            result = query_one(
+                f"SELECT COUNT(*) as cnt FROM {Tables.ACTION_COSTS}"
+            )
+            existing_count = result["cnt"] if result else 0
+            print(f"[PRICING] action_costs table exists, current count: {existing_count}")
+        except Exception as e:
+            print(f"[PRICING] action_costs table check failed: {e}")
+            return 0
+
+        seeded = 0
+        for ac in DEFAULT_ACTION_COSTS:
+            try:
+                execute(
+                    f"""
+                    INSERT INTO {Tables.ACTION_COSTS}
+                        (action_code, cost_credits, provider, updated_at)
+                    VALUES
+                        (%s, %s, %s, NOW())
+                    ON CONFLICT (action_code) DO NOTHING
+                    """,
+                    (ac["action_code"], ac["cost_credits"], ac["provider"]),
+                )
+                seeded += 1
+            except Exception as e:
+                print(f"[PRICING] Error seeding action_cost {ac['action_code']}: {e}")
+
+        # Clear cache so next lookup fetches fresh data
+        PricingService._action_costs_cache = {}
+
+        print(f"[PRICING] Action costs seed complete: {seeded} checked, {existing_count} pre-existing")
         return seeded
