@@ -174,6 +174,32 @@ def dispatch_meshy_image_to_3d_async(
     print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
 
     try:
+        user_id = identity_id
+        s3_image_url = image_url
+        prompt = store_meta.get("prompt", "")
+        s3_name = prompt if prompt else "image_to_3d_source"
+
+        # If image is a data URL, upload to S3 FIRST so Meshy gets an accessible URL
+        is_data_url = isinstance(image_url, str) and image_url.startswith("data:")
+        if is_data_url and AWS_BUCKET_MODELS:
+            try:
+                s3_image_url = safe_upload_to_s3(
+                    image_url,
+                    "image/png",
+                    "source_images",
+                    s3_name,
+                    user_id=user_id,
+                    key_base=f"source_images/{user_id or 'public'}/{internal_job_id}",
+                    provider="user",
+                )
+                if s3_image_url:
+                    print(f"[ASYNC] Uploaded data URL image to S3 before Meshy call: {s3_image_url}")
+                    payload["image_url"] = s3_image_url
+                else:
+                    print(f"[ASYNC] S3 upload returned no URL, sending data URL to Meshy")
+            except Exception as e:
+                print(f"[ASYNC] Failed to pre-upload data URL to S3: {e}, sending data URL to Meshy")
+
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
 
@@ -190,12 +216,8 @@ def dispatch_meshy_image_to_3d_async(
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
-        user_id = identity_id
-        s3_image_url = image_url
-        prompt = store_meta.get("prompt", "")
-        s3_name = prompt if prompt else "image_to_3d_source"
-
-        if AWS_BUCKET_MODELS:
+        # Upload source image to S3 for archival (if not already uploaded above)
+        if not is_data_url and AWS_BUCKET_MODELS:
             try:
                 s3_image_url = safe_upload_to_s3(
                     image_url,
