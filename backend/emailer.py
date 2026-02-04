@@ -37,11 +37,10 @@ _logo_loaded = False
 
 
 def _load_logo() -> Optional[bytes]:
-    """Load TimrX logo PNG from local paths. Cached after first call."""
+    """Load TimrX logo PNG from local paths. Cached only on successful load."""
     global _logo_bytes, _logo_loaded
     if _logo_loaded:
         return _logo_bytes
-    _logo_loaded = True
 
     candidates = [
         config.APP_DIR / "backend" / "assets" / "logo.png",
@@ -54,12 +53,14 @@ def _load_logo() -> Optional[bytes]:
             resolved = p.resolve()
             if resolved.is_file():
                 _logo_bytes = resolved.read_bytes()
+                _logo_loaded = True  # only cache when actually found
                 print(f"[EMAIL] Logo loaded from {resolved} ({len(_logo_bytes)} bytes)")
                 return _logo_bytes
-        except Exception:
+        except Exception as exc:
+            print(f"[EMAIL] Logo candidate {p} failed: {exc}")
             continue
 
-    print("[EMAIL] Logo not found at any candidate path")
+    print(f"[EMAIL] Logo not found at any candidate path (APP_DIR={config.APP_DIR})")
     return None
 
 
@@ -109,16 +110,15 @@ def send_magic_code(to_email: str, code: str) -> bool:
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 22px; width: auto; display: block;" />'
+            'style="height: 8px; width: auto; display: block;" />'
         )
 
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background-color: #ffffff; border-radius: 12px; overflow: hidden;
-                border: 1px solid #e8e8e8;">
+                background-color: #000000; border-radius: 12px; overflow: hidden;">
 
         <!-- Header with logo -->
-        <div style="background-color: #1a1a2e; padding: 18px 24px;">
+        <div style="background-color: #000000; padding: 12px 20px;">
             <table cellpadding="0" cellspacing="0" border="0">
                 <tr>
                     <td style="vertical-align: middle; padding-right: 8px;">
@@ -134,35 +134,35 @@ def send_magic_code(to_email: str, code: str) -> bool:
 
         <!-- Body -->
         <div style="padding: 36px 32px 28px;">
-            <h2 style="color: #1a1a2e; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
+            <h2 style="color: #ffffff; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
                 Your Access Code
             </h2>
-            <p style="color: #555; font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
+            <p style="color: #aaa; font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
                 Use the code below to access your TimrX account:
             </p>
 
             <!-- Code box -->
-            <div style="background-color: #f0f4ff; border: 2px dashed #c0cfff; border-radius: 10px;
+            <div style="background-color: #111111; border: 2px dashed #333; border-radius: 10px;
                         padding: 24px; text-align: center; margin: 0 0 24px;">
                 <span style="font-size: 36px; font-weight: 700; letter-spacing: 8px;
-                             color: #1a1a2e; font-family: 'Courier New', monospace;">{code}</span>
+                             color: #ffffff; font-family: 'Courier New', monospace;">{code}</span>
             </div>
 
-            <p style="color: #777; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
-                This code expires in <strong style="color: #555;">15 minutes</strong>.
+            <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
+                This code expires in <strong style="color: #ccc;">15 minutes</strong>.
             </p>
-            <p style="color: #999; font-size: 13px; line-height: 1.5; margin: 0;">
+            <p style="color: #666; font-size: 13px; line-height: 1.5; margin: 0;">
                 If you didn't request this code, you can safely ignore this email.
             </p>
         </div>
 
         <!-- Footer -->
-        <div style="background-color: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+        <div style="border-top: 1px solid #222; padding: 20px 32px;
                     text-align: center;">
-            <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
+            <p style="color: #555; font-size: 12px; margin: 0 0 6px;">
                 TimrX &mdash; 3D Print Hub
             </p>
-            <p style="color: #aaa; font-size: 11px; margin: 0;">
+            <p style="color: #444; font-size: 11px; margin: 0;">
                 Need help? Contact us at
                 <a href="mailto:support@timrx.live"
                    style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
@@ -229,7 +229,7 @@ def send_purchase_receipt(
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 22px; width: auto;" />'
+            'style="height: 8px; width: auto;" />'
         )
 
     # Build header: logo + TimrX text, or just text
@@ -238,64 +238,65 @@ def send_purchase_receipt(
             <tr>
                 <td style="vertical-align: middle; padding-right: 8px;">{logo_img_tag}</td>
                 <td style="vertical-align: middle;">
-                    <span style="font-size: 15px; font-weight: 700; color: #1a1a2e; letter-spacing: 0.5px;">TimrX</span>
+                    <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
                 </td>
             </tr>
         </table>
     """ if logo_bytes else """
-        <span style="font-size: 15px; font-weight: 700; color: #1a1a2e; letter-spacing: 0.5px;">TimrX</span>
+        <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
     """
 
     html_body = f"""
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                max-width: 600px; margin: 0 auto; color: #1a1a2e; padding: 0 16px;">
+                max-width: 600px; margin: 0 auto; color: #ffffff; padding: 0 16px;
+                background-color: #000000; border-radius: 12px;">
 
         <!-- Logo -->
-        <div style="padding: 24px 0 20px;">
+        <div style="padding: 20px 0 16px;">
             {header_html}
         </div>
 
         <!-- Amount section -->
-        <div style="padding: 0 0 28px; border-bottom: 1px solid #e8e8e8;">
-            <p style="color: #666; font-size: 15px; margin: 0 0 6px;">Receipt from TimrX</p>
-            <p style="font-size: 36px; font-weight: 700; margin: 0 0 8px; color: #1a1a2e;">&pound;{amount_gbp:.2f}</p>
+        <div style="padding: 0 0 24px; border-bottom: 1px solid #222;">
+            <p style="color: #888; font-size: 15px; margin: 0 0 6px;">Receipt from TimrX</p>
+            <p style="font-size: 36px; font-weight: 700; margin: 0 0 8px; color: #ffffff;">&pound;{amount_gbp:.2f}</p>
             <p style="color: #27ae60; font-size: 14px; font-weight: 600; margin: 0;">Paid {paid_date}</p>
         </div>
 
         <!-- Summary card -->
-        <div style="margin: 28px 0;">
-            <div style="border: 1px solid #e2e2e2; border-radius: 8px; overflow: hidden;">
-                <div style="padding: 14px 16px; background-color: #f7f7f9; border-bottom: 1px solid #e2e2e2;">
-                    <span style="font-weight: 600; font-size: 14px; color: #1a1a2e;">Summary</span>
+        <div style="margin: 24px 0;">
+            <div style="border: 1px solid #222; border-radius: 8px; overflow: hidden;">
+                <div style="padding: 12px 16px; background-color: #111; border-bottom: 1px solid #222;">
+                    <span style="font-weight: 600; font-size: 14px; color: #ffffff;">Summary</span>
                 </div>
                 <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #efefef;">
-                        <td style="padding: 14px 16px; font-size: 14px; color: #1a1a2e;">{plan_name}</td>
-                        <td style="padding: 14px 16px; text-align: right; font-size: 14px; color: #1a1a2e;">&pound;{amount_gbp:.2f}</td>
+                    <tr style="border-bottom: 1px solid #222;">
+                        <td style="padding: 12px 16px; font-size: 14px; color: #ffffff;">{plan_name}</td>
+                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
                     </tr>
-                    <tr style="border-bottom: 1px solid #efefef;">
-                        <td style="padding: 14px 16px; font-size: 14px; color: #666;">Credits added</td>
-                        <td style="padding: 14px 16px; text-align: right; font-size: 14px; color: #1a1a2e;">{credits:,}</td>
+                    <tr style="border-bottom: 1px solid #222;">
+                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Credits added</td>
+                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{credits:,}</td>
                     </tr>
-                    <tr style="background-color: #f7f7f9;">
-                        <td style="padding: 14px 16px; font-weight: 700; font-size: 14px; color: #1a1a2e;">Amount paid</td>
-                        <td style="padding: 14px 16px; text-align: right; font-weight: 700; font-size: 14px; color: #1a1a2e;">&pound;{amount_gbp:.2f}</td>
+                    <tr style="background-color: #111;">
+                        <td style="padding: 12px 16px; font-weight: 700; font-size: 14px; color: #ffffff;">Amount paid</td>
+                        <td style="padding: 12px 16px; text-align: right; font-weight: 700; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
                     </tr>
                 </table>
             </div>
         </div>
 
-        <p style="color: #666; font-size: 14px; line-height: 1.5; margin: 0 0 28px;">
+        <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 24px;">
             Your credits are now available in your account.
         </p>
 
         <!-- Footer -->
-        <div style="padding: 24px 0; border-top: 1px solid #e8e8e8; text-align: center;">
-            <p style="color: #999; font-size: 12px; margin: 0 0 4px;">
+        <div style="padding: 20px 0; border-top: 1px solid #222; text-align: center;">
+            <p style="color: #555; font-size: 12px; margin: 0 0 4px;">
                 Questions? Contact us at
                 <a href="mailto:support@timrx.live" style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
             </p>
-            <p style="color: #bbb; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
+            <p style="color: #444; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
         </div>
     </div>
     """
@@ -375,7 +376,7 @@ def send_invoice_email(
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 22px; width: auto;" />'
+            'style="height: 8px; width: auto;" />'
         )
 
     # Build header: logo + TimrX text, or just text
@@ -384,41 +385,42 @@ def send_invoice_email(
             <tr>
                 <td style="vertical-align: middle; padding-right: 8px;">{logo_img_tag}</td>
                 <td style="vertical-align: middle;">
-                    <span style="font-size: 15px; font-weight: 700; color: #1a1a2e; letter-spacing: 0.5px;">TimrX</span>
+                    <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
                 </td>
             </tr>
         </table>
     """ if logo_bytes else """
-        <span style="font-size: 15px; font-weight: 700; color: #1a1a2e; letter-spacing: 0.5px;">TimrX</span>
+        <span style="font-size: 15px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">TimrX</span>
     """
 
     html_body = f"""
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                max-width: 600px; margin: 0 auto; color: #1a1a2e; padding: 0 16px;">
+                max-width: 600px; margin: 0 auto; color: #ffffff; padding: 0 16px;
+                background-color: #000000; border-radius: 12px;">
 
         <!-- Logo -->
-        <div style="padding: 24px 0 20px;">
+        <div style="padding: 20px 0 16px;">
             {header_html}
         </div>
 
         <!-- Amount section -->
-        <div style="padding: 0 0 28px; border-bottom: 1px solid #e8e8e8;">
-            <p style="color: #666; font-size: 15px; margin: 0 0 6px;">Receipt from TimrX</p>
-            <p style="font-size: 36px; font-weight: 700; margin: 0 0 8px; color: #1a1a2e;">&pound;{amount_gbp:.2f}</p>
+        <div style="padding: 0 0 24px; border-bottom: 1px solid #222;">
+            <p style="color: #888; font-size: 15px; margin: 0 0 6px;">Receipt from TimrX</p>
+            <p style="font-size: 36px; font-weight: 700; margin: 0 0 8px; color: #ffffff;">&pound;{amount_gbp:.2f}</p>
             <p style="color: #27ae60; font-size: 14px; font-weight: 600; margin: 0;">Paid {paid_date}</p>
         </div>
 
         <!-- Reference numbers -->
         <div style="margin: 24px 0;">
-            <div style="border: 1px solid #e2e2e2; border-radius: 8px; overflow: hidden;">
+            <div style="border: 1px solid #222; border-radius: 8px; overflow: hidden;">
                 <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #efefef;">
-                        <td style="padding: 12px 16px; font-size: 14px; color: #666;">Invoice number</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #1a1a2e;">{invoice_number}</td>
+                    <tr style="border-bottom: 1px solid #222;">
+                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Invoice number</td>
+                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{invoice_number}</td>
                     </tr>
                     <tr>
-                        <td style="padding: 12px 16px; font-size: 14px; color: #666;">Receipt number</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #1a1a2e;">{receipt_number}</td>
+                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Receipt number</td>
+                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{receipt_number}</td>
                     </tr>
                 </table>
             </div>
@@ -426,41 +428,41 @@ def send_invoice_email(
 
         <!-- Summary card -->
         <div style="margin: 0 0 24px;">
-            <div style="border: 1px solid #e2e2e2; border-radius: 8px; overflow: hidden;">
-                <div style="padding: 14px 16px; background-color: #f7f7f9; border-bottom: 1px solid #e2e2e2;">
-                    <span style="font-weight: 600; font-size: 14px; color: #1a1a2e;">Summary</span>
+            <div style="border: 1px solid #222; border-radius: 8px; overflow: hidden;">
+                <div style="padding: 12px 16px; background-color: #111; border-bottom: 1px solid #222;">
+                    <span style="font-weight: 600; font-size: 14px; color: #ffffff;">Summary</span>
                 </div>
                 <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #efefef;">
-                        <td style="padding: 14px 16px; font-size: 14px; color: #1a1a2e;">{plan_name}</td>
-                        <td style="padding: 14px 16px; text-align: right; font-size: 14px; color: #1a1a2e;">&pound;{amount_gbp:.2f}</td>
+                    <tr style="border-bottom: 1px solid #222;">
+                        <td style="padding: 12px 16px; font-size: 14px; color: #ffffff;">{plan_name}</td>
+                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
                     </tr>
-                    <tr style="border-bottom: 1px solid #efefef;">
-                        <td style="padding: 14px 16px; font-size: 14px; color: #666;">Credits added</td>
-                        <td style="padding: 14px 16px; text-align: right; font-size: 14px; color: #1a1a2e;">{credits:,}</td>
+                    <tr style="border-bottom: 1px solid #222;">
+                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Credits added</td>
+                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{credits:,}</td>
                     </tr>
-                    <tr style="background-color: #f7f7f9;">
-                        <td style="padding: 14px 16px; font-weight: 700; font-size: 14px; color: #1a1a2e;">Amount paid</td>
-                        <td style="padding: 14px 16px; text-align: right; font-weight: 700; font-size: 14px; color: #1a1a2e;">&pound;{amount_gbp:.2f}</td>
+                    <tr style="background-color: #111;">
+                        <td style="padding: 12px 16px; font-weight: 700; font-size: 14px; color: #ffffff;">Amount paid</td>
+                        <td style="padding: 12px 16px; text-align: right; font-weight: 700; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
                     </tr>
                 </table>
             </div>
         </div>
 
-        <p style="color: #666; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
+        <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
             Your invoice and receipt PDFs are attached to this email.
         </p>
-        <p style="color: #666; font-size: 14px; line-height: 1.5; margin: 0 0 28px;">
+        <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 24px;">
             Your credits are now available in your account.
         </p>
 
         <!-- Footer -->
-        <div style="padding: 24px 0; border-top: 1px solid #e8e8e8; text-align: center;">
-            <p style="color: #999; font-size: 12px; margin: 0 0 4px;">
+        <div style="padding: 20px 0; border-top: 1px solid #222; text-align: center;">
+            <p style="color: #555; font-size: 12px; margin: 0 0 4px;">
                 Questions? Contact us at
                 <a href="mailto:support@timrx.live" style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
             </p>
-            <p style="color: #bbb; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
+            <p style="color: #444; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
         </div>
     </div>
     """
@@ -549,26 +551,30 @@ def send_blog_update(
 
     # Load logo + blog icon for inline CID embedding
     logo_bytes = _load_logo()
+    print(f"[EMAIL] send_blog_update: logo_bytes={'loaded (' + str(len(logo_bytes)) + ' bytes)' if logo_bytes else 'None'}")
 
     blog_icon_bytes = None
-    try:
-        from backend.config import config as _cfg
-        for _bp in [
-            _cfg.APP_DIR / "backend" / "assets" / "blogs.png",  # server
-            _cfg.APP_DIR / "assets" / "blogs.png",               # local alt
-        ]:
+    for _bp in [
+        config.APP_DIR / "backend" / "assets" / "blogs.png",  # server
+        config.APP_DIR / "assets" / "blogs.png",               # local alt
+    ]:
+        try:
             resolved = _bp.resolve()
             if resolved.is_file():
                 blog_icon_bytes = resolved.read_bytes()
+                print(f"[EMAIL] Blog icon loaded from {resolved} ({len(blog_icon_bytes)} bytes)")
                 break
-    except Exception:
-        pass
+        except Exception as exc:
+            print(f"[EMAIL] Blog icon candidate {_bp} failed: {exc}")
+            continue
+    if not blog_icon_bytes:
+        print(f"[EMAIL] Blog icon not found (APP_DIR={config.APP_DIR})")
 
     logo_img_tag = ""
     if logo_bytes:
         logo_img_tag = (
             '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 22px; width: auto; display: block;" />'
+            'style="height: 8px; width: auto; display: block;" />'
         )
 
     blog_icon_tag = ""
@@ -594,11 +600,10 @@ def send_blog_update(
 
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background-color: #ffffff; border-radius: 12px; overflow: hidden;
-                border: 1px solid #e8e8e8;">
+                background-color: #000000; border-radius: 12px; overflow: hidden;">
 
         <!-- Header with logo -->
-        <div style="background-color: #1a1a2e; padding: 18px 24px;">
+        <div style="background-color: #000000; padding: 12px 20px;">
             <table cellpadding="0" cellspacing="0" border="0">
                 <tr>
                     <td style="vertical-align: middle; padding-right: 8px;">
@@ -617,22 +622,22 @@ def send_blog_update(
             <div style="text-align: center;">
                 {blog_icon_tag}
             </div>
-            <h2 style="color: #1a1a2e; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
+            <h2 style="color: #ffffff; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
                 {title}
             </h2>
-            <div style="color: #555; font-size: 15px; line-height: 1.6; margin: 0 0 8px;">
+            <div style="color: #aaa; font-size: 15px; line-height: 1.6; margin: 0 0 8px;">
                 {summary}
             </div>
             {cta_html}
         </div>
 
         <!-- Footer -->
-        <div style="background-color: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+        <div style="border-top: 1px solid #222; padding: 20px 32px;
                     text-align: center;">
-            <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
+            <p style="color: #555; font-size: 12px; margin: 0 0 6px;">
                 TimrX &mdash; 3D Print Hub
             </p>
-            <p style="color: #aaa; font-size: 11px; margin: 0;">
+            <p style="color: #444; font-size: 11px; margin: 0;">
                 Need help? Contact us at
                 <a href="mailto:support@timrx.live"
                    style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
@@ -668,6 +673,8 @@ Need help? Contact us at support@timrx.live
             "content_type": "image/png",
         })
 
+    print(f"[EMAIL] send_blog_update: {len(inline_images)} inline image(s) to embed")
+
     if inline_images:
         try:
             from backend.services.email_service import EmailService
@@ -679,10 +686,15 @@ Need help? Contact us at support@timrx.live
                 inline_images=inline_images,
             )
             if result.success:
+                print(f"[EMAIL] send_blog_update: send_raw succeeded")
                 return True
             print(f"[EMAIL] send_blog_update send_raw failed: {result.message}, falling back to simple send")
         except Exception as e:
+            import traceback
             print(f"[EMAIL] send_blog_update send_raw error: {e}, falling back to simple send")
+            traceback.print_exc()
+    else:
+        print("[EMAIL] send_blog_update: no inline images, using simple send (logo will not appear)")
 
     return send_email(to_email, subject, html_body, text_body)
 
