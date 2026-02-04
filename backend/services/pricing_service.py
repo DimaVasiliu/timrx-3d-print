@@ -60,7 +60,7 @@ class PricingService:
     _frontend_to_db_map: Dict[str, str] = {}
 
     # Mapping from DB action_code to stable frontend keys
-    # DB codes: MESHY_TEXT_TO_3D, MESHY_IMAGE_TO_3D, MESHY_REFINE, MESHY_RETEXTURE, MESHY_RIG, OPENAI_IMAGE, VIDEO_GENERATE
+    # DB codes: MESHY_TEXT_TO_3D, MESHY_IMAGE_TO_3D, MESHY_REFINE, MESHY_RETEXTURE, MESHY_RIG, OPENAI_IMAGE, VIDEO_GENERATE, VIDEO_TEXT_GENERATE, VIDEO_IMAGE_ANIMATE
     ACTION_CODE_MAP = {
         "MESHY_TEXT_TO_3D": "text_to_3d_generate",
         "MESHY_IMAGE_TO_3D": "image_to_3d_generate",
@@ -69,6 +69,8 @@ class PricingService:
         "MESHY_RIG": "rig",
         "OPENAI_IMAGE": "image_studio_generate",
         "VIDEO_GENERATE": "video",
+        "VIDEO_TEXT_GENERATE": "video_text_generate",
+        "VIDEO_IMAGE_ANIMATE": "video_image_animate",
     }
 
     # Additional frontend aliases that map to same DB codes
@@ -88,6 +90,13 @@ class PricingService:
         "upscale": "MESHY_REFINE",     # upscale is same as refine (10c)
         "image_generate": "OPENAI_IMAGE",  # Legacy key
         "video_generate": "VIDEO_GENERATE",  # Alternative video key
+        # Granular video action keys
+        "video_text_generate": "VIDEO_TEXT_GENERATE",
+        "video-text-generate": "VIDEO_TEXT_GENERATE",
+        "text2video": "VIDEO_TEXT_GENERATE",
+        "video_image_animate": "VIDEO_IMAGE_ANIMATE",
+        "video-image-animate": "VIDEO_IMAGE_ANIMATE",
+        "image2video": "VIDEO_IMAGE_ANIMATE",
         "preview": "MESHY_TEXT_TO_3D",  # Preview is text-to-3d cost
         # Explicit preview key used by frontend
         "text-to-3d-preview": "MESHY_TEXT_TO_3D",
@@ -386,6 +395,10 @@ class PricingService:
             "image-studio": "OPENAI_IMAGE",
             "video": "VIDEO_GENERATE",
             "video-generate": "VIDEO_GENERATE",
+            "text2video": "VIDEO_TEXT_GENERATE",
+            "image2video": "VIDEO_IMAGE_ANIMATE",
+            "video-text-generate": "VIDEO_TEXT_GENERATE",
+            "video-image-animate": "VIDEO_IMAGE_ANIMATE",
         }
         return mapping.get(job, "MESHY_TEXT_TO_3D")  # Default to text-to-3d cost
 
