@@ -109,8 +109,8 @@ def send_magic_code(to_email: str, code: str) -> bool:
     logo_img_tag = ""
     if logo_bytes:
         logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" '
-            'style="height: 3px; width: auto; display: block;" />'
+            '<img src="cid:timrx_logo" alt="TimrX" height="24" '
+            'style="height:24px; width:auto; display:block;" />'
         )
 
     html_body = f"""
@@ -119,14 +119,20 @@ def send_magic_code(to_email: str, code: str) -> bool:
 
         <!-- Header with logo -->
         <div style="background-color: #000000; padding: 12px 20px;">
-            <table cellpadding="0" cellspacing="0" border="0">
+            <table cellpadding="0" cellspacing="0" border="0" width="100%">
                 <tr>
-                    <td style="vertical-align: middle; padding-right: 8px;">
-                        {logo_img_tag}
-                    </td>
-                    <td style="vertical-align: middle;">
-                        <span style="font-size: 15px; font-weight: 700; color: #ffffff;
-                                     letter-spacing: 0.5px;">TimrX</span>
+                    <td>
+                        <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
+                                    {logo_img_tag}
+                                </td>
+                                <td style="vertical-align: middle;">
+                                    <span style="font-size: 20px; font-weight: 800; color: #ffffff;
+                                                 letter-spacing: 0.5px;">TimrX</span>
+                                </td>
+                            </tr>
+                        </table>
                     </td>
                 </tr>
             </table>
