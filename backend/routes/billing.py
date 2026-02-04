@@ -22,6 +22,7 @@ from backend.services.wallet_service import WalletService
 from backend.services.reservation_service import ReservationService
 from backend.services.purchase_service import PurchaseService
 from backend.services.mollie_service import MollieService, MollieCreateError
+from backend.services.subscription_service import SubscriptionService
 
 bp = Blueprint("billing", __name__)
 
@@ -902,3 +903,143 @@ def get_purchases():
             "limit": 20,
             "offset": 0,
         })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSCRIPTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/subscriptions/plans", methods=["GET"])
+def subscription_plans():
+    """List available subscription plans."""
+    plans = SubscriptionService.list_plans()
+    return jsonify({"ok": True, "plans": plans})
+
+
+@bp.route("/subscriptions/me", methods=["GET"])
+@require_session
+@no_cache
+def subscription_me():
+    """
+    Get the current user's active subscription.
+
+    Response (with subscription):
+    { ok: true, subscription: { plan_code, status, current_period_start, current_period_end, ... } }
+
+    Response (no subscription):
+    { ok: true, subscription: null }
+    """
+    sub = SubscriptionService.get_active_subscription(g.identity_id)
+    if not sub:
+        return jsonify({"ok": True, "subscription": None})
+
+    plan_info = SubscriptionService.get_plan_info(sub["plan_code"]) or {}
+    return jsonify({
+        "ok": True,
+        "subscription": {
+            "id": str(sub["id"]),
+            "plan_code": sub["plan_code"],
+            "plan_name": plan_info.get("name", sub["plan_code"]),
+            "credits_per_month": plan_info.get("credits_per_month", 0),
+            "cadence": plan_info.get("cadence", "monthly"),
+            "status": sub["status"],
+            "current_period_start": sub["current_period_start"].isoformat() if sub.get("current_period_start") else None,
+            "current_period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
+            "cancelled_at": sub["cancelled_at"].isoformat() if sub.get("cancelled_at") else None,
+        },
+    })
+
+
+@bp.route("/subscriptions/checkout", methods=["POST"])
+@require_session
+def subscription_checkout():
+    """
+    Create a Mollie payment for a subscription plan.
+
+    Body: { "plan_code": "creator_monthly" }
+    Returns: { ok: true, checkout_url: "..." }
+    """
+    body = request.get_json(silent=True) or {}
+    plan_code = body.get("plan_code", "").strip()
+
+    if not plan_code:
+        return jsonify({"error": "missing_plan_code", "message": "plan_code is required"}), 400
+
+    plan = SubscriptionService.get_plan_info(plan_code)
+    if not plan:
+        return jsonify({"error": "invalid_plan", "message": f"Unknown plan: {plan_code}"}), 400
+
+    # Check if user already has an active subscription
+    existing = SubscriptionService.get_active_subscription(g.identity_id)
+    if existing and existing["status"] == "active":
+        return jsonify({
+            "error": "already_subscribed",
+            "message": "You already have an active subscription. Cancel it first.",
+            "current_plan": existing["plan_code"],
+        }), 409
+
+    if not MollieService.is_available():
+        return jsonify({"error": "payments_unavailable", "message": "Payment service is not available"}), 503
+
+    email = body.get("email", "").strip()
+    if not email:
+        # Try to get email from identity
+        from backend.db import get_conn, Tables
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT email FROM {Tables.IDENTITIES} WHERE id = %s",
+                        (g.identity_id,),
+                    )
+                    row = cur.fetchone()
+                    if row and row.get("email"):
+                        email = row["email"]
+        except Exception:
+            pass
+
+    if not email:
+        return jsonify({"error": "email_required", "message": "Email is required for subscription checkout"}), 400
+
+    try:
+        from backend.config import config
+        frontend_url = (config.FRONTEND_BASE_URL or config.PUBLIC_BASE_URL or "").rstrip("/")
+        success_url = f"{frontend_url}/hub.html?checkout=success&type=subscription&plan={plan_code}"
+
+        result = MollieService.create_subscription_checkout(
+            identity_id=g.identity_id,
+            plan_code=plan_code,
+            email=email,
+            success_url=success_url,
+        )
+
+        return jsonify({
+            "ok": True,
+            "checkout_url": result["checkout_url"],
+            "payment_id": result.get("payment_id"),
+        })
+
+    except (MollieCreateError, ValueError) as e:
+        print(f"[BILLING] Subscription checkout error: {e}")
+        return jsonify({"error": "checkout_failed", "message": str(e)}), 500
+    except Exception as e:
+        print(f"[BILLING] Unexpected subscription checkout error: {e}")
+        return jsonify({"error": "checkout_failed", "message": "Failed to create checkout"}), 500
+
+
+@bp.route("/subscriptions/cancel", methods=["POST"])
+@require_session
+def subscription_cancel():
+    """Cancel the current subscription at period end."""
+    sub = SubscriptionService.get_active_subscription(g.identity_id)
+    if not sub or sub["status"] != "active":
+        return jsonify({"error": "no_active_subscription", "message": "No active subscription to cancel"}), 404
+
+    ok = SubscriptionService.cancel_subscription(str(sub["id"]))
+    if ok:
+        return jsonify({
+            "ok": True,
+            "message": "Subscription cancelled. You'll keep access until the end of your billing period.",
+            "period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
+        })
+    return jsonify({"error": "cancel_failed", "message": "Failed to cancel subscription"}), 500
