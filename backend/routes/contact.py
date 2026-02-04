@@ -118,9 +118,26 @@ def submit_contact():
 </head>
 <body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;background:#f5f5f5;">
     <div style="max-width:600px;margin:0 auto;padding:20px;">
-        <div style="background:#0b0b0b;color:#fff;padding:24px 30px;border-radius:12px 12px 0 0;">
-            <h1 style="margin:0;font-size:24px;font-weight:600;">New Contact Form Submission</h1>
-            <p style="margin:8px 0 0;opacity:0.7;font-size:14px;">TimrX Portfolio</p>
+        <div style="background:#000000;color:#fff;padding:20px 24px 16px;border-radius:12px 12px 0 0;">
+            <table cellpadding="0" cellspacing="0" border="0" width="100%">
+                <tr>
+                    <td>
+                        <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td style="vertical-align:middle;padding-right:10px;line-height:0;">
+                                    <img src="https://timrx.live/img/logo.png" alt="TimrX" height="32"
+                                         style="height:32px;width:auto;display:block;" />
+                                </td>
+                                <td style="vertical-align:middle;">
+                                    <span style="font-size:18px;font-weight:800;color:#ffffff;letter-spacing:0.5px;">TimrX</span>
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
+            <h1 style="margin:16px 0 0;font-size:20px;font-weight:600;color:#ffffff;">New Contact Form Submission</h1>
+            <p style="margin:6px 0 0;opacity:0.7;font-size:13px;color:#aaa;">TimrX Portfolio</p>
         </div>
 
         <div style="background:#fff;padding:30px;border:1px solid #e8e8e8;border-top:none;">
