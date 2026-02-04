@@ -67,6 +67,21 @@ def send_magic_code(to_email: str, code: str) -> bool:
     """Send a magic login code to the user."""
     subject = "Your TimrX Access Code"
 
+    # Load logo for inline CID embedding
+    try:
+        from backend.services.invoicing_service import _load_logo
+        logo_bytes = _load_logo()
+    except Exception:
+        logo_bytes = None
+
+    # Logo tag: CID if logo available, hidden otherwise
+    logo_img_tag = ""
+    if logo_bytes:
+        logo_img_tag = (
+            '<img src="cid:timrx_logo" alt="TimrX" '
+            'style="height: 36px; width: auto; display: block;" />'
+        )
+
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
                 background: #ffffff; border-radius: 12px; overflow: hidden;
@@ -78,8 +93,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
             <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
                 <tr>
                     <td style="vertical-align: middle; padding-right: 12px;">
-                        <img src="https://timrx.live/logo.png" alt="TimrX"
-                             style="height: 36px; width: auto; display: block;" />
+                        {logo_img_tag}
                     </td>
                     <td style="vertical-align: middle;">
                         <span style="font-size: 24px; font-weight: 700; color: #ffffff;
@@ -142,6 +156,25 @@ If you didn't request this code, you can safely ignore this email.
 TimrX - 3D Print Hub
 Need help? Contact us at support@timrx.live
 """
+
+    # Use send_raw with inline logo if logo available, otherwise simple send
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            return result.success
+        except Exception as e:
+            print(f"[EMAIL] send_magic_code send_raw error: {e}, falling back to simple send")
 
     return send_email(to_email, subject, html_body, text_body)
 
