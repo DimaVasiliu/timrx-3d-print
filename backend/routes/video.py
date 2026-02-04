@@ -684,12 +684,15 @@ def _video_status_handler(job_id: str):
 
                 if job["status"] == "failed":
                     error_msg = job.get("error_message", "Video generation failed")
-                    # Parse error code if present
-                    error_code = "gemini_video_failed"
-                    if error_msg and error_msg.startswith("gemini_"):
+                    error_code = "video_failed"
+                    # Parse error code from "code: message" format
+                    if error_msg and ":" in error_msg:
                         parts = error_msg.split(":", 1)
-                        error_code = parts[0]
-                        error_msg = parts[1].strip() if len(parts) > 1 else error_msg
+                        candidate = parts[0].strip()
+                        # Accept any machine-readable code (snake_case, no spaces)
+                        if candidate and " " not in candidate:
+                            error_code = candidate
+                            error_msg = parts[1].strip()
 
                     return jsonify({
                         "ok": False,
@@ -761,6 +764,67 @@ def _video_status_handler(job_id: str):
             "progress": meta.get("progress", 0),
             "message": "Generating video...",
         })
+
+    # Store has an entry but with an unexpected status — treat as in-flight
+    if meta:
+        return jsonify({
+            "ok": True,
+            "status": "processing",
+            "job_id": job_id,
+            "progress": meta.get("progress", 0),
+            "message": "Generating video...",
+        })
+
+    # Last resort: check DB without identity constraint (handles edge cases)
+    if USE_DB:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, status, error_message, meta
+                        FROM {Tables.JOBS}
+                        WHERE id::text = %s
+                        LIMIT 1
+                        """,
+                        (job_id,),
+                    )
+                    job = cur.fetchone()
+            if job:
+                status = job["status"]
+                if status == "ready":
+                    jm = job.get("meta") or {}
+                    if isinstance(jm, str):
+                        try:
+                            jm = __import__('json').loads(jm)
+                        except Exception:
+                            jm = {}
+                    return jsonify({
+                        "ok": True,
+                        "status": "done",
+                        "job_id": job_id,
+                        "video_id": job_id,
+                        "video_url": jm.get("video_url"),
+                        "thumbnail_url": jm.get("thumbnail_url"),
+                    })
+                if status == "failed":
+                    return jsonify({
+                        "ok": False,
+                        "status": "failed",
+                        "job_id": job_id,
+                        "error": "video_failed",
+                        "message": job.get("error_message") or "Video generation failed",
+                    })
+                # queued / processing / other — return in-flight
+                return jsonify({
+                    "ok": True,
+                    "status": status if status in ("queued", "processing") else "processing",
+                    "job_id": job_id,
+                    "progress": 0,
+                    "message": "Generating video...",
+                })
+        except Exception as e:
+            print(f"[VIDEO STATUS] Fallback DB check error for {job_id}: {e}")
 
     return jsonify({
         "error": "job_not_found",
