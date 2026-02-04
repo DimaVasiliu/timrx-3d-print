@@ -71,8 +71,14 @@ def send_magic_code(to_email: str, code: str) -> bool:
     try:
         from backend.services.invoicing_service import _load_logo
         logo_bytes = _load_logo()
-    except Exception:
+    except Exception as e:
+        print(f"[EMAIL] send_magic_code: failed to load logo: {e}")
         logo_bytes = None
+
+    if logo_bytes:
+        print(f"[EMAIL] send_magic_code: logo loaded ({len(logo_bytes)} bytes)")
+    else:
+        print("[EMAIL] send_magic_code: no logo available, sending without logo")
 
     # Logo tag: CID if logo available, hidden otherwise
     logo_img_tag = ""
@@ -84,12 +90,11 @@ def send_magic_code(to_email: str, code: str) -> bool:
 
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background: #ffffff; border-radius: 12px; overflow: hidden;
+                background-color: #ffffff; border-radius: 12px; overflow: hidden;
                 border: 1px solid #e8e8e8;">
 
         <!-- Header with logo -->
-        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 28px 32px; text-align: center;">
+        <div style="background-color: #1a1a2e; padding: 28px 32px; text-align: center;">
             <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
                 <tr>
                     <td style="vertical-align: middle; padding-right: 12px;">
@@ -113,7 +118,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
             </p>
 
             <!-- Code box -->
-            <div style="background: #f0f4ff; border: 2px dashed #c0cfff; border-radius: 10px;
+            <div style="background-color: #f0f4ff; border: 2px dashed #c0cfff; border-radius: 10px;
                         padding: 24px; text-align: center; margin: 0 0 24px;">
                 <span style="font-size: 36px; font-weight: 700; letter-spacing: 8px;
                              color: #1a1a2e; font-family: 'Courier New', monospace;">{code}</span>
@@ -128,7 +133,7 @@ def send_magic_code(to_email: str, code: str) -> bool:
         </div>
 
         <!-- Footer -->
-        <div style="background: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+        <div style="background-color: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
                     text-align: center;">
             <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
                 TimrX &mdash; 3D Print Hub
@@ -172,7 +177,9 @@ Need help? Contact us at support@timrx.live
                     "content_type": "image/png",
                 }],
             )
-            return result.success
+            if result.success:
+                return True
+            print(f"[EMAIL] send_magic_code send_raw failed: {result.message}, falling back to simple send")
         except Exception as e:
             print(f"[EMAIL] send_magic_code send_raw error: {e}, falling back to simple send")
 
@@ -204,12 +211,11 @@ def send_purchase_receipt(
 
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background: #ffffff; border-radius: 12px; overflow: hidden;
+                background-color: #ffffff; border-radius: 12px; overflow: hidden;
                 border: 1px solid #e8e8e8;">
 
         <!-- Header with logo -->
-        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 28px 32px; text-align: center;">
+        <div style="background-color: #1a1a2e; padding: 28px 32px; text-align: center;">
             <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
                 <tr>
                     <td style="vertical-align: middle; padding-right: 12px;">
@@ -233,7 +239,7 @@ def send_purchase_receipt(
             </p>
 
             <!-- Details box -->
-            <div style="background: #f0f4ff; border: 1px solid #e0e8ff; border-radius: 10px;
+            <div style="background-color: #f0f4ff; border: 1px solid #e0e8ff; border-radius: 10px;
                         padding: 20px 24px; margin: 0 0 24px;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <tr>
@@ -259,7 +265,7 @@ def send_purchase_receipt(
         </div>
 
         <!-- Footer -->
-        <div style="background: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+        <div style="background-color: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
                     text-align: center;">
             <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
                 TimrX &mdash; 3D Print Hub
@@ -303,7 +309,9 @@ Need help? Contact us at support@timrx.live
                     "content_type": "image/png",
                 }],
             )
-            return result.success
+            if result.success:
+                return True
+            print(f"[EMAIL] send_purchase_receipt send_raw failed: {result.message}, falling back to simple send")
         except Exception as e:
             print(f"[EMAIL] send_purchase_receipt send_raw error: {e}, falling back to simple send")
 
@@ -350,12 +358,11 @@ def send_invoice_email(
 
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background: #ffffff; border-radius: 12px; overflow: hidden;
+                background-color: #ffffff; border-radius: 12px; overflow: hidden;
                 border: 1px solid #e8e8e8;">
 
         <!-- Header with logo -->
-        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    padding: 28px 32px; text-align: center;">
+        <div style="background-color: #1a1a2e; padding: 28px 32px; text-align: center;">
             <table cellpadding="0" cellspacing="0" border="0" style="margin: 0 auto;">
                 <tr>
                     <td style="vertical-align: middle; padding-right: 12px;">
@@ -379,7 +386,7 @@ def send_invoice_email(
             </p>
 
             <!-- Details box -->
-            <div style="background: #f0f4ff; border: 1px solid #e0e8ff; border-radius: 10px;
+            <div style="background-color: #f0f4ff; border: 1px solid #e0e8ff; border-radius: 10px;
                         padding: 20px 24px; margin: 0 0 20px;">
                 <table style="width: 100%; border-collapse: collapse;">
                     <tr>
@@ -412,7 +419,7 @@ def send_invoice_email(
         </div>
 
         <!-- Footer -->
-        <div style="background: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
+        <div style="background-color: #f9f9fb; border-top: 1px solid #eee; padding: 20px 32px;
                     text-align: center;">
             <p style="color: #999; font-size: 12px; margin: 0 0 6px;">
                 TimrX &mdash; 3D Print Hub
