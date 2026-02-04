@@ -1043,3 +1043,71 @@ def subscription_cancel():
             "period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
         })
     return jsonify({"error": "cancel_failed", "message": "Failed to cancel subscription"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INVOICE / RECEIPT PDF DOWNLOADS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/invoice/<invoice_id>/pdf", methods=["GET"])
+@require_session
+@no_cache
+def download_invoice_pdf(invoice_id):
+    """
+    Download invoice PDF.  Ownership enforced via identity_id.
+
+    Returns a 302 redirect to a presigned S3 URL (valid for 1 hour).
+    """
+    from backend.services.invoicing_service import InvoicingService
+    from backend.services.s3_service import presign_s3_key
+
+    invoice = InvoicingService.get_invoice(invoice_id)
+    if not invoice:
+        return jsonify({"error": {"code": "NOT_FOUND", "message": "Invoice not found"}}), 404
+
+    # Ownership check
+    if str(invoice.get("identity_id")) != g.identity_id:
+        return jsonify({"error": {"code": "NOT_FOUND", "message": "Invoice not found"}}), 404
+
+    s3_key = invoice.get("pdf_s3_key")
+    if not s3_key:
+        return jsonify({"error": {"code": "PDF_NOT_AVAILABLE", "message": "Invoice PDF not yet generated"}}), 404
+
+    presigned = presign_s3_key(s3_key, expires_in=3600)
+    if not presigned:
+        return jsonify({"error": {"code": "INTERNAL_ERROR", "message": "Failed to generate download URL"}}), 500
+
+    from flask import redirect
+    return redirect(presigned)
+
+
+@bp.route("/receipt/<receipt_id>/pdf", methods=["GET"])
+@require_session
+@no_cache
+def download_receipt_pdf(receipt_id):
+    """
+    Download receipt PDF.  Ownership enforced via identity_id.
+
+    Returns a 302 redirect to a presigned S3 URL (valid for 1 hour).
+    """
+    from backend.services.invoicing_service import InvoicingService
+    from backend.services.s3_service import presign_s3_key
+
+    receipt = InvoicingService.get_receipt(receipt_id)
+    if not receipt:
+        return jsonify({"error": {"code": "NOT_FOUND", "message": "Receipt not found"}}), 404
+
+    # Ownership check
+    if str(receipt.get("identity_id")) != g.identity_id:
+        return jsonify({"error": {"code": "NOT_FOUND", "message": "Receipt not found"}}), 404
+
+    s3_key = receipt.get("pdf_s3_key")
+    if not s3_key:
+        return jsonify({"error": {"code": "PDF_NOT_AVAILABLE", "message": "Receipt PDF not yet generated"}}), 404
+
+    presigned = presign_s3_key(s3_key, expires_in=3600)
+    if not presigned:
+        return jsonify({"error": {"code": "INTERNAL_ERROR", "message": "Failed to generate download URL"}}), 500
+
+    from flask import redirect
+    return redirect(presigned)
