@@ -36,9 +36,10 @@ def _load_logo() -> Optional[bytes]:
     # Try local paths (development)
     from backend.config import config
     candidates = [
-        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo (1).png",
+        config.APP_DIR / "backend" / "assets" / "logo.png",       # server (APP_DIR = repo root)
+        config.APP_DIR / "assets" / "logo.png",                    # local alt
+        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo (1).png",  # local dev
         config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo.png",
-        config.APP_DIR / "assets" / "logo.png",
     ]
     for p in candidates:
         try:
