@@ -462,6 +462,10 @@ class Config:
     OPENAI_API_KEY: str = field(default_factory=lambda: _get_env("OPENAI_API_KEY"))
     # GEMINI_API_KEY with fallback to GOOGLE_API_KEY for backward compatibility
     GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY"))
+    # Runway video generation
+    RUNWAY_API_KEY: str = field(default_factory=lambda: _get_env("RUNWAY_API_KEY"))
+    RUNWAY_API_BASE: str = field(default_factory=lambda: _get_env("RUNWAY_API_BASE", "https://api.dev.runwayml.com").rstrip("/"))
+    RUNWAY_API_VERSION: str = field(default_factory=lambda: _get_env("RUNWAY_API_VERSION", "2024-11-06"))
 
     # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
@@ -659,6 +663,9 @@ MESHY_API_KEY = config.MESHY_API_KEY
 MESHY_API_BASE = config.MESHY_API_BASE
 OPENAI_API_KEY = config.OPENAI_API_KEY
 GEMINI_API_KEY = config.GEMINI_API_KEY
+RUNWAY_API_KEY = config.RUNWAY_API_KEY
+RUNWAY_API_BASE = config.RUNWAY_API_BASE
+RUNWAY_API_VERSION = config.RUNWAY_API_VERSION
 DEFAULT_MODEL_TITLE = config.DEFAULT_MODEL_TITLE
 ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS
