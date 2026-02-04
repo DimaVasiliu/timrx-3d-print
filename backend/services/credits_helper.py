@@ -179,6 +179,8 @@ ACTION_KEYS = CONFIG_ACTION_KEYS or {
     "image_generate": "image_studio_generate",
     "video": "video",
     "video-generate": "video",
-    "text2video": "video",
-    "image2video": "video",
+    "text2video": "video_text_generate",
+    "image2video": "video_image_animate",
+    "video_text_generate": "video_text_generate",
+    "video_image_animate": "video_image_animate",
 }
