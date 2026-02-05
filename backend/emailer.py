@@ -662,6 +662,117 @@ Need help? Reply to this email or contact support@timrx.live
 # ─────────────────────────────────────────────────────────────
 # Admin Notifications
 # ─────────────────────────────────────────────────────────────
+def send_payment_received(
+    to_email: str,
+    plan_name: str,
+    credits: int,
+    amount_gbp: float,
+) -> bool:
+    """
+    Send a minimal "Payment Received" confirmation email (HTML only, no PDFs).
+
+    This is used as a fallback when invoice/receipt PDF generation fails,
+    ensuring the buyer always receives immediate confirmation.
+    """
+    from datetime import datetime, timezone
+
+    subject = f"TimrX Payment Received - {plan_name}"
+    paid_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Load logo for inline CID embedding
+    logo_bytes = _load_logo()
+
+    # Build body HTML with success message
+    body_html = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f0fdf4;border:1px solid #86efac;border-radius:8px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        &#10003; Payment Successful
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        Your {credits:,} credits have been added to your account.
+                    </p>
+                </td>
+            </tr>
+        </table>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr>
+                <td style="padding:16px;background-color:{BG_LIGHT};border-radius:6px;">
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Plan:</strong> {plan_name}
+                    </p>
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Amount:</strong> &pound;{amount_gbp:.2f}
+                    </p>
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Credits:</strong> {credits:,}
+                    </p>
+                    <p style="margin:0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Date:</strong> {paid_date}
+                    </p>
+                </td>
+            </tr>
+            <tr>
+                <td style="padding-top:16px;">
+                    <p style="margin:0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                        Your full invoice and receipt will be sent separately.
+                        Your credits are available immediately.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Payment Received",
+        intro="Thank you for your purchase! Your payment has been confirmed.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Payment Received - TimrX
+
+Thank you for your purchase! Your payment has been confirmed.
+
+Plan: {plan_name}
+Amount: £{amount_gbp:.2f}
+Credits: {credits:,}
+Date: {paid_date}
+
+Your credits have been added to your account and are available immediately.
+Your full invoice and receipt will be sent separately.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    # Use send_raw with inline logo if logo available
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_payment_received send_raw failed: {result.message}, falling back to simple send")
+        except Exception as e:
+            print(f"[EMAIL] send_payment_received send_raw error: {e}, falling back to simple send")
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
 def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None) -> bool:
     """Send a notification to the admin email."""
     admin_email = config.ADMIN_EMAIL
