@@ -18,7 +18,7 @@ from flask import Blueprint, Response, jsonify, request
 from backend.config import OPENAI_API_KEY, config
 from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
-from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async
+from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, update_job_status_ready, update_job_status_failed
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.gemini_image_service import (
     gemini_generate_image,
@@ -149,7 +149,7 @@ def _handle_gemini_image_generate(body: dict):
     internal_job_id = str(uuid.uuid4())
 
     # Reserve credits
-    action_key = "image-studio"
+    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
@@ -158,6 +158,18 @@ def _handle_gemini_image_generate(body: dict):
     )
     if credit_error:
         return credit_error
+
+    # Create job record for tracking (same as OpenAI flow)
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="google",
+        action_key=action_key,
+        prompt=prompt,
+        meta={"model": "imagen-4.0", "aspect_ratio": aspect_ratio, "image_size": image_size},
+        reservation_id=reservation_id,
+        status="queued",
+    )
 
     try:
         # Generate image synchronously (Imagen is reasonably fast)
@@ -178,6 +190,13 @@ def _handle_gemini_image_generate(body: dict):
             image_urls=result.get("image_urls", [result["image_url"]]),
             user_id=identity_id,
             provider="google",
+        )
+
+        # Update job status to ready
+        update_job_status_ready(
+            job_id=internal_job_id,
+            image_id=internal_job_id,
+            image_url=result["image_url"],
         )
 
         # Finalize credits
@@ -203,6 +222,7 @@ def _handle_gemini_image_generate(body: dict):
 
     except GeminiConfigError as e:
         from backend.services.credits_helper import release_job_credits
+        update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
         return jsonify({
@@ -212,6 +232,7 @@ def _handle_gemini_image_generate(body: dict):
 
     except GeminiValidationError as e:
         from backend.services.credits_helper import release_job_credits
+        update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
         return jsonify({
@@ -223,6 +244,7 @@ def _handle_gemini_image_generate(body: dict):
 
     except GeminiAuthError as e:
         from backend.services.credits_helper import release_job_credits
+        update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
         return jsonify({
@@ -232,10 +254,11 @@ def _handle_gemini_image_generate(body: dict):
 
     except RuntimeError as e:
         from backend.services.credits_helper import release_job_credits
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_error", internal_job_id)
         error_str = str(e)
         print(f"[Gemini Imagen] Error: {error_str}")
+        update_job_status_failed(internal_job_id, error_str)
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
 
         if error_str.startswith("gemini_"):
             parts = error_str.split(":", 1)
@@ -252,9 +275,10 @@ def _handle_gemini_image_generate(body: dict):
 
     except Exception as e:
         from backend.services.credits_helper import release_job_credits
+        print(f"[Gemini Imagen] Unexpected error: {e}")
+        update_job_status_failed(internal_job_id, str(e))
         if reservation_id:
             release_job_credits(reservation_id, "gemini_error", internal_job_id)
-        print(f"[Gemini Imagen] Unexpected error: {e}")
         return jsonify({
             "error": "gemini_image_failed",
             "message": f"Gemini image failed: {e}"
@@ -298,7 +322,7 @@ def _handle_openai_image_generate(body: dict):
     response_format = (body.get("response_format") or "url").strip()
 
     internal_job_id = str(uuid.uuid4())
-    action_key = "image-studio"
+    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
 
     reservation_id, credit_error = start_paid_job(
         identity_id,
@@ -448,7 +472,7 @@ def gemini_image_mod():
     internal_job_id = str(uuid.uuid4())
 
     # Reserve credits
-    action_key = "image-studio"
+    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
@@ -457,6 +481,18 @@ def gemini_image_mod():
     )
     if credit_error:
         return credit_error
+
+    # Create job record for tracking (same as OpenAI flow)
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="google",
+        action_key=action_key,
+        prompt=prompt,
+        meta={"model": "imagen-4.0", "aspect_ratio": aspect_ratio, "image_size": image_size},
+        reservation_id=reservation_id,
+        status="queued",
+    )
 
     try:
         # Generate image synchronously (Imagen is reasonably fast)
@@ -477,6 +513,13 @@ def gemini_image_mod():
             image_urls=result.get("image_urls", [result["image_url"]]),
             user_id=identity_id,
             provider="google",
+        )
+
+        # Update job status to ready
+        update_job_status_ready(
+            job_id=internal_job_id,
+            image_id=internal_job_id,
+            image_url=result["image_url"],
         )
 
         # Finalize credits
@@ -501,6 +544,7 @@ def gemini_image_mod():
 
     except GeminiConfigError as e:
         from backend.services.credits_helper import release_job_credits
+        update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
         return jsonify({
@@ -510,6 +554,7 @@ def gemini_image_mod():
 
     except GeminiValidationError as e:
         from backend.services.credits_helper import release_job_credits
+        update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
         return jsonify({
@@ -521,6 +566,7 @@ def gemini_image_mod():
 
     except GeminiAuthError as e:
         from backend.services.credits_helper import release_job_credits
+        update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
         return jsonify({
@@ -530,10 +576,11 @@ def gemini_image_mod():
 
     except RuntimeError as e:
         from backend.services.credits_helper import release_job_credits
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_error", internal_job_id)
         error_str = str(e)
         print(f"[Gemini Imagen] Error: {error_str}")
+        update_job_status_failed(internal_job_id, error_str)
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_error", internal_job_id)
 
         # Parse error code from message if present
         if error_str.startswith("gemini_"):
@@ -551,9 +598,10 @@ def gemini_image_mod():
 
     except Exception as e:
         from backend.services.credits_helper import release_job_credits
+        print(f"[Gemini Imagen] Unexpected error: {e}")
+        update_job_status_failed(internal_job_id, str(e))
         if reservation_id:
             release_job_credits(reservation_id, "gemini_error", internal_job_id)
-        print(f"[Gemini Imagen] Unexpected error: {e}")
         return jsonify({
             "error": "gemini_image_failed",
             "message": str(e)
@@ -601,7 +649,10 @@ def openai_image_mod():
 
     internal_job_id = str(uuid.uuid4())
     # Use credits helper action key mapping in routes
-    action_key = "image-studio"
+    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
+
+    # DEBUG: Trace OpenAI image credit flow
+    print(f"[OPENAI_IMAGE:DEBUG] >>> Route handler: identity_id={identity_id}, action_key={action_key}, job_id={internal_job_id}")
 
     reservation_id, credit_error = start_paid_job(
         identity_id,
@@ -609,7 +660,11 @@ def openai_image_mod():
         internal_job_id,
         {"prompt": prompt[:100], "n": n, "model": model, "size": size},
     )
+
+    print(f"[OPENAI_IMAGE:DEBUG] start_paid_job returned: reservation_id={reservation_id}, credit_error={credit_error is not None}")
+
     if credit_error:
+        print(f"[OPENAI_IMAGE:DEBUG] !!! Credit error returned, aborting")
         return credit_error
 
     store_meta = {
@@ -656,6 +711,11 @@ def openai_image_mod():
     log_event("image/openai:dispatched[mod]", {"internal_job_id": internal_job_id})
 
     balance_info = get_current_balance(identity_id)
+    # DEBUG: Log wallet state after reservation
+    print(f"[OPENAI_IMAGE:DEBUG] Job dispatched. balance_info={balance_info}, reservation_id={reservation_id}")
+    if balance_info:
+        print(f"[OPENAI_IMAGE:DEBUG] Wallet state: balance={balance_info.get('balance')}, reserved={balance_info.get('reserved')}, available={balance_info.get('available')}")
+
     return jsonify(
         {
             "ok": True,
