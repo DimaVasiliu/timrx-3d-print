@@ -75,13 +75,15 @@ def history_mod():
                                     -- Model data from joined models table
                                     m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
                                     m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
+                                    m.prompt AS m_prompt, m.status AS m_status,
                                     -- Image data from joined images table
                                     i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
-                                    i.thumbnail_url AS i_thumbnail_url,
+                                    i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt,
                                     -- Video data from joined videos table
                                     v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
                                     v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
-                                    v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio
+                                    v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio,
+                                    v.meta AS v_meta, v.prompt AS v_prompt
                                 FROM {Tables.HISTORY_ITEMS} h
                                 LEFT JOIN {Tables.MODELS} m ON (
                                     m.identity_id = %s AND (
@@ -163,12 +165,29 @@ def history_mod():
                             return meta.get("model_urls", {}), meta.get("textured_model_urls", {})
                         return {}, {}
 
+                    def _parse_meta(meta):
+                        """Parse meta JSONB to dict."""
+                        if not meta:
+                            return {}
+                        if isinstance(meta, str):
+                            try:
+                                return json.loads(meta)
+                            except Exception:
+                                return {}
+                        return meta if isinstance(meta, dict) else {}
+
                     for r in rows:
-                        item = r["payload"] if r["payload"] else {}
-                        payload = item if isinstance(item, dict) else {}
-                        item["id"] = str(r["id"])
-                        item["type"] = r["item_type"]
-                        item["status"] = r["status"]
+                        # Build unified response structure with 'kind' field
+                        item_type = r["item_type"]
+                        item = {
+                            "id": str(r["id"]),
+                            "kind": item_type,  # unified 'kind' field
+                            "type": item_type,  # keep 'type' for backward compatibility
+                            "status": r["status"],
+                            "created_at": int(r["created_at"].timestamp() * 1000) if r["created_at"] else None,
+                        }
+
+                        # Base fields from history_items
                         if r["stage"]:
                             item["stage"] = r["stage"]
                         if r["title"]:
@@ -183,72 +202,82 @@ def history_mod():
                             item["image_url"] = r["image_url"]
                         if r.get("video_url"):
                             item["video_url"] = r["video_url"]
-                        if r["created_at"]:
-                            item["created_at"] = int(r["created_at"].timestamp() * 1000)
 
-                        # Apply joined model data (from LEFT JOIN)
+                        # Include original payload for legacy compatibility
+                        payload = r["payload"] if r["payload"] else {}
+                        if isinstance(payload, str):
+                            try:
+                                payload = json.loads(payload)
+                            except Exception:
+                                payload = {}
+
+                        # Hydrate from joined MODEL data
                         if r.get("m_id"):
+                            item["model_id"] = str(r["m_id"])
                             if r.get("m_glb_url"):
                                 item["glb_url"] = r["m_glb_url"]
-                                payload["glb_url"] = r["m_glb_url"]
                             if r.get("m_thumbnail_url"):
                                 item["thumbnail_url"] = r["m_thumbnail_url"]
-                                payload["thumbnail_url"] = r["m_thumbnail_url"]
-                            model_urls, textured_model_urls = _enrich_model_meta(r.get("m_meta"))
-                            if model_urls:
-                                item["model_urls"] = model_urls
-                                payload["model_urls"] = model_urls
-                            if textured_model_urls:
-                                item["textured_model_urls"] = textured_model_urls
-                                payload["textured_model_urls"] = textured_model_urls
                             if r.get("m_title") and not item.get("title"):
                                 item["title"] = r["m_title"]
+                            if r.get("m_prompt") and not item.get("prompt"):
+                                item["prompt"] = r["m_prompt"]
+                            # Include full model meta
+                            model_meta = _parse_meta(r.get("m_meta"))
+                            if model_meta:
+                                item["meta"] = model_meta
+                                # Also extract model_urls for convenience
+                                model_urls, textured_model_urls = _enrich_model_meta(r.get("m_meta"))
+                                if model_urls:
+                                    item["model_urls"] = model_urls
+                                if textured_model_urls:
+                                    item["textured_model_urls"] = textured_model_urls
 
-                        # Apply joined image data (from LEFT JOIN)
+                        # Hydrate from joined IMAGE data
                         if r.get("i_id"):
+                            item["image_id"] = str(r["i_id"])
                             if r.get("i_image_url"):
                                 item["image_url"] = r["i_image_url"]
-                                payload["image_url"] = r["i_image_url"]
                             if r.get("i_thumbnail_url"):
                                 item["thumbnail_url"] = r["i_thumbnail_url"]
-                                payload["thumbnail_url"] = r["i_thumbnail_url"]
                             if r.get("i_title") and not item.get("title"):
                                 item["title"] = r["i_title"]
+                            if r.get("i_prompt") and not item.get("prompt"):
+                                item["prompt"] = r["i_prompt"]
 
-                        # Apply joined video data (from LEFT JOIN)
+                        # Hydrate from joined VIDEO data
                         if r.get("v_id"):
+                            item["video_id"] = str(r["v_id"])
                             if r.get("v_video_url"):
                                 item["video_url"] = r["v_video_url"]
-                                payload["video_url"] = r["v_video_url"]
                             if r.get("v_thumbnail_url"):
                                 item["thumbnail_url"] = r["v_thumbnail_url"]
-                                payload["thumbnail_url"] = r["v_thumbnail_url"]
                             if r.get("v_title") and not item.get("title"):
                                 item["title"] = r["v_title"]
+                            if r.get("v_prompt") and not item.get("prompt"):
+                                item["prompt"] = r["v_prompt"]
                             if r.get("v_duration_seconds"):
                                 item["duration_seconds"] = r["v_duration_seconds"]
-                                payload["duration_seconds"] = r["v_duration_seconds"]
                             if r.get("v_resolution"):
                                 item["resolution"] = r["v_resolution"]
-                                payload["resolution"] = r["v_resolution"]
                             if r.get("v_aspect_ratio"):
                                 item["aspect_ratio"] = r["v_aspect_ratio"]
-                                payload["aspect_ratio"] = r["v_aspect_ratio"]
+                            # Include video meta
+                            video_meta = _parse_meta(r.get("v_meta"))
+                            if video_meta:
+                                item["meta"] = video_meta
 
                         # Scrub any remaining meshy.ai URLs (we only want S3 URLs)
-                        for key in ("glb_url", "thumbnail_url", "image_url"):
+                        for key in ("glb_url", "thumbnail_url", "image_url", "video_url"):
                             val = item.get(key)
                             if isinstance(val, str) and "meshy.ai" in val:
                                 item[key] = None
-                                if isinstance(payload, dict):
-                                    payload[key] = None
 
                         for key in ("model_urls", "textured_model_urls", "texture_urls"):
                             if key in item:
                                 item[key] = _scrub_meshy_urls(item.get(key))
-                            if isinstance(payload, dict) and key in payload:
-                                payload[key] = _scrub_meshy_urls(payload.get(key))
 
+                        # Derive title if still missing
                         if not item.get("title"):
                             item["title"] = derive_display_title(item.get("prompt"), None)
 
@@ -773,6 +802,7 @@ def history_item_update_mod(item_id: str):
             try:
                 with get_conn() as conn:
                     with conn.cursor(row_factory=dict_row) as cur:
+                        # Single optimized query with LEFT JOINs to hydrate all asset data
                         cur.execute(
                             f"""
                             SELECT
@@ -780,12 +810,20 @@ def history_item_update_mod(item_id: str):
                                 h.thumbnail_url, h.glb_url, h.image_url, h.video_url,
                                 h.payload, h.created_at,
                                 h.model_id, h.image_id, h.video_id,
-                                v.video_url  AS v_video_url,
-                                v.thumbnail_url AS v_thumbnail_url,
-                                v.duration_seconds AS v_duration_seconds,
-                                v.resolution AS v_resolution,
-                                v.aspect_ratio AS v_aspect_ratio
+                                -- Model data from joined models table
+                                m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
+                                m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
+                                m.prompt AS m_prompt, m.status AS m_status,
+                                -- Image data from joined images table
+                                i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
+                                i.thumbnail_url AS i_thumbnail_url,
+                                -- Video data from joined videos table
+                                v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
+                                v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
+                                v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio
                             FROM {Tables.HISTORY_ITEMS} h
+                            LEFT JOIN {Tables.MODELS} m ON h.model_id = m.id
+                            LEFT JOIN {Tables.IMAGES} i ON h.image_id = i.id
                             LEFT JOIN {Tables.VIDEOS} v ON h.video_id = v.id
                             WHERE h.id::text = %s AND h.identity_id = %s
                             LIMIT 1
@@ -806,23 +844,67 @@ def history_item_update_mod(item_id: str):
                     "thumbnail_url": row.get("thumbnail_url"),
                     "glb_url": row.get("glb_url"),
                     "image_url": row.get("image_url"),
-                    "video_url": row.get("video_url") or row.get("v_video_url"),
+                    "video_url": row.get("video_url"),
                     "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
                     "model_id": str(row["model_id"]) if row.get("model_id") else None,
                     "image_id": str(row["image_id"]) if row.get("image_id") else None,
                     "video_id": str(row["video_id"]) if row.get("video_id") else None,
                 }
-                # Enrich video data
-                if row.get("v_video_url"):
-                    item["video_url"] = row["v_video_url"]
-                if row.get("v_thumbnail_url"):
-                    item["thumbnail_url"] = row["v_thumbnail_url"]
-                if row.get("v_duration_seconds"):
-                    item["duration_seconds"] = row["v_duration_seconds"]
-                if row.get("v_resolution"):
-                    item["resolution"] = row["v_resolution"]
-                if row.get("v_aspect_ratio"):
-                    item["aspect_ratio"] = row["v_aspect_ratio"]
+
+                # Helper to extract model_urls from meta JSONB
+                def _extract_model_urls(meta):
+                    if not meta:
+                        return {}, {}
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            return {}, {}
+                    if isinstance(meta, dict):
+                        return meta.get("model_urls", {}), meta.get("textured_model_urls", {})
+                    return {}, {}
+
+                # Enrich with model data (from LEFT JOIN)
+                if row.get("m_id"):
+                    if row.get("m_glb_url"):
+                        item["glb_url"] = row["m_glb_url"]
+                    if row.get("m_thumbnail_url"):
+                        item["thumbnail_url"] = row["m_thumbnail_url"]
+                    if row.get("m_title") and not item.get("title"):
+                        item["title"] = row["m_title"]
+                    if row.get("m_prompt") and not item.get("prompt"):
+                        item["prompt"] = row["m_prompt"]
+                    # Extract model_urls and textured_model_urls from meta
+                    model_urls, textured_model_urls = _extract_model_urls(row.get("m_meta"))
+                    if model_urls:
+                        item["model_urls"] = model_urls
+                    if textured_model_urls:
+                        item["textured_model_urls"] = textured_model_urls
+
+                # Enrich with image data (from LEFT JOIN)
+                if row.get("i_id"):
+                    if row.get("i_image_url"):
+                        item["image_url"] = row["i_image_url"]
+                    if row.get("i_thumbnail_url"):
+                        item["thumbnail_url"] = row["i_thumbnail_url"]
+                    if row.get("i_title") and not item.get("title"):
+                        item["title"] = row["i_title"]
+
+                # Enrich with video data (from LEFT JOIN)
+                if row.get("v_id"):
+                    if row.get("v_video_url"):
+                        item["video_url"] = row["v_video_url"]
+                    if row.get("v_thumbnail_url"):
+                        item["thumbnail_url"] = row["v_thumbnail_url"]
+                    if row.get("v_title") and not item.get("title"):
+                        item["title"] = row["v_title"]
+                    if row.get("v_duration_seconds"):
+                        item["duration_seconds"] = row["v_duration_seconds"]
+                    if row.get("v_resolution"):
+                        item["resolution"] = row["v_resolution"]
+                    if row.get("v_aspect_ratio"):
+                        item["aspect_ratio"] = row["v_aspect_ratio"]
+
                 # Include payload fields
                 payload = row.get("payload") or {}
                 if isinstance(payload, str):
@@ -832,6 +914,10 @@ def history_item_update_mod(item_id: str):
                         payload = {}
                 if isinstance(payload, dict):
                     item["payload"] = payload
+
+                # Derive title if still missing
+                if not item.get("title"):
+                    item["title"] = derive_display_title(item.get("prompt"), None)
 
                 return jsonify({"ok": True, "item": item})
             except Exception as e:
