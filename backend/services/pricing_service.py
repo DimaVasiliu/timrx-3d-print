@@ -100,7 +100,7 @@ class PricingService:
         "texture": "MESHY_RETEXTURE",    # texture alias (15c)
         "rigging": "MESHY_RIG",        # rigging alias for rig (25c)
         "upscale": "MESHY_REFINE",     # upscale is same as refine (10c)
-        "image_generate": "OPENAI_IMAGE",  # Legacy key
+        "image_generate": "OPENAI_IMAGE",  # Canonical key for image generation
         "video_generate": "VIDEO_GENERATE",  # Alternative video key
         # Granular video action keys
         "video_text_generate": "VIDEO_TEXT_GENERATE",
