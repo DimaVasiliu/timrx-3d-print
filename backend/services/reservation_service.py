@@ -236,6 +236,9 @@ class ReservationService:
             balance = wallet.get("balance_credits", 0) or 0
 
             # 2. Get current reserved amount (excluding expired)
+            # CRITICAL: Lock all held reservations for this identity to prevent race condition.
+            # Without FOR UPDATE, two concurrent requests could both pass balance check and
+            # create reservations, potentially going over the available balance.
             cur.execute(
                 f"""
                 SELECT COALESCE(SUM(cost_credits), 0) as total
@@ -243,6 +246,7 @@ class ReservationService:
                 WHERE identity_id = %s
                   AND status = %s
                   AND expires_at > NOW()
+                FOR UPDATE
                 """,
                 (identity_id, ReservationStatus.HELD),
             )
