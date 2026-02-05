@@ -239,9 +239,12 @@ class ReservationService:
             # CRITICAL: Lock all held reservations for this identity to prevent race condition.
             # Without FOR UPDATE, two concurrent requests could both pass balance check and
             # create reservations, potentially going over the available balance.
+            #
+            # NOTE: PostgreSQL does NOT allow FOR UPDATE with aggregate functions (SUM).
+            # So we first lock all the rows, then sum in Python.
             cur.execute(
                 f"""
-                SELECT COALESCE(SUM(cost_credits), 0) as total
+                SELECT id, cost_credits
                 FROM {Tables.CREDIT_RESERVATIONS}
                 WHERE identity_id = %s
                   AND status = %s
@@ -250,8 +253,11 @@ class ReservationService:
                 """,
                 (identity_id, ReservationStatus.HELD),
             )
-            reserved_row = fetch_one(cur)
-            current_reserved = int(reserved_row.get("total", 0) or 0) if reserved_row else 0
+            locked_reservations = fetch_all(cur)
+            current_reserved = sum(
+                int(r.get("cost_credits", 0) or 0)
+                for r in locked_reservations
+            )
 
             # 3. Check available balance
             available = balance - current_reserved
