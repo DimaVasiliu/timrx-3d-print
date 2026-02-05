@@ -30,19 +30,21 @@ if not EMAIL_SERVICE_AVAILABLE:
 
 
 # ─────────────────────────────────────────────────────────────
-# Logo loader (self-contained — no external dependency)
+# Logo loaders (self-contained — no external dependency)
 # ─────────────────────────────────────────────────────────────
 _logo_bytes: Optional[bytes] = None
 _logo_loaded = False
+_blogs_logo_bytes: Optional[bytes] = None
+_blogs_logo_loaded = False
 
 
 def _load_logo() -> Optional[bytes]:
-    """Load TimrX email logo from backend/assets/logo-email.png. Cached on success."""
+    """Load TimrX email logo from assets/logo.png. Cached on success."""
     global _logo_bytes, _logo_loaded
     if _logo_loaded:
         return _logo_bytes
 
-    logo_path = config.APP_DIR / "backend" / "assets" / "logo-email.png"
+    logo_path = config.APP_DIR / "assets" / "logo.png"
     try:
         resolved = logo_path.resolve()
         if resolved.is_file():
@@ -54,6 +56,27 @@ def _load_logo() -> Optional[bytes]:
         print(f"[EMAIL] Logo load failed: {exc}")
 
     print(f"[EMAIL] Logo not found at {logo_path}")
+    return None
+
+
+def _load_blogs_logo() -> Optional[bytes]:
+    """Load TimrX blogs logo from assets/blogs.png. Cached on success."""
+    global _blogs_logo_bytes, _blogs_logo_loaded
+    if _blogs_logo_loaded:
+        return _blogs_logo_bytes
+
+    logo_path = config.APP_DIR / "assets" / "blogs.png"
+    try:
+        resolved = logo_path.resolve()
+        if resolved.is_file():
+            _blogs_logo_bytes = resolved.read_bytes()
+            _blogs_logo_loaded = True
+            print(f"[EMAIL] Blogs logo loaded from {resolved} ({len(_blogs_logo_bytes)} bytes)")
+            return _blogs_logo_bytes
+    except Exception as exc:
+        print(f"[EMAIL] Blogs logo load failed: {exc}")
+
+    print(f"[EMAIL] Blogs logo not found at {logo_path}")
     return None
 
 
@@ -548,6 +571,16 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
         print(f"[EMAIL] Admin notification (no ADMIN_EMAIL configured): {subject}")
         return False
 
+    # Load logo for inline CID embedding
+    logo_bytes = _load_logo()
+
+    logo_img_tag = ""
+    if logo_bytes:
+        logo_img_tag = (
+            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
+            'style="height:32px; width:auto; display:block;" />'
+        )
+
     data_html = ""
     if data:
         rows = "".join(
@@ -570,8 +603,7 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
                         <table cellpadding="0" cellspacing="0" border="0">
                             <tr>
                                 <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
-                                    <img src="https://timrx.live/img/logo.png" alt="TimrX" height="32"
-                                         style="height:32px; width:auto; display:block;" />
+                                    {logo_img_tag}
                                 </td>
                                 <td style="vertical-align: middle;">
                                     <span style="font-size: 18px; font-weight: 800; color: #ffffff;
@@ -596,6 +628,35 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
     </div>
     </div>
     """
+
+    text_body = f"""{subject}
+
+{message}
+
+---
+TimrX Admin Notification
+"""
+
+    # Use send_raw with inline logo if logo available
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=admin_email,
+                subject=f"[TimrX Admin] {subject}",
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] notify_admin send_raw failed: {result.message}, falling back to simple send")
+        except Exception as e:
+            print(f"[EMAIL] notify_admin send_raw error: {e}, falling back to simple send")
 
     return send_email(admin_email, f"[TimrX Admin] {subject}", html_body)
 
