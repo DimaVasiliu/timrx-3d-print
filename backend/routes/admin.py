@@ -17,6 +17,7 @@ Endpoints:
 - POST /api/admin/reservations/<id>/release - Release a reservation
 - GET  /api/admin/jobs               - List jobs
 - GET  /api/admin/health             - Admin health check
+- GET  /api/admin/debug/user         - Internal debug: user summary (masked email, wallet, history)
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -610,4 +611,152 @@ def reconciliation_dry_run():
         return jsonify({"ok": True, **result})
     except Exception as e:
         print(f"[ADMIN] Reconciliation dry-run error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL DEBUG ENDPOINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mask_email(email: str) -> str:
+    """Mask email for debug output: jo***@ex***.com"""
+    if not email or "@" not in email:
+        return email
+    local, domain = email.rsplit("@", 1)
+    domain_parts = domain.split(".")
+    masked_local = local[:2] + "***" if len(local) > 2 else local[0] + "***"
+    masked_domain = domain_parts[0][:2] + "***" if len(domain_parts[0]) > 2 else domain_parts[0]
+    return f"{masked_local}@{masked_domain}.{'.'.join(domain_parts[1:])}"
+
+
+@bp.route("/debug/user", methods=["GET"])
+@require_admin
+def debug_user():
+    """
+    Internal debug endpoint for user troubleshooting.
+
+    Query params:
+        - identity_id: The identity UUID to lookup
+        - email: Email address to lookup (alternative to identity_id)
+
+    Returns (non-sensitive data only):
+        - identity_id
+        - email (masked)
+        - wallet.balance_credits
+        - reserved_credits
+        - last_purchase summary
+        - last 10 history items summary
+    """
+    from backend.db import query_one, query_all, Tables
+
+    identity_id = request.args.get("identity_id")
+    email = request.args.get("email")
+
+    if not identity_id and not email:
+        return jsonify({"ok": False, "error": "Provide identity_id or email"}), 400
+
+    try:
+        # ── Lookup identity ────────────────────────────────────────
+        if email and not identity_id:
+            identity = query_one(
+                f"SELECT id, email, email_verified, created_at FROM {Tables.IDENTITIES} WHERE email = %s",
+                (email,),
+            )
+            if not identity:
+                return jsonify({"ok": False, "error": "Identity not found"}), 404
+            identity_id = str(identity["id"])
+        else:
+            identity = query_one(
+                f"SELECT id, email, email_verified, created_at FROM {Tables.IDENTITIES} WHERE id = %s",
+                (identity_id,),
+            )
+            if not identity:
+                return jsonify({"ok": False, "error": "Identity not found"}), 404
+
+        # ── Get wallet ─────────────────────────────────────────────
+        wallet = query_one(
+            f"SELECT balance_credits, updated_at FROM {Tables.WALLETS} WHERE identity_id = %s",
+            (identity_id,),
+        )
+
+        # ── Get reserved credits ───────────────────────────────────
+        reserved_row = query_one(
+            f"""
+            SELECT COALESCE(SUM(cost_credits), 0) as total
+            FROM {Tables.CREDIT_RESERVATIONS}
+            WHERE identity_id = %s AND status = 'held' AND expires_at > NOW()
+            """,
+            (identity_id,),
+        )
+        reserved_credits = int(reserved_row["total"]) if reserved_row else 0
+
+        # ── Get last purchase ──────────────────────────────────────
+        last_purchase = query_one(
+            f"""
+            SELECT id, amount_gbp, credits_granted, status, created_at
+            FROM {Tables.PURCHASES}
+            WHERE identity_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (identity_id,),
+        )
+        last_purchase_summary = None
+        if last_purchase:
+            last_purchase_summary = {
+                "id": str(last_purchase["id"]),
+                "amount_gbp": float(last_purchase["amount_gbp"]) if last_purchase["amount_gbp"] else None,
+                "credits": last_purchase["credits_granted"],
+                "status": last_purchase["status"],
+                "created_at": last_purchase["created_at"].isoformat() if last_purchase["created_at"] else None,
+            }
+
+        # ── Get last 10 history items ──────────────────────────────
+        history_items = query_all(
+            f"""
+            SELECT id, item_type, status, created_at
+            FROM {Tables.HISTORY_ITEMS}
+            WHERE identity_id = %s
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            (identity_id,),
+        )
+        history_summary = [
+            {
+                "id": str(h["id"]),
+                "kind": h["item_type"],
+                "status": h["status"],
+                "created_at": h["created_at"].isoformat() if h["created_at"] else None,
+            }
+            for h in history_items
+        ]
+
+        # ── Build response ─────────────────────────────────────────
+        result = {
+            "ok": True,
+            "identity_id": identity_id,
+            "email": _mask_email(identity.get("email")) if identity.get("email") else None,
+            "email_verified": identity.get("email_verified", False),
+            "identity_created_at": identity["created_at"].isoformat() if identity.get("created_at") else None,
+            "wallet": {
+                "balance_credits": wallet["balance_credits"] if wallet else 0,
+                "reserved_credits": reserved_credits,
+                "available_credits": max(0, (wallet["balance_credits"] if wallet else 0) - reserved_credits),
+                "updated_at": wallet["updated_at"].isoformat() if wallet and wallet.get("updated_at") else None,
+            },
+            "last_purchase": last_purchase_summary,
+            "history_items": history_summary,
+            "history_count": len(history_summary),
+        }
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Debug user lookup: {identity_id[:8]}... by {admin_email or 'token'}")
+
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[ADMIN] Debug user error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
