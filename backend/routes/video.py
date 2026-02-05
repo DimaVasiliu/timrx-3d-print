@@ -180,8 +180,8 @@ def generate_video():
     # Generate internal job ID
     internal_job_id = str(uuid.uuid4())
 
-    # Determine action key for credits (granular per task type)
-    action_key = "text2video" if task == "text2video" else "image2video"
+    # Determine action key for credits (canonical keys)
+    action_key = "video_text_generate" if task == "text2video" else "video_image_animate"
 
     # Reserve credits
     reservation_id, credit_error = start_paid_job(
@@ -321,7 +321,8 @@ def _dispatch_video_job(
             duration_seconds = 6
 
     internal_job_id = str(uuid.uuid4())
-    action_key = "text2video" if task == "text2video" else "image2video"
+    # Canonical action keys for video generation
+    action_key = "video_text_generate" if task == "text2video" else "video_image_animate"
 
     reservation_id, credit_error = start_paid_job(
         identity_id,
