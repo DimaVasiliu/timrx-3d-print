@@ -403,3 +403,211 @@ def run_subscription_grants():
     from backend.services.subscription_service import SubscriptionService
     granted = SubscriptionService.run_pending_grants()
     return jsonify({"ok": True, "granted": granted})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL OUTBOX / CRON ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/email/outbox/stats", methods=["GET"])
+@require_admin
+def email_outbox_stats():
+    """
+    Get email outbox statistics.
+
+    Returns:
+        - pending: Emails waiting to be sent
+        - sent: Successfully sent emails
+        - failed: Permanently failed emails (after max retries)
+        - total: Total emails in outbox
+    """
+    try:
+        from backend.services.email_outbox_service import EmailOutboxService
+        stats = EmailOutboxService.get_outbox_stats()
+        return jsonify({"ok": True, **stats})
+    except Exception as e:
+        print(f"[ADMIN] Email outbox stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/email/outbox/send-pending", methods=["POST"])
+@bp.route("/email/send-pending", methods=["POST"])
+@require_admin
+def send_pending_emails():
+    """
+    Process pending emails from the outbox (cron-callable endpoint).
+
+    Call this endpoint periodically (e.g., every minute) from:
+    - A Render cron job
+    - An external scheduler (e.g., cron.org, EasyCron)
+    - A background worker
+
+    Query params:
+        - limit: Max emails to process (default 50, max 200)
+
+    Returns:
+        - sent: Number of emails successfully sent
+        - failed: Number of emails that failed this attempt
+        - remaining: Number of emails still pending
+
+    Safe to call frequently - processes oldest pending emails first.
+    Failed emails are automatically retried until max_attempts reached.
+    """
+    try:
+        from backend.services.email_outbox_service import EmailOutboxService
+
+        limit = request.args.get("limit", 50, type=int)
+        limit = min(limit, 200)  # Cap at 200 to prevent timeout
+
+        result = EmailOutboxService.send_pending_emails(limit=limit)
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Email outbox processed by {admin_email or 'token'}: {result}")
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Email send-pending error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/email/outbox/retry-failed", methods=["POST"])
+@require_admin
+def retry_failed_emails():
+    """
+    Reset failed emails to pending for retry.
+
+    Use this to manually retry emails that permanently failed.
+    Resets status to 'pending' and clears attempt counter.
+
+    Query params:
+        - limit: Max emails to reset (default 10, max 50)
+
+    Returns:
+        - reset: Number of emails reset to pending
+    """
+    try:
+        from backend.db import execute
+
+        limit = request.args.get("limit", 10, type=int)
+        limit = min(limit, 50)
+
+        count = execute(
+            """
+            UPDATE timrx_billing.email_outbox
+            SET status = 'pending', attempts = 0, last_error = NULL,
+                failed_at = NULL
+            WHERE status = 'failed'
+            AND id IN (
+                SELECT id FROM timrx_billing.email_outbox
+                WHERE status = 'failed'
+                ORDER BY created_at ASC
+                LIMIT %s
+            )
+            """,
+            (limit,),
+        )
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reset {count} failed emails to pending by {admin_email or 'token'}")
+
+        return jsonify({"ok": True, "reset": count})
+    except Exception as e:
+        print(f"[ADMIN] Email retry-failed error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECONCILIATION / SAFETY JOB ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/reconcile", methods=["POST"])
+@bp.route("/reconcile/run", methods=["POST"])
+@require_admin
+def run_reconciliation():
+    """
+    Run the safety reconciliation job.
+
+    This job detects and fixes data inconsistencies:
+    - Purchases missing ledger entries
+    - Wallet balance mismatches
+    - Stale held reservations (job terminal or missing)
+    - Completed jobs missing history_items
+
+    Query params:
+        - dry_run: If 'true', detect issues but don't fix them (default: false)
+        - send_alert: If 'true', send admin email on fixes (default: true)
+
+    Returns:
+        Summary of all checks and fixes applied
+
+    Safe to call frequently (every 15 minutes recommended via cron).
+    All fixes are idempotent.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+        send_alert = request.args.get("send_alert", "true").lower() != "false"
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reconciliation triggered by {admin_email or 'token'} (dry_run={dry_run})")
+
+        result = ReconciliationService.reconcile_safety(
+            dry_run=dry_run,
+            send_alert=send_alert,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/stats", methods=["GET"])
+@require_admin
+def reconciliation_stats():
+    """
+    Get current reconciliation stats without applying fixes.
+
+    Returns counts of issues that would be fixed:
+    - purchases_missing_ledger: Paid purchases without ledger entry
+    - wallet_mismatches: Wallets where balance != ledger sum
+    - stale_reservations: Held reservations with terminal/missing jobs
+
+    Useful for monitoring dashboards.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        stats = ReconciliationService.get_stats()
+        return jsonify({"ok": True, **stats})
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/dry-run", methods=["POST"])
+@require_admin
+def reconciliation_dry_run():
+    """
+    Run reconciliation in dry-run mode (detect but don't fix).
+
+    Alias for POST /reconcile?dry_run=true
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reconciliation dry-run by {admin_email or 'token'}")
+
+        result = ReconciliationService.reconcile_safety(
+            dry_run=True,
+            send_alert=False,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation dry-run error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
