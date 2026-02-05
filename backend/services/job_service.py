@@ -1378,7 +1378,8 @@ def create_internal_job_row(
                     VALUES
                         (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
-                    SET reservation_id = COALESCE(EXCLUDED.reservation_id, {Tables.JOBS}.reservation_id),
+                    SET provider = EXCLUDED.provider,
+                        reservation_id = COALESCE(EXCLUDED.reservation_id, {Tables.JOBS}.reservation_id),
                         prompt = COALESCE(EXCLUDED.prompt, {Tables.JOBS}.prompt),
                         meta = COALESCE({Tables.JOBS}.meta, '{{}}'::jsonb) || COALESCE(EXCLUDED.meta, '{{}}'::jsonb),
                         priority = EXCLUDED.priority,
