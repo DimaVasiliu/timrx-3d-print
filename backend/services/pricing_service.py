@@ -5,21 +5,157 @@ Responsibilities:
 - Get available purchase plans
 - Get action costs for credit checks
 - Validate plan codes
+- Normalize action keys to canonical form
 
-Stable frontend keys:
-- text_to_3d_generate
-- image_to_3d_generate
-- refine
-- remesh
-- texture
-- rig
-- image_studio_generate
-- video
+CANONICAL ACTION KEYS (use these in new code):
+- image_generate       (10c) - All 2D image providers (OpenAI, Gemini, etc.)
+- text_to_3d_generate  (20c) - Text to 3D preview generation
+- image_to_3d_generate (30c) - Image to 3D conversion
+- refine               (10c) - Refine/upscale 3D model
+- remesh               (10c) - Remesh 3D model (same cost as refine)
+- retexture            (15c) - Apply new texture to 3D model
+- rigging              (25c) - Add skeleton/rig to 3D model
+- video_generate       (60c) - Generic video generation
+- video_text_generate  (60c) - Text-to-video generation
+- video_image_animate  (60c) - Image-to-video animation
+
+LEGACY ALIASES (backwards compatibility only):
+- preview, text-to-3d, text-to-3d-preview -> text_to_3d_generate
+- image-to-3d -> image_to_3d_generate
+- text-to-3d-refine, upscale -> refine
+- texture -> retexture
+- rig -> rigging
+- image_studio_generate, openai-image, text-to-image -> image_generate
+- video, video-generate -> video_generate
+- text2video, video-text-generate -> video_text_generate
+- image2video, video-image-animate -> video_image_animate
 """
 
 from typing import Optional, Dict, Any, List
 
 from backend.db import query_one, query_all, execute, Tables
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CANONICAL ACTION KEYS - Single source of truth
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Canonical action keys (use these in all new code)
+class CanonicalActions:
+    """Canonical action key constants."""
+    IMAGE_GENERATE = "image_generate"
+    TEXT_TO_3D_GENERATE = "text_to_3d_generate"
+    IMAGE_TO_3D_GENERATE = "image_to_3d_generate"
+    REFINE = "refine"
+    REMESH = "remesh"
+    RETEXTURE = "retexture"
+    RIGGING = "rigging"
+    VIDEO_GENERATE = "video_generate"
+    VIDEO_TEXT_GENERATE = "video_text_generate"
+    VIDEO_IMAGE_ANIMATE = "video_image_animate"
+
+
+# Canonical key -> DB action code mapping
+CANONICAL_TO_DB = {
+    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",
+    CanonicalActions.TEXT_TO_3D_GENERATE: "MESHY_TEXT_TO_3D",
+    CanonicalActions.IMAGE_TO_3D_GENERATE: "MESHY_IMAGE_TO_3D",
+    CanonicalActions.REFINE: "MESHY_REFINE",
+    CanonicalActions.REMESH: "MESHY_REFINE",  # Remesh uses same cost as refine
+    CanonicalActions.RETEXTURE: "MESHY_RETEXTURE",
+    CanonicalActions.RIGGING: "MESHY_RIG",
+    CanonicalActions.VIDEO_GENERATE: "VIDEO_GENERATE",
+    CanonicalActions.VIDEO_TEXT_GENERATE: "VIDEO_TEXT_GENERATE",
+    CanonicalActions.VIDEO_IMAGE_ANIMATE: "VIDEO_IMAGE_ANIMATE",
+}
+
+# Alias -> Canonical key mapping (for backwards compatibility)
+# All variations map to canonical keys
+ALIAS_TO_CANONICAL = {
+    # Image generation aliases
+    "image_studio_generate": CanonicalActions.IMAGE_GENERATE,
+    "openai-image": CanonicalActions.IMAGE_GENERATE,
+    "text-to-image": CanonicalActions.IMAGE_GENERATE,
+    "image-studio": CanonicalActions.IMAGE_GENERATE,
+    "nano-image": CanonicalActions.IMAGE_GENERATE,
+
+    # Text-to-3D aliases
+    "preview": CanonicalActions.TEXT_TO_3D_GENERATE,
+    "text-to-3d": CanonicalActions.TEXT_TO_3D_GENERATE,
+    "text-to-3d-preview": CanonicalActions.TEXT_TO_3D_GENERATE,
+
+    # Image-to-3D aliases
+    "image-to-3d": CanonicalActions.IMAGE_TO_3D_GENERATE,
+
+    # Refine aliases
+    "text-to-3d-refine": CanonicalActions.REFINE,
+    "upscale": CanonicalActions.REFINE,
+
+    # Remesh aliases
+    "text-to-3d-remesh": CanonicalActions.REMESH,
+
+    # Retexture aliases
+    "texture": CanonicalActions.RETEXTURE,
+
+    # Rigging aliases
+    "rig": CanonicalActions.RIGGING,
+
+    # Video aliases
+    "video": CanonicalActions.VIDEO_GENERATE,
+    "video-generate": CanonicalActions.VIDEO_GENERATE,
+    "text2video": CanonicalActions.VIDEO_TEXT_GENERATE,
+    "video-text-generate": CanonicalActions.VIDEO_TEXT_GENERATE,
+    "image2video": CanonicalActions.VIDEO_IMAGE_ANIMATE,
+    "video-image-animate": CanonicalActions.VIDEO_IMAGE_ANIMATE,
+}
+
+
+def normalize_action_key(action_key: str) -> str:
+    """
+    Normalize any action key to its canonical form.
+
+    Args:
+        action_key: Any action key (canonical, alias, or legacy)
+
+    Returns:
+        Canonical action key
+
+    Example:
+        normalize_action_key("openai-image") -> "image_generate"
+        normalize_action_key("image_generate") -> "image_generate"
+        normalize_action_key("text-to-3d-preview") -> "text_to_3d_generate"
+    """
+    # Already canonical?
+    if action_key in CANONICAL_TO_DB:
+        return action_key
+
+    # Check alias mapping
+    if action_key in ALIAS_TO_CANONICAL:
+        return ALIAS_TO_CANONICAL[action_key]
+
+    # Normalize hyphens to underscores and try again
+    normalized = action_key.replace("-", "_").lower()
+    if normalized in CANONICAL_TO_DB:
+        return normalized
+    if normalized in ALIAS_TO_CANONICAL:
+        return ALIAS_TO_CANONICAL[normalized]
+
+    # Unknown - log warning and return as-is
+    print(f"[PRICING] WARNING: Unknown action key '{action_key}', cannot normalize")
+    return action_key
+
+
+def get_db_action_code_from_canonical(canonical_key: str) -> Optional[str]:
+    """
+    Get DB action code from canonical key.
+
+    Args:
+        canonical_key: A canonical action key
+
+    Returns:
+        DB action code (e.g., "OPENAI_IMAGE") or None if not found
+    """
+    return CANONICAL_TO_DB.get(canonical_key)
 
 
 # Default plans to seed into the database
@@ -68,53 +204,26 @@ class PricingService:
 
     # Cache for action costs (refreshed on startup or manually)
     _action_costs_cache: Dict[str, int] = {}
-    _db_to_frontend_map: Dict[str, str] = {}
-    _frontend_to_db_map: Dict[str, str] = {}
 
-    # Mapping from DB action_code to stable frontend keys
-    # DB codes: MESHY_TEXT_TO_3D, MESHY_IMAGE_TO_3D, MESHY_REFINE, MESHY_RETEXTURE, MESHY_RIG, OPENAI_IMAGE, VIDEO_GENERATE, VIDEO_TEXT_GENERATE, VIDEO_IMAGE_ANIMATE
+    # DB action code -> canonical key mapping (reverse of CANONICAL_TO_DB)
+    DB_TO_CANONICAL = {v: k for k, v in CANONICAL_TO_DB.items()}
+
+    # Legacy mapping for backwards compatibility (deprecated - use normalize_action_key)
     ACTION_CODE_MAP = {
-        "MESHY_TEXT_TO_3D": "text_to_3d_generate",
-        "MESHY_IMAGE_TO_3D": "image_to_3d_generate",
-        "MESHY_REFINE": "refine",
-        "MESHY_RETEXTURE": "texture",
-        "MESHY_RIG": "rig",
-        "OPENAI_IMAGE": "image_studio_generate",
-        "VIDEO_GENERATE": "video",
-        "VIDEO_TEXT_GENERATE": "video_text_generate",
-        "VIDEO_IMAGE_ANIMATE": "video_image_animate",
+        "MESHY_TEXT_TO_3D": CanonicalActions.TEXT_TO_3D_GENERATE,
+        "MESHY_IMAGE_TO_3D": CanonicalActions.IMAGE_TO_3D_GENERATE,
+        "MESHY_REFINE": CanonicalActions.REFINE,
+        "MESHY_RETEXTURE": CanonicalActions.RETEXTURE,
+        "MESHY_RIG": CanonicalActions.RIGGING,
+        "OPENAI_IMAGE": CanonicalActions.IMAGE_GENERATE,
+        "VIDEO_GENERATE": CanonicalActions.VIDEO_GENERATE,
+        "VIDEO_TEXT_GENERATE": CanonicalActions.VIDEO_TEXT_GENERATE,
+        "VIDEO_IMAGE_ANIMATE": CanonicalActions.VIDEO_IMAGE_ANIMATE,
     }
 
-    # Additional frontend aliases that map to same DB codes
-    # These cover all UI action keys used in workspace-credits.js BUTTON_CONFIG
-    FRONTEND_ALIASES = {
-        # Hyphenated frontend keys (from BUTTON_CONFIG)
-        "text-to-3d": "MESHY_TEXT_TO_3D",
-        "image-to-3d": "MESHY_IMAGE_TO_3D",
-        "text-to-image": "OPENAI_IMAGE",
-        "image-studio": "OPENAI_IMAGE",
-        "openai-image": "OPENAI_IMAGE",
-        # Alternative names
-        "remesh": "MESHY_REFINE",      # remesh uses same cost as refine (10c)
-        "retexture": "MESHY_RETEXTURE",  # retexture operation (15c)
-        "texture": "MESHY_RETEXTURE",    # texture alias (15c)
-        "rigging": "MESHY_RIG",        # rigging alias for rig (25c)
-        "upscale": "MESHY_REFINE",     # upscale is same as refine (10c)
-        "image_generate": "OPENAI_IMAGE",  # Canonical key for image generation
-        "video_generate": "VIDEO_GENERATE",  # Alternative video key
-        # Granular video action keys
-        "video_text_generate": "VIDEO_TEXT_GENERATE",
-        "video-text-generate": "VIDEO_TEXT_GENERATE",
-        "text2video": "VIDEO_TEXT_GENERATE",
-        "video_image_animate": "VIDEO_IMAGE_ANIMATE",
-        "video-image-animate": "VIDEO_IMAGE_ANIMATE",
-        "image2video": "VIDEO_IMAGE_ANIMATE",
-        "preview": "MESHY_TEXT_TO_3D",  # Preview is text-to-3d cost
-        # Explicit preview key used by frontend
-        "text-to-3d-preview": "MESHY_TEXT_TO_3D",
-        # Explicit refine key used by frontend
-        "text-to-3d-refine": "MESHY_REFINE",
-    }
+    # Legacy aliases (deprecated - use ALIAS_TO_CANONICAL)
+    FRONTEND_ALIASES = {alias: CANONICAL_TO_DB.get(canonical, canonical)
+                        for alias, canonical in ALIAS_TO_CANONICAL.items()}
 
     @staticmethod
     def get_plans(active_only: bool = True) -> List[Dict[str, Any]]:
@@ -251,18 +360,21 @@ class PricingService:
     @staticmethod
     def get_action_costs() -> Dict[str, int]:
         """
-        Get all action costs as a dict with stable frontend keys.
-        Returns {frontend_key: cost_credits}.
+        Get all action costs as a dict with canonical keys.
+        Returns {canonical_key: cost_credits}.
 
         Example response:
         {
+            "image_generate": 10,
             "text_to_3d_generate": 20,
             "image_to_3d_generate": 30,
             "refine": 10,
             "remesh": 10,
-            "texture": 10,
-            "rig": 10,
-            "image_studio_generate": 12
+            "retexture": 15,
+            "rigging": 25,
+            "video_generate": 60,
+            "video_text_generate": 60,
+            "video_image_animate": 60
         }
         """
         # Use cache if available
@@ -282,22 +394,21 @@ class PricingService:
         for row in rows:
             db_costs[row["action_code"]] = row["cost_credits"]
 
-        # Map to frontend keys
+        # Map DB codes to canonical keys
         result: Dict[str, int] = {}
-
-        # Primary mappings (DB codes to stable frontend keys)
-        for db_code, frontend_key in PricingService.ACTION_CODE_MAP.items():
+        for canonical_key, db_code in CANONICAL_TO_DB.items():
             if db_code in db_costs:
-                result[frontend_key] = db_costs[db_code]
+                result[canonical_key] = db_costs[db_code]
 
-        # All aliases (remesh, rig, hyphenated keys, etc.)
-        for alias, db_code in PricingService.FRONTEND_ALIASES.items():
-            if db_code in db_costs:
-                result[alias] = db_costs[db_code]
+        # Also include all aliases for backwards compatibility
+        for alias, canonical_key in ALIAS_TO_CANONICAL.items():
+            if canonical_key in result:
+                result[alias] = result[canonical_key]
 
         # Log what we're returning for debugging
         if result:
-            print(f"[PRICING] Action costs loaded from DB: {len(result)} keys")
+            canonical_count = len(CANONICAL_TO_DB)
+            print(f"[PRICING] Action costs loaded: {canonical_count} canonical keys + {len(result) - canonical_count} aliases")
         else:
             print("[PRICING] WARNING: No action costs found in database!")
 
@@ -329,50 +440,78 @@ class PricingService:
     def get_action_cost(action_key: str) -> int:
         """
         Get cost in credits for a specific action.
-        Accepts both frontend keys (e.g., 'text_to_3d_generate')
-        and DB codes (e.g., 'MESHY_TEXT_TO_3D').
+        Accepts any action key (canonical, alias, or DB code).
 
-        Returns 0 if action not found (should not happen in production).
+        Args:
+            action_key: Any action key
+
+        Returns:
+            Cost in credits, or 0 if not found
         """
         costs = PricingService.get_action_costs()
 
-        # Try direct frontend key lookup
+        # Direct lookup (handles canonical keys and cached aliases)
         if action_key in costs:
             return costs[action_key]
 
-        # Try mapping from DB code
-        frontend_key = PricingService.ACTION_CODE_MAP.get(action_key)
-        if frontend_key and frontend_key in costs:
-            return costs[frontend_key]
+        # Try normalizing to canonical
+        canonical = normalize_action_key(action_key)
+        if canonical in costs:
+            return costs[canonical]
 
-        # Fallback - check aliases
-        if action_key in PricingService.FRONTEND_ALIASES:
-            db_code = PricingService.FRONTEND_ALIASES[action_key]
-            frontend_key = PricingService.ACTION_CODE_MAP.get(db_code)
-            if frontend_key and frontend_key in costs:
-                return costs[frontend_key]
+        # Try as DB code (e.g., "MESHY_TEXT_TO_3D")
+        canonical_from_db = PricingService.DB_TO_CANONICAL.get(action_key)
+        if canonical_from_db and canonical_from_db in costs:
+            return costs[canonical_from_db]
 
         print(f"[PRICING] Warning: Unknown action key '{action_key}', returning 0 cost")
         return 0
 
     @staticmethod
-    def get_db_action_code(frontend_key: str) -> Optional[str]:
+    def get_db_action_code(action_key: str) -> Optional[str]:
         """
-        Convert frontend key to DB action_code.
-        Returns None if not found.
+        Convert any action key to DB action_code.
 
-        Example: 'text_to_3d_generate' -> 'MESHY_TEXT_TO_3D'
+        Args:
+            action_key: Any action key (canonical, alias, or legacy)
+
+        Returns:
+            DB action code (e.g., "OPENAI_IMAGE") or None if not found
+
+        Example:
+            get_db_action_code('image_generate') -> 'OPENAI_IMAGE'
+            get_db_action_code('openai-image') -> 'OPENAI_IMAGE'
+            get_db_action_code('text-to-3d-preview') -> 'MESHY_TEXT_TO_3D'
         """
-        # Check aliases first
-        if frontend_key in PricingService.FRONTEND_ALIASES:
-            return PricingService.FRONTEND_ALIASES[frontend_key]
+        # Normalize to canonical first
+        canonical = normalize_action_key(action_key)
 
-        # Reverse lookup in primary map
-        for db_code, fe_key in PricingService.ACTION_CODE_MAP.items():
-            if fe_key == frontend_key:
-                return db_code
+        # Get DB code from canonical
+        db_code = CANONICAL_TO_DB.get(canonical)
+        if db_code:
+            return db_code
+
+        # Already a DB code?
+        if action_key in PricingService.DB_TO_CANONICAL:
+            return action_key
 
         return None
+
+    @staticmethod
+    def normalize_and_get_cost(action_key: str) -> tuple[str, str, int]:
+        """
+        Normalize action key and get its cost.
+        Returns (canonical_key, db_code, cost).
+
+        Useful for logging both requested and canonical action codes.
+
+        Example:
+            normalize_and_get_cost('openai-image') -> ('image_generate', 'OPENAI_IMAGE', 10)
+        """
+        canonical = normalize_action_key(action_key)
+        db_code = CANONICAL_TO_DB.get(canonical, "UNKNOWN")
+        cost = PricingService.get_action_cost(canonical)
+        return (canonical, db_code, cost)
 
     @staticmethod
     def refresh_costs_cache() -> None:
@@ -387,32 +526,32 @@ class PricingService:
     @staticmethod
     def map_job_type_to_action(job_type: str) -> str:
         """
-        Map frontend job type names to DB action codes.
-        E.g., 'text-to-3d' -> 'MESHY_TEXT_TO_3D'
+        Map any job type string to DB action code.
+        Uses canonical normalization under the hood.
 
-        This is for backward compatibility with old job type strings.
+        Args:
+            job_type: Any job type string (legacy or current)
+
+        Returns:
+            DB action code (e.g., 'MESHY_TEXT_TO_3D')
+
+        Example:
+            map_job_type_to_action('text-to-3d') -> 'MESHY_TEXT_TO_3D'
+            map_job_type_to_action('openai-image') -> 'OPENAI_IMAGE'
         """
-        job = (job_type or "").lower().replace("_", "-")
-        mapping = {
-            "text-to-3d": "MESHY_TEXT_TO_3D",
-            "image-to-3d": "MESHY_IMAGE_TO_3D",
-            "texture": "MESHY_RETEXTURE",
-            "retexture": "MESHY_RETEXTURE",
-            "remesh": "MESHY_REFINE",
-            "refine": "MESHY_REFINE",
-            "rigging": "MESHY_RIG",
-            "rig": "MESHY_RIG",
-            "openai-image": "OPENAI_IMAGE",
-            "nano-image": "OPENAI_IMAGE",
-            "image-studio": "OPENAI_IMAGE",
-            "video": "VIDEO_GENERATE",
-            "video-generate": "VIDEO_GENERATE",
-            "text2video": "VIDEO_TEXT_GENERATE",
-            "image2video": "VIDEO_IMAGE_ANIMATE",
-            "video-text-generate": "VIDEO_TEXT_GENERATE",
-            "video-image-animate": "VIDEO_IMAGE_ANIMATE",
-        }
-        return mapping.get(job, "MESHY_TEXT_TO_3D")  # Default to text-to-3d cost
+        if not job_type:
+            return "MESHY_TEXT_TO_3D"  # Default
+
+        # Normalize and get DB code
+        canonical = normalize_action_key(job_type)
+        db_code = CANONICAL_TO_DB.get(canonical)
+
+        if db_code:
+            return db_code
+
+        # Fallback for unknown types
+        print(f"[PRICING] Warning: Unknown job type '{job_type}', defaulting to MESHY_TEXT_TO_3D")
+        return "MESHY_TEXT_TO_3D"
 
     @staticmethod
     def seed_plans() -> int:
