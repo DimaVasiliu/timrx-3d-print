@@ -44,7 +44,15 @@ def register_blueprints(app):
     from backend.routes.community import bp as community_bp
     from backend.routes.contact import bp as contact_bp
     from backend.routes.video import bp as video_bp
-    from backend.routes.inspire import bp as inspire_bp
+
+    # Import inspire with explicit error handling for debugging
+    try:
+        from backend.routes.inspire import bp as inspire_bp
+    except Exception as e:
+        print(f"[ROUTES] ERROR importing inspire: {e}")
+        import traceback
+        traceback.print_exc()
+        inspire_bp = None
 
     # Frontend routes (no prefix)
     app.register_blueprint(frontend_bp)
@@ -65,7 +73,8 @@ def register_blueprints(app):
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
     app.register_blueprint(video_bp, url_prefix="/api/_mod")
-    app.register_blueprint(inspire_bp, url_prefix="/api/_mod")
+    if inspire_bp:
+        app.register_blueprint(inspire_bp, url_prefix="/api/_mod")
     app.register_blueprint(contact_bp, url_prefix="/api")
 
     # Also register under /api for backward compatibility (cached frontend)
@@ -79,7 +88,8 @@ def register_blueprints(app):
     app.register_blueprint(image_gen_bp, url_prefix="/api", name="image_gen_compat")
     app.register_blueprint(community_bp, url_prefix="/api", name="community_compat")
     app.register_blueprint(video_bp, url_prefix="/api", name="video_compat")
-    app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
+    if inspire_bp:
+        app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
 
     # Print route map at startup for debugging
     _print_route_map(app)
