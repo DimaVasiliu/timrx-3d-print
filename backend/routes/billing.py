@@ -1111,3 +1111,272 @@ def download_receipt_pdf(receipt_id):
 
     from flask import redirect
     return redirect(presigned)
+
+
+# ─────────────────────────────────────────────────────────────
+# Debug endpoint for testing PDF generation and email
+# ─────────────────────────────────────────────────────────────
+@bp.route("/debug/test-invoice-pdf", methods=["POST"])
+def debug_test_invoice_pdf():
+    """
+    Debug endpoint to test PDF generation and optionally send test email.
+
+    Request body:
+    {
+        "send_email": false,           // Optional: actually send email
+        "email": "test@example.com"    // Required if send_email=true
+    }
+
+    Returns:
+    {
+        "ok": true,
+        "invoice_pdf_bytes": 12345,
+        "receipt_pdf_bytes": 12345,
+        "logo_loaded": true,
+        "logo_bytes": 5000,
+        "errors": []
+    }
+    """
+    from backend.config import config
+
+    # Only allow in dev mode or with admin token
+    admin_token = request.headers.get("X-Admin-Token") or request.args.get("admin_token")
+    if not config.IS_DEV and admin_token != config.ADMIN_TOKEN:
+        return jsonify({"error": "Forbidden - requires dev mode or admin token"}), 403
+
+    errors = []
+    result = {
+        "ok": True,
+        "invoice_pdf_bytes": 0,
+        "receipt_pdf_bytes": 0,
+        "logo_loaded": False,
+        "logo_bytes": 0,
+        "errors": errors,
+    }
+
+    # Test logo loading
+    logo = None
+    try:
+        from backend.services.invoicing_service import _load_logo
+        logo = _load_logo()
+        result["logo_loaded"] = logo is not None
+        result["logo_bytes"] = len(logo) if logo else 0
+    except Exception as e:
+        errors.append(f"Logo load error: {e}")
+
+    # Test PDF generation with mock data
+    mock_invoice = {
+        "id": "test-invoice-id",
+        "invoice_number": "INV-2026-TEST",
+        "issued_at": None,
+        "customer_email": "test@example.com",
+        "subtotal": 9.99,
+        "tax_amount": 0,
+        "total": 9.99,
+    }
+    mock_receipt = {
+        "id": "test-receipt-id",
+        "receipt_number": "RCPT-2026-TEST",
+        "paid_at": None,
+        "payment_method": "mollie",
+        "currency": "GBP",
+        "amount_paid": 9.99,
+    }
+    mock_items = [
+        {
+            "description": "Test Plan - 100 Credits",
+            "quantity": 1,
+            "unit_price": 9.99,
+            "total": 9.99,
+        }
+    ]
+
+    invoice_pdf = None
+    receipt_pdf = None
+
+    try:
+        from backend.services.invoicing_service import InvoicingService
+        invoice_pdf = InvoicingService.generate_invoice_pdf(mock_invoice, mock_items)
+        result["invoice_pdf_bytes"] = len(invoice_pdf) if invoice_pdf else 0
+    except Exception as e:
+        errors.append(f"Invoice PDF error: {e}")
+        result["ok"] = False
+
+    try:
+        from backend.services.invoicing_service import InvoicingService
+        receipt_pdf = InvoicingService.generate_receipt_pdf(mock_receipt, mock_invoice)
+        result["receipt_pdf_bytes"] = len(receipt_pdf) if receipt_pdf else 0
+    except Exception as e:
+        errors.append(f"Receipt PDF error: {e}")
+        result["ok"] = False
+
+    # Optionally send test email
+    data = request.get_json(silent=True) or {}
+    if data.get("send_email") and data.get("email"):
+        try:
+            from backend.emailer import send_invoice_email
+            send_invoice_email(
+                to_email=data["email"],
+                invoice_number="INV-2026-TEST",
+                receipt_number="RCPT-2026-TEST",
+                plan_name="Test Plan",
+                credits=100,
+                amount_gbp=9.99,
+                invoice_pdf=invoice_pdf or b"",
+                receipt_pdf=receipt_pdf or b"",
+                logo_bytes=logo,
+            )
+            result["email_sent"] = True
+            result["email_to"] = data["email"]
+        except Exception as e:
+            errors.append(f"Email send error: {e}")
+            result["email_sent"] = False
+
+    return jsonify(result)
+
+
+@bp.route("/debug/email-preview", methods=["GET"])
+def debug_email_preview():
+    """
+    Debug endpoint to preview email templates in browser (HTML render, no sending).
+
+    Query params:
+        ?template=magic_code|purchase_receipt|invoice|admin
+
+    Returns rendered HTML for browser preview.
+    """
+    from backend.config import config
+    from flask import Response
+
+    # Only allow in dev mode or with admin token
+    admin_token = request.headers.get("X-Admin-Token") or request.args.get("admin_token")
+    if not config.IS_DEV and admin_token != config.ADMIN_TOKEN:
+        return jsonify({"error": "Forbidden - requires dev mode or admin token"}), 403
+
+    template = request.args.get("template", "purchase_receipt")
+
+    from backend.emailer import (
+        render_email_html,
+        render_detail_card,
+        render_highlight_box,
+        render_amount_display,
+        TEXT_PRIMARY,
+        TEXT_SECONDARY,
+    )
+
+    if template == "magic_code":
+        code_box = render_highlight_box(
+            f'<span style="font-size:32px;font-weight:700;letter-spacing:8px;color:{TEXT_PRIMARY};font-family:\'Courier New\',Courier,monospace;">ABC123</span>'
+        )
+        body_html = f'''
+            {code_box}
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+                <tr>
+                    <td>
+                        <p style="margin:0 0 8px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                            This code expires in <strong style="color:{TEXT_PRIMARY};">15 minutes</strong>.
+                        </p>
+                        <p style="margin:0;font-size:13px;line-height:1.6;color:#888888;font-family:Arial,Helvetica,sans-serif;">
+                            If you didn't request this code, you can safely ignore this email.
+                        </p>
+                    </td>
+                </tr>
+            </table>
+        '''
+        html = render_email_html(
+            title="Your Access Code",
+            intro="Use the code below to sign in to your TimrX account:",
+            body_html=body_html,
+            logo_cid=None,  # No logo in preview
+        )
+
+    elif template == "invoice":
+        amount_display = render_amount_display("9.99", "GBP", "Paid February 5, 2026")
+        ref_card = render_detail_card([
+            ("Invoice number", "INV-2026-0001"),
+            ("Receipt number", "RCPT-2026-0001"),
+        ], header="Reference")
+        summary_card = render_detail_card([
+            ("Starter Plan", "&pound;9.99"),
+            ("Credits added", "100"),
+            ("Amount paid", "&pound;9.99"),
+        ], header="Summary")
+        body_html = f'''
+            {amount_display}
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+                <tr><td style="padding-bottom:16px;">{ref_card}</td></tr>
+                <tr><td>{summary_card}</td></tr>
+                <tr>
+                    <td style="padding-top:24px;">
+                        <p style="margin:0 0 8px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                            Your invoice and receipt PDFs are attached to this email.
+                        </p>
+                        <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                            Your credits are now available in your account.
+                        </p>
+                    </td>
+                </tr>
+            </table>
+        '''
+        html = render_email_html(
+            title="Purchase Confirmed",
+            intro="Thank you for your purchase. Here's your receipt with invoice and receipt documents attached.",
+            body_html=body_html,
+            logo_cid=None,
+            footer_extra="Your PDF documents are attached to this email.",
+        )
+
+    elif template == "admin":
+        data_card = render_detail_card([
+            ("Identity ID", "id_abc123xyz"),
+            ("Email", "user@example.com"),
+            ("Plan", "Starter Plan"),
+            ("Credits", "100"),
+            ("Amount", "9.99 GBP"),
+        ], header="Details")
+        body_html = f'''
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                <tr>
+                    <td style="padding-bottom:16px;">
+                        <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">A user has purchased the Starter Plan.</p>
+                    </td>
+                </tr>
+                <tr><td>{data_card}</td></tr>
+            </table>
+        '''
+        html = render_email_html(
+            title="New Purchase",
+            intro="Admin notification from TimrX system.",
+            body_html=body_html,
+            logo_cid=None,
+            footer_extra="This is an automated admin notification.",
+        )
+
+    else:  # purchase_receipt (default)
+        amount_display = render_amount_display("9.99", "GBP", "Paid February 5, 2026")
+        summary_card = render_detail_card([
+            ("Starter Plan", "&pound;9.99"),
+            ("Credits added", "100"),
+            ("Amount paid", "&pound;9.99"),
+        ], header="Summary")
+        body_html = f'''
+            {amount_display}
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+                <tr><td>{summary_card}</td></tr>
+                <tr>
+                    <td style="padding-top:24px;">
+                        <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                            Your credits are now available in your account.
+                        </p>
+                    </td>
+                </tr>
+            </table>
+        '''
+        html = render_email_html(
+            title="Purchase Confirmed",
+            intro="Thank you for your purchase. Here's your receipt.",
+            body_html=body_html,
+            logo_cid=None,
+        )
+
+    return Response(html, mimetype="text/html")
