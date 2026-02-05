@@ -439,6 +439,7 @@ class ReservationService:
                 (new_balance, identity_id),
             )
 
+            provider = _derive_provider_from_action_code(action_code)
             print(
                 f"[RESERVATION] Finalized: id={reservation_id}, credits={cost_credits}, "
                 f"balance: {current_balance} -> {new_balance}"
@@ -450,6 +451,11 @@ class ReservationService:
                 "was_already_finalized": False,
                 "was_already_released": False,
                 "not_found": False,
+                # Additional fields for structured logging
+                "identity_id": identity_id,
+                "action_code": action_code,
+                "cost": cost_credits,
+                "provider": provider,
             }
 
     @staticmethod
@@ -527,9 +533,14 @@ class ReservationService:
             )
             updated = fetch_one(cur)
 
+            identity_id = str(reservation["identity_id"])
+            action_code = reservation["action_code"]
+            cost_credits = reservation["cost_credits"]
+            provider = _derive_provider_from_action_code(action_code)
+
             print(
                 f"[RESERVATION] Released: id={reservation_id}, reason={reason}, "
-                f"credits={reservation['cost_credits']} returned to available"
+                f"credits={cost_credits} returned to available"
             )
 
             return {
@@ -537,6 +548,11 @@ class ReservationService:
                 "was_already_released": False,
                 "was_already_finalized": False,
                 "not_found": False,
+                # Additional fields for structured logging
+                "identity_id": identity_id,
+                "action_code": action_code,
+                "cost": cost_credits,
+                "provider": provider,
             }
 
     @staticmethod
