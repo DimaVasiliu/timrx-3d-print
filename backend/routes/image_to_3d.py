@@ -255,7 +255,7 @@ def image_to_3d_status_mod(job_id: str):
             reservation_id = meta.get("reservation_id")
             internal_job_id = meta.get("internal_job_id")
             if reservation_id:
-                finalize_job_credits(reservation_id, meshy_job_id)
+                finalize_job_credits(reservation_id, meshy_job_id, user_id)
 
             if internal_job_id:
                 _update_job_status_ready(
