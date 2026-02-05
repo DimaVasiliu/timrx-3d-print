@@ -8,7 +8,7 @@ Returns random models, images, and videos for the Inspire overlay.
 from __future__ import annotations
 
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Blueprint, jsonify, request
 
 from backend.db import USE_DB, get_conn, dict_row
@@ -242,7 +242,12 @@ def inspire_feed():
             # Generate tags based on recency
             tags = []
             if row.get("created_at"):
-                days_old = (datetime.now() - row["created_at"]).days
+                created_at = row["created_at"]
+                # Handle both naive and timezone-aware datetimes
+                if created_at.tzinfo is None:
+                    days_old = (datetime.now() - created_at).days
+                else:
+                    days_old = (datetime.now(timezone.utc) - created_at).days
                 if days_old <= 7:
                     tags.append("new")
                 if days_old <= 3:
