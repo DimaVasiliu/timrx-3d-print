@@ -165,7 +165,7 @@ def mesh_remesh_mod():
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"ok": False, "error": str(e)}), 502
 
-    finalize_job_credits(reservation_id, meshy_task_id)
+    finalize_job_credits(reservation_id, meshy_task_id, identity_id)
 
     # Update internal job with upstream id for ownership/status
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -372,7 +372,7 @@ def mesh_retexture_mod():
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
 
-    finalize_job_credits(reservation_id, meshy_task_id)
+    finalize_job_credits(reservation_id, meshy_task_id, identity_id)
 
     # Update internal job with upstream id for ownership/status
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -573,7 +573,7 @@ def mesh_rigging_mod():
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"error": str(e)}), 502
 
-    finalize_job_credits(reservation_id, meshy_task_id)
+    finalize_job_credits(reservation_id, meshy_task_id, identity_id)
 
     # Update internal job with upstream id for ownership/status
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
