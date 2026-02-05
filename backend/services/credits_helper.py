@@ -42,6 +42,59 @@ from backend.utils import log_generation_event
 CREDITS_AVAILABLE = bool(getattr(config, "HAS_DATABASE", False) or getattr(config, "DATABASE_URL", ""))
 
 
+def _mark_job_ready_unbilled(job_id: str | None, identity_id: str | None) -> None:
+    """
+    Mark a job as ready_unbilled when it completed successfully but had no reservation.
+
+    This is a CRITICAL bug indicator - it means credits were never reserved but the job
+    was dispatched anyway. These jobs need admin review for manual billing.
+
+    The job is marked in the jobs table with status='ready_unbilled' and an error_message
+    explaining the issue.
+    """
+    if not job_id:
+        print(f"[CREDITS:ERROR] Cannot mark ready_unbilled - no job_id provided")
+        return
+
+    try:
+        from backend.db import USE_DB, get_conn, Tables
+
+        if not USE_DB:
+            print(f"[CREDITS:ERROR] Cannot mark ready_unbilled - DB not available")
+            return
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'ready_unbilled',
+                        error_message = 'BILLING_BUG: Job completed successfully but no credit reservation was found. Manual reconciliation required.',
+                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                    RETURNING id
+                    """,
+                    (
+                        __import__('json').dumps({
+                            "ready_unbilled_detected_at": __import__('time').time(),
+                            "identity_id_at_detection": identity_id,
+                        }),
+                        job_id,
+                    ),
+                )
+                result = cur.fetchone()
+            conn.commit()
+
+        if result:
+            print(f"[CREDITS:ERROR] Marked job {job_id} as ready_unbilled for admin reconciliation")
+        else:
+            print(f"[CREDITS:ERROR] Could not mark job {job_id} as ready_unbilled - job not found in DB")
+
+    except Exception as e:
+        print(f"[CREDITS:ERROR] Failed to mark job {job_id} as ready_unbilled: {e}")
+
+
 def _make_credit_error(code: str, message: str, status: int = 400, **extra) -> Tuple:
     payload = {"ok": False, "code": code, "error": message}
     if extra:
@@ -161,27 +214,77 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
 
     except ValueError as e:
         error_msg = str(e)
-        print(f"[CREDITS] Reservation failed: {error_msg}")
+        print(f"[CREDITS] Reservation failed (ValueError): {error_msg}")
         if "INSUFFICIENT_CREDITS" in error_msg:
             return None, _make_credit_error("INSUFFICIENT_CREDITS", error_msg, 402)
         return None, _make_credit_error("CREDIT_ERROR", str(e), 400)
 
     except Exception as e:
-        print(f"[CREDITS] Unexpected error reserving credits: {e}")
+        # CRITICAL: Do NOT return (None, None) - this allows free generations!
+        # Always return an error response so the route doesn't dispatch the provider call.
+        print(f"[CREDITS] CRITICAL: Unexpected error reserving credits: {e}")
         import traceback
-
         traceback.print_exc()
-        return None, None
+
+        # Return a 500 error so the route knows to abort
+        return None, _make_credit_error(
+            "CREDIT_RESERVATION_FAILED",
+            f"Credit reservation system error. Please try again. Error: {type(e).__name__}",
+            500,
+            job_id=internal_job_id,
+        )
 
 
-def finalize_job_credits(reservation_id: str, job_id: str | None = None) -> None:
-    """Finalize (capture) credits after successful job completion."""
+def finalize_job_credits(
+    reservation_id: str,
+    job_id: str | None = None,
+    identity_id: str | None = None,
+) -> bool:
+    """
+    Finalize (capture) credits after successful job completion.
+
+    Args:
+        reservation_id: The credit reservation ID to finalize
+        job_id: The job ID (for logging)
+        identity_id: The user identity ID (for logging unbilled cases)
+
+    Returns:
+        True if credits were finalized, False if skipped (no reservation or system unavailable)
+
+    IMPORTANT: If reservation_id is missing for a successful job, this indicates a bug
+    in the credit flow. The job will be marked as ready_unbilled for admin reconciliation.
+    """
     print(f"[CREDITS:DEBUG] >>> finalize_job_credits called: reservation_id={reservation_id}, job_id={job_id}")
     print(f"[CREDITS:DEBUG] CREDITS_AVAILABLE={CREDITS_AVAILABLE}, reservation_id is truthy={bool(reservation_id)}")
 
-    if not CREDITS_AVAILABLE or not reservation_id:
-        print(f"[CREDITS:DEBUG] !!! SKIPPING FINALIZE - CREDITS_AVAILABLE={CREDITS_AVAILABLE}, reservation_id={reservation_id}")
-        return
+    # If credits system unavailable, silently skip (dev mode / no DB)
+    if not CREDITS_AVAILABLE:
+        print(f"[CREDITS:DEBUG] !!! SKIPPING FINALIZE - CREDITS_AVAILABLE=False")
+        return False
+
+    # CRITICAL: Missing reservation_id for a successful job is a BUG
+    # This means credits were never reserved but the job completed anyway
+    if not reservation_id:
+        print(f"[CREDITS:ERROR] !!! READY_UNBILLED BUG DETECTED - job_id={job_id}, identity_id={identity_id}")
+        print(f"[CREDITS:ERROR] Job completed successfully but NO reservation_id to finalize!")
+        print(f"[CREDITS:ERROR] This indicates a credit reservation failure that was silently bypassed.")
+
+        # Mark job as ready_unbilled for admin reconciliation
+        _mark_job_ready_unbilled(job_id, identity_id)
+
+        # Log for audit trail
+        log_generation_event(
+            event="credits_ready_unbilled",
+            provider="unknown",
+            action_code="UNKNOWN",
+            identity_id=identity_id,
+            job_id=job_id,
+            reservation_id=None,
+            cost=None,
+            status="ready_unbilled",
+            error="missing_reservation_id",
+        )
+        return False
 
     try:
         print(f"[CREDITS:DEBUG] Calling ReservationService.finalize_reservation({reservation_id})")
