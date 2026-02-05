@@ -20,12 +20,15 @@ from backend.services.history_service import (
     _lookup_asset_id_for_history,
     _validate_history_item_asset_ids,
     delete_history_local,
-    delete_s3_objects,
     load_history_store,
     save_history_store,
     upsert_history_local,
 )
-from backend.services.s3_service import collect_s3_keys, ensure_s3_url_for_data_uri
+from backend.services.s3_service import (
+    collect_all_s3_keys_for_history_item,
+    delete_s3_objects_safe,
+    ensure_s3_url_for_data_uri,
+)
 from backend.utils import derive_display_title, log_db_continue
 
 bp = Blueprint("history", __name__)
@@ -927,6 +930,8 @@ def history_item_update_mod(item_id: str):
         if request.method == "DELETE":
             db_ok = False
             db_errors: list[dict[str, str]] = []
+            s3_cleanup_result = None
+
             if USE_DB:
                 try:
                     with get_conn() as conn:
@@ -955,7 +960,17 @@ def history_item_update_mod(item_id: str):
                                 payload = {}
 
                         row["payload"] = payload
-                        s3_keys = collect_s3_keys(row)
+
+                        # Collect ALL S3 keys BEFORE deleting DB rows
+                        # This includes keys from history row AND from model/image/video tables
+                        s3_keys = collect_all_s3_keys_for_history_item(
+                            history_row=row,
+                            model_id=model_id,
+                            image_id=image_id,
+                            video_id=video_id,
+                        )
+
+                        print(f"[DELETE] history_item={item_id} model_id={model_id} image_id={image_id} video_id={video_id} s3_keys={len(s3_keys)}")
 
                         with conn.cursor() as cur:
                             cur.execute(
@@ -975,12 +990,18 @@ def history_item_update_mod(item_id: str):
                         conn.commit()
                         db_ok = True
 
+                        # Delete S3 objects (idempotent - safe to retry, logs errors)
                         if s3_keys:
-                            try:
-                                delete_s3_objects(s3_keys)
-                            except Exception as e:
-                                log_db_continue("history_item_delete_s3", e)
-                                db_errors.append({"op": "history_item_delete_s3", "error": str(e)})
+                            s3_cleanup_result = delete_s3_objects_safe(
+                                keys=s3_keys,
+                                source=f"history_item_delete:{item_id}",
+                            )
+                            if s3_cleanup_result.get("errors"):
+                                db_errors.append({
+                                    "op": "history_item_delete_s3",
+                                    "error": f"partial_failure: {len(s3_cleanup_result['errors'])} errors",
+                                })
+
                 except Exception as e:
                     log_db_continue("history_item_delete", e)
                     db_errors.append({"op": "history_item_delete", "error": str(e)})
@@ -988,7 +1009,15 @@ def history_item_update_mod(item_id: str):
                     return jsonify({"ok": False, "error": "delete_failed"}), 500
 
             delete_history_local(item_id)
-            return jsonify({"ok": True, "source": "modular"})
+
+            response = {"ok": True, "source": "modular"}
+            if s3_cleanup_result:
+                response["s3_cleanup"] = {
+                    "deleted": s3_cleanup_result.get("deleted", 0),
+                    "already_missing": s3_cleanup_result.get("already_missing", 0),
+                    "errors": len(s3_cleanup_result.get("errors", [])),
+                }
+            return jsonify(response)
 
         if request.method == "PATCH":
             try:
