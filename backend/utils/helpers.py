@@ -260,3 +260,61 @@ def log_db_continue(op: str, err: Exception) -> None:
         _logger.warning("[DB] CONTINUE: %s failed: %s: %s", op, type(err).__name__, err)
     except Exception:
         print(f"[DB] CONTINUE: {op} failed: {type(err).__name__}: {err}")
+
+
+def log_generation_event(
+    event: str,
+    provider: str,
+    action_code: str,
+    identity_id: str | None,
+    job_id: str | None = None,
+    reservation_id: str | None = None,
+    cost: int | None = None,
+    status: str | None = None,
+    error: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """
+    Structured logging for generation events.
+
+    Use this to log all generation lifecycle events for auditing:
+    - job_started: When a generation job begins
+    - job_completed: When a generation completes successfully
+    - job_failed: When a generation fails
+    - credits_reserved: When credits are held
+    - credits_finalized: When credits are captured
+    - credits_released: When credits are refunded
+
+    Example:
+        log_generation_event(
+            event="job_started",
+            provider="openai",
+            action_code="OPENAI_IMAGE",
+            identity_id=identity_id,
+            job_id=job_id,
+            reservation_id=reservation_id,
+            cost=10,
+        )
+    """
+    try:
+        data = {
+            "event": event,
+            "provider": provider,
+            "action_code": action_code,
+            "identity_id": identity_id[:8] + "..." if identity_id else None,
+            "job_id": job_id,
+            "reservation_id": reservation_id[:8] + "..." if reservation_id else None,
+            "cost": cost,
+            "status": status,
+        }
+        if error:
+            data["error"] = error[:200] if len(error) > 200 else error
+        if extra:
+            data["extra"] = {k: str(v)[:100] for k, v in extra.items()}
+
+        # Structured log line for easy parsing
+        log_parts = [f"{k}={v}" for k, v in data.items() if v is not None]
+        print(f"[GEN] {' '.join(log_parts)}")
+
+    except Exception as e:
+        print(f"[GEN] log_generation_event failed: {e}")
