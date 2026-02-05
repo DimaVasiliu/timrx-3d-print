@@ -68,6 +68,7 @@ class ReconciliationService:
             "wallet_mismatches_fixed": [],
             "stale_reservations_released": [],
             "missing_history_items_created": [],
+            "ready_unbilled_jobs": [],  # Jobs that succeeded without credit deduction
             "errors": [],
         }
 
@@ -103,6 +104,16 @@ class ReconciliationService:
             print(f"[RECONCILE] ERROR in missing_history_items: {e}")
             results["errors"].append({"check": "missing_history_items", "error": str(e)})
 
+        # 5. Detect ready_unbilled jobs (detection only - no automatic fix)
+        try:
+            unbilled = ReconciliationService._detect_ready_unbilled_jobs()
+            results["ready_unbilled_jobs"] = unbilled
+            if unbilled:
+                print(f"[RECONCILE] CRITICAL: Found {len(unbilled)} ready_unbilled jobs requiring manual review!")
+        except Exception as e:
+            print(f"[RECONCILE] ERROR in ready_unbilled: {e}")
+            results["errors"].append({"check": "ready_unbilled", "error": str(e)})
+
         # Calculate totals
         total_fixes = (
             len(results["purchases_missing_ledger"])
@@ -110,21 +121,24 @@ class ReconciliationService:
             + len(results["stale_reservations_released"])
             + len(results["missing_history_items_created"])
         )
+        # ready_unbilled is detection only, count separately
+        total_unbilled = len(results["ready_unbilled_jobs"])
 
         end_time = datetime.now(timezone.utc)
         duration_ms = int((end_time - start_time).total_seconds() * 1000)
 
         results["total_fixes"] = total_fixes
+        results["total_unbilled"] = total_unbilled
         results["total_errors"] = len(results["errors"])
         results["duration_ms"] = duration_ms
 
         print(
-            f"[RECONCILE] Completed: fixes={total_fixes}, errors={len(results['errors'])}, "
-            f"duration={duration_ms}ms"
+            f"[RECONCILE] Completed: fixes={total_fixes}, unbilled={total_unbilled}, "
+            f"errors={len(results['errors'])}, duration={duration_ms}ms"
         )
 
-        # Send admin alert if fixes were applied
-        if send_alert and total_fixes > 0 and not dry_run:
+        # Send admin alert if fixes were applied or unbilled jobs detected
+        if send_alert and (total_fixes > 0 or total_unbilled > 0) and not dry_run:
             ReconciliationService._send_admin_alert(results)
 
         return results
@@ -685,6 +699,138 @@ class ReconciliationService:
             }
 
     # ─────────────────────────────────────────────────────────────
+    # Check 5: Ready Unbilled Jobs (Detection Only)
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _detect_ready_unbilled_jobs(limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Detect jobs that completed successfully but were never billed.
+
+        This is a CRITICAL billing bug detection - these jobs:
+        1. Have status='ready_unbilled' (explicitly marked by finalize_job_credits)
+        2. OR have status='ready'/'done' but no reservation_id and no ledger entry
+
+        These require manual admin review to determine if billing should be applied
+        retroactively or the user should be notified.
+
+        NOTE: This is detection only - no automatic fix is applied because billing
+        retroactively requires human judgment.
+        """
+        unbilled_jobs = []
+
+        # Case 1: Jobs explicitly marked as ready_unbilled
+        explicit_unbilled = query_all(
+            f"""
+            SELECT
+                j.id as job_id,
+                j.identity_id,
+                j.provider,
+                j.action_code,
+                j.status,
+                j.cost_credits,
+                j.reservation_id,
+                j.prompt,
+                j.error_message,
+                j.created_at,
+                j.updated_at,
+                j.meta
+            FROM {Tables.JOBS} j
+            WHERE j.status = 'ready_unbilled'
+            ORDER BY j.created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+        for row in explicit_unbilled:
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+
+            unbilled_jobs.append({
+                "job_id": str(row["job_id"]),
+                "identity_id": str(row["identity_id"]) if row.get("identity_id") else None,
+                "provider": row.get("provider"),
+                "action_code": row.get("action_code"),
+                "status": row.get("status"),
+                "cost_credits": row.get("cost_credits"),
+                "reservation_id": str(row["reservation_id"]) if row.get("reservation_id") else None,
+                "prompt": (row.get("prompt") or "")[:50] + "..." if row.get("prompt") and len(row.get("prompt", "")) > 50 else row.get("prompt"),
+                "error_message": row.get("error_message"),
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                "detection_source": "explicit_status",
+                "detected_at": meta.get("ready_unbilled_detected_at"),
+            })
+
+        # Case 2: Jobs with ready/done status but no reservation and no ledger debit
+        # These slipped through without proper credit reservation
+        implicit_unbilled = query_all(
+            f"""
+            SELECT
+                j.id as job_id,
+                j.identity_id,
+                j.provider,
+                j.action_code,
+                j.status,
+                j.cost_credits,
+                j.reservation_id,
+                j.prompt,
+                j.created_at,
+                j.updated_at
+            FROM {Tables.JOBS} j
+            WHERE j.status IN ('ready', 'done', 'succeeded', 'completed')
+              AND j.reservation_id IS NULL
+              AND j.cost_credits > 0
+              AND j.identity_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.LEDGER_ENTRIES} le
+                  WHERE le.identity_id = j.identity_id
+                    AND le.ref_type = 'job'
+                    AND le.ref_id = j.id::text
+                    AND le.amount_credits < 0
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.CREDIT_RESERVATIONS} r
+                  WHERE r.ref_job_id = j.id
+                    AND r.status IN ('finalized', 'held')
+              )
+            ORDER BY j.created_at DESC
+            LIMIT %s
+            """,
+            (limit - len(unbilled_jobs),),
+        )
+
+        for row in implicit_unbilled:
+            unbilled_jobs.append({
+                "job_id": str(row["job_id"]),
+                "identity_id": str(row["identity_id"]) if row.get("identity_id") else None,
+                "provider": row.get("provider"),
+                "action_code": row.get("action_code"),
+                "status": row.get("status"),
+                "cost_credits": row.get("cost_credits"),
+                "reservation_id": None,
+                "prompt": (row.get("prompt") or "")[:50] + "..." if row.get("prompt") and len(row.get("prompt", "")) > 50 else row.get("prompt"),
+                "error_message": None,
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                "detection_source": "implicit_missing_reservation",
+                "detected_at": None,
+            })
+
+        if unbilled_jobs:
+            print(
+                f"[RECONCILE] CRITICAL: Found {len(unbilled_jobs)} ready_unbilled jobs "
+                f"({len(explicit_unbilled)} explicit, {len(implicit_unbilled)} implicit)"
+            )
+
+        return unbilled_jobs
+
+    # ─────────────────────────────────────────────────────────────
     # Admin Notification
     # ─────────────────────────────────────────────────────────────
 
@@ -712,6 +858,10 @@ class ReconciliationService:
             if results["missing_history_items_created"]:
                 count = len(results["missing_history_items_created"])
                 fixes_summary.append(f"- {count} missing history item(s) created")
+
+            if results["ready_unbilled_jobs"]:
+                count = len(results["ready_unbilled_jobs"])
+                fixes_summary.append(f"- CRITICAL: {count} job(s) completed without billing (requires manual review)")
 
             if results["errors"]:
                 count = len(results["errors"])
@@ -743,6 +893,10 @@ class ReconciliationService:
             if results["stale_reservations_released"]:
                 sample = results["stale_reservations_released"][:3]
                 data["Reservation Releases (sample)"] = json.dumps(sample, default=str)
+
+            if results["ready_unbilled_jobs"]:
+                sample = results["ready_unbilled_jobs"][:5]  # More samples for critical issue
+                data["CRITICAL: Unbilled Jobs (sample)"] = json.dumps(sample, default=str)
 
             if results["errors"]:
                 data["Errors"] = json.dumps(results["errors"], default=str)
@@ -800,6 +954,7 @@ class ReconciliationService:
             "jobs_missing_history": [],
             "finalized_reservations_missing_ledger": [],
             "stale_held_reservations": [],
+            "ready_unbilled_jobs": [],  # CRITICAL: Jobs that succeeded without billing
             "orphan_s3_objects": [],
             "warnings": [],
             "errors": [],
@@ -835,7 +990,17 @@ class ReconciliationService:
             print(f"[RECONCILE:DETECT] ERROR in stale_reservations: {e}")
             results["errors"].append({"check": "stale_reservations", "error": str(e)})
 
-        # 4. Orphan S3 objects (optional, slow)
+        # 4. Ready unbilled jobs (CRITICAL)
+        try:
+            unbilled = ReconciliationService._detect_ready_unbilled_jobs(limit)
+            results["ready_unbilled_jobs"] = unbilled
+            if unbilled:
+                print(f"[RECONCILE:DETECT] CRITICAL: {len(unbilled)} jobs completed without billing")
+        except Exception as e:
+            print(f"[RECONCILE:DETECT] ERROR in ready_unbilled: {e}")
+            results["errors"].append({"check": "ready_unbilled", "error": str(e)})
+
+        # 5. Orphan S3 objects (optional, slow)
         if check_s3:
             try:
                 orphans = ReconciliationService._detect_orphan_s3_objects(limit)
@@ -856,6 +1021,7 @@ class ReconciliationService:
             "jobs_missing_history_count": len(results["jobs_missing_history"]) if isinstance(results["jobs_missing_history"], list) else 0,
             "finalized_missing_ledger_count": len(results["finalized_reservations_missing_ledger"]) if isinstance(results["finalized_reservations_missing_ledger"], list) else 0,
             "stale_reservations_count": len(results["stale_held_reservations"]) if isinstance(results["stale_held_reservations"], list) else 0,
+            "ready_unbilled_count": len(results["ready_unbilled_jobs"]) if isinstance(results["ready_unbilled_jobs"], list) else 0,
             "orphan_s3_count": len(results["orphan_s3_objects"]) if isinstance(results["orphan_s3_objects"], list) else 0,
             "total_anomalies": 0,
             "errors_count": len(results["errors"]),
@@ -864,6 +1030,7 @@ class ReconciliationService:
             results["summary"]["jobs_missing_history_count"]
             + results["summary"]["finalized_missing_ledger_count"]
             + results["summary"]["stale_reservations_count"]
+            + results["summary"]["ready_unbilled_count"]
             + results["summary"]["orphan_s3_count"]
         )
         results["duration_ms"] = duration_ms
@@ -1201,8 +1368,31 @@ class ReconciliationService:
             (ReservationStatus.HELD, stale_threshold),
         )
 
+        # Count ready_unbilled jobs
+        ready_unbilled = query_one(
+            f"""
+            SELECT COUNT(*) as count
+            FROM {Tables.JOBS} j
+            WHERE (
+                j.status = 'ready_unbilled'
+                OR (
+                    j.status IN ('ready', 'done', 'succeeded', 'completed')
+                    AND j.reservation_id IS NULL
+                    AND j.cost_credits > 0
+                    AND j.identity_id IS NOT NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM {Tables.CREDIT_RESERVATIONS} r
+                        WHERE r.ref_job_id = j.id
+                          AND r.status IN ('finalized', 'held')
+                    )
+                )
+            )
+            """,
+        )
+
         return {
             "purchases_missing_ledger": purchases_missing["count"] if purchases_missing else 0,
             "wallet_mismatches": wallet_mismatches["count"] if wallet_mismatches else 0,
             "stale_reservations": stale_reservations["count"] if stale_reservations else 0,
+            "ready_unbilled_jobs": ready_unbilled["count"] if ready_unbilled else 0,
         }
