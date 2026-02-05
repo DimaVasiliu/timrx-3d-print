@@ -614,6 +614,68 @@ def reconciliation_dry_run():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@bp.route("/reconcile/detect", methods=["GET"])
+@require_admin
+def reconciliation_detect():
+    """
+    Detect data anomalies (detection only, no fixes).
+
+    This endpoint identifies inconsistencies in the data without applying
+    any fixes. Use this for auditing and monitoring.
+
+    Query params:
+        - stale_minutes: Threshold for stale held reservations (default: 30)
+        - check_s3: If 'true', also check for orphan S3 objects (slow, default: false)
+        - limit: Max results per category (default: 100)
+
+    Returns:
+        - jobs_missing_history: Jobs with success status but no history item
+        - finalized_reservations_missing_ledger: Finalized reservations without ledger entry
+        - stale_held_reservations: Held reservations older than stale_minutes
+        - orphan_s3_objects: S3 objects with no DB reference (if check_s3=true)
+        - summary: Counts and totals
+
+    Detections:
+    1. Jobs with status=ready/succeeded/done but no history_items row
+       - May indicate: save_finished_job_to_normalized_db() failed silently
+       - Impact: User doesn't see their generation in history
+
+    2. Finalized reservations without ledger entries
+       - May indicate: finalize_reservation() updated status but ledger insert failed
+       - Impact: Credits deducted from available but wallet balance unchanged
+
+    3. Held reservations older than X minutes
+       - May indicate: Job never completed, or finalize/release never called
+       - Impact: Credits stuck in "held" state, reducing user's available balance
+
+    4. S3 objects with no DB references (optional, slow)
+       - May indicate: DB delete succeeded but S3 delete failed
+       - Impact: Orphan storage costs, potential data inconsistency
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        stale_minutes = request.args.get("stale_minutes", 30, type=int)
+        check_s3 = request.args.get("check_s3", "false").lower() == "true"
+        limit = min(request.args.get("limit", 100, type=int), 500)
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Anomaly detection by {admin_email or 'token'} (stale_minutes={stale_minutes}, check_s3={check_s3})")
+
+        result = ReconciliationService.detect_anomalies(
+            stale_minutes=stale_minutes,
+            check_s3=check_s3,
+            limit=limit,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Anomaly detection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERNAL DEBUG ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -757,6 +819,335 @@ def debug_user():
 
     except Exception as e:
         print(f"[ADMIN] Debug user error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG: OpenAI Image Credit Flow Verification
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/debug/openai-credits", methods=["GET"])
+@require_admin
+def debug_openai_credits():
+    """
+    DEBUG: Verify credit flow for OpenAI image jobs.
+
+    Query params:
+        - identity_id: User UUID (optional - shows all OPENAI_IMAGE entries if not provided)
+        - job_id: Specific job ID to trace (optional)
+        - limit: Max results (default 20)
+
+    Returns:
+        - reservations: Recent OPENAI_IMAGE reservations with status
+        - ledger_entries: Recent OPENAI_IMAGE ledger entries (should be negative)
+        - jobs: Recent OpenAI image jobs
+        - wallet: Current wallet state if identity_id provided
+        - diagnosis: Analysis of whether credits are being deducted
+    """
+    from backend.db import query_one, query_all, Tables, USE_DB
+
+    if not USE_DB:
+        return jsonify({
+            "ok": False,
+            "error": "Database not configured",
+            "diagnosis": "DATABASE NOT AVAILABLE - credits cannot be tracked"
+        }), 500
+
+    identity_id = request.args.get("identity_id")
+    job_id = request.args.get("job_id")
+    limit = min(request.args.get("limit", 20, type=int), 100)
+
+    try:
+        result = {"ok": True, "diagnosis": []}
+
+        # ── Check reservations for OPENAI_IMAGE ────────────────────
+        if job_id:
+            reservations = query_all(
+                f"""
+                SELECT id, identity_id, action_code, cost_credits, status,
+                       ref_job_id, created_at, captured_at, released_at
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE ref_job_id = %s OR id::text = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (job_id, job_id, limit),
+            )
+        elif identity_id:
+            reservations = query_all(
+                f"""
+                SELECT id, identity_id, action_code, cost_credits, status,
+                       ref_job_id, created_at, captured_at, released_at
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE identity_id = %s AND action_code = 'OPENAI_IMAGE'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, limit),
+            )
+        else:
+            reservations = query_all(
+                f"""
+                SELECT id, identity_id, action_code, cost_credits, status,
+                       ref_job_id, created_at, captured_at, released_at
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE action_code = 'OPENAI_IMAGE'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        result["reservations"] = [
+            {
+                "id": str(r["id"]),
+                "identity_id": str(r["identity_id"]),
+                "action_code": r["action_code"],
+                "cost_credits": r["cost_credits"],
+                "status": r["status"],
+                "job_id": str(r["ref_job_id"]) if r.get("ref_job_id") else None,
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "captured_at": r["captured_at"].isoformat() if r.get("captured_at") else None,
+                "released_at": r["released_at"].isoformat() if r.get("released_at") else None,
+            }
+            for r in reservations
+        ]
+
+        # Count by status
+        held_count = sum(1 for r in reservations if r["status"] == "held")
+        finalized_count = sum(1 for r in reservations if r["status"] == "finalized")
+        released_count = sum(1 for r in reservations if r["status"] == "released")
+
+        result["reservation_stats"] = {
+            "total": len(reservations),
+            "held": held_count,
+            "finalized": finalized_count,
+            "released": released_count,
+        }
+
+        if len(reservations) == 0:
+            result["diagnosis"].append("⚠️ NO RESERVATIONS FOUND for OPENAI_IMAGE - credits are NOT being held")
+        elif finalized_count == 0:
+            result["diagnosis"].append("⚠️ NO FINALIZED RESERVATIONS - credits are being held but NOT captured")
+        else:
+            result["diagnosis"].append(f"✓ Found {finalized_count} finalized reservations - credits ARE being deducted")
+
+        # ── Check ledger entries ───────────────────────────────────
+        if identity_id:
+            ledger_entries = query_all(
+                f"""
+                SELECT id, identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at
+                FROM {Tables.LEDGER_ENTRIES}
+                WHERE identity_id = %s
+                  AND (entry_type = 'RESERVATION_FINALIZE' OR meta::text LIKE '%%OPENAI_IMAGE%%' OR meta::text LIKE '%%image-studio%%')
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, limit),
+            )
+        else:
+            ledger_entries = query_all(
+                f"""
+                SELECT id, identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at
+                FROM {Tables.LEDGER_ENTRIES}
+                WHERE entry_type = 'RESERVATION_FINALIZE'
+                  AND meta::text LIKE '%%OPENAI_IMAGE%%'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        result["ledger_entries"] = [
+            {
+                "id": str(le["id"]),
+                "identity_id": str(le["identity_id"]),
+                "entry_type": le["entry_type"],
+                "amount_credits": le["amount_credits"],
+                "ref_type": le["ref_type"],
+                "ref_id": str(le["ref_id"]) if le.get("ref_id") else None,
+                "meta": le["meta"],
+                "created_at": le["created_at"].isoformat() if le.get("created_at") else None,
+            }
+            for le in ledger_entries
+        ]
+
+        openai_debits = [le for le in ledger_entries if le["amount_credits"] < 0]
+        if len(openai_debits) == 0:
+            result["diagnosis"].append("⚠️ NO LEDGER DEBITS found - wallet balance is NOT being reduced")
+        else:
+            total_deducted = sum(abs(le["amount_credits"]) for le in openai_debits)
+            result["diagnosis"].append(f"✓ Found {len(openai_debits)} ledger debits totaling -{total_deducted} credits")
+
+        # ── Check jobs ──────────────────────────────────���──────────
+        if job_id:
+            jobs = query_all(
+                f"""
+                SELECT id, identity_id, provider, action_code, status, reservation_id, created_at, updated_at
+                FROM {Tables.JOBS}
+                WHERE id::text = %s OR reservation_id::text = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (job_id, job_id, limit),
+            )
+        elif identity_id:
+            jobs = query_all(
+                f"""
+                SELECT id, identity_id, provider, action_code, status, reservation_id, created_at, updated_at
+                FROM {Tables.JOBS}
+                WHERE identity_id = %s AND (provider = 'openai' OR action_code = 'OPENAI_IMAGE')
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, limit),
+            )
+        else:
+            jobs = query_all(
+                f"""
+                SELECT id, identity_id, provider, action_code, status, reservation_id, created_at, updated_at
+                FROM {Tables.JOBS}
+                WHERE provider = 'openai' OR action_code = 'OPENAI_IMAGE'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        result["jobs"] = [
+            {
+                "id": str(j["id"]),
+                "identity_id": str(j["identity_id"]),
+                "provider": j["provider"],
+                "action_code": j["action_code"],
+                "status": j["status"],
+                "reservation_id": str(j["reservation_id"]) if j.get("reservation_id") else None,
+                "created_at": j["created_at"].isoformat() if j.get("created_at") else None,
+            }
+            for j in jobs
+        ]
+
+        jobs_without_reservation = [j for j in jobs if not j.get("reservation_id")]
+        if jobs_without_reservation:
+            result["diagnosis"].append(f"⚠️ {len(jobs_without_reservation)} jobs have NO reservation_id - credits not tracked")
+
+        # ── Get wallet if identity provided ────────────────────────
+        if identity_id:
+            wallet = query_one(
+                f"SELECT balance_credits, updated_at FROM {Tables.WALLETS} WHERE identity_id = %s",
+                (identity_id,),
+            )
+            reserved = query_one(
+                f"""
+                SELECT COALESCE(SUM(cost_credits), 0) as total
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE identity_id = %s AND status = 'held'
+                """,
+                (identity_id,),
+            )
+
+            result["wallet"] = {
+                "balance_credits": wallet["balance_credits"] if wallet else 0,
+                "reserved_credits": int(reserved["total"]) if reserved else 0,
+                "available_credits": max(0, (wallet["balance_credits"] if wallet else 0) - int(reserved["total"] if reserved else 0)),
+                "updated_at": wallet["updated_at"].isoformat() if wallet and wallet.get("updated_at") else None,
+            }
+
+        # ── Final diagnosis ────────────────────────────────────────
+        if len(reservations) > 0 and finalized_count > 0 and len(openai_debits) > 0:
+            result["diagnosis"].append("✓ CREDITS ARE BEING DEDUCTED for OpenAI images")
+        else:
+            result["diagnosis"].append("❌ CREDITS ARE NOT BEING DEDUCTED - see individual checks above")
+
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[ADMIN] Debug openai-credits error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG: Magic Code Retrieval (for acceptance testing only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/debug/magic-code", methods=["GET"])
+@require_admin
+def debug_magic_code():
+    """
+    DEBUG: Retrieve the most recent magic code for an email.
+
+    WARNING: This endpoint is for TESTING ONLY. It bypasses email verification.
+    In production, this should be disabled or heavily rate-limited.
+
+    Query params:
+        - email: Email address to get code for (required)
+
+    Returns:
+        - code: The plain-text code (if found)
+        - expires_at: When the code expires
+        - attempts: Number of failed attempts
+    """
+    from backend.db import query_one, Tables, USE_DB
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": "Database not configured"}), 500
+
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"ok": False, "error": "email parameter required"}), 400
+
+    try:
+        # For testing, we store a copy of the plain code in a test-only column
+        # OR we generate a new code and return it
+        # Since we hash codes, we can't retrieve them - so generate a fresh one
+
+        from backend.services.magic_code_service import MagicCodeService
+
+        # Check if identity exists
+        identity = query_one(
+            f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
+            (email,),
+        )
+
+        if not identity:
+            return jsonify({
+                "ok": False,
+                "error": "No identity found for this email",
+            }), 404
+
+        # Generate a fresh code for testing
+        plain_code = MagicCodeService.generate_code()
+        code_hash = MagicCodeService.hash_code(plain_code)
+
+        # Store it
+        from backend.db import execute
+        from backend.config import config
+
+        execute(
+            f"""
+            INSERT INTO {Tables.MAGIC_CODES}
+            (email, code_hash, expires_at, attempts, consumed, created_at)
+            VALUES (%s, %s, NOW() + INTERVAL '%s minutes', 0, FALSE, NOW())
+            """,
+            (email, code_hash, config.MAGIC_CODE_EXPIRY_MINUTES),
+        )
+
+        print(f"[ADMIN:DEBUG] Generated test magic code for {email}: {plain_code}")
+
+        return jsonify({
+            "ok": True,
+            "code": plain_code,
+            "email": email,
+            "expires_in_minutes": config.MAGIC_CODE_EXPIRY_MINUTES,
+            "warning": "TEST ONLY - bypasses email verification",
+        })
+
+    except Exception as e:
+        print(f"[ADMIN] Debug magic-code error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
