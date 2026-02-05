@@ -23,7 +23,7 @@ import json
 
 from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
 from backend.config import config
-from backend.emailer import send_purchase_receipt, notify_purchase
+from backend.emailer import send_purchase_receipt, notify_purchase, send_invoice_email
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService, LedgerEntryType
 from backend.services.identity_service import IdentityService
@@ -306,15 +306,34 @@ class PurchaseService:
 
                 # Send emails (non-blocking - failures are logged as warnings only)
                 if customer_email:
+                    # Invoice pipeline: create invoice + receipt, generate PDFs,
+                    # upload to S3, send email with attachments
                     try:
-                        send_purchase_receipt(
-                            to_email=customer_email,
+                        from backend.services.invoicing_service import InvoicingService
+                        InvoicingService.process_purchase_invoice(
+                            purchase_id=purchase_id,
+                            identity_id=identity_id,
+                            plan_code=plan_code,
                             plan_name=plan_name,
                             credits=credits,
                             amount_gbp=amount_gbp,
+                            customer_email=customer_email,
                         )
+                    except Exception as inv_err:
+                        print(f"[PURCHASE] WARNING: Invoice pipeline failed for purchase {purchase_id}: {inv_err}")
+                        # Fallback to simple receipt email (no PDF attachments)
+                        try:
+                            send_purchase_receipt(
+                                to_email=customer_email,
+                                plan_name=plan_name,
+                                credits=credits,
+                                amount_gbp=amount_gbp,
+                            )
+                        except Exception as email_err:
+                            print(f"[PURCHASE] WARNING: Fallback email also failed: {email_err} (credits already granted)")
 
-                        # Send admin notification
+                    # Admin notification (always, independent of invoice)
+                    try:
                         notify_purchase(
                             identity_id=identity_id,
                             email=customer_email,
@@ -322,9 +341,8 @@ class PurchaseService:
                             credits=credits,
                             amount_gbp=amount_gbp,
                         )
-                    except Exception as email_err:
-                        # Never fail purchase due to email errors
-                        print(f"[PURCHASE] WARNING: Email failed for purchase {purchase_id}: {email_err} (credits already granted)")
+                    except Exception as admin_err:
+                        print(f"[PURCHASE] WARNING: Admin notification failed: {admin_err}")
 
                 return {
                     "purchase_id": purchase_id,
