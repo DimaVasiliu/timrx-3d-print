@@ -33,22 +33,34 @@ stripe = None
 STRIPE_AVAILABLE = False
 
 # Check PAYMENTS_PROVIDER directly (avoids property issues on some deployments)
-_payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie').lower()
+try:
+    _payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie')
+    if _payments_provider:
+        _payments_provider = _payments_provider.lower()
+    else:
+        _payments_provider = 'mollie'
+except Exception as e:
+    print(f"[STRIPE] Error reading PAYMENTS_PROVIDER: {e}")
+    _payments_provider = 'mollie'
+
 _use_stripe = _payments_provider in ('stripe', 'both')
 
 if _use_stripe:
     try:
         import stripe as stripe_module
         stripe = stripe_module
-        stripe.api_key = config.STRIPE_SECRET_KEY
-        STRIPE_AVAILABLE = bool(config.STRIPE_SECRET_KEY)
+        _stripe_key = getattr(config, 'STRIPE_SECRET_KEY', None) or ''
+        stripe.api_key = _stripe_key
+        STRIPE_AVAILABLE = bool(_stripe_key)
         if STRIPE_AVAILABLE:
-            stripe_mode = "live" if config.STRIPE_SECRET_KEY.startswith("sk_live_") else "test"
+            stripe_mode = "live" if _stripe_key.startswith("sk_live_") else "test"
             print(f"[STRIPE] Stripe configured and ready (mode: {stripe_mode})")
         else:
             print("[STRIPE] Stripe enabled but not configured (missing STRIPE_SECRET_KEY)")
     except ImportError:
         print("[STRIPE] Stripe package not installed")
+    except Exception as e:
+        print(f"[STRIPE] Error initializing Stripe: {e}")
 # If PAYMENTS_PROVIDER is not 'stripe' or 'both', Stripe is silently disabled (no warnings)
 
 
