@@ -762,6 +762,386 @@ class ReconciliationService:
     # Utility Methods
     # ─────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────
+    # Detection-Only Mode (No Fixes)
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def detect_anomalies(
+        stale_minutes: int = 30,
+        check_s3: bool = False,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """
+        Detect data anomalies WITHOUT applying fixes.
+
+        This is an admin-only diagnostic tool for identifying:
+        1. Jobs with terminal status but missing history_items
+        2. Finalized reservations without corresponding ledger entries
+        3. Held reservations older than stale_minutes
+        4. (Optional) S3 objects with no DB references
+
+        Args:
+            stale_minutes: Threshold for "stale" held reservations
+            check_s3: If True, also check for orphan S3 objects (slow)
+            limit: Max results per category
+
+        Returns:
+            Summary of detected anomalies with details
+        """
+        from datetime import datetime, timezone, timedelta
+
+        start_time = datetime.now(timezone.utc)
+        print(f"[RECONCILE:DETECT] Starting anomaly detection (stale_minutes={stale_minutes}, check_s3={check_s3})")
+
+        results = {
+            "run_at": start_time.isoformat(),
+            "mode": "detection_only",
+            "jobs_missing_history": [],
+            "finalized_reservations_missing_ledger": [],
+            "stale_held_reservations": [],
+            "orphan_s3_objects": [],
+            "warnings": [],
+            "errors": [],
+        }
+
+        # 1. Jobs with terminal status but missing history_items
+        try:
+            jobs_missing = ReconciliationService._detect_jobs_missing_history(limit)
+            results["jobs_missing_history"] = jobs_missing
+            if jobs_missing:
+                print(f"[RECONCILE:DETECT] WARNING: {len(jobs_missing)} jobs missing history items")
+        except Exception as e:
+            print(f"[RECONCILE:DETECT] ERROR in jobs_missing_history: {e}")
+            results["errors"].append({"check": "jobs_missing_history", "error": str(e)})
+
+        # 2. Finalized reservations without ledger entries
+        try:
+            missing_ledger = ReconciliationService._detect_finalized_without_ledger(limit)
+            results["finalized_reservations_missing_ledger"] = missing_ledger
+            if missing_ledger:
+                print(f"[RECONCILE:DETECT] WARNING: {len(missing_ledger)} finalized reservations missing ledger entries")
+        except Exception as e:
+            print(f"[RECONCILE:DETECT] ERROR in finalized_without_ledger: {e}")
+            results["errors"].append({"check": "finalized_without_ledger", "error": str(e)})
+
+        # 3. Stale held reservations
+        try:
+            stale = ReconciliationService._detect_stale_reservations(stale_minutes, limit)
+            results["stale_held_reservations"] = stale
+            if stale:
+                print(f"[RECONCILE:DETECT] WARNING: {len(stale)} held reservations older than {stale_minutes} minutes")
+        except Exception as e:
+            print(f"[RECONCILE:DETECT] ERROR in stale_reservations: {e}")
+            results["errors"].append({"check": "stale_reservations", "error": str(e)})
+
+        # 4. Orphan S3 objects (optional, slow)
+        if check_s3:
+            try:
+                orphans = ReconciliationService._detect_orphan_s3_objects(limit)
+                results["orphan_s3_objects"] = orphans
+                if orphans:
+                    print(f"[RECONCILE:DETECT] WARNING: {len(orphans)} S3 objects with no DB references")
+            except Exception as e:
+                print(f"[RECONCILE:DETECT] ERROR in orphan_s3: {e}")
+                results["errors"].append({"check": "orphan_s3", "error": str(e)})
+        else:
+            results["orphan_s3_objects"] = {"skipped": True, "reason": "check_s3=false"}
+
+        # Calculate totals
+        end_time = datetime.now(timezone.utc)
+        duration_ms = int((end_time - start_time).total_seconds() * 1000)
+
+        results["summary"] = {
+            "jobs_missing_history_count": len(results["jobs_missing_history"]) if isinstance(results["jobs_missing_history"], list) else 0,
+            "finalized_missing_ledger_count": len(results["finalized_reservations_missing_ledger"]) if isinstance(results["finalized_reservations_missing_ledger"], list) else 0,
+            "stale_reservations_count": len(results["stale_held_reservations"]) if isinstance(results["stale_held_reservations"], list) else 0,
+            "orphan_s3_count": len(results["orphan_s3_objects"]) if isinstance(results["orphan_s3_objects"], list) else 0,
+            "total_anomalies": 0,
+            "errors_count": len(results["errors"]),
+        }
+        results["summary"]["total_anomalies"] = (
+            results["summary"]["jobs_missing_history_count"]
+            + results["summary"]["finalized_missing_ledger_count"]
+            + results["summary"]["stale_reservations_count"]
+            + results["summary"]["orphan_s3_count"]
+        )
+        results["duration_ms"] = duration_ms
+
+        print(
+            f"[RECONCILE:DETECT] Completed: anomalies={results['summary']['total_anomalies']}, "
+            f"errors={len(results['errors'])}, duration={duration_ms}ms"
+        )
+
+        return results
+
+    @staticmethod
+    def _detect_jobs_missing_history(limit: int) -> List[Dict[str, Any]]:
+        """
+        Detect jobs with terminal success status but no history_items row.
+        """
+        # Jobs with status indicating success but no history item
+        missing = query_all(
+            f"""
+            SELECT
+                j.id as job_id,
+                j.identity_id,
+                j.provider,
+                j.action_code,
+                j.status,
+                j.prompt,
+                j.created_at,
+                j.updated_at
+            FROM {Tables.JOBS} j
+            WHERE j.status IN ('succeeded', 'completed', 'complete', 'ready', 'done')
+              AND j.identity_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.HISTORY_ITEMS} h
+                  WHERE h.identity_id = j.identity_id
+                    AND (
+                        h.payload->>'original_job_id' = j.id::text
+                        OR h.payload->>'job_id' = j.id::text
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.MODELS} m
+                  WHERE m.upstream_job_id = j.id::text
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.IMAGES} i
+                  WHERE i.upstream_id = j.id::text
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.VIDEOS} v
+                  WHERE v.upstream_id = j.id::text
+              )
+            ORDER BY j.created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+        return [
+            {
+                "job_id": str(row["job_id"]),
+                "identity_id": str(row["identity_id"]),
+                "provider": row["provider"],
+                "action_code": row["action_code"],
+                "status": row["status"],
+                "prompt": (row.get("prompt") or "")[:50] + "..." if row.get("prompt") and len(row.get("prompt", "")) > 50 else row.get("prompt"),
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "age_hours": round((datetime.now(timezone.utc) - row["created_at"].replace(tzinfo=timezone.utc)).total_seconds() / 3600, 1) if row.get("created_at") else None,
+            }
+            for row in missing
+        ]
+
+    @staticmethod
+    def _detect_finalized_without_ledger(limit: int) -> List[Dict[str, Any]]:
+        """
+        Detect finalized reservations that don't have a corresponding ledger entry.
+
+        When a reservation is finalized, there should be a ledger entry with:
+        - entry_type = 'RESERVATION_FINALIZE'
+        - ref_type = 'reservation'
+        - ref_id = reservation.id
+        """
+        missing = query_all(
+            f"""
+            SELECT
+                r.id as reservation_id,
+                r.identity_id,
+                r.action_code,
+                r.cost_credits,
+                r.status,
+                r.ref_job_id,
+                r.created_at,
+                r.captured_at
+            FROM {Tables.CREDIT_RESERVATIONS} r
+            WHERE r.status = 'finalized'
+              AND r.captured_at IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.LEDGER_ENTRIES} le
+                  WHERE le.ref_type = 'reservation'
+                    AND le.ref_id = r.id::text
+                    AND le.entry_type = %s
+              )
+            ORDER BY r.created_at DESC
+            LIMIT %s
+            """,
+            (LedgerEntryType.RESERVATION_FINALIZE, limit),
+        )
+
+        return [
+            {
+                "reservation_id": str(row["reservation_id"]),
+                "identity_id": str(row["identity_id"]),
+                "action_code": row["action_code"],
+                "cost_credits": row["cost_credits"],
+                "job_id": str(row["ref_job_id"]) if row.get("ref_job_id") else None,
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "captured_at": row["captured_at"].isoformat() if row.get("captured_at") else None,
+                "issue": "finalized_but_no_ledger_debit",
+            }
+            for row in missing
+        ]
+
+    @staticmethod
+    def _detect_stale_reservations(stale_minutes: int, limit: int) -> List[Dict[str, Any]]:
+        """
+        Detect held reservations older than stale_minutes.
+
+        These may indicate:
+        - Jobs that never completed
+        - Finalization that failed silently
+        - Orphaned reservations
+        """
+        stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+
+        stale = query_all(
+            f"""
+            SELECT
+                r.id as reservation_id,
+                r.identity_id,
+                r.action_code,
+                r.cost_credits,
+                r.ref_job_id,
+                r.created_at,
+                r.expires_at,
+                j.status as job_status,
+                j.updated_at as job_updated_at
+            FROM {Tables.CREDIT_RESERVATIONS} r
+            LEFT JOIN {Tables.JOBS} j ON j.id = r.ref_job_id
+            WHERE r.status = 'held'
+              AND r.created_at < %s
+            ORDER BY r.created_at ASC
+            LIMIT %s
+            """,
+            (stale_threshold, limit),
+        )
+
+        return [
+            {
+                "reservation_id": str(row["reservation_id"]),
+                "identity_id": str(row["identity_id"]),
+                "action_code": row["action_code"],
+                "cost_credits": row["cost_credits"],
+                "job_id": str(row["ref_job_id"]) if row.get("ref_job_id") else None,
+                "job_status": row.get("job_status"),
+                "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+                "expires_at": row["expires_at"].isoformat() if row.get("expires_at") else None,
+                "age_minutes": round((datetime.now(timezone.utc) - row["created_at"].replace(tzinfo=timezone.utc)).total_seconds() / 60, 1) if row.get("created_at") else None,
+                "issue": "job_missing" if row.get("job_status") is None else f"job_status_{row.get('job_status')}",
+            }
+            for row in stale
+        ]
+
+    @staticmethod
+    def _detect_orphan_s3_objects(limit: int) -> List[Dict[str, Any]]:
+        """
+        Detect S3 objects that have no corresponding DB reference.
+
+        This is a best-effort check that samples S3 and looks for unreferenced objects.
+        Note: This is slow and may have false positives due to timing issues.
+        """
+        try:
+            from backend.services.s3_service import S3Service
+
+            # Get S3 client and bucket
+            s3 = S3Service.get_client()
+            bucket = config.S3_BUCKET
+
+            if not s3 or not bucket:
+                return [{"skipped": True, "reason": "S3 not configured"}]
+
+            orphans = []
+            prefixes_to_check = ["images/", "models/", "videos/", "thumbnails/"]
+
+            for prefix in prefixes_to_check:
+                if len(orphans) >= limit:
+                    break
+
+                try:
+                    # List objects with this prefix (sample first 100)
+                    response = s3.list_objects_v2(
+                        Bucket=bucket,
+                        Prefix=prefix,
+                        MaxKeys=min(100, limit - len(orphans)),
+                    )
+
+                    for obj in response.get("Contents", []):
+                        if len(orphans) >= limit:
+                            break
+
+                        s3_key = obj["Key"]
+
+                        # Check if this key is referenced in the DB
+                        is_referenced = ReconciliationService._is_s3_key_referenced(s3_key)
+
+                        if not is_referenced:
+                            orphans.append({
+                                "s3_key": s3_key,
+                                "prefix": prefix,
+                                "size_bytes": obj.get("Size", 0),
+                                "last_modified": obj["LastModified"].isoformat() if obj.get("LastModified") else None,
+                            })
+
+                except Exception as e:
+                    print(f"[RECONCILE:DETECT] Error listing S3 prefix {prefix}: {e}")
+
+            return orphans
+
+        except ImportError:
+            return [{"skipped": True, "reason": "S3Service not available"}]
+        except Exception as e:
+            return [{"skipped": True, "reason": str(e)}]
+
+    @staticmethod
+    def _is_s3_key_referenced(s3_key: str) -> bool:
+        """
+        Check if an S3 key is referenced in any DB table.
+        """
+        # Check models
+        if query_one(
+            f"SELECT 1 FROM {Tables.MODELS} WHERE glb_s3_key = %s OR thumbnail_s3_key = %s LIMIT 1",
+            (s3_key, s3_key),
+        ):
+            return True
+
+        # Check images
+        if query_one(
+            f"SELECT 1 FROM {Tables.IMAGES} WHERE image_s3_key = %s OR thumbnail_s3_key = %s OR source_s3_key = %s LIMIT 1",
+            (s3_key, s3_key, s3_key),
+        ):
+            return True
+
+        # Check videos
+        if query_one(
+            f"SELECT 1 FROM {Tables.VIDEOS} WHERE video_s3_key = %s OR thumbnail_s3_key = %s LIMIT 1",
+            (s3_key, s3_key),
+        ):
+            return True
+
+        # Check history_items URLs (less reliable, URL may differ from key)
+        # We check if the key appears in any URL field
+        if query_one(
+            f"""
+            SELECT 1 FROM {Tables.HISTORY_ITEMS}
+            WHERE thumbnail_url LIKE %s
+               OR glb_url LIKE %s
+               OR image_url LIKE %s
+               OR video_url LIKE %s
+            LIMIT 1
+            """,
+            (f"%{s3_key}%", f"%{s3_key}%", f"%{s3_key}%", f"%{s3_key}%"),
+        ):
+            return True
+
+        return False
+
+    # ─────────────────────────────────────────────────────────────
+    # Stats (Original Method)
+    # ─────────────────────────────────────────────────────────────
+
     @staticmethod
     def get_stats() -> Dict[str, Any]:
         """
