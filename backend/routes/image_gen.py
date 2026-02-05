@@ -18,7 +18,7 @@ from flask import Blueprint, Response, jsonify, request
 from backend.config import OPENAI_API_KEY, config
 from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
-from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, update_job_status_ready, update_job_status_failed
+from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, dispatch_gemini_image_async, update_job_status_ready, update_job_status_failed
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.gemini_image_service import (
     gemini_generate_image,
@@ -99,7 +99,7 @@ def image_generate_unified():
 
 
 def _handle_gemini_image_generate(body: dict):
-    """Handle Gemini Imagen image generation."""
+    """Handle Gemini Imagen image generation (async, returns job_id for polling)."""
     # Fail-fast: Check if Gemini is configured
     is_configured, config_error = check_gemini_configured()
     if not is_configured:
@@ -148,7 +148,7 @@ def _handle_gemini_image_generate(body: dict):
     # Generate job ID
     internal_job_id = str(uuid.uuid4())
 
-    # Reserve credits
+    # Reserve credits (creates held reservation in DB)
     action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
     reservation_id, credit_error = start_paid_job(
         identity_id,
@@ -159,6 +159,28 @@ def _handle_gemini_image_generate(body: dict):
     if credit_error:
         return credit_error
 
+    # Store metadata for async processing
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": "imagen-4.0",
+        "aspect_ratio": aspect_ratio,
+        "image_size": image_size,
+        "sample_count": sample_count,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "google",
+    }
+
+    # Save to in-memory store
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
     # Create job record for tracking (same as OpenAI flow)
     create_internal_job_row(
         internal_job_id=internal_job_id,
@@ -166,123 +188,39 @@ def _handle_gemini_image_generate(body: dict):
         provider="google",
         action_key=action_key,
         prompt=prompt,
-        meta={"model": "imagen-4.0", "aspect_ratio": aspect_ratio, "image_size": image_size},
+        meta=store_meta,
         reservation_id=reservation_id,
         status="queued",
     )
 
-    try:
-        # Generate image synchronously (Imagen is reasonably fast)
-        result = gemini_generate_image(
-            prompt=prompt,
-            aspect_ratio=aspect_ratio,
-            image_size=image_size,
-            sample_count=sample_count,
-        )
+    # Dispatch async - Gemini API call happens in background thread
+    get_executor().submit(
+        dispatch_gemini_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        prompt,
+        aspect_ratio,
+        image_size,
+        sample_count,
+        store_meta,
+    )
 
-        # Save to history (creates both images row and history_items row)
-        save_image_to_normalized_db(
-            image_id=internal_job_id,
-            image_url=result["image_url"],
-            prompt=prompt,
-            ai_model="imagen-4.0",
-            size=f"{aspect_ratio}@{image_size}",
-            image_urls=result.get("image_urls", [result["image_url"]]),
-            user_id=identity_id,
-            provider="google",
-        )
+    log_event("image/generate:gemini:queued", {"internal_job_id": internal_job_id})
 
-        # Update job status to ready
-        update_job_status_ready(
-            job_id=internal_job_id,
-            image_id=internal_job_id,
-            image_url=result["image_url"],
-        )
-
-        # Finalize credits
-        from backend.services.credits_helper import finalize_job_credits
-        if reservation_id:
-            finalize_job_credits(reservation_id, internal_job_id)
-
-        log_event("image/generate:gemini", {"job_id": internal_job_id, "model": "imagen-4.0"})
-
-        balance_info = get_current_balance(identity_id) if identity_id else None
-        return jsonify({
-            "ok": True,
-            "image_url": result["image_url"],
-            "image_base64": result.get("image_base64"),
-            "image_urls": result.get("image_urls", []),
-            "image_id": internal_job_id,
-            "job_id": internal_job_id,
-            "new_balance": balance_info["available"] if balance_info else None,
-            "model": "imagen-4.0",
-            "provider": "google",
-            "status": "done",
-        })
-
-    except GeminiConfigError as e:
-        from backend.services.credits_helper import release_job_credits
-        update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
-        return jsonify({
-            "error": "gemini_not_configured",
-            "message": f"Gemini image failed: {e}"
-        }), 500
-
-    except GeminiValidationError as e:
-        from backend.services.credits_helper import release_job_credits
-        update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Gemini image failed: {e.message}",
-            "field": e.field,
-            "allowed": e.allowed
-        }), 400
-
-    except GeminiAuthError as e:
-        from backend.services.credits_helper import release_job_credits
-        update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
-        return jsonify({
-            "error": "gemini_auth_failed",
-            "message": f"Gemini image failed: {e}"
-        }), 401
-
-    except RuntimeError as e:
-        from backend.services.credits_helper import release_job_credits
-        error_str = str(e)
-        print(f"[Gemini Imagen] Error: {error_str}")
-        update_job_status_failed(internal_job_id, error_str)
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_error", internal_job_id)
-
-        if error_str.startswith("gemini_"):
-            parts = error_str.split(":", 1)
-            error_code = parts[0]
-            error_msg = parts[1].strip() if len(parts) > 1 else error_str
-        else:
-            error_code = "gemini_image_failed"
-            error_msg = error_str
-
-        return jsonify({
-            "error": error_code,
-            "message": f"Gemini image failed: {error_msg}"
-        }), 500
-
-    except Exception as e:
-        from backend.services.credits_helper import release_job_credits
-        print(f"[Gemini Imagen] Unexpected error: {e}")
-        update_job_status_failed(internal_job_id, str(e))
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_error", internal_job_id)
-        return jsonify({
-            "error": "gemini_image_failed",
-            "message": f"Gemini image failed: {e}"
-        }), 500
+    # Return immediately with job_id for polling
+    # Credits are now held in DB - frontend can see via /api/credits/wallet
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": "imagen-4.0",
+        "provider": "google",
+    })
 
 
 def _handle_openai_image_generate(body: dict):
@@ -471,7 +409,7 @@ def gemini_image_mod():
     # Generate job ID
     internal_job_id = str(uuid.uuid4())
 
-    # Reserve credits
+    # Reserve credits (creates held reservation in DB)
     action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
     reservation_id, credit_error = start_paid_job(
         identity_id,
@@ -482,6 +420,28 @@ def gemini_image_mod():
     if credit_error:
         return credit_error
 
+    # Store metadata for async processing
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": "imagen-4.0",
+        "aspect_ratio": aspect_ratio,
+        "image_size": image_size,
+        "sample_count": sample_count,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "google",
+    }
+
+    # Save to in-memory store
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
     # Create job record for tracking (same as OpenAI flow)
     create_internal_job_row(
         internal_job_id=internal_job_id,
@@ -489,123 +449,39 @@ def gemini_image_mod():
         provider="google",
         action_key=action_key,
         prompt=prompt,
-        meta={"model": "imagen-4.0", "aspect_ratio": aspect_ratio, "image_size": image_size},
+        meta=store_meta,
         reservation_id=reservation_id,
         status="queued",
     )
 
-    try:
-        # Generate image synchronously (Imagen is reasonably fast)
-        result = gemini_generate_image(
-            prompt=prompt,
-            aspect_ratio=aspect_ratio,
-            image_size=image_size,
-            sample_count=sample_count,
-        )
+    # Dispatch async - Gemini API call happens in background thread
+    get_executor().submit(
+        dispatch_gemini_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        prompt,
+        aspect_ratio,
+        image_size,
+        sample_count,
+        store_meta,
+    )
 
-        # Save to history
-        save_image_to_normalized_db(
-            image_id=internal_job_id,
-            image_url=result["image_url"],
-            prompt=prompt,
-            ai_model="imagen-4.0",
-            size=f"{aspect_ratio}@{image_size}",
-            image_urls=result.get("image_urls", [result["image_url"]]),
-            user_id=identity_id,
-            provider="google",
-        )
+    log_event("image/gemini:queued", {"internal_job_id": internal_job_id})
 
-        # Update job status to ready
-        update_job_status_ready(
-            job_id=internal_job_id,
-            image_id=internal_job_id,
-            image_url=result["image_url"],
-        )
-
-        # Finalize credits
-        from backend.services.credits_helper import finalize_job_credits
-        if reservation_id:
-            finalize_job_credits(reservation_id, internal_job_id)
-
-        log_event("image/gemini:generated", {"job_id": internal_job_id, "model": "imagen-4.0"})
-
-        balance_info = get_current_balance(identity_id) if identity_id else None
-        return jsonify({
-            "ok": True,
-            "image_url": result["image_url"],
-            "image_base64": result.get("image_base64"),
-            "image_urls": result.get("image_urls", []),
-            "image_id": internal_job_id,
-            "job_id": internal_job_id,
-            "new_balance": balance_info["available"] if balance_info else None,
-            "model": "imagen-4.0",
-            "provider": "google",
-        })
-
-    except GeminiConfigError as e:
-        from backend.services.credits_helper import release_job_credits
-        update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
-        return jsonify({
-            "error": "gemini_not_configured",
-            "message": str(e)
-        }), 500
-
-    except GeminiValidationError as e:
-        from backend.services.credits_helper import release_job_credits
-        update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
-        return jsonify({
-            "error": "invalid_params",
-            "message": e.message,
-            "field": e.field,
-            "allowed": e.allowed
-        }), 400
-
-    except GeminiAuthError as e:
-        from backend.services.credits_helper import release_job_credits
-        update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
-        return jsonify({
-            "error": "gemini_auth_failed",
-            "message": str(e)
-        }), 401
-
-    except RuntimeError as e:
-        from backend.services.credits_helper import release_job_credits
-        error_str = str(e)
-        print(f"[Gemini Imagen] Error: {error_str}")
-        update_job_status_failed(internal_job_id, error_str)
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_error", internal_job_id)
-
-        # Parse error code from message if present
-        if error_str.startswith("gemini_"):
-            parts = error_str.split(":", 1)
-            error_code = parts[0]
-            error_msg = parts[1].strip() if len(parts) > 1 else error_str
-        else:
-            error_code = "gemini_image_failed"
-            error_msg = error_str
-
-        return jsonify({
-            "error": error_code,
-            "message": error_msg
-        }), 500
-
-    except Exception as e:
-        from backend.services.credits_helper import release_job_credits
-        print(f"[Gemini Imagen] Unexpected error: {e}")
-        update_job_status_failed(internal_job_id, str(e))
-        if reservation_id:
-            release_job_credits(reservation_id, "gemini_error", internal_job_id)
-        return jsonify({
-            "error": "gemini_image_failed",
-            "message": str(e)
-        }), 500
+    # Return immediately with job_id for polling
+    # Credits are now held in DB - frontend can see via /api/credits/wallet
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": "imagen-4.0",
+        "provider": "google",
+    })
 
 
 # NOTE: Image editing endpoint removed - Imagen 4.0 is text-to-image only.
@@ -824,6 +700,126 @@ def openai_image_status_mod(job_id: str):
             "image_base64": meta.get("image_base64"),
             "model": meta.get("model"),
             "size": meta.get("size"),
+        })
+
+    return jsonify({"error": "Job not found"}), 404
+
+
+@bp.route("/image/gemini/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def gemini_image_status_mod(job_id: str):
+    """
+    Poll status of a Gemini image generation job.
+
+    Returns:
+    - status: "queued" | "done" | "failed"
+    - On done: image_url, image_urls, image_base64
+    - On failed: error message
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    store = load_store()
+    meta = store.get(job_id) or {}
+
+    if USE_DB:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, status, error_message, meta
+                        FROM timrx_billing.jobs
+                        WHERE id::text = %s AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (job_id, identity_id),
+                    )
+                    job = cur.fetchone()
+
+            if job:
+                job_meta = job.get("meta") or {}
+                if isinstance(job_meta, str):
+                    try:
+                        job_meta = __import__('json').loads(job_meta)
+                    except Exception:
+                        job_meta = {}
+
+                if job["status"] == "queued":
+                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image..."})
+
+                if job["status"] == "failed":
+                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "error": job.get("error_message", "Image generation failed")})
+
+                if job["status"] == "ready":
+                    image_url = meta.get("image_url") or job_meta.get("image_url")
+                    image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
+
+                    canonical = get_canonical_image_row(
+                        identity_id,
+                        upstream_id=job_id,
+                        alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
+                    )
+                    if canonical:
+                        if canonical.get("image_url"):
+                            image_url = canonical["image_url"]
+                            image_urls = [image_url]
+                        if canonical.get("thumbnail_url"):
+                            meta["thumbnail_url"] = canonical["thumbnail_url"]
+
+                    # Get updated balance to return to frontend
+                    balance_info = get_current_balance(identity_id) if identity_id else None
+
+                    return jsonify({
+                        "ok": True,
+                        "status": "done",
+                        "job_id": job_id,
+                        "image_id": job_id,
+                        "image_url": image_url,
+                        "image_urls": image_urls,
+                        "image_base64": meta.get("image_base64") or job_meta.get("image_base64"),
+                        "model": meta.get("model") or job_meta.get("model") or "imagen-4.0",
+                        "aspect_ratio": meta.get("aspect_ratio") or job_meta.get("aspect_ratio"),
+                        "image_size": meta.get("image_size") or job_meta.get("image_size"),
+                        "provider": "google",
+                        "new_balance": balance_info["available"] if balance_info else None,
+                    })
+        except Exception as e:
+            print(f"[STATUS][mod] Error checking Gemini job {job_id}: {e}")
+
+    # Fallback to in-memory store
+    if meta.get("status") == "done":
+        canonical = get_canonical_image_row(
+            identity_id,
+            upstream_id=job_id,
+            alt_upstream_id=meta.get("image_id"),
+        )
+        if canonical:
+            if canonical.get("image_url"):
+                meta["image_url"] = canonical["image_url"]
+                meta["image_urls"] = [canonical["image_url"]]
+            if canonical.get("thumbnail_url"):
+                meta["thumbnail_url"] = canonical["thumbnail_url"]
+
+        balance_info = get_current_balance(identity_id) if identity_id else None
+
+        return jsonify({
+            "ok": True,
+            "status": "done",
+            "job_id": job_id,
+            "image_id": job_id,
+            "image_url": meta.get("image_url"),
+            "image_urls": meta.get("image_urls", []),
+            "image_base64": meta.get("image_base64"),
+            "model": meta.get("model") or "imagen-4.0",
+            "aspect_ratio": meta.get("aspect_ratio"),
+            "image_size": meta.get("image_size"),
+            "provider": "google",
+            "new_balance": balance_info["available"] if balance_info else None,
         })
 
     return jsonify({"error": "Job not found"}), 404
