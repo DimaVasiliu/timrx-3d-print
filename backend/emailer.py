@@ -32,6 +32,8 @@ if not EMAIL_SERVICE_AVAILABLE:
 # ─────────────────────────────────────────────────────────────
 # Logo loaders (self-contained — no external dependency)
 # ─────────────────────────────────────────────────────────────
+from pathlib import Path
+
 _logo_bytes: Optional[bytes] = None
 _logo_loaded = False
 _blogs_logo_bytes: Optional[bytes] = None
@@ -39,45 +41,285 @@ _blogs_logo_loaded = False
 
 
 def _load_logo() -> Optional[bytes]:
-    """Load TimrX email logo from assets/logo.png. Cached on success."""
+    """Load TimrX email logo. Tries Render paths, local paths, then web fallback. Cached."""
     global _logo_bytes, _logo_loaded
     if _logo_loaded:
         return _logo_bytes
 
-    logo_path = config.APP_DIR / "assets" / "logo.png"
-    try:
-        resolved = logo_path.resolve()
-        if resolved.is_file():
-            _logo_bytes = resolved.read_bytes()
-            _logo_loaded = True
-            print(f"[EMAIL] Logo loaded from {resolved} ({len(_logo_bytes)} bytes)")
-            return _logo_bytes
-    except Exception as exc:
-        print(f"[EMAIL] Logo load failed: {exc}")
+    _logo_loaded = True
 
-    print(f"[EMAIL] Logo not found at {logo_path}")
+    # Build list of candidate paths (ordered by priority)
+    candidates = [
+        # Render deployment paths (most likely in production)
+        Path("/opt/render/project/src/backend/assets/logo.png"),
+        Path("/opt/render/project/src/assets/logo.png"),
+        # APP_DIR-relative paths (APP_DIR = meshy/ in this project)
+        config.APP_DIR / "assets" / "logo.png",
+        config.APP_DIR / "backend" / "assets" / "logo.png",
+        # Local development paths
+        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo.png",
+    ]
+
+    for p in candidates:
+        try:
+            resolved = p.resolve()
+            if resolved.is_file():
+                _logo_bytes = resolved.read_bytes()
+                print(f"[EMAIL] Logo loaded from {resolved} ({len(_logo_bytes)} bytes)")
+                return _logo_bytes
+        except Exception:
+            continue
+
+    # Fallback: download from public URL
+    try:
+        import requests as _req
+        resp = _req.get("https://timrx.live/img/logo.png", timeout=10)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            _logo_bytes = resp.content
+            print(f"[EMAIL] Logo downloaded from web ({len(_logo_bytes) if _logo_bytes else 0} bytes)")
+            return _logo_bytes
+    except Exception as e:
+        print(f"[EMAIL] Could not download logo: {e}")
+
+    print("[EMAIL] Logo not found in any location")
     return None
 
 
 def _load_blogs_logo() -> Optional[bytes]:
-    """Load TimrX blogs logo from assets/blogs.png. Cached on success."""
+    """Load TimrX blogs logo. Tries Render paths, local paths, then web fallback. Cached."""
     global _blogs_logo_bytes, _blogs_logo_loaded
     if _blogs_logo_loaded:
         return _blogs_logo_bytes
 
-    logo_path = config.APP_DIR / "assets" / "blogs.png"
-    try:
-        resolved = logo_path.resolve()
-        if resolved.is_file():
-            _blogs_logo_bytes = resolved.read_bytes()
-            _blogs_logo_loaded = True
-            print(f"[EMAIL] Blogs logo loaded from {resolved} ({len(_blogs_logo_bytes)} bytes)")
-            return _blogs_logo_bytes
-    except Exception as exc:
-        print(f"[EMAIL] Blogs logo load failed: {exc}")
+    _blogs_logo_loaded = True
 
-    print(f"[EMAIL] Blogs logo not found at {logo_path}")
+    # Build list of candidate paths (ordered by priority)
+    candidates = [
+        # Render deployment paths
+        Path("/opt/render/project/src/backend/assets/blogs.png"),
+        Path("/opt/render/project/src/assets/blogs.png"),
+        # APP_DIR-relative paths
+        config.APP_DIR / "assets" / "blogs.png",
+        config.APP_DIR / "backend" / "assets" / "blogs.png",
+        # Local development paths
+        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "blogs.png",
+    ]
+
+    for p in candidates:
+        try:
+            resolved = p.resolve()
+            if resolved.is_file():
+                _blogs_logo_bytes = resolved.read_bytes()
+                print(f"[EMAIL] Blogs logo loaded from {resolved} ({len(_blogs_logo_bytes)} bytes)")
+                return _blogs_logo_bytes
+        except Exception:
+            continue
+
+    # Fallback: download from public URL
+    try:
+        import requests as _req
+        resp = _req.get("https://timrx.live/img/blogs.png", timeout=10)
+        if resp.status_code == 200 and len(resp.content) > 100:
+            _blogs_logo_bytes = resp.content
+            print(f"[EMAIL] Blogs logo downloaded from web ({len(_blogs_logo_bytes) if _blogs_logo_bytes else 0} bytes)")
+            return _blogs_logo_bytes
+    except Exception as e:
+        print(f"[EMAIL] Could not download blogs logo: {e}")
+
+    print("[EMAIL] Blogs logo not found in any location")
     return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Email Template Constants & Wrapper
+# ─────────────────────────────────────────────────────────────
+
+# Brand colors (email-safe)
+ACCENT_COLOR = "#C97A2B"  # Warm amber/copper
+TEXT_PRIMARY = "#111111"
+TEXT_SECONDARY = "#555555"
+TEXT_MUTED = "#888888"
+BG_WHITE = "#ffffff"
+BG_LIGHT = "#f7f7f7"
+BORDER_COLOR = "#e5e5e5"
+SUCCESS_COLOR = "#22863a"
+
+
+def render_email_html(
+    title: str,
+    intro: str,
+    body_html: str,
+    logo_cid: Optional[str] = "timrx_logo",
+    footer_extra: str = "",
+) -> str:
+    """
+    Render a cross-client compatible HTML email template.
+
+    Uses table-based layout with inline styles for maximum compatibility
+    with Gmail, Outlook, Yahoo, Apple Mail, etc.
+
+    Args:
+        title: Main heading (e.g. "Purchase Confirmed")
+        intro: Lead paragraph text
+        body_html: Main content HTML (cards, tables, etc.)
+        logo_cid: Content-ID for inline logo image, or None to skip
+        footer_extra: Additional footer content (e.g. "Reply to this email for help")
+
+    Returns:
+        Complete HTML email string
+    """
+    logo_img = ""
+    if logo_cid:
+        logo_img = f'''<img src="cid:{logo_cid}" alt="TimrX" width="32" height="32" style="display:block;width:32px;height:32px;border:0;" />'''
+
+    return f'''<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <meta name="supported-color-schemes" content="light" />
+    <title>{title}</title>
+    <!--[if mso]>
+    <style type="text/css">
+        table {{border-collapse:collapse;border-spacing:0;margin:0;}}
+        div, td {{padding:0;}}
+        div {{margin:0 !important;}}
+    </style>
+    <noscript>
+    <xml>
+        <o:OfficeDocumentSettings>
+            <o:PixelsPerInch>96</o:PixelsPerInch>
+        </o:OfficeDocumentSettings>
+    </xml>
+    </noscript>
+    <![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:{BG_LIGHT};font-family:Arial,Helvetica,sans-serif;-webkit-font-smoothing:antialiased;">
+    <!-- Outer wrapper table -->
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:{BG_LIGHT};">
+        <tr>
+            <td align="center" style="padding:32px 16px;">
+                <!-- Main content table (600px max) -->
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="600" style="max-width:600px;width:100%;background-color:{BG_WHITE};border:1px solid {BORDER_COLOR};border-radius:8px;">
+
+                    <!-- Header -->
+                    <tr>
+                        <td style="padding:24px 32px;border-bottom:1px solid {BORDER_COLOR};">
+                            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                                <tr>
+                                    <td width="40" valign="middle" style="padding-right:12px;">
+                                        {logo_img}
+                                    </td>
+                                    <td valign="middle">
+                                        <span style="font-size:22px;font-weight:700;color:{TEXT_PRIMARY};letter-spacing:-0.5px;font-family:Arial,Helvetica,sans-serif;">TimrX</span>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                    <!-- Title & Intro -->
+                    <tr>
+                        <td style="padding:32px 32px 16px 32px;">
+                            <h1 style="margin:0 0 12px 0;font-size:24px;font-weight:700;color:{TEXT_PRIMARY};line-height:1.3;font-family:Arial,Helvetica,sans-serif;">{title}</h1>
+                            <p style="margin:0;font-size:15px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">{intro}</p>
+                        </td>
+                    </tr>
+
+                    <!-- Body Content -->
+                    <tr>
+                        <td style="padding:0 32px 32px 32px;">
+                            {body_html}
+                        </td>
+                    </tr>
+
+                    <!-- Footer -->
+                    <tr>
+                        <td style="padding:24px 32px;border-top:1px solid {BORDER_COLOR};background-color:{BG_LIGHT};">
+                            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+                                <tr>
+                                    <td align="center">
+                                        <p style="margin:0 0 8px 0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                                            TimrX &bull; 3D Print Hub
+                                        </p>
+                                        <p style="margin:0;font-size:12px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                                            If you need help, reply to this email or contact
+                                            <a href="mailto:support@timrx.live" style="color:{ACCENT_COLOR};text-decoration:underline;">support@timrx.live</a>
+                                        </p>
+                                        {f'<p style="margin:8px 0 0 0;font-size:11px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">{footer_extra}</p>' if footer_extra else ''}
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+
+                </table>
+                <!-- /Main content table -->
+            </td>
+        </tr>
+    </table>
+    <!-- /Outer wrapper table -->
+</body>
+</html>'''
+
+
+def render_detail_card(rows: list, header: str = "Details") -> str:
+    """
+    Render a bordered card with key-value rows.
+
+    Args:
+        rows: List of (label, value) tuples
+        header: Card header text
+
+    Returns:
+        HTML string for the card
+    """
+    rows_html = ""
+    for i, (label, value) in enumerate(rows):
+        border_style = f"border-bottom:1px solid {BORDER_COLOR};" if i < len(rows) - 1 else ""
+        rows_html += f'''
+            <tr>
+                <td style="padding:12px 16px;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;{border_style}">{label}</td>
+                <td style="padding:12px 16px;font-size:14px;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;text-align:right;font-weight:600;{border_style}">{value}</td>
+            </tr>'''
+
+    return f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid {BORDER_COLOR};border-radius:6px;border-collapse:separate;">
+            <tr>
+                <td colspan="2" style="padding:12px 16px;background-color:{BG_LIGHT};border-bottom:1px solid {BORDER_COLOR};border-radius:6px 6px 0 0;">
+                    <span style="font-size:14px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">{header}</span>
+                </td>
+            </tr>
+            {rows_html}
+        </table>'''
+
+
+def render_highlight_box(content: str, bg_color: str = BG_LIGHT) -> str:
+    """Render a highlighted box (e.g. for codes, amounts)."""
+    return f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border:2px dashed {BORDER_COLOR};border-radius:8px;background-color:{bg_color};">
+            <tr>
+                <td align="center" style="padding:24px 16px;">
+                    {content}
+                </td>
+            </tr>
+        </table>'''
+
+
+def render_amount_display(amount: str, currency: str = "GBP", status: str = "Paid") -> str:
+    """Render a large amount display with status."""
+    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    return f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Amount</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount}</p>
+                    <p style="margin:0;font-size:14px;font-weight:600;color:{SUCCESS_COLOR};font-family:Arial,Helvetica,sans-serif;">{status}</p>
+                </td>
+            </tr>
+        </table>'''
 
 
 # ─────────────────────────────────────────────────────────────
@@ -121,83 +363,37 @@ def send_magic_code(to_email: str, code: str) -> bool:
     # Load logo for inline CID embedding
     logo_bytes = _load_logo()
 
-    # Logo tag: CID if logo available, hidden otherwise
-    logo_img_tag = ""
-    if logo_bytes:
-        logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
-            'style="height:32px; width:auto; display:block;" />'
-        )
+    # Build code box HTML
+    code_box = render_highlight_box(
+        f'<span style="font-size:32px;font-weight:700;letter-spacing:8px;color:{TEXT_PRIMARY};font-family:\'Courier New\',Courier,monospace;">{code}</span>'
+    )
 
-    html_body = f"""
-    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
-    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;
-                background-color: #000000; border-radius: 12px; overflow: hidden;">
+    body_html = f'''
+        {code_box}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr>
+                <td>
+                    <p style="margin:0 0 8px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        This code expires in <strong style="color:{TEXT_PRIMARY};">15 minutes</strong>.
+                    </p>
+                    <p style="margin:0;font-size:13px;line-height:1.6;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                        If you didn't request this code, you can safely ignore this email.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
 
-        <!-- Header with logo -->
-        <div style="background-color: #000000; padding: 12px 20px;">
-            <table cellpadding="0" cellspacing="0" border="0" width="100%">
-                <tr>
-                    <td>
-                        <table cellpadding="0" cellspacing="0" border="0">
-                            <tr>
-                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
-                                    {logo_img_tag}
-                                </td>
-                                <td style="vertical-align: middle;">
-                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
-                                                 letter-spacing: 0.5px;">TimrX</span>
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </div>
-
-        <!-- Body -->
-        <div style="padding: 36px 32px 28px;">
-            <h2 style="color: #ffffff; margin: 0 0 8px; font-size: 22px; font-weight: 600;">
-                Your Access Code
-            </h2>
-            <p style="color: #aaa; font-size: 15px; line-height: 1.5; margin: 0 0 24px;">
-                Use the code below to access your TimrX account:
-            </p>
-
-            <!-- Code box -->
-            <div style="background-color: #111111; border: 2px dashed #333; border-radius: 10px;
-                        padding: 24px; text-align: center; margin: 0 0 24px;">
-                <span style="font-size: 36px; font-weight: 700; letter-spacing: 8px;
-                             color: #ffffff; font-family: 'Courier New', monospace;">{code}</span>
-            </div>
-
-            <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
-                This code expires in <strong style="color: #ccc;">15 minutes</strong>.
-            </p>
-            <p style="color: #666; font-size: 13px; line-height: 1.5; margin: 0;">
-                If you didn't request this code, you can safely ignore this email.
-            </p>
-        </div>
-
-        <!-- Footer -->
-        <div style="border-top: 1px solid #222; padding: 20px 32px;
-                    text-align: center;">
-            <p style="color: #555; font-size: 12px; margin: 0 0 6px;">
-                TimrX &mdash; 3D Print Hub
-            </p>
-            <p style="color: #444; font-size: 11px; margin: 0;">
-                Need help? Contact us at
-                <a href="mailto:support@timrx.live"
-                   style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
-            </p>
-        </div>
-    </div>
-    </div>
-    """
+    html_body = render_email_html(
+        title="Your Access Code",
+        intro="Use the code below to sign in to your TimrX account:",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
 
     text_body = f"""Your TimrX Access Code
 
-Use the code below to access your TimrX account:
+Use the code below to sign in to your TimrX account:
 
 {code}
 
@@ -207,7 +403,7 @@ If you didn't request this code, you can safely ignore this email.
 
 ---
 TimrX - 3D Print Hub
-Need help? Contact us at support@timrx.live
+Need help? Reply to this email or contact support@timrx.live
 """
 
     # Use send_raw with inline logo if logo available, otherwise simple send
@@ -240,7 +436,7 @@ def send_purchase_receipt(
     credits: int,
     amount_gbp: float,
 ) -> bool:
-    """Send a purchase confirmation receipt (Stripe-like design)."""
+    """Send a purchase confirmation receipt."""
     from datetime import datetime, timezone
 
     subject = f"TimrX Receipt - {plan_name}"
@@ -249,85 +445,39 @@ def send_purchase_receipt(
     # Load logo for inline CID embedding
     logo_bytes = _load_logo()
 
-    logo_img_tag = ""
-    if logo_bytes:
-        logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
-            'style="height:32px; width:auto; display:block;" />'
-        )
+    # Build body HTML using helper functions
+    amount_display = render_amount_display(f"{amount_gbp:.2f}", "GBP", f"Paid {paid_date}")
 
-    html_body = f"""
-    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
-    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                max-width: 600px; margin: 0 auto; color: #ffffff; padding: 0 16px;
-                background-color: #000000; border-radius: 12px;">
+    summary_card = render_detail_card([
+        (plan_name, f"&pound;{amount_gbp:.2f}"),
+        ("Credits added", f"{credits:,}"),
+        ("Amount paid", f"&pound;{amount_gbp:.2f}"),
+    ], header="Summary")
 
-        <!-- Header with logo -->
-        <div style="padding: 20px 0 16px;">
-            <table cellpadding="0" cellspacing="0" border="0" width="100%">
-                <tr>
-                    <td>
-                        <table cellpadding="0" cellspacing="0" border="0">
-                            <tr>
-                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
-                                    {logo_img_tag}
-                                </td>
-                                <td style="vertical-align: middle;">
-                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
-                                                 letter-spacing: 0.5px;">TimrX</span>
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </div>
+    body_html = f'''
+        {amount_display}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr>
+                <td>
+                    {summary_card}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding-top:24px;">
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your credits are now available in your account.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
 
-        <!-- Amount section -->
-        <div style="padding: 0 0 24px; border-bottom: 1px solid #222;">
-            <p style="color: #888; font-size: 15px; margin: 0 0 6px;">Receipt from TimrX</p>
-            <p style="font-size: 36px; font-weight: 700; margin: 0 0 8px; color: #ffffff;">&pound;{amount_gbp:.2f}</p>
-            <p style="color: #27ae60; font-size: 14px; font-weight: 600; margin: 0;">Paid {paid_date}</p>
-        </div>
-
-        <!-- Summary card -->
-        <div style="margin: 24px 0;">
-            <div style="border: 1px solid #222; border-radius: 8px; overflow: hidden;">
-                <div style="padding: 12px 16px; background-color: #111; border-bottom: 1px solid #222;">
-                    <span style="font-weight: 600; font-size: 14px; color: #ffffff;">Summary</span>
-                </div>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #222;">
-                        <td style="padding: 12px 16px; font-size: 14px; color: #ffffff;">{plan_name}</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #222;">
-                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Credits added</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{credits:,}</td>
-                    </tr>
-                    <tr style="background-color: #111;">
-                        <td style="padding: 12px 16px; font-weight: 700; font-size: 14px; color: #ffffff;">Amount paid</td>
-                        <td style="padding: 12px 16px; text-align: right; font-weight: 700; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
-                    </tr>
-                </table>
-            </div>
-        </div>
-
-        <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 24px;">
-            Your credits are now available in your account.
-        </p>
-
-        <!-- Footer -->
-        <div style="padding: 20px 0; border-top: 1px solid #222; text-align: center;">
-            <p style="color: #555; font-size: 12px; margin: 0 0 4px;">
-                Questions? Contact us at
-                <a href="mailto:support@timrx.live" style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
-            </p>
-            <p style="color: #444; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
-        </div>
-    </div>
-    </div>
-    """
+    html_body = render_email_html(
+        title="Purchase Confirmed",
+        intro="Thank you for your purchase. Here's your receipt.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
 
     text_body = f"""Receipt from TimrX
 
@@ -343,7 +493,7 @@ Your credits are now available in your account.
 
 ---
 TimrX - 3D Print Hub
-Questions? Contact us at support@timrx.live
+Need help? Reply to this email or contact support@timrx.live
 """
 
     # Use send_raw with inline logo if logo available, otherwise simple send
@@ -386,118 +536,66 @@ def send_invoice_email(
 ) -> bool:
     """
     Send a purchase confirmation email with invoice + receipt PDFs attached.
-    Stripe-like design matching send_purchase_receipt.
 
     Uses EmailService.send_raw() for MIME multipart with attachments and
     inline logo image.  Falls back to simple send_purchase_receipt() on error.
     """
     from datetime import datetime, timezone
 
-    subject = f"TimrX Receipt — {plan_name}"
+    subject = f"TimrX Receipt - {plan_name}"
     paid_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
     # If no logo_bytes passed in, load it locally
     if not logo_bytes:
         logo_bytes = _load_logo()
 
-    logo_img_tag = ""
-    if logo_bytes:
-        logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
-            'style="height:32px; width:auto; display:block;" />'
-        )
+    # Build body HTML using helper functions
+    amount_display = render_amount_display(f"{amount_gbp:.2f}", "GBP", f"Paid {paid_date}")
 
-    html_body = f"""
-    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
-    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-                max-width: 600px; margin: 0 auto; color: #ffffff; padding: 0 16px;
-                background-color: #000000; border-radius: 12px;">
+    ref_card = render_detail_card([
+        ("Invoice number", invoice_number),
+        ("Receipt number", receipt_number),
+    ], header="Reference")
 
-        <!-- Header with logo -->
-        <div style="padding: 20px 0 16px;">
-            <table cellpadding="0" cellspacing="0" border="0" width="100%">
-                <tr>
-                    <td>
-                        <table cellpadding="0" cellspacing="0" border="0">
-                            <tr>
-                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
-                                    {logo_img_tag}
-                                </td>
-                                <td style="vertical-align: middle;">
-                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
-                                                 letter-spacing: 0.5px;">TimrX</span>
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </div>
+    summary_card = render_detail_card([
+        (plan_name, f"&pound;{amount_gbp:.2f}"),
+        ("Credits added", f"{credits:,}"),
+        ("Amount paid", f"&pound;{amount_gbp:.2f}"),
+    ], header="Summary")
 
-        <!-- Amount section -->
-        <div style="padding: 0 0 24px; border-bottom: 1px solid #222;">
-            <p style="color: #888; font-size: 15px; margin: 0 0 6px;">Receipt from TimrX</p>
-            <p style="font-size: 36px; font-weight: 700; margin: 0 0 8px; color: #ffffff;">&pound;{amount_gbp:.2f}</p>
-            <p style="color: #27ae60; font-size: 14px; font-weight: 600; margin: 0;">Paid {paid_date}</p>
-        </div>
+    body_html = f'''
+        {amount_display}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr>
+                <td style="padding-bottom:16px;">
+                    {ref_card}
+                </td>
+            </tr>
+            <tr>
+                <td>
+                    {summary_card}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding-top:24px;">
+                    <p style="margin:0 0 8px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your invoice and receipt PDFs are attached to this email.
+                    </p>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your credits are now available in your account.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
 
-        <!-- Reference numbers -->
-        <div style="margin: 24px 0;">
-            <div style="border: 1px solid #222; border-radius: 8px; overflow: hidden;">
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #222;">
-                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Invoice number</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{invoice_number}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Receipt number</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{receipt_number}</td>
-                    </tr>
-                </table>
-            </div>
-        </div>
-
-        <!-- Summary card -->
-        <div style="margin: 0 0 24px;">
-            <div style="border: 1px solid #222; border-radius: 8px; overflow: hidden;">
-                <div style="padding: 12px 16px; background-color: #111; border-bottom: 1px solid #222;">
-                    <span style="font-weight: 600; font-size: 14px; color: #ffffff;">Summary</span>
-                </div>
-                <table style="width: 100%; border-collapse: collapse;">
-                    <tr style="border-bottom: 1px solid #222;">
-                        <td style="padding: 12px 16px; font-size: 14px; color: #ffffff;">{plan_name}</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
-                    </tr>
-                    <tr style="border-bottom: 1px solid #222;">
-                        <td style="padding: 12px 16px; font-size: 14px; color: #888;">Credits added</td>
-                        <td style="padding: 12px 16px; text-align: right; font-size: 14px; color: #ffffff;">{credits:,}</td>
-                    </tr>
-                    <tr style="background-color: #111;">
-                        <td style="padding: 12px 16px; font-weight: 700; font-size: 14px; color: #ffffff;">Amount paid</td>
-                        <td style="padding: 12px 16px; text-align: right; font-weight: 700; font-size: 14px; color: #ffffff;">&pound;{amount_gbp:.2f}</td>
-                    </tr>
-                </table>
-            </div>
-        </div>
-
-        <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 6px;">
-            Your invoice and receipt PDFs are attached to this email.
-        </p>
-        <p style="color: #888; font-size: 14px; line-height: 1.5; margin: 0 0 24px;">
-            Your credits are now available in your account.
-        </p>
-
-        <!-- Footer -->
-        <div style="padding: 20px 0; border-top: 1px solid #222; text-align: center;">
-            <p style="color: #555; font-size: 12px; margin: 0 0 4px;">
-                Questions? Contact us at
-                <a href="mailto:support@timrx.live" style="color: #5b7cfa; text-decoration: none;">support@timrx.live</a>
-            </p>
-            <p style="color: #444; font-size: 11px; margin: 8px 0 0;">TimrX &mdash; 3D Print Hub</p>
-        </div>
-    </div>
-    </div>
-    """
+    html_body = render_email_html(
+        title="Purchase Confirmed",
+        intro="Thank you for your purchase. Here's your receipt with invoice and receipt documents attached.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+        footer_extra="Your PDF documents are attached to this email.",
+    )
 
     text_body = f"""Receipt from TimrX
 
@@ -517,7 +615,7 @@ Your credits are now available in your account.
 
 ---
 TimrX - 3D Print Hub
-Questions? Contact us at support@timrx.live
+Need help? Reply to this email or contact support@timrx.live
 """
 
     # Build attachments list
@@ -574,65 +672,43 @@ def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = No
     # Load logo for inline CID embedding
     logo_bytes = _load_logo()
 
-    logo_img_tag = ""
-    if logo_bytes:
-        logo_img_tag = (
-            '<img src="cid:timrx_logo" alt="TimrX" height="32" '
-            'style="height:32px; width:auto; display:block;" />'
-        )
-
-    data_html = ""
+    # Build data card if data provided
+    data_card = ""
     if data:
-        rows = "".join(
-            f"<tr><td style='padding: 6px 10px; color: #888; font-size: 13px;'>{k}:</td>"
-            f"<td style='padding: 6px 10px; color: #ffffff; font-size: 13px;'>{v}</td></tr>"
-            for k, v in data.items()
+        data_card = render_detail_card(
+            [(k, v) for k, v in data.items()],
+            header="Details"
         )
-        data_html = f"<table style='margin-top: 12px; border: 1px solid #222; border-radius: 8px; overflow: hidden;'>{rows}</table>"
 
-    html_body = f"""
-    <div style="background-color: #000000; width: 100%; padding: 0; margin: 0;">
-    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-                max-width: 600px; margin: 0 auto; background-color: #000000; border-radius: 12px; overflow: hidden;">
+    body_html = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td style="padding-bottom:16px;">
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">{message}</p>
+                </td>
+            </tr>
+            {f'<tr><td>{data_card}</td></tr>' if data_card else ''}
+        </table>
+    '''
 
-        <!-- Header with logo -->
-        <div style="padding: 20px 24px 16px;">
-            <table cellpadding="0" cellspacing="0" border="0" width="100%">
-                <tr>
-                    <td>
-                        <table cellpadding="0" cellspacing="0" border="0">
-                            <tr>
-                                <td style="vertical-align: middle; padding-right: 10px; line-height: 0;">
-                                    {logo_img_tag}
-                                </td>
-                                <td style="vertical-align: middle;">
-                                    <span style="font-size: 18px; font-weight: 800; color: #ffffff;
-                                                 letter-spacing: 0.5px;">TimrX</span>
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-        </div>
+    html_body = render_email_html(
+        title=subject,
+        intro="Admin notification from TimrX system.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+        footer_extra="This is an automated admin notification.",
+    )
 
-        <div style="padding: 24px 24px 28px;">
-            <h3 style="color: #ffffff; margin: 0 0 12px; font-size: 18px; font-weight: 600;">{subject}</h3>
-            <p style="color: #aaa; font-size: 14px; line-height: 1.5; margin: 0 0 16px;">{message}</p>
-            {data_html}
-        </div>
-
-        <div style="border-top: 1px solid #222; padding: 16px 24px; text-align: center;">
-            <p style="color: #555; font-size: 11px; margin: 0;">TimrX Admin Notification</p>
-        </div>
-    </div>
-    </div>
-    """
+    # Build plain text version
+    data_text = ""
+    if data:
+        data_text = "\n".join(f"  {k}: {v}" for k, v in data.items())
+        data_text = f"\nDetails:\n{data_text}\n"
 
     text_body = f"""{subject}
 
 {message}
-
+{data_text}
 ---
 TimrX Admin Notification
 """
@@ -658,7 +734,7 @@ TimrX Admin Notification
         except Exception as e:
             print(f"[EMAIL] notify_admin send_raw error: {e}, falling back to simple send")
 
-    return send_email(admin_email, f"[TimrX Admin] {subject}", html_body)
+    return send_email(admin_email, f"[TimrX Admin] {subject}", html_body, text_body)
 
 
 def notify_new_identity(identity_id: str, email: Optional[str] = None) -> bool:
