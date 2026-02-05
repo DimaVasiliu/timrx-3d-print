@@ -14,11 +14,60 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from backend.db import get_conn, fetch_one, transaction, Tables
+
+
+# ── Text sanitizer for PDF (Helvetica doesn't support Unicode) ──
+def sanitize_pdf_text(text: str) -> str:
+    """
+    Replace Unicode characters that Helvetica can't render with ASCII equivalents.
+    This prevents 'character outside the range' errors in fpdf2.
+    """
+    if not text:
+        return text
+
+    # Character replacements: Unicode → ASCII
+    replacements = {
+        '–': '-',      # en-dash → hyphen
+        '—': '-',      # em-dash → hyphen
+        ''': "'",      # left single quote
+        ''': "'",      # right single quote
+        '"': '"',      # left double quote
+        '"': '"',      # right double quote
+        '…': '...',    # ellipsis
+        '•': '*',      # bullet
+        '×': 'x',      # multiplication sign
+        '÷': '/',      # division sign
+        '≤': '<=',     # less than or equal
+        '≥': '>=',     # greater than or equal
+        '≠': '!=',     # not equal
+        '±': '+/-',    # plus-minus
+        '€': 'EUR',    # euro (keep £ as it's in Latin-1)
+        '™': '(TM)',   # trademark
+        '®': '(R)',    # registered
+        '©': '(C)',    # copyright
+        '\u00a0': ' ', # non-breaking space
+    }
+
+    for unicode_char, ascii_char in replacements.items():
+        text = text.replace(unicode_char, ascii_char)
+
+    # Remove any remaining non-Latin-1 characters (keep £ which is \u00a3)
+    # Latin-1 range is 0x00-0xFF
+    result = []
+    for char in text:
+        if ord(char) <= 0xFF:
+            result.append(char)
+        else:
+            result.append('?')  # Replace unknown chars with ?
+
+    return ''.join(result)
 
 # ── Logo cache ──────────────────────────────────────────────
 _logo_bytes: Optional[bytes] = None
@@ -26,21 +75,28 @@ _logo_loaded = False
 
 
 def _load_logo() -> Optional[bytes]:
-    """Load TimrX logo PNG.  Tries local paths then public URL.  Cached."""
+    """Load TimrX logo PNG.  Tries Render paths, local paths, then public URL.  Cached."""
     global _logo_bytes, _logo_loaded
     if _logo_loaded:
         return _logo_bytes
 
     _logo_loaded = True
 
-    # Try local paths (development)
     from backend.config import config
+
+    # Build list of candidate paths (ordered by priority)
     candidates = [
-        config.APP_DIR / "backend" / "assets" / "logo.png",       # server (APP_DIR = repo root)
-        config.APP_DIR / "assets" / "logo.png",                    # local alt
-        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo (1).png",  # local dev
+        # Render deployment paths (most likely in production)
+        Path("/opt/render/project/src/backend/assets/logo.png"),
+        Path("/opt/render/project/src/assets/logo.png"),
+        # APP_DIR-relative paths (APP_DIR = meshy/ in this project)
+        config.APP_DIR / "assets" / "logo.png",
+        config.APP_DIR / "backend" / "assets" / "logo.png",
+        # Local development paths
         config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo.png",
+        config.APP_DIR / ".." / ".." / "Frontend" / "img" / "logo (1).png",
     ]
+
     for p in candidates:
         try:
             resolved = p.resolve()
@@ -54,7 +110,7 @@ def _load_logo() -> Optional[bytes]:
     # Fallback: download from public URL
     try:
         import requests as _req
-        resp = _req.get("https://timrx.live/logo.png", timeout=10)
+        resp = _req.get("https://timrx.live/img/logo.png", timeout=10)
         if resp.status_code == 200 and len(resp.content) > 100:
             _logo_bytes = resp.content
             print(f"[INVOICE] Logo downloaded from web ({len(_logo_bytes)} bytes)")
@@ -274,7 +330,8 @@ class InvoicingService:
 
         pdf.set_font("Helvetica", "", 10)
         pdf.set_xy(120, 22)
-        pdf.cell(80, 5, f"No: {invoice['invoice_number']}", align="R")
+        invoice_num = sanitize_pdf_text(str(invoice['invoice_number']))
+        pdf.cell(80, 5, f"No: {invoice_num}", align="R")
 
         issued = invoice.get("issued_at")
         if issued:
@@ -282,7 +339,7 @@ class InvoicingService:
         else:
             date_str = datetime.now(timezone.utc).strftime("%d %B %Y")
         pdf.set_xy(120, 28)
-        pdf.cell(80, 5, f"Date: {date_str}", align="R")
+        pdf.cell(80, 5, f"Date: {sanitize_pdf_text(date_str)}", align="R")
 
         # -- From
         pdf.set_xy(10, 45)
@@ -299,7 +356,7 @@ class InvoicingService:
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(80, 6, "Bill To", align="R")
         pdf.set_font("Helvetica", "", 9)
-        email = invoice.get("customer_email", "—")
+        email = sanitize_pdf_text(invoice.get("customer_email") or "-")
         pdf.set_xy(120, 52)
         pdf.cell(80, 5, email, align="R")
 
@@ -321,7 +378,8 @@ class InvoicingService:
         pdf.set_text_color(0, 0, 0)
         pdf.set_font("Helvetica", "", 9)
         for item in items:
-            pdf.cell(90, 8, f"  {item['description']}")
+            desc = sanitize_pdf_text(str(item.get('description', '')))
+            pdf.cell(90, 8, f"  {desc}")
             pdf.cell(25, 8, str(item.get("quantity", 1)), align="C")
             pdf.cell(35, 8, f"\u00a3{float(item['unit_price']):.2f}", align="R")
             pdf.cell(35, 8, f"\u00a3{float(item['total']):.2f}  ", align="R")
@@ -386,7 +444,8 @@ class InvoicingService:
 
         pdf.set_font("Helvetica", "", 10)
         pdf.set_xy(120, 22)
-        pdf.cell(80, 5, f"No: {receipt['receipt_number']}", align="R")
+        receipt_num = sanitize_pdf_text(str(receipt['receipt_number']))
+        pdf.cell(80, 5, f"No: {receipt_num}", align="R")
 
         paid_at = receipt.get("paid_at")
         if paid_at:
@@ -394,7 +453,7 @@ class InvoicingService:
         else:
             date_str = datetime.now(timezone.utc).strftime("%d %B %Y")
         pdf.set_xy(120, 28)
-        pdf.cell(80, 5, f"Date: {date_str}", align="R")
+        pdf.cell(80, 5, f"Date: {sanitize_pdf_text(date_str)}", align="R")
 
         # -- PAID stamp
         pdf.set_font("Helvetica", "B", 28)
@@ -412,15 +471,15 @@ class InvoicingService:
         pdf.set_font("Helvetica", "", 9)
         details = [
             ("Receipt No:", receipt["receipt_number"]),
-            ("Invoice No:", invoice.get("invoice_number", "—")),
-            ("Customer:", invoice.get("customer_email", "—")),
+            ("Invoice No:", invoice.get("invoice_number") or "-"),
+            ("Customer:", invoice.get("customer_email") or "-"),
             ("Payment Method:", (receipt.get("payment_method") or "mollie").title()),
             ("Currency:", receipt.get("currency", "GBP")),
             ("Date:", date_str),
         ]
         for label, value in details:
             pdf.cell(45, 7, label)
-            pdf.cell(100, 7, str(value))
+            pdf.cell(100, 7, sanitize_pdf_text(str(value)))
             pdf.ln()
 
         # -- Amount
@@ -510,6 +569,12 @@ class InvoicingService:
         Idempotent and safe — never throws, never blocks credit granting.
         Returns summary dict or None.
         """
+        invoice_pdf = None
+        receipt_pdf = None
+        inv_url = None
+        rcpt_url = None
+        pdf_error = None
+
         try:
             # 1. Create invoice + receipt (idempotent)
             result = InvoicingService.create_invoice_for_purchase(
@@ -535,39 +600,58 @@ class InvoicingService:
             receipt_number = receipt["receipt_number"] if receipt else None
             year = datetime.now(timezone.utc).year
 
-            # 2. Generate PDFs
-            invoice_pdf = InvoicingService.generate_invoice_pdf(invoice, items)
-            receipt_pdf = InvoicingService.generate_receipt_pdf(receipt, invoice) if receipt else None
+            # 2. Generate PDFs (with error handling - don't fail the whole pipeline)
+            try:
+                invoice_pdf = InvoicingService.generate_invoice_pdf(invoice, items)
+                receipt_pdf = InvoicingService.generate_receipt_pdf(receipt, invoice) if receipt else None
+                print(f"[INVOICE] PDFs generated: invoice={len(invoice_pdf) if invoice_pdf else 0} bytes, receipt={len(receipt_pdf) if receipt_pdf else 0} bytes")
+            except Exception as pdf_err:
+                pdf_error = str(pdf_err)
+                print(f"[INVOICE] PDF generation failed: {pdf_error}")
 
-            # 3. Upload to S3
-            inv_key = f"invoices/{year}/{invoice_number}.pdf"
-            inv_url = InvoicingService._upload_pdf(invoice_pdf, inv_key)
-            if inv_url:
-                InvoicingService._update_invoice_pdf(invoice_id, inv_key, inv_url)
+            # 3. Upload to S3 (only if PDFs were generated)
+            if invoice_pdf:
+                inv_key = f"invoices/{year}/{invoice_number}.pdf"
+                inv_url = InvoicingService._upload_pdf(invoice_pdf, inv_key)
+                if inv_url:
+                    InvoicingService._update_invoice_pdf(invoice_id, inv_key, inv_url)
 
-            rcpt_url = None
             if receipt_pdf and receipt_id and receipt_number:
                 rcpt_key = f"receipts/{year}/{receipt_number}.pdf"
                 rcpt_url = InvoicingService._upload_pdf(receipt_pdf, rcpt_key)
                 if rcpt_url:
                     InvoicingService._update_receipt_pdf(receipt_id, rcpt_key, rcpt_url)
 
-            # 4. Send email with PDFs
+            # 4. Send email to customer (ALWAYS attempt, with or without PDFs)
             if customer_email:
                 try:
-                    from backend.emailer import send_invoice_email
+                    from backend.emailer import send_invoice_email, send_purchase_receipt
                     logo = _load_logo()
-                    send_invoice_email(
-                        to_email=customer_email,
-                        invoice_number=invoice_number,
-                        receipt_number=receipt_number or "",
-                        plan_name=plan_name,
-                        credits=credits,
-                        amount_gbp=amount_gbp,
-                        invoice_pdf=invoice_pdf,
-                        receipt_pdf=receipt_pdf or b"",
-                        logo_bytes=logo,
-                    )
+
+                    # If we have PDFs, send full invoice email with attachments
+                    if invoice_pdf and receipt_pdf:
+                        send_invoice_email(
+                            to_email=customer_email,
+                            invoice_number=invoice_number,
+                            receipt_number=receipt_number or "",
+                            plan_name=sanitize_pdf_text(plan_name),
+                            credits=credits,
+                            amount_gbp=amount_gbp,
+                            invoice_pdf=invoice_pdf,
+                            receipt_pdf=receipt_pdf,
+                            logo_bytes=logo,
+                        )
+                        print(f"[INVOICE] Email sent to {customer_email} with PDF attachments")
+                    else:
+                        # Fallback: send HTML receipt without PDFs
+                        print(f"[INVOICE] Sending fallback email (no PDFs) to {customer_email}")
+                        send_purchase_receipt(
+                            to_email=customer_email,
+                            plan_name=sanitize_pdf_text(plan_name),
+                            credits=credits,
+                            amount_gbp=amount_gbp,
+                        )
+                        print(f"[INVOICE] Fallback email sent to {customer_email} (PDF error: {pdf_error})")
                 except Exception as email_err:
                     print(f"[INVOICE] Email failed (PDFs still saved): {email_err}")
 
