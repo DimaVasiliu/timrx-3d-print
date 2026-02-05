@@ -329,15 +329,13 @@ def dispatch_openai_image_async(
         store[internal_job_id] = store_meta
         save_store(store)
 
-        # DEBUG: Trace credit finalization
+        # Finalize credits (handles missing reservation_id as ready_unbilled bug)
         print(f"[OPENAI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
-        if reservation_id:
-            print(f"[OPENAI_IMAGE:DEBUG] Calling finalize_job_credits({reservation_id}, {internal_job_id})")
-            finalize_job_credits(reservation_id, internal_job_id)
-            print(f"[OPENAI_IMAGE:DEBUG] finalize_job_credits returned")
+        finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
+        if finalized:
             print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
-        else:
-            print(f"[OPENAI_IMAGE:DEBUG] !!! NO RESERVATION_ID - credits NOT being finalized!")
+        elif reservation_id is None:
+            print(f"[OPENAI_IMAGE:DEBUG] !!! NO RESERVATION_ID - job marked as ready_unbilled")
 
         update_job_status_ready(
             internal_job_id,
@@ -423,15 +421,13 @@ def dispatch_gemini_image_async(
         store[internal_job_id] = store_meta
         save_store(store)
 
-        # Finalize credits
+        # Finalize credits (handles missing reservation_id as ready_unbilled bug)
         print(f"[GEMINI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
-        if reservation_id:
-            print(f"[GEMINI_IMAGE:DEBUG] Calling finalize_job_credits({reservation_id}, {internal_job_id})")
-            finalize_job_credits(reservation_id, internal_job_id)
-            print(f"[GEMINI_IMAGE:DEBUG] finalize_job_credits returned")
+        finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
+        if finalized:
             print(f"[ASYNC] Credits captured for Gemini image job {internal_job_id}")
-        else:
-            print(f"[GEMINI_IMAGE:DEBUG] !!! NO RESERVATION_ID - credits NOT being finalized!")
+        elif reservation_id is None:
+            print(f"[GEMINI_IMAGE:DEBUG] !!! NO RESERVATION_ID - job marked as ready_unbilled")
 
         # Update job status to ready
         update_job_status_ready(
@@ -1257,10 +1253,12 @@ def _finalize_video_success(
     store[internal_job_id] = store_meta
     save_store(store)
 
-    # Finalize credits
-    if reservation_id:
-        finalize_job_credits(reservation_id, internal_job_id)
+    # Finalize credits (handles missing reservation_id as ready_unbilled bug)
+    finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    if finalized:
         print(f"[ASYNC] Credits captured for {provider_name} video job {internal_job_id}")
+    elif reservation_id is None:
+        print(f"[ASYNC] !!! NO RESERVATION_ID for video job {internal_job_id} - marked as ready_unbilled")
 
     # Save to normalized tables (videos + history_items)
     # This creates the video row and history_items row with video_id
