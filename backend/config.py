@@ -471,15 +471,26 @@ class Config:
     # Generation Defaults & Action Keys
     # ─────────────────────────────────────────────────────────────
     DEFAULT_MODEL_TITLE: str = "3D Model"
+    # Maps route-level action names to CANONICAL action keys
+    # CANONICAL KEYS: image_generate, text_to_3d_generate, image_to_3d_generate,
+    #                 refine, remesh, retexture, rigging,
+    #                 video_generate, video_text_generate, video_image_animate
     ACTION_KEYS: dict = field(
         default_factory=lambda: {
-            "text-to-3d-preview": "text-to-3d-preview",
-            "text-to-3d-refine": "text-to-3d-refine",
-            "image-to-3d": "image-to-3d",
-            "remesh": "remesh",
-            "retexture": "retexture",
-            "rigging": "rigging",
-            "openai-image": "openai-image",
+            # Routes use these keys to look up what to pass to start_paid_job
+            "text-to-3d-preview": "text_to_3d_generate",  # Canonical
+            "text-to-3d-refine": "refine",                # Canonical
+            "image-to-3d": "image_to_3d_generate",        # Canonical
+            "remesh": "remesh",                           # Already canonical
+            "retexture": "retexture",                     # Already canonical
+            "rigging": "rigging",                         # Already canonical
+            "openai-image": "image_generate",             # Canonical
+            # Additional canonical mappings
+            "image_generate": "image_generate",
+            "refine": "refine",
+            "video_generate": "video_generate",
+            "video_text_generate": "video_text_generate",
+            "video_image_animate": "video_image_animate",
         }
     )
 
