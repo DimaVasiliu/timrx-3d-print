@@ -1,534 +1,609 @@
 """
-Pricing Service - Manages plans and action costs.
+Purchase Service - Handles credit purchases via Stripe.
 
-Responsibilities:
-- Get available purchase plans
-- Get action costs for credit checks
-- Validate plan codes
+Flow:
+1. start_checkout(identity_id, plan_code, email) -> checkout_url
+2. User completes payment on Stripe
+3. handle_webhook() processes checkout.session.completed:
+   - Creates purchases row
+   - Adds ledger entry purchase_credit (+credits)
+   - Updates wallet balance
+   - Attaches email to identity (if not already)
+   - Sends receipt email to user
+   - Sends admin notification email
 
-Stable frontend keys:
-- text_to_3d_generate
-- image_to_3d_generate
-- refine
-- remesh
-- texture
-- rig
-- image_studio_generate
-- video
+Idempotency:
+- Purchases are keyed by provider_payment_id (Stripe session ID)
+- Repeated webhooks for same session are safely ignored
 """
 
 from typing import Optional, Dict, Any, List
+from datetime import datetime
+import json
 
-from backend.db import query_one, query_all, execute, Tables
+from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
+from backend.config import config
+from backend.services.pricing_service import PricingService
+from backend.services.wallet_service import WalletService, LedgerEntryType
+from backend.services.identity_service import IdentityService
+from backend.services.email_outbox_service import EmailOutboxService
 
+# Stripe import (only if enabled via PAYMENTS_PROVIDER)
+stripe = None
+STRIPE_AVAILABLE = False
 
-# Default plans to seed into the database
-DEFAULT_ACTION_COSTS = [
-    {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
-    {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
-    {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
-    {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
-    {"action_code": "MESHY_RIG", "cost_credits": 25, "provider": "meshy"},
-    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},
-    {"action_code": "VIDEO_GENERATE", "cost_credits": 60, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 60, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 60, "provider": "video"},
-]
+# Check PAYMENTS_PROVIDER directly (avoids property issues on some deployments)
+_payments_provider = getattr(config, 'PAYMENTS_PROVIDER', 'mollie').lower()
+_use_stripe = _payments_provider in ('stripe', 'both')
 
-DEFAULT_PLANS = [
-    {
-        "code": "starter_80",
-        "name": "Starter",
-        "description": "Try the tools. Great for a few generations.",
-        "price_gbp": 7.99,
-        "credit_grant": 80,
-        "includes_priority": False,
-    },
-    {
-        "code": "creator_300",
-        "name": "Creator",
-        "description": "Regular use. Better value bundle.",
-        "price_gbp": 19.99,
-        "credit_grant": 300,
-        "includes_priority": False,
-    },
-    {
-        "code": "studio_600",
-        "name": "Studio",
-        "description": "Heavy use. Best value. Priority queue access.",
-        "price_gbp": 34.99,
-        "credit_grant": 600,
-        "includes_priority": True,
-    },
-]
-
-
-class PricingService:
-    """Service for managing pricing plans and action costs."""
-
-    # Cache for action costs (refreshed on startup or manually)
-    _action_costs_cache: Dict[str, int] = {}
-    _db_to_frontend_map: Dict[str, str] = {}
-    _frontend_to_db_map: Dict[str, str] = {}
-
-    # Mapping from DB action_code to stable frontend keys
-    # DB codes: MESHY_TEXT_TO_3D, MESHY_IMAGE_TO_3D, MESHY_REFINE, MESHY_RETEXTURE, MESHY_RIG, OPENAI_IMAGE, VIDEO_GENERATE, VIDEO_TEXT_GENERATE, VIDEO_IMAGE_ANIMATE
-    ACTION_CODE_MAP = {
-        "MESHY_TEXT_TO_3D": "text_to_3d_generate",
-        "MESHY_IMAGE_TO_3D": "image_to_3d_generate",
-        "MESHY_REFINE": "refine",
-        "MESHY_RETEXTURE": "texture",
-        "MESHY_RIG": "rig",
-        "OPENAI_IMAGE": "image_studio_generate",
-        "VIDEO_GENERATE": "video",
-        "VIDEO_TEXT_GENERATE": "video_text_generate",
-        "VIDEO_IMAGE_ANIMATE": "video_image_animate",
-    }
-
-    # Additional frontend aliases that map to same DB codes
-    # These cover all UI action keys used in workspace-credits.js BUTTON_CONFIG
-    FRONTEND_ALIASES = {
-        # Hyphenated frontend keys (from BUTTON_CONFIG)
-        "text-to-3d": "MESHY_TEXT_TO_3D",
-        "image-to-3d": "MESHY_IMAGE_TO_3D",
-        "text-to-image": "OPENAI_IMAGE",
-        "image-studio": "OPENAI_IMAGE",
-        "openai-image": "OPENAI_IMAGE",
-        # Alternative names
-        "remesh": "MESHY_REFINE",      # remesh uses same cost as refine (10c)
-        "retexture": "MESHY_RETEXTURE",  # retexture operation (15c)
-        "texture": "MESHY_RETEXTURE",    # texture alias (15c)
-        "rigging": "MESHY_RIG",        # rigging alias for rig (25c)
-        "upscale": "MESHY_REFINE",     # upscale is same as refine (10c)
-        "image_generate": "OPENAI_IMAGE",  # Legacy key
-        "video_generate": "VIDEO_GENERATE",  # Alternative video key
-        # Granular video action keys
-        "video_text_generate": "VIDEO_TEXT_GENERATE",
-        "video-text-generate": "VIDEO_TEXT_GENERATE",
-        "text2video": "VIDEO_TEXT_GENERATE",
-        "video_image_animate": "VIDEO_IMAGE_ANIMATE",
-        "video-image-animate": "VIDEO_IMAGE_ANIMATE",
-        "image2video": "VIDEO_IMAGE_ANIMATE",
-        "preview": "MESHY_TEXT_TO_3D",  # Preview is text-to-3d cost
-        # Explicit preview key used by frontend
-        "text-to-3d-preview": "MESHY_TEXT_TO_3D",
-        # Explicit refine key used by frontend
-        "text-to-3d-refine": "MESHY_REFINE",
-    }
-
-    @staticmethod
-    def get_plans(active_only: bool = True) -> List[Dict[str, Any]]:
-        """
-        Get available credit plans.
-        Returns list of plans with code, name, price, credits.
-        """
-        if active_only:
-            plans = query_all(
-                f"""
-                SELECT id, code, name, description, price_gbp, currency,
-                       credit_grant, includes_priority, meta, created_at
-                FROM {Tables.PLANS}
-                WHERE is_active = TRUE
-                ORDER BY price_gbp ASC
-                """
-            )
+if _use_stripe:
+    try:
+        import stripe as stripe_module
+        stripe = stripe_module
+        stripe.api_key = config.STRIPE_SECRET_KEY
+        STRIPE_AVAILABLE = bool(config.STRIPE_SECRET_KEY)
+        if STRIPE_AVAILABLE:
+            stripe_mode = "live" if config.STRIPE_SECRET_KEY.startswith("sk_live_") else "test"
+            print(f"[STRIPE] Stripe configured and ready (mode: {stripe_mode})")
         else:
-            plans = query_all(
-                f"""
-                SELECT id, code, name, description, price_gbp, currency,
-                       credit_grant, includes_priority, is_active, meta, created_at
-                FROM {Tables.PLANS}
-                ORDER BY price_gbp ASC
-                """
-            )
+            print("[STRIPE] Stripe enabled but not configured (missing STRIPE_SECRET_KEY)")
+    except ImportError:
+        print("[STRIPE] Stripe package not installed")
+# If PAYMENTS_PROVIDER is not 'stripe' or 'both', Stripe is silently disabled (no warnings)
 
-        # Format for frontend
-        return [
-            {
-                "id": str(plan["id"]),
-                "code": plan["code"],
-                "name": plan["name"],
-                "description": plan.get("description"),
-                "price": float(plan["price_gbp"]),
-                "currency": plan.get("currency", "GBP"),
-                "credits": plan["credit_grant"],
-                "includes_priority": plan.get("includes_priority", False),
-            }
-            for plan in plans
-        ]
+
+class PurchaseStatus:
+    """Valid purchase statuses."""
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+
+
+class PurchaseService:
+    """Service for handling credit purchases via Stripe."""
 
     @staticmethod
-    def get_plan_by_code(code: str) -> Optional[Dict[str, Any]]:
-        """
-        Get a specific plan by its code.
-        Returns None if not found or inactive.
-        """
-        plan = query_one(
-            f"""
-            SELECT id, code, name, description, price_gbp, currency,
-                   credit_grant, includes_priority, meta, created_at
-            FROM {Tables.PLANS}
-            WHERE code = %s AND is_active = TRUE
-            """,
-            (code,),
-        )
+    def is_available() -> bool:
+        """Check if purchase functionality is available."""
+        return STRIPE_AVAILABLE
 
+    # ─────────────────────────────────────────────────────────────
+    # Checkout Flow
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def start_checkout(
+        identity_id: str,
+        plan_code: str,
+        email: str,
+        success_url: str,
+        cancel_url: str,
+    ) -> Dict[str, Any]:
+        """
+        Create a Stripe Checkout session for purchasing credits.
+
+        Args:
+            identity_id: The user's identity ID
+            plan_code: The plan code to purchase (e.g., 'starter_80')
+            email: User's email (pre-filled in checkout)
+            success_url: URL to redirect on success (can include {CHECKOUT_SESSION_ID})
+            cancel_url: URL to redirect on cancel
+
+        Returns:
+            {
+                "checkout_url": "https://checkout.stripe.com/...",
+                "session_id": "cs_..."
+            }
+
+        Raises:
+            ValueError: If Stripe not configured, plan not found, or API error
+        """
+        if not STRIPE_AVAILABLE:
+            raise ValueError("Stripe is not configured")
+
+        # Validate plan exists
+        plan = PricingService.get_plan_by_code(plan_code)
         if not plan:
+            raise ValueError(f"Plan '{plan_code}' not found or inactive")
+
+        # Get plan details
+        plan_id = plan["id"]
+        plan_name = plan["name"]
+        price_gbp = plan["price"]
+        credits = plan["credits"]
+
+        # Price in pence (Stripe uses smallest currency unit)
+        price_pence = int(price_gbp * 100)
+
+        try:
+            # Create Stripe Checkout session
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="payment",
+                customer_email=email,
+                line_items=[
+                    {
+                        "price_data": {
+                            "currency": "gbp",
+                            "unit_amount": price_pence,
+                            "product_data": {
+                                "name": f"{plan_name} - {credits} Credits",
+                                "description": f"Purchase {credits:,} credits for TimrX 3D Print Hub",
+                            },
+                        },
+                        "quantity": 1,
+                    }
+                ],
+                metadata={
+                    "identity_id": identity_id,
+                    "plan_code": plan_code,
+                    "plan_id": plan_id,
+                    "credits": str(credits),
+                },
+                success_url=success_url,
+                cancel_url=cancel_url,
+            )
+
+            print(
+                f"[PURCHASE] Checkout session created: session={session.id}, "
+                f"identity={identity_id}, plan={plan_code}, credits={credits}"
+            )
+
+            return {
+                "checkout_url": session.url,
+                "session_id": session.id,
+            }
+
+        except stripe.error.StripeError as e:
+            print(f"[PURCHASE] Stripe error creating checkout: {e}")
+            raise ValueError(f"Payment service error: {str(e)}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Webhook Processing
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def process_webhook(payload: bytes, signature: str) -> Dict[str, Any]:
+        """
+        Process a Stripe webhook event.
+
+        Args:
+            payload: Raw request body
+            signature: Stripe-Signature header value
+
+        Returns:
+            {
+                "ok": True/False,
+                "event_type": "checkout.session.completed",
+                "message": "...",
+                "purchase_id": "..." (if applicable)
+            }
+        """
+        if not STRIPE_AVAILABLE:
+            return {"ok": False, "error": "Stripe not configured"}
+
+        # Verify webhook signature (REQUIRED in production)
+        try:
+            if config.STRIPE_WEBHOOK_SECRET:
+                event = stripe.Webhook.construct_event(
+                    payload, signature, config.STRIPE_WEBHOOK_SECRET
+                )
+            elif config.IS_DEV:
+                # Dev only: allow unverified webhooks for local testing
+                print("[PURCHASE] WARNING: Webhook signature not verified (dev mode, no secret)")
+                event = stripe.Event.construct_from(
+                    json.loads(payload), stripe.api_key
+                )
+            else:
+                # Production requires webhook secret
+                print("[PURCHASE] ERROR: STRIPE_WEBHOOK_SECRET not configured in production")
+                return {"ok": False, "error": "Webhook secret not configured"}
+        except stripe.error.SignatureVerificationError as e:
+            print(f"[PURCHASE] Webhook signature verification failed: {e}")
+            return {"ok": False, "error": "Invalid signature"}
+        except json.JSONDecodeError as e:
+            print(f"[PURCHASE] Webhook JSON parse error: {e}")
+            return {"ok": False, "error": "Invalid payload"}
+
+        event_type = event.get("type", "unknown")
+        print(f"[PURCHASE] Webhook received: {event_type}")
+
+        # Handle supported events
+        if event_type == "checkout.session.completed":
+            session = event["data"]["object"]
+            result = PurchaseService.handle_checkout_completed(session)
+
+            if result:
+                return {
+                    "ok": True,
+                    "event_type": event_type,
+                    "message": "Purchase completed successfully",
+                    "purchase_id": result.get("purchase_id"),
+                }
+            else:
+                return {
+                    "ok": False,
+                    "event_type": event_type,
+                    "error": "Failed to process checkout completion",
+                }
+
+        # Log but acknowledge other events
+        print(f"[PURCHASE] Ignoring event type: {event_type}")
+        return {
+            "ok": True,
+            "event_type": event_type,
+            "message": f"Event type '{event_type}' acknowledged but not processed",
+        }
+
+    @staticmethod
+    def handle_checkout_completed(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle checkout.session.completed event.
+        Creates purchase record and grants credits.
+
+        Args:
+            session: Stripe checkout session object
+
+        Returns:
+            Dict with purchase info, or None on failure
+        """
+        session_id = session.get("id")
+        payment_status = session.get("payment_status")
+
+        # Only process paid sessions
+        if payment_status != "paid":
+            print(f"[PURCHASE] Session {session_id[:16]}... not paid (status: {payment_status})")
             return None
 
-        return {
-            "id": str(plan["id"]),
-            "code": plan["code"],
-            "name": plan["name"],
-            "description": plan.get("description"),
-            "price": float(plan["price_gbp"]),
-            "currency": plan.get("currency", "GBP"),
-            "credits": plan["credit_grant"],
-            "includes_priority": plan.get("includes_priority", False),
-        }
+        # Extract metadata
+        metadata = session.get("metadata", {})
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        plan_id = metadata.get("plan_id")
+        credits_str = metadata.get("credits")
 
-    @staticmethod
-    def get_plans_with_perks(active_only: bool = True) -> List[Dict[str, Any]]:
-        """
-        Get available credit plans with perks object.
-        Returns list of plans in frontend-friendly format.
+        if not identity_id or not plan_code or not credits_str:
+            print(f"[PURCHASE] Missing metadata in session {session_id[:16]}... (keys: {list(metadata.keys())})")
+            return None
 
-        Response format:
-        [
-            {
-                "id": "uuid",
-                "code": "starter_80",
-                "name": "Starter",
-                "price_gbp": 7.99,
-                "credits": 80,
-                "perks": {
-                    "priority": false,
-                    "retention_days": 30
-                }
-            },
-            ...
-        ]
-        """
-        if active_only:
-            plans = query_all(
-                f"""
-                SELECT id, code, name, description, price_gbp, currency,
-                       credit_grant, includes_priority, meta, created_at
-                FROM {Tables.PLANS}
-                WHERE is_active = TRUE
-                ORDER BY price_gbp ASC
-                """
-            )
-        else:
-            plans = query_all(
-                f"""
-                SELECT id, code, name, description, price_gbp, currency,
-                       credit_grant, includes_priority, is_active, meta, created_at
-                FROM {Tables.PLANS}
-                ORDER BY price_gbp ASC
-                """
-            )
+        credits = int(credits_str)
 
-        # Default retention days (can be overridden via meta)
-        DEFAULT_RETENTION_DAYS = 30
+        # Get email from session
+        customer_email = session.get("customer_email") or session.get("customer_details", {}).get("email")
 
-        # Format for frontend with perks
-        return [
-            {
-                "id": str(plan["id"]),
-                "code": plan["code"],
-                "name": plan["name"],
-                "price_gbp": float(plan["price_gbp"]),
-                "credits": plan["credit_grant"],
-                "perks": {
-                    "priority": plan.get("includes_priority", False),
-                    "retention_days": (plan.get("meta") or {}).get("retention_days", DEFAULT_RETENTION_DAYS),
-                },
+        # Get amount from session (in pence)
+        amount_total = session.get("amount_total", 0)
+        amount_gbp = amount_total / 100.0
+
+        # Get plan name
+        plan = PricingService.get_plan_by_code(plan_code)
+        plan_name = plan["name"] if plan else plan_code
+
+        # Idempotency check: see if purchase already exists for this session
+        existing = PurchaseService.get_purchase_by_provider_id(session_id)
+        if existing:
+            print(f"[PURCHASE] Already processed session {session_id[:16]}..., purchase_id={existing['id']}")
+            return {
+                "purchase_id": existing["id"],
+                "was_existing": True,
             }
-            for plan in plans
-        ]
 
-    @staticmethod
-    def get_action_costs() -> Dict[str, int]:
-        """
-        Get all action costs as a dict with stable frontend keys.
-        Returns {frontend_key: cost_credits}.
+        # Process the purchase in a transaction
+        try:
+            result = PurchaseService.record_purchase(
+                identity_id=identity_id,
+                plan_id=plan_id,
+                plan_code=plan_code,
+                provider_payment_id=session_id,
+                amount_gbp=amount_gbp,
+                credits_granted=credits,
+                customer_email=customer_email,
+            )
 
-        Example response:
-        {
-            "text_to_3d_generate": 20,
-            "image_to_3d_generate": 30,
-            "refine": 10,
-            "remesh": 10,
-            "texture": 10,
-            "rig": 10,
-            "image_studio_generate": 12
-        }
-        """
-        # Use cache if available
-        if PricingService._action_costs_cache:
-            return PricingService._action_costs_cache.copy()
+            if result:
+                purchase_id = result["purchase"]["id"]
 
-        # Fetch from DB
-        rows = query_all(
-            f"""
-            SELECT action_code, cost_credits
-            FROM {Tables.ACTION_COSTS}
-            """
-        )
+                # Emails are now queued durably in record_purchase() transaction.
+                # Try immediate send (best-effort - failures are already queued for retry).
+                if customer_email:
+                    try:
+                        send_result = EmailOutboxService.send_pending_emails(
+                            limit=10,
+                            purchase_id=purchase_id,
+                        )
+                        print(f"[PURCHASE] Immediate email send: sent={send_result['sent']} failed={send_result['failed']}")
+                    except Exception as send_err:
+                        # Non-fatal: emails are already queued and will be retried by cron
+                        print(f"[PURCHASE] Immediate email send failed (will retry via cron): {send_err}")
 
-        # Build cost lookup by DB code
-        db_costs: Dict[str, int] = {}
-        for row in rows:
-            db_costs[row["action_code"]] = row["cost_credits"]
+                return {
+                    "purchase_id": purchase_id,
+                    "was_existing": False,
+                }
 
-        # Map to frontend keys
-        result: Dict[str, int] = {}
-
-        # Primary mappings (DB codes to stable frontend keys)
-        for db_code, frontend_key in PricingService.ACTION_CODE_MAP.items():
-            if db_code in db_costs:
-                result[frontend_key] = db_costs[db_code]
-
-        # All aliases (remesh, rig, hyphenated keys, etc.)
-        for alias, db_code in PricingService.FRONTEND_ALIASES.items():
-            if db_code in db_costs:
-                result[alias] = db_costs[db_code]
-
-        # Log what we're returning for debugging
-        if result:
-            print(f"[PRICING] Action costs loaded from DB: {len(result)} keys")
-        else:
-            print("[PRICING] WARNING: No action costs found in database!")
-
-        # Cache the result
-        PricingService._action_costs_cache = result.copy()
-
-        return result
-
-    @staticmethod
-    def get_action_costs_list() -> List[Dict[str, Any]]:
-        """
-        Get all action costs as a list of {action_key, credits} objects.
-        Suitable for frontend caching.
-
-        Response format:
-        [
-            {"action_key": "text_to_3d_generate", "credits": 20},
-            {"action_key": "image_to_3d_generate", "credits": 30},
-            ...
-        ]
-        """
-        costs_dict = PricingService.get_action_costs()
-        return [
-            {"action_key": key, "credits": credits}
-            for key, credits in costs_dict.items()
-        ]
-
-    @staticmethod
-    def get_action_cost(action_key: str) -> int:
-        """
-        Get cost in credits for a specific action.
-        Accepts both frontend keys (e.g., 'text_to_3d_generate')
-        and DB codes (e.g., 'MESHY_TEXT_TO_3D').
-
-        Returns 0 if action not found (should not happen in production).
-        """
-        costs = PricingService.get_action_costs()
-
-        # Try direct frontend key lookup
-        if action_key in costs:
-            return costs[action_key]
-
-        # Try mapping from DB code
-        frontend_key = PricingService.ACTION_CODE_MAP.get(action_key)
-        if frontend_key and frontend_key in costs:
-            return costs[frontend_key]
-
-        # Fallback - check aliases
-        if action_key in PricingService.FRONTEND_ALIASES:
-            db_code = PricingService.FRONTEND_ALIASES[action_key]
-            frontend_key = PricingService.ACTION_CODE_MAP.get(db_code)
-            if frontend_key and frontend_key in costs:
-                return costs[frontend_key]
-
-        print(f"[PRICING] Warning: Unknown action key '{action_key}', returning 0 cost")
-        return 0
-
-    @staticmethod
-    def get_db_action_code(frontend_key: str) -> Optional[str]:
-        """
-        Convert frontend key to DB action_code.
-        Returns None if not found.
-
-        Example: 'text_to_3d_generate' -> 'MESHY_TEXT_TO_3D'
-        """
-        # Check aliases first
-        if frontend_key in PricingService.FRONTEND_ALIASES:
-            return PricingService.FRONTEND_ALIASES[frontend_key]
-
-        # Reverse lookup in primary map
-        for db_code, fe_key in PricingService.ACTION_CODE_MAP.items():
-            if fe_key == frontend_key:
-                return db_code
+        except Exception as e:
+            print(f"[PURCHASE] Error processing checkout completion: {e}")
+            return None
 
         return None
 
-    @staticmethod
-    def refresh_costs_cache() -> None:
-        """
-        Refresh the action costs cache from database.
-        Called on startup and can be called to refresh.
-        """
-        PricingService._action_costs_cache = {}
-        PricingService.get_action_costs()  # This repopulates the cache
-        print(f"[PRICING] Refreshed action costs cache: {PricingService._action_costs_cache}")
+    # ─────────────────────────────────────────────────────────────
+    # Purchase Recording
+    # ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def map_job_type_to_action(job_type: str) -> str:
+    def record_purchase(
+        identity_id: str,
+        plan_id: str,
+        plan_code: str,
+        provider_payment_id: str,
+        amount_gbp: float,
+        credits_granted: int,
+        customer_email: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Map frontend job type names to DB action codes.
-        E.g., 'text-to-3d' -> 'MESHY_TEXT_TO_3D'
+        Record a completed purchase and grant credits.
+        This is the core transactional operation.
 
-        This is for backward compatibility with old job type strings.
+        Performs in a single transaction:
+        1. Create purchase record
+        2. Add ledger entry (purchase_credit, +credits)
+        3. Update wallet balance
+        4. Attach email to identity (if provided and not already set)
+
+        Args:
+            identity_id: The user's identity ID
+            plan_id: The plan UUID
+            plan_code: The plan code (for reference)
+            provider_payment_id: Stripe session/payment ID
+            amount_gbp: Amount paid in GBP
+            credits_granted: Number of credits to grant
+            customer_email: Customer email from checkout
+
+        Returns:
+            Dict with purchase and wallet info, or None on failure
         """
-        job = (job_type or "").lower().replace("_", "-")
-        mapping = {
-            "text-to-3d": "MESHY_TEXT_TO_3D",
-            "image-to-3d": "MESHY_IMAGE_TO_3D",
-            "texture": "MESHY_RETEXTURE",
-            "retexture": "MESHY_RETEXTURE",
-            "remesh": "MESHY_REFINE",
-            "refine": "MESHY_REFINE",
-            "rigging": "MESHY_RIG",
-            "rig": "MESHY_RIG",
-            "openai-image": "OPENAI_IMAGE",
-            "nano-image": "OPENAI_IMAGE",
-            "image-studio": "OPENAI_IMAGE",
-            "video": "VIDEO_GENERATE",
-            "video-generate": "VIDEO_GENERATE",
-            "text2video": "VIDEO_TEXT_GENERATE",
-            "image2video": "VIDEO_IMAGE_ANIMATE",
-            "video-text-generate": "VIDEO_TEXT_GENERATE",
-            "video-image-animate": "VIDEO_IMAGE_ANIMATE",
+        with transaction() as cur:
+            # 1. Create purchase record (IDEMPOTENT: ON CONFLICT prevents double-grant on webhook retry)
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.PURCHASES}
+                (identity_id, plan_id, provider, provider_payment_id,
+                 amount, currency, credits_granted, status, purchased_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (provider, provider_payment_id) DO NOTHING
+                RETURNING *
+                """,
+                (
+                    identity_id,
+                    plan_id,
+                    "stripe",
+                    provider_payment_id,
+                    amount_gbp,
+                    "GBP",
+                    credits_granted,
+                    PurchaseStatus.COMPLETED,
+                ),
+            )
+            purchase = fetch_one(cur)
+
+            # Idempotency: if purchase already exists (conflict), return existing record
+            if not purchase:
+                existing = PurchaseService.get_purchase_by_provider_id(provider_payment_id)
+                if existing:
+                    print(f"[PURCHASE] Idempotent: purchase already exists for {provider_payment_id[:16]}...")
+                    return {
+                        "purchase": existing,
+                        "was_existing": True,
+                    }
+                # No conflict but no return - shouldn't happen, but handle gracefully
+                print(f"[PURCHASE] ERROR: INSERT returned nothing but no existing purchase for {provider_payment_id[:16]}...")
+                return None
+
+            purchase_id = str(purchase["id"])
+
+            # 2. Lock wallet for update
+            cur.execute(
+                f"""
+                SELECT identity_id, balance_credits
+                FROM {Tables.WALLETS}
+                WHERE identity_id = %s
+                FOR UPDATE
+                """,
+                (identity_id,),
+            )
+            wallet = fetch_one(cur)
+
+            if not wallet:
+                # Create wallet if doesn't exist
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
+                    VALUES (%s, 0, NOW())
+                    ON CONFLICT (identity_id) DO NOTHING
+                    RETURNING *
+                    """,
+                    (identity_id,),
+                )
+                wallet = fetch_one(cur)
+                if not wallet:
+                    # Conflict means it was created, fetch it
+                    cur.execute(
+                        f"SELECT * FROM {Tables.WALLETS} WHERE identity_id = %s FOR UPDATE",
+                        (identity_id,),
+                    )
+                    wallet = fetch_one(cur)
+
+            current_balance = wallet.get("balance_credits", 0) or 0
+            new_balance = current_balance + credits_granted
+
+            # 3. Insert ledger entry
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.LEDGER_ENTRIES}
+                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                RETURNING *
+                """,
+                (
+                    identity_id,
+                    LedgerEntryType.PURCHASE_CREDIT,
+                    credits_granted,  # Positive amount
+                    "purchase",
+                    purchase_id,
+                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp}),
+                ),
+            )
+            ledger_entry = fetch_one(cur)
+
+            # 4. Update wallet balance
+            cur.execute(
+                f"""
+                UPDATE {Tables.WALLETS}
+                SET balance_credits = %s, updated_at = NOW()
+                WHERE identity_id = %s
+                """,
+                (new_balance, identity_id),
+            )
+
+            # 5. Attach email to identity if provided (safe + idempotent)
+            # Only attach if: identity has no email AND email not used by another identity
+            email_attached = False
+            if customer_email:
+                normalized_email = customer_email.lower().strip()
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.IDENTITIES}
+                    SET email = %s,
+                        last_seen_at = NOW()
+                    WHERE id = %s
+                      AND email IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {Tables.IDENTITIES} i2
+                          WHERE lower(i2.email) = lower(%s)
+                      )
+                    """,
+                    (normalized_email, identity_id, normalized_email),
+                )
+                email_attached = cur.rowcount > 0
+                print(
+                    f"[PURCHASE] Email attach attempted for identity={identity_id} "
+                    f"email={normalized_email} (rows={cur.rowcount})"
+                )
+
+            # 6. Queue purchase emails (durable - within same transaction)
+            # This ensures emails are never lost even if the process crashes after commit
+            email_queued = False
+            if customer_email:
+                try:
+                    # Get plan details for email
+                    plan = PricingService.get_plan_by_code(plan_code) if plan_code else None
+                    plan_name = plan["name"] if plan else plan_code or "Credits"
+
+                    EmailOutboxService.queue_purchase_emails(
+                        cur=cur,
+                        purchase_id=purchase_id,
+                        identity_id=identity_id,
+                        to_email=customer_email,
+                        plan_name=plan_name,
+                        credits=credits_granted,
+                        amount_gbp=amount_gbp,
+                        plan_code=plan_code,
+                    )
+                    email_queued = True
+                except Exception as queue_err:
+                    # Log but don't fail the purchase - credits are more important
+                    print(f"[PURCHASE] WARNING: Failed to queue emails: {queue_err}")
+
+            print(
+                f"[PURCHASE] Recorded: purchase_id={purchase_id}, identity={identity_id}, "
+                f"credits={credits_granted}, balance: {current_balance} -> {new_balance}, "
+                f"email_attached={email_attached}, email_queued={email_queued}"
+            )
+
+            return {
+                "purchase": PurchaseService._format_purchase(purchase),
+                "ledger_entry_id": str(ledger_entry["id"]),
+                "balance": new_balance,
+                "email_attached": email_attached,
+                "email_queued": email_queued,
+            }
+
+    # ─────────────────────────────────────────────────────────────
+    # Read Operations
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_purchase(purchase_id: str) -> Optional[Dict[str, Any]]:
+        """Get a purchase by ID."""
+        purchase = query_one(
+            f"""
+            SELECT p.*, pl.code as plan_code, pl.name as plan_name
+            FROM {Tables.PURCHASES} p
+            LEFT JOIN {Tables.PLANS} pl ON p.plan_id = pl.id
+            WHERE p.id = %s
+            """,
+            (purchase_id,),
+        )
+        if purchase:
+            return PurchaseService._format_purchase(purchase)
+        return None
+
+    @staticmethod
+    def get_purchase_by_provider_id(provider_payment_id: str) -> Optional[Dict[str, Any]]:
+        """Get a purchase by Stripe session/payment ID (for idempotency)."""
+        purchase = query_one(
+            f"""
+            SELECT p.*, pl.code as plan_code, pl.name as plan_name
+            FROM {Tables.PURCHASES} p
+            LEFT JOIN {Tables.PLANS} pl ON p.plan_id = pl.id
+            WHERE p.provider_payment_id = %s
+            """,
+            (provider_payment_id,),
+        )
+        if purchase:
+            return PurchaseService._format_purchase(purchase)
+        return None
+
+    @staticmethod
+    def get_purchases_for_identity(
+        identity_id: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Get purchases for an identity, most recent first."""
+        purchases = query_all(
+            f"""
+            SELECT p.*, pl.code as plan_code, pl.name as plan_name
+            FROM {Tables.PURCHASES} p
+            LEFT JOIN {Tables.PLANS} pl ON p.plan_id = pl.id
+            WHERE p.identity_id = %s
+            ORDER BY p.purchased_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            (identity_id, limit, offset),
+        )
+        return [PurchaseService._format_purchase(p) for p in purchases]
+
+    # ─────────────────────────────────────────────────────────────
+    # Helpers
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_purchase(purchase: Dict[str, Any]) -> Dict[str, Any]:
+        """Format purchase for API response."""
+        return {
+            "id": str(purchase["id"]),
+            "identity_id": str(purchase["identity_id"]),
+            "plan_id": str(purchase["plan_id"]) if purchase.get("plan_id") else None,
+            "plan_code": purchase.get("plan_code"),
+            "plan_name": purchase.get("plan_name"),
+            "provider": purchase.get("provider"),
+            "amount": float(purchase.get("amount", 0)),
+            "currency": purchase.get("currency", "GBP"),
+            "credits_granted": purchase.get("credits_granted", 0),
+            "status": purchase.get("status"),
+            "purchased_at": purchase["purchased_at"].isoformat() if purchase.get("purchased_at") else None,
         }
-        return mapping.get(job, "MESHY_TEXT_TO_3D")  # Default to text-to-3d cost
-
-    @staticmethod
-    def seed_plans() -> int:
-        """
-        Seed the default plans into the database.
-        Uses INSERT ... ON CONFLICT DO UPDATE to ensure plans exist and are active.
-        Safe to call multiple times (idempotent).
-
-        Plans use the credit_grant column to store the number of credits to grant.
-
-        Returns:
-            Number of plans seeded/updated
-        """
-        from backend.db import is_available
-
-        print("[PRICING] Starting plan seed...")
-
-        if not is_available():
-            print("[PRICING] Database not available, skipping plan seed")
-            return 0
-
-        # First verify the table exists
-        try:
-            result = query_one(
-                f"SELECT COUNT(*) as cnt FROM {Tables.PLANS}"
-            )
-            existing_count = result["cnt"] if result else 0
-            print(f"[PRICING] Plans table exists, current count: {existing_count}")
-        except Exception as e:
-            print(f"[PRICING] Plans table check failed: {e}")
-            print("[PRICING] Table may not exist - ensure migrations have run")
-            return 0
-
-        seeded = 0
-        for plan in DEFAULT_PLANS:
-            try:
-                execute(
-                    f"""
-                    INSERT INTO {Tables.PLANS}
-                        (code, name, description, price_gbp, currency, credit_grant, includes_priority, is_active, created_at)
-                    VALUES
-                        (%s, %s, %s, %s, 'GBP', %s, %s, TRUE, NOW())
-                    ON CONFLICT (code) DO UPDATE SET
-                        name = EXCLUDED.name,
-                        description = EXCLUDED.description,
-                        price_gbp = EXCLUDED.price_gbp,
-                        credit_grant = EXCLUDED.credit_grant,
-                        includes_priority = EXCLUDED.includes_priority,
-                        is_active = TRUE
-                    """,
-                    (
-                        plan["code"],
-                        plan["name"],
-                        plan["description"],
-                        plan["price_gbp"],
-                        plan["credit_grant"],
-                        plan["includes_priority"],
-                    ),
-                )
-                seeded += 1
-                print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ £{plan['price_gbp']})")
-            except Exception as e:
-                print(f"[PRICING] Error seeding plan {plan['code']}: {e}")
-                import traceback
-                traceback.print_exc()
-
-        print(f"[PRICING] Plans seed complete: {seeded}/{len(DEFAULT_PLANS)}")
-        return seeded
-
-    @staticmethod
-    def seed_action_costs() -> int:
-        """
-        Seed default action costs into the database.
-        Uses INSERT ... ON CONFLICT DO NOTHING (idempotent).
-        Safe to call multiple times — existing rows are never overwritten.
-
-        Returns:
-            Number of action costs seeded (new rows only)
-        """
-        from backend.db import is_available
-
-        print("[PRICING] Starting action_costs seed...")
-
-        if not is_available():
-            print("[PRICING] Database not available, skipping action_costs seed")
-            return 0
-
-        try:
-            result = query_one(
-                f"SELECT COUNT(*) as cnt FROM {Tables.ACTION_COSTS}"
-            )
-            existing_count = result["cnt"] if result else 0
-            print(f"[PRICING] action_costs table exists, current count: {existing_count}")
-        except Exception as e:
-            print(f"[PRICING] action_costs table check failed: {e}")
-            return 0
-
-        seeded = 0
-        for ac in DEFAULT_ACTION_COSTS:
-            try:
-                execute(
-                    f"""
-                    INSERT INTO {Tables.ACTION_COSTS}
-                        (action_code, cost_credits, provider, updated_at)
-                    VALUES
-                        (%s, %s, %s, NOW())
-                    ON CONFLICT (action_code) DO NOTHING
-                    """,
-                    (ac["action_code"], ac["cost_credits"], ac["provider"]),
-                )
-                seeded += 1
-            except Exception as e:
-                print(f"[PRICING] Error seeding action_cost {ac['action_code']}: {e}")
-
-        # Clear cache so next lookup fetches fresh data
-        PricingService._action_costs_cache = {}
-
-        print(f"[PRICING] Action costs seed complete: {seeded} checked, {existing_count} pre-existing")
-        return seeded
