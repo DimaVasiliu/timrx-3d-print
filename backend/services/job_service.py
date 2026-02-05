@@ -34,6 +34,22 @@ from backend.services.reservation_service import ReservationService, Reservation
 from backend.services.pricing_service import PricingService
 
 
+class MissingIdentityError(ValueError):
+    """
+    Raised when a job operation requires an identity_id but none was provided.
+
+    This prevents orphaned jobs that cannot be retrieved by any user.
+    """
+
+    def __init__(self, operation: str, job_id: str = None):
+        self.operation = operation
+        self.job_id = job_id
+        msg = f"identity_id is required for {operation}"
+        if job_id:
+            msg += f" (job_id={job_id})"
+        super().__init__(msg)
+
+
 class JobStatus:
     """Valid job statuses."""
     QUEUED = "queued"
@@ -829,14 +845,43 @@ def _map_provider(job_type: str) -> str:
     return "openai" if "image" in job else "meshy"
 
 
-def save_active_job_to_db(job_id: str, job_type: str, stage: str = None, metadata: dict = None, user_id: str = None):
-    """Persist active job metadata for recovery."""
+def save_active_job_to_db(
+    job_id: str,
+    job_type: str,
+    stage: str = None,
+    metadata: dict = None,
+    user_id: str = None,
+    allow_anonymous: bool = False,
+):
+    """
+    Persist active job metadata for recovery.
+
+    Args:
+        job_id: The upstream provider job ID
+        job_type: Type of job (e.g., 'text-to-3d', 'image')
+        stage: Optional stage (e.g., 'preview', 'refine')
+        metadata: Job metadata dict (may contain identity_id, prompt, etc.)
+        user_id: The identity_id of the job owner (required unless allow_anonymous=True)
+        allow_anonymous: If True, allow jobs without identity (for legacy compatibility)
+
+    Returns:
+        True if saved successfully, False otherwise
+
+    Raises:
+        MissingIdentityError: If user_id is not provided and allow_anonymous=False
+    """
     if not USE_DB:
         return False
+
+    job_meta = metadata or {}
+    if not user_id:
+        user_id = job_meta.get("identity_id") or job_meta.get("user_id")
+
+    # ENFORCE identity_id requirement - prevents orphaned jobs
+    if not user_id and not allow_anonymous:
+        raise MissingIdentityError("save_active_job_to_db", job_id)
+
     try:
-        job_meta = metadata or {}
-        if not user_id:
-            user_id = job_meta.get("identity_id") or job_meta.get("user_id")
         payload = dict(job_meta)
         payload.setdefault("job_type", job_type)
         payload.setdefault("stage", stage)
@@ -1278,11 +1323,34 @@ def create_internal_job_row(
     Create or update a timrx_billing.jobs row for an internal job id.
 
     This makes status polling resilient across workers (no in-memory dependency).
+
+    Args:
+        internal_job_id: The internal job UUID
+        identity_id: The identity UUID (REQUIRED - prevents orphaned jobs)
+        provider: Provider name ('meshy', 'openai')
+        action_key: Action key for pricing lookup
+        prompt: Optional prompt text
+        meta: Optional metadata dict
+        reservation_id: Optional credit reservation UUID
+        status: Initial job status (default: 'queued')
+        priority: Job priority (default: 'normal')
+
+    Returns:
+        True if created/updated successfully, False otherwise
+
+    Raises:
+        MissingIdentityError: If identity_id is not provided
     """
     if not USE_DB:
         return False
-    if not internal_job_id or not identity_id:
+
+    if not internal_job_id:
+        print(f"[JOB] ERROR: create_internal_job_row called without internal_job_id")
         return False
+
+    # ENFORCE identity_id requirement - prevents orphaned jobs
+    if not identity_id:
+        raise MissingIdentityError("create_internal_job_row", internal_job_id)
 
     # Map action_key -> DB action_code (must exist in action_costs)
     action_code = PricingService.get_db_action_code(action_key)
