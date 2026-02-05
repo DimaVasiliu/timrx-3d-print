@@ -30,6 +30,12 @@ from backend.services.gemini_video_service import (
     GeminiConfigError,
     GeminiValidationError,
 )
+from backend.services.gemini_image_service import (
+    gemini_generate_image,
+    GeminiAuthError as GeminiImageAuthError,
+    GeminiConfigError as GeminiImageConfigError,
+    GeminiValidationError as GeminiImageValidationError,
+)
 from backend.services.video_router import (
     QuotaExhaustedError,
     ProviderUnavailableError,
@@ -347,6 +353,122 @@ def dispatch_openai_image_async(
         print(f"[ASYNC] ERROR: OpenAI call failed for job {internal_job_id} after {duration_ms}ms: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "openai_api_error", internal_job_id)
+        update_job_status_failed(internal_job_id, str(e))
+
+
+def dispatch_gemini_image_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    prompt: str,
+    aspect_ratio: str,
+    image_size: str,
+    sample_count: int,
+    store_meta: dict,
+):
+    """
+    Async dispatch for Gemini/Imagen image generation.
+
+    This runs in a background thread to allow the endpoint to return immediately
+    with job_id + reservation_id, so frontend can see the held credits.
+    """
+    start_time = time.time()
+    print(f"[ASYNC] Starting Gemini image dispatch for job {internal_job_id}")
+    print(f"[JOB] provider_started job_id={internal_job_id} provider=google action=image-gen reservation_id={reservation_id}")
+
+    try:
+        # Call Gemini API
+        result = gemini_generate_image(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            sample_count=sample_count,
+        )
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] Gemini returned for job {internal_job_id} in {duration_ms}ms")
+        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
+
+        # Extract image URLs
+        image_url = result.get("image_url")
+        image_urls = result.get("image_urls", [image_url] if image_url else [])
+        image_base64 = result.get("image_base64")
+
+        if not image_url and not image_urls:
+            print(f"[ASYNC] ERROR: No images from Gemini for job {internal_job_id}")
+            if reservation_id:
+                release_job_credits(reservation_id, "gemini_no_images", internal_job_id)
+            update_job_status_failed(internal_job_id, "Gemini returned no images")
+            return
+
+        # Save to normalized DB (creates images row + history_items row)
+        save_image_to_normalized_db(
+            image_id=internal_job_id,
+            image_url=image_url or image_urls[0],
+            prompt=prompt,
+            ai_model="imagen-4.0",
+            size=f"{aspect_ratio}@{image_size}",
+            image_urls=image_urls,
+            user_id=identity_id,
+            provider="google",
+        )
+        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=google")
+
+        # Update in-memory store
+        store = load_store()
+        store_meta["status"] = "done"
+        store_meta["image_url"] = image_url or image_urls[0]
+        store_meta["image_urls"] = image_urls
+        store_meta["image_base64"] = image_base64
+        store[internal_job_id] = store_meta
+        save_store(store)
+
+        # Finalize credits
+        print(f"[GEMINI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
+        if reservation_id:
+            print(f"[GEMINI_IMAGE:DEBUG] Calling finalize_job_credits({reservation_id}, {internal_job_id})")
+            finalize_job_credits(reservation_id, internal_job_id)
+            print(f"[GEMINI_IMAGE:DEBUG] finalize_job_credits returned")
+            print(f"[ASYNC] Credits captured for Gemini image job {internal_job_id}")
+        else:
+            print(f"[GEMINI_IMAGE:DEBUG] !!! NO RESERVATION_ID - credits NOT being finalized!")
+
+        # Update job status to ready
+        update_job_status_ready(
+            internal_job_id,
+            upstream_job_id=None,
+            image_id=internal_job_id,
+            image_url=image_url or image_urls[0],
+        )
+
+        print(f"[ASYNC] Gemini image job {internal_job_id} completed successfully")
+
+    except GeminiImageConfigError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini config error for job {internal_job_id} after {duration_ms}ms: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
+
+    except GeminiImageValidationError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini validation error for job {internal_job_id} after {duration_ms}ms: {e.message}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
+
+    except GeminiImageAuthError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini auth error for job {internal_job_id} after {duration_ms}ms: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Gemini call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_api_error", internal_job_id)
         update_job_status_failed(internal_job_id, str(e))
 
 
