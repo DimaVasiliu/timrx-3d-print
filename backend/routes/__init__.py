@@ -91,5 +91,5 @@ def register_blueprints(app):
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
 
-    # Print route map at startup for debugging
-    _print_route_map(app)
+    # Route map printing disabled (use _print_route_map(app) to debug)
+    # _print_route_map(app)
