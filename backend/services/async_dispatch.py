@@ -323,9 +323,15 @@ def dispatch_openai_image_async(
         store[internal_job_id] = store_meta
         save_store(store)
 
+        # DEBUG: Trace credit finalization
+        print(f"[OPENAI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
         if reservation_id:
+            print(f"[OPENAI_IMAGE:DEBUG] Calling finalize_job_credits({reservation_id}, {internal_job_id})")
             finalize_job_credits(reservation_id, internal_job_id)
+            print(f"[OPENAI_IMAGE:DEBUG] finalize_job_credits returned")
             print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
+        else:
+            print(f"[OPENAI_IMAGE:DEBUG] !!! NO RESERVATION_ID - credits NOT being finalized!")
 
         update_job_status_ready(
             internal_job_id,
