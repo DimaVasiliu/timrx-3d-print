@@ -415,6 +415,7 @@ class Tables:
     INVOICES = f"{_BILLING_SCHEMA}.invoices"
     INVOICE_ITEMS = f"{_BILLING_SCHEMA}.invoice_items"
     RECEIPTS = f"{_BILLING_SCHEMA}.receipts"
+    EMAIL_OUTBOX = f"{_BILLING_SCHEMA}.email_outbox"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
