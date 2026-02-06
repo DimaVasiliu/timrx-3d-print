@@ -216,7 +216,9 @@ def text_to_3d_refine_mod():
     original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = preview_meta.get("root_prompt") or original_prompt
     texture_prompt = body.get("texture_prompt")
-    title = f"(refine) {original_prompt[:40]}" if original_prompt else derive_display_title(body.get("prompt"), body.get("title"))
+    # Derive title from prompt/root_prompt - derive_display_title handles generic titles automatically
+    explicit_title = body.get("title") or preview_meta.get("title")
+    title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-refine"]
