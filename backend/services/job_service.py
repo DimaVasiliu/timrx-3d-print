@@ -1662,46 +1662,121 @@ def resolve_meshy_job_id(input_id: str) -> str:
 
 
 def verify_job_ownership(job_id: str, identity_id: str) -> bool:
+    """
+    Verify that a job belongs to the given identity.
+
+    Returns True if:
+    - Job is found and belongs to identity_id
+    - Job is found and has no owner (legacy data)
+    - Job is not found in DB and USE_DB is False (backwards compat)
+
+    Returns False if:
+    - Job is found but belongs to different identity
+    - Job is not found and USE_DB is True
+    """
+    result = verify_job_ownership_detailed(job_id, identity_id)
+    return result["authorized"]
+
+
+def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
+    """
+    Verify job ownership with detailed result for proper HTTP status codes.
+
+    Returns dict with:
+    - found: bool - whether the job was found
+    - authorized: bool - whether access is allowed
+    - owner_id: str|None - the job's owner identity_id
+    - source: str - where the job was found ('store', 'active_jobs', 'jobs', 'models', 'history_items', None)
+
+    Use this to return proper HTTP status codes:
+    - found=False -> 404 Not Found
+    - found=True, authorized=False -> 403 Forbidden
+    - found=True, authorized=True -> proceed
+    """
+    result = {"found": False, "authorized": False, "owner_id": None, "source": None}
+
+    # Check in-memory store first
     store = load_store()
     if job_id in store:
-        job_user_id = store[job_id].get("user_id")
+        result["found"] = True
+        result["source"] = "store"
+        job_user_id = store[job_id].get("user_id") or store[job_id].get("identity_id")
+        result["owner_id"] = job_user_id
         if identity_id:
-            return job_user_id == identity_id or job_user_id is None
-        return job_user_id is None
+            result["authorized"] = job_user_id == identity_id or job_user_id is None
+        else:
+            result["authorized"] = job_user_id is None
+        return result
 
     if not USE_DB:
-        return True
+        # Without DB, allow access if not in store (backwards compat)
+        result["found"] = True
+        result["authorized"] = True
+        result["source"] = "legacy"
+        return result
 
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Check active_jobs, history_items, AND timrx_billing.jobs tables
+                # Check all tables where jobs might exist
+                # Use COALESCE to handle different column names for identity
                 cur.execute(
                     f"""
-                    SELECT identity_id FROM {Tables.ACTIVE_JOBS} WHERE upstream_job_id = %s
-                    UNION
-                    SELECT identity_id FROM {Tables.HISTORY_ITEMS} WHERE id::text = %s
+                    SELECT identity_id, 'active_jobs' as source
+                    FROM {Tables.ACTIVE_JOBS}
+                    WHERE upstream_job_id = %s OR id::text = %s
+
+                    UNION ALL
+
+                    SELECT identity_id, 'jobs' as source
+                    FROM {Tables.JOBS}
+                    WHERE id::text = %s OR upstream_job_id = %s
+
+                    UNION ALL
+
+                    SELECT identity_id, 'models' as source
+                    FROM {Tables.MODELS}
+                    WHERE upstream_job_id = %s OR id::text = %s
+
+                    UNION ALL
+
+                    SELECT identity_id, 'history_items' as source
+                    FROM {Tables.HISTORY_ITEMS}
+                    WHERE id::text = %s
+                       OR upstream_job_id = %s
                        OR payload->>'original_job_id' = %s
                        OR payload->>'job_id' = %s
-                    UNION
-                    SELECT identity_id FROM {Tables.JOBS} WHERE id::text = %s
-                       OR upstream_job_id = %s
+
                     LIMIT 1
                     """,
-                    (job_id, job_id, job_id, job_id, job_id, job_id),
+                    (job_id, job_id, job_id, job_id, job_id, job_id, job_id, job_id, job_id, job_id),
                 )
                 row = cur.fetchone()
 
             if not row:
-                return False
+                # Job not found in any table
+                result["found"] = False
+                result["authorized"] = False
+                return result
 
+            result["found"] = True
+            result["source"] = row[1] if len(row) > 1 else "unknown"
             job_user_id = str(row[0]) if row[0] else None
+            result["owner_id"] = job_user_id
+
             if identity_id:
-                return job_user_id == identity_id or job_user_id is None
-            return job_user_id is None
+                result["authorized"] = job_user_id == identity_id or job_user_id is None
+            else:
+                result["authorized"] = job_user_id is None
+            return result
+
     except Exception as e:
-        print(f"[DB] verify_job_ownership failed for {job_id}: {e}")
-        return True
+        print(f"[DB] verify_job_ownership_detailed failed for {job_id}: {e}")
+        # On DB error, be permissive to not block users
+        result["found"] = True
+        result["authorized"] = True
+        result["source"] = "error_fallback"
+        return result
 
 
 def create_internal_job_row(
