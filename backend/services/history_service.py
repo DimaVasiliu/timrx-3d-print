@@ -1517,20 +1517,30 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     cur.execute("SAVEPOINT model_upsert")
                     try:
                         if existing_by_hash_id:
+                            # Update existing model matched by content_hash
+                            # Protect existing good titles from being overwritten
                             cur.execute(
                                 f"""
                                 UPDATE {Tables.MODELS}
                                 SET identity_id = COALESCE(%s, identity_id),
                                     title = CASE
+                                        -- Keep existing good title
+                                        WHEN title IS NOT NULL
+                                         AND BTRIM(title) <> ''
+                                         AND LOWER(BTRIM(title)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
+                                        THEN title
+                                        -- Use incoming title if it's good
                                         WHEN %s IS NOT NULL
-                                         AND %s <> ''
-                                         AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                         AND BTRIM(%s) <> ''
+                                         AND LOWER(BTRIM(%s)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
                                         THEN %s
-                                        ELSE title
+                                        -- Fallback to existing
+                                        ELSE COALESCE(title, %s)
                                     END,
                                     prompt = COALESCE(%s, prompt),
                                     root_prompt = COALESCE(%s, root_prompt),
                                     upstream_job_id = COALESCE(upstream_job_id, %s),
+                                    upstream_id = COALESCE(upstream_id, %s),
                                     status = 'ready',
                                     s3_bucket = COALESCE(%s, s3_bucket),
                                     glb_url = %s,
@@ -1550,9 +1560,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     final_title,
                                     final_title,
                                     final_title,
+                                    final_title,  # fallback
                                     final_prompt,
                                     root_prompt,
                                     job_id,
+                                    job_id,  # upstream_id = upstream_job_id
                                     s3_bucket,
                                     final_glb_url,
                                     final_thumbnail_url,
@@ -1571,7 +1583,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 INSERT INTO {Tables.MODELS} (
                                     id, identity_id,
                                     title, prompt, root_prompt,
-                                    provider, upstream_job_id,
+                                    provider, upstream_job_id, upstream_id,
                                     status,
                                     s3_bucket,
                                     glb_url, thumbnail_url,
@@ -1582,7 +1594,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 ) VALUES (
                                     %s, %s,
                                     %s, %s, %s,
-                                    %s, %s,
+                                    %s, %s, %s,
                                     %s,
                                     %s,
                                     %s, %s,
@@ -1591,17 +1603,25 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     %s,
                                     %s
                                 )
-                                ON CONFLICT (provider, upstream_job_id) DO UPDATE
+                                ON CONFLICT (provider, upstream_id) DO UPDATE
                                 SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.MODELS}.identity_id),
                                     title = CASE
+                                        -- Keep existing good title
+                                        WHEN {Tables.MODELS}.title IS NOT NULL
+                                         AND BTRIM({Tables.MODELS}.title) <> ''
+                                         AND LOWER(BTRIM({Tables.MODELS}.title)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
+                                        THEN {Tables.MODELS}.title
+                                        -- Use incoming title if it's good
                                         WHEN EXCLUDED.title IS NOT NULL
-                                         AND EXCLUDED.title <> ''
-                                         AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                         AND BTRIM(EXCLUDED.title) <> ''
+                                         AND LOWER(BTRIM(EXCLUDED.title)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
                                         THEN EXCLUDED.title
-                                        ELSE {Tables.MODELS}.title
+                                        -- Fallback to existing (even if generic)
+                                        ELSE COALESCE({Tables.MODELS}.title, EXCLUDED.title)
                                     END,
                                     prompt = COALESCE(EXCLUDED.prompt, {Tables.MODELS}.prompt),
                                     root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.MODELS}.root_prompt),
+                                    upstream_job_id = COALESCE(EXCLUDED.upstream_job_id, {Tables.MODELS}.upstream_job_id),
                                     status = 'ready',
                                     s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.MODELS}.s3_bucket),
                                     glb_url = EXCLUDED.glb_url,
@@ -1622,6 +1642,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     root_prompt,
                                     provider,
                                     job_id,
+                                    job_id,  # upstream_id = upstream_job_id
                                     "ready",
                                     s3_bucket,
                                     final_glb_url,
@@ -1640,30 +1661,48 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             raise
                         cur.execute("ROLLBACK TO SAVEPOINT model_upsert")
                         print("[DB] models upsert fallback: missing unique constraint, using manual upsert")
+                        # Use upstream_id as the stable lookup key (matches DB constraint)
                         cur.execute(
                             f"""
-                            SELECT id FROM {Tables.MODELS}
-                            WHERE provider = %s AND upstream_job_id = %s
+                            SELECT id, title FROM {Tables.MODELS}
+                            WHERE provider = %s AND upstream_id = %s
                             LIMIT 1
                             """,
                             (provider, job_id),
                         )
                         existing_row = cur.fetchone()
                         if existing_row:
+                            # Determine safe title: protect existing good titles
+                            existing_title = existing_row.get("title") or ""
+                            existing_is_good = (
+                                existing_title.strip() != ""
+                                and existing_title.lower().strip() not in (
+                                    'untitled', '(untitled)', '3d model', 'textured model',
+                                    'remeshed model', 'refined model', 'rigged model',
+                                    'image to 3d model', 'generated model', 'model', 'image', 'video'
+                                )
+                            )
+                            incoming_title = final_title or ""
+                            incoming_is_good = (
+                                incoming_title.strip() != ""
+                                and incoming_title.lower().strip() not in (
+                                    'untitled', '(untitled)', '3d model', 'textured model',
+                                    'remeshed model', 'refined model', 'rigged model',
+                                    'image to 3d model', 'generated model', 'model', 'image', 'video'
+                                )
+                            )
+                            # Keep existing good title, otherwise use incoming if good, else keep existing
+                            safe_title = existing_title if existing_is_good else (incoming_title if incoming_is_good else existing_title or incoming_title)
+
                             cur.execute(
                                 f"""
                                 UPDATE {Tables.MODELS}
                                 SET identity_id = COALESCE(%s, identity_id),
-                                    title = CASE
-                                        WHEN %s IS NOT NULL
-                                         AND %s <> ''
-                                         AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
-                                        THEN %s
-                                        ELSE title
-                                    END,
+                                    title = %s,
                                     prompt = COALESCE(%s, prompt),
                                     root_prompt = COALESCE(%s, root_prompt),
                                     upstream_job_id = COALESCE(upstream_job_id, %s),
+                                    upstream_id = COALESCE(upstream_id, %s),
                                     status = 'ready',
                                     s3_bucket = COALESCE(%s, s3_bucket),
                                     glb_url = %s,
@@ -1679,13 +1718,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 """,
                                 (
                                     user_id,
-                                    final_title,
-                                    final_title,
-                                    final_title,
-                                    final_title,
+                                    safe_title,
                                     final_prompt,
                                     root_prompt,
                                     job_id,
+                                    job_id,  # upstream_id = upstream_job_id
                                     s3_bucket,
                                     final_glb_url,
                                     final_thumbnail_url,
@@ -1703,7 +1740,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 INSERT INTO {Tables.MODELS} (
                                     id, identity_id,
                                     title, prompt, root_prompt,
-                                    provider, upstream_job_id,
+                                    provider, upstream_job_id, upstream_id,
                                     status,
                                     s3_bucket,
                                     glb_url, thumbnail_url,
@@ -1714,7 +1751,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 ) VALUES (
                                     %s, %s,
                                     %s, %s, %s,
-                                    %s, %s,
+                                    %s, %s, %s,
                                     %s,
                                     %s,
                                     %s, %s,
@@ -1733,6 +1770,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     root_prompt,
                                     provider,
                                     job_id,
+                                    job_id,  # upstream_id = upstream_job_id
                                     "ready",
                                     s3_bucket,
                                     final_glb_url,
