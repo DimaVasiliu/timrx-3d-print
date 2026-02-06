@@ -216,13 +216,13 @@ def upload_bytes_to_s3(
     content_hash = compute_sha256(data_bytes) if return_hash else None
     if s3_key_exists(key):
         s3_url = build_s3_url(key)
-        print(f"[S3] SKIP: Key exists -> {s3_url}")
+        # print(f"[S3] SKIP: Key exists -> {s3_url}")
         return wrap_upload_result(s3_url, content_hash, return_hash, s3_key=key, reused=True)
 
-    print(
-        f"[S3] Uploading {len(data_bytes)} bytes to bucket={config.AWS_BUCKET_MODELS}, "
-        f"key={key}, content_type={content_type}"
-    )
+    # print(
+    #     f"[S3] Uploading {len(data_bytes)} bytes to bucket={config.AWS_BUCKET_MODELS}, "
+    #     f"key={key}, content_type={content_type}"
+    # )
     _s3.put_object(
         Bucket=config.AWS_BUCKET_MODELS,
         Key=key,
@@ -230,7 +230,7 @@ def upload_bytes_to_s3(
         ContentType=content_type,
     )
     s3_url = build_s3_url(key)
-    print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
+    # print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
     return wrap_upload_result(s3_url, content_hash, return_hash, s3_key=key, reused=False)
 
 
@@ -247,7 +247,7 @@ def upload_url_to_s3(
         key = ensure_s3_key_ext(key.lstrip("/"), content_type or "application/octet-stream")
         if s3_key_exists(key):
             s3_url = build_s3_url(key)
-            print(f"[S3] SKIP: Key exists -> {s3_url}")
+            # print(f"[S3] SKIP: Key exists -> {s3_url}")
             return wrap_upload_result(s3_url, None, return_hash, s3_key=key, reused=True)
 
     resp = requests.get(url, timeout=120)
@@ -323,7 +323,7 @@ def safe_upload_to_s3(
     s3_key = build_hash_s3_key(prefix, provider, content_hash, resolved_type)
     if s3_key_exists(s3_key):
         s3_url = build_s3_url(s3_key)
-        print(f"[S3] SKIP: Key exists -> {s3_url}")
+        # print(f"[S3] SKIP: Key exists -> {s3_url}")
         return wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=True)
 
     _s3.put_object(
@@ -333,7 +333,7 @@ def safe_upload_to_s3(
         ContentType=resolved_type,
     )
     s3_url = build_s3_url(s3_key)
-    print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
+    # print(f"[S3] SUCCESS: Uploaded {len(data_bytes)} bytes -> {s3_url}")
     return wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=False)
 
 
@@ -480,7 +480,7 @@ def delete_s3_objects_safe(keys: list[str], source: str = "unknown") -> dict:
         return result
 
     if not config.AWS_BUCKET_MODELS:
-        print(f"[S3] SKIP delete ({source}): AWS_BUCKET_MODELS not configured")
+        # print(f"[S3] SKIP delete ({source}): AWS_BUCKET_MODELS not configured")
         return result
 
     # Filter out empty/None keys
@@ -515,7 +515,7 @@ def delete_s3_objects_safe(keys: list[str], source: str = "unknown") -> dict:
                 # NoSuchKey means already deleted - that's fine (idempotent)
                 if err_code == "NoSuchKey":
                     result["already_missing"] += 1
-                    print(f"[S3] OK ({source}): Key already deleted: {err_key}")
+                    # print(f"[S3] OK ({source}): Key already deleted: {err_key}")
                 else:
                     result["errors"].append({
                         "key": err_key,
@@ -543,11 +543,11 @@ def delete_s3_objects_safe(keys: list[str], source: str = "unknown") -> dict:
             print(f"[S3] ERROR ({source}): Unexpected error during batch delete: {e}")
 
     # Summary log
-    if result["deleted"] > 0 or result["already_missing"] > 0:
-        print(
-            f"[S3] Cleanup ({source}): deleted={result['deleted']}, "
-            f"already_missing={result['already_missing']}, errors={len(result['errors'])}"
-        )
+    # if result["deleted"] > 0 or result["already_missing"] > 0:
+    #     print(
+    #         f"[S3] Cleanup ({source}): deleted={result['deleted']}, "
+    #         f"already_missing={result['already_missing']}, errors={len(result['errors'])}"
+    #     )
 
     return result
 
