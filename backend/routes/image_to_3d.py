@@ -233,9 +233,13 @@ def image_to_3d_status_mod(job_id: str):
         if not meta.get("root_prompt"):
             meta["root_prompt"] = meta.get("prompt")
 
-        if not meta.get("title"):
-            prompt_for_title = meta.get("prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else "Image to 3D Model"
+        if not meta.get("title") or meta.get("title") == "Untitled":
+            # derive_display_title handles generic titles automatically
+            meta["title"] = derive_display_title(
+                meta.get("prompt"),
+                None,
+                root_prompt=meta.get("root_prompt"),
+            )
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type="image-to-3d", user_id=user_id)
