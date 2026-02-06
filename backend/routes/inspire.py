@@ -157,14 +157,16 @@ def _get_prompt_of_the_day(cursor) -> Dict[str, Any]:
 def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
     """
     Fetch models with valid thumbnails. Accepts various success status values.
-    Returns thumb_preview (always) and thumb_refined (if a refined/textured version exists).
+    Includes ALL stages: preview, texture, remesh, refine, etc.
+    Returns thumb_preview (always) and thumb_refined (if a related version exists).
     If limit is None, fetches ALL models.
     """
     order = "ORDER BY m.created_at DESC"
     limit_clause = f"LIMIT {limit}" if limit else ""
 
-    # Query models with optional refined/textured thumbnail via self-join on upstream_job_id
-    # Preview stage thumbnail + look for refined/textured versions
+    # Query ALL models (all stages) with valid thumbnails
+    # For preview models: look for textured/refined versions as thumb_refined
+    # For texture/remesh/refine models: look for preview version as thumb_refined (shows before/after)
     # Status filter: accept 'ready', 'succeeded', 'success', 'completed', 'done', 'finished' (case-insensitive)
     cursor.execute(f"""
         WITH base_models AS (
@@ -172,6 +174,7 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
                 id,
                 title,
                 prompt,
+                root_prompt,
                 thumbnail_url,
                 glb_url,
                 stage,
@@ -180,6 +183,8 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
             FROM timrx_app.models
             WHERE thumbnail_url IS NOT NULL
               AND thumbnail_url != ''
+              AND glb_url IS NOT NULL
+              AND glb_url != ''
               AND (
                 status IS NULL
                 OR LOWER(status) IN ('ready', 'succeeded', 'success', 'completed', 'done', 'finished')
@@ -189,26 +194,35 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
             m.id::text as id,
             'model' as type,
             m.title,
-            m.prompt,
+            COALESCE(m.prompt, m.root_prompt) as prompt,
             m.thumbnail_url as thumb_preview,
             m.glb_url,
-            -- Find refined/textured thumbnail: prefer textured > refined > null
-            COALESCE(
-                (SELECT thumbnail_url FROM base_models r
-                 WHERE r.upstream_job_id = m.upstream_job_id
-                   AND r.id != m.id
-                   AND LOWER(r.stage) IN ('texture', 'retexture', 'textured')
-                 ORDER BY r.created_at DESC LIMIT 1),
-                (SELECT thumbnail_url FROM base_models r
-                 WHERE r.upstream_job_id = m.upstream_job_id
-                   AND r.id != m.id
-                   AND LOWER(r.stage) IN ('refine', 'refined', 'remesh')
-                 ORDER BY r.created_at DESC LIMIT 1)
-            ) as thumb_refined,
-            m.stage,
+            -- For preview: find textured/refined version; For texture/refine: find preview version
+            CASE
+                WHEN m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', 'image3d', '') THEN
+                    COALESCE(
+                        (SELECT thumbnail_url FROM base_models r
+                         WHERE r.upstream_job_id = m.upstream_job_id
+                           AND r.id != m.id
+                           AND LOWER(r.stage) IN ('texture', 'retexture', 'textured')
+                         ORDER BY r.created_at DESC LIMIT 1),
+                        (SELECT thumbnail_url FROM base_models r
+                         WHERE r.upstream_job_id = m.upstream_job_id
+                           AND r.id != m.id
+                           AND LOWER(r.stage) IN ('refine', 'refined', 'remesh')
+                         ORDER BY r.created_at DESC LIMIT 1)
+                    )
+                ELSE
+                    -- For texture/remesh/refine: show preview as "before" on hover
+                    (SELECT thumbnail_url FROM base_models r
+                     WHERE r.upstream_job_id = m.upstream_job_id
+                       AND r.id != m.id
+                       AND (r.stage IS NULL OR LOWER(r.stage) IN ('preview', 'initial', 'image3d', ''))
+                     ORDER BY r.created_at ASC LIMIT 1)
+            END as thumb_refined,
+            COALESCE(m.stage, 'preview') as stage,
             m.created_at
         FROM base_models m
-        WHERE m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', 'image3d', '')
         {order}
         {limit_clause}
     """)
