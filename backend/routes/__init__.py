@@ -58,8 +58,7 @@ def register_blueprints(app):
     try:
         print("[ROUTES] Attempting to import inspire blueprint...")
         from backend.routes.inspire import bp as inspire_bp
-        print(f"[ROUTES] Inspire import SUCCESS: {inspire_bp}")
-        print(f"[ROUTES] Inspire blueprint routes: {[r.rule for r in inspire_bp.deferred_functions] if hasattr(inspire_bp, 'deferred_functions') else 'N/A'}")
+        print(f"[ROUTES] Inspire import SUCCESS: {inspire_bp.name}")
     except ImportError as e:
         print(f"[ROUTES] ImportError importing inspire: {e}")
         import traceback
