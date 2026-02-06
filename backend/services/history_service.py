@@ -1169,6 +1169,31 @@ def save_video_to_normalized_db(
 def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta: dict, job_type: str = "model", user_id: str | None = None):
     """
     Save finished job data to normalized tables (history_items, models, images).
+
+    For derived jobs (texture/refine/remesh/rig), inherits title/prompt/root_prompt
+    from the parent job when Meshy returns null values.
+
+    Verification queries (run in psql after a texture/refine job completes):
+    -------------------------------------------------------------------------
+    -- Check for Untitled models (should be zero or decreasing):
+    SELECT COUNT(*) FROM timrx_app.models
+    WHERE LOWER(TRIM(title)) IN ('untitled', '(untitled)', '')
+       OR title IS NULL;
+
+    -- Check models with NULL prompt (should be zero for text-to-3d lineages):
+    SELECT m.id, m.title, m.prompt, m.root_prompt, m.upstream_id
+    FROM timrx_app.models m
+    WHERE m.prompt IS NULL AND m.provider = 'meshy'
+    ORDER BY m.created_at DESC LIMIT 10;
+
+    -- Verify derived jobs inherit from parent:
+    SELECT h.id, h.title, h.prompt, h.root_prompt,
+           h.payload->>'source_task_id' as source_task_id,
+           h.payload->>'preview_task_id' as preview_task_id
+    FROM timrx_app.history_items h
+    WHERE h.payload->>'source_task_id' IS NOT NULL
+       OR h.payload->>'preview_task_id' IS NOT NULL
+    ORDER BY h.created_at DESC LIMIT 10;
     """
     model_log_info = None
     image_log_info = None
@@ -1220,6 +1245,42 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             final_prompt = job_meta.get("prompt")
             root_prompt = job_meta.get("root_prompt") or final_prompt
             provider = _map_provider(job_type)
+
+            # ─────────────────────────────────────────────────────────────────
+            # PARENT METADATA INHERITANCE for derived jobs (texture/refine/etc)
+            # When Meshy returns root_prompt=null, inherit from parent job
+            # ─────────────────────────────────────────────────────────────────
+            parent_task_id = (
+                job_meta.get("source_task_id")
+                or job_meta.get("preview_task_id")
+                or status_data.get("preview_task_id")
+            )
+            parent_title = None
+            parent_prompt = None
+            parent_root_prompt = None
+            if parent_task_id:
+                try:
+                    cur.execute(
+                        f"""
+                        SELECT title, prompt, root_prompt
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE id::text = %s OR payload->>'original_job_id' = %s
+                        LIMIT 1
+                        """,
+                        (str(parent_task_id), str(parent_task_id)),
+                    )
+                    parent_row = cur.fetchone()
+                    if parent_row:
+                        parent_title = parent_row.get("title")
+                        parent_prompt = parent_row.get("prompt")
+                        parent_root_prompt = parent_row.get("root_prompt")
+                        # Inherit from parent when current values are missing
+                        if not final_prompt and parent_prompt:
+                            final_prompt = parent_prompt
+                        if not root_prompt and (parent_root_prompt or parent_prompt):
+                            root_prompt = parent_root_prompt or parent_prompt
+                except Exception as parent_lookup_err:
+                    log_db_continue("parent_metadata_lookup", parent_lookup_err)
             s3_bucket = AWS_BUCKET_MODELS or None
             image_job_types = ("image", "image-studio", "openai-image", "image-gen", "openai_image")
             is_image_output = (
@@ -1469,10 +1530,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             if final_thumbnail_url:
                 payload["thumbnail_url"] = final_thumbnail_url
 
+            # Use inherited values (final_prompt/root_prompt may have been set from parent)
+            # Also use parent_title as fallback for explicit title
             final_title = derive_display_title(
-                job_meta.get("prompt"),
-                job_meta.get("title"),
-                root_prompt=job_meta.get("root_prompt"),
+                final_prompt or job_meta.get("prompt"),
+                job_meta.get("title") or parent_title,
+                root_prompt=root_prompt or job_meta.get("root_prompt"),
             )
             glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
             thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
