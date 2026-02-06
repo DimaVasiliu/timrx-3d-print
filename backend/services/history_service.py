@@ -33,6 +33,7 @@ from backend.services.s3_service import (
 from backend.utils import (
     build_canonical_url,
     derive_display_title,
+    is_generic_title,
     log_db_continue,
     normalize_epoch_ms,
     sanitize_filename,
@@ -2079,6 +2080,24 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         """,
                         (history_item_id, history_item_id),
                     )
+
+                # Sync model title from prompt if model still has generic title
+                if model_id and (final_prompt or root_prompt):
+                    prompt_title = (final_prompt or root_prompt or "").strip()[:100]
+                    if prompt_title and not is_generic_title(prompt_title):
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.MODELS}
+                            SET title = %s, updated_at = NOW()
+                            WHERE id = %s
+                              AND (title IS NULL OR LOWER(TRIM(title)) IN (
+                                  'untitled', '(untitled)', '', '3d model', 'textured model',
+                                  'remeshed model', 'refined model', 'rigged model',
+                                  'image to 3d model', 'generated model', 'model', 'image', 'video'
+                              ))
+                            """,
+                            (prompt_title, model_id),
+                        )
 
                 cur.execute("RELEASE SAVEPOINT normalized_save")
             except Exception as e:
