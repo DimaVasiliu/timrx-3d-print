@@ -282,7 +282,11 @@ def history_mod():
 
                         # Derive title if still missing
                         if not item.get("title"):
-                            item["title"] = derive_display_title(item.get("prompt"), None)
+                            item["title"] = derive_display_title(
+                                item.get("prompt"),
+                                None,
+                                root_prompt=item.get("root_prompt"),
+                            )
 
                         items.append(item)
 
@@ -354,9 +358,9 @@ def history_mod():
                                 stage = item.get("stage")
                                 title = item.get("title")
                                 prompt = item.get("prompt")
-                                if not title:
-                                    title = derive_display_title(prompt, None)
                                 root_prompt = item.get("root_prompt")
+                                if not title:
+                                    title = derive_display_title(prompt, None, root_prompt=root_prompt)
                                 thumbnail_url = item.get("thumbnail_url")
                                 glb_url = item.get("glb_url")
                                 image_url = item.get("image_url")
@@ -582,9 +586,9 @@ def history_item_add_mod():
                             stage = item.get("stage")
                             title = item.get("title")
                             prompt = item.get("prompt")
-                            if not title:
-                                title = derive_display_title(prompt, None)
                             root_prompt = item.get("root_prompt")
+                            if not title:
+                                title = derive_display_title(prompt, None, root_prompt=root_prompt)
                             thumbnail_url = item.get("thumbnail_url")
                             glb_url = item.get("glb_url")
                             image_url = item.get("image_url")
@@ -920,7 +924,11 @@ def history_item_update_mod(item_id: str):
 
                 # Derive title if still missing
                 if not item.get("title"):
-                    item["title"] = derive_display_title(item.get("prompt"), None)
+                    item["title"] = derive_display_title(
+                        item.get("prompt"),
+                        None,
+                        root_prompt=item.get("root_prompt"),
+                    )
 
                 return jsonify({"ok": True, "item": item})
             except Exception as e:
