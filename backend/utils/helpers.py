@@ -376,7 +376,7 @@ def log_generation_event(
 
         # Structured log line for easy parsing
         log_parts = [f"{k}={v}" for k, v in data.items() if v is not None]
-        print(f"[GEN] {' '.join(log_parts)}")
+        # print(f"[GEN] {' '.join(log_parts)}")
 
     except Exception as e:
         print(f"[GEN] log_generation_event failed: {e}")
