@@ -163,6 +163,7 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
 
     # Query models with optional refined/textured thumbnail via self-join on upstream_job_id
     # Preview stage thumbnail + look for refined/textured versions
+    # Status filter: accept 'ready', 'succeeded', 'success', 'completed', 'done', 'finished' (case-insensitive)
     cursor.execute(f"""
         WITH base_models AS (
             SELECT
@@ -170,6 +171,7 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
                 title,
                 prompt,
                 thumbnail_url,
+                glb_url,
                 stage,
                 upstream_job_id,
                 created_at
@@ -178,7 +180,7 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
               AND thumbnail_url != ''
               AND (
                 status IS NULL
-                OR UPPER(status) IN ('SUCCEEDED', 'SUCCESS', 'COMPLETED', 'DONE', 'FINISHED')
+                OR LOWER(status) IN ('ready', 'succeeded', 'success', 'completed', 'done', 'finished')
               )
         )
         SELECT
@@ -187,6 +189,7 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
             m.title,
             m.prompt,
             m.thumbnail_url as thumb_preview,
+            m.glb_url,
             -- Find refined/textured thumbnail: prefer textured > refined > null
             COALESCE(
                 (SELECT thumbnail_url FROM base_models r
@@ -203,25 +206,28 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
             m.stage,
             m.created_at
         FROM base_models m
-        WHERE m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', '')
+        WHERE m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', 'image3d', '')
         {order}
         LIMIT %s
     """, (limit,))
 
     rows = cursor.fetchall()
 
-    # Debug: if no models found, log distinct statuses and stages
-    if debug and len(rows) == 0:
-        cursor.execute("""
-            SELECT status, stage, COUNT(*) as cnt
-            FROM timrx_app.models
-            WHERE thumbnail_url IS NOT NULL AND thumbnail_url != ''
-            GROUP BY status, stage
-            ORDER BY cnt DESC
-            LIMIT 10
-        """)
-        info = cursor.fetchall()
-        print(f"[INSPIRE] DEBUG: No models found. Status/stage combos: {[dict(s) for s in info]}")
+    # Debug logging
+    if debug:
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} models after filtering")
+        if len(rows) == 0:
+            # Show what statuses/stages exist in DB to help diagnose
+            cursor.execute("""
+                SELECT status, stage, COUNT(*) as cnt
+                FROM timrx_app.models
+                WHERE thumbnail_url IS NOT NULL AND thumbnail_url != ''
+                GROUP BY status, stage
+                ORDER BY cnt DESC
+                LIMIT 10
+            """)
+            info = cursor.fetchall()
+            print(f"[INSPIRE] DEBUG: No models matched. Existing status/stage combos: {[dict(s) for s in info]}")
 
     if seed and shuffle:
         rows = _seeded_shuffle(rows, seed + "_models")
@@ -397,6 +403,10 @@ def _transform_to_card(item: Dict, index: int, total_count: int = 24) -> Dict[st
         "tags": _get_tags(item.get("created_at"), item_id),
         "size": size,
     }
+
+    # Add glb_url for models (for 3D viewer loading)
+    if item_type == "model" and item.get("glb_url"):
+        card["glb_url"] = item["glb_url"]
 
     # Add video URL for videos
     if item_type == "video" and item.get("video_url"):
