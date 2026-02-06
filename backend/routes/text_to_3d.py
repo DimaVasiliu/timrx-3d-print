@@ -366,7 +366,8 @@ def text_to_3d_remesh_start_mod():
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         return jsonify({"ok": False, "error": str(e)}), 502
 
-    finalize_job_credits(reservation_id, meshy_task_id, identity_id)
+    # Use internal_job_id (not meshy_task_id) for credit finalization tracking
+    finalize_job_credits(reservation_id, internal_job_id, identity_id)
 
     store_meta = {
         "stage": "preview",
@@ -565,7 +566,8 @@ def text_to_3d_status_mod(job_id: str):
             internal_job_id = meta.get("internal_job_id")
             user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
             if reservation_id:
-                finalize_job_credits(reservation_id, job_id, user_id)
+                # Use internal_job_id (not upstream job_id) for credit finalization tracking
+                finalize_job_credits(reservation_id, internal_job_id or job_id, user_id)
 
             if internal_job_id:
                 _update_job_status_ready(
