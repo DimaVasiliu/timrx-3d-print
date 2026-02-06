@@ -109,7 +109,7 @@ def get_wallet():
         reserved = WalletService.get_reserved_credits(g.identity_id)
         available = max(0, balance - reserved)
 
-        print(f"[CREDITS] Wallet fetch: identity={g.identity_id}, balance={balance}, reserved={reserved}, available={available}")
+        # print(f"[CREDITS] Wallet fetch: identity={g.identity_id}, balance={balance}, reserved={reserved}, available={available}")
 
         return jsonify({
             "ok": True,
