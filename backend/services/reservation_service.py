@@ -189,10 +189,10 @@ class ReservationService:
         # Get the cost for this action
         if amount_override is not None:
             cost_credits = amount_override
-            print(f"[RESERVATION] Using override cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
+            # print(f"[RESERVATION] Using override cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
         else:
             cost_credits = PricingService.get_action_cost(action_key)
-            print(f"[RESERVATION] Looked up cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
+            # print(f"[RESERVATION] Looked up cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
             if cost_credits == 0:
                 raise ValueError(f"Unknown action: {action_key}")
 
@@ -205,7 +205,7 @@ class ReservationService:
             balance = wallet.get("balance_credits", 0) if wallet else 0
             reserved = WalletService.get_reserved_credits(identity_id)
 
-            print(f"[RESERVATION] Idempotent return for job {job_id}, reservation {existing['id']}")
+            # print(f"[RESERVATION] Idempotent return for job {job_id}, reservation {existing['id']}")
             return {
                 "reservation": ReservationService._format_reservation(existing),
                 "balance": balance,
@@ -261,7 +261,7 @@ class ReservationService:
 
             # 3. Check available balance
             available = balance - current_reserved
-            print(f"[RESERVATION] Credit check: action={action_key}, required={cost_credits}, balance={balance}, reserved={current_reserved}, available={available}")
+            # print(f"[RESERVATION] Credit check: action={action_key}, required={cost_credits}, balance={balance}, reserved={current_reserved}, available={available}")
             if available < cost_credits:
                 print(f"[RESERVATION] REJECTED: insufficient credits for {action_key} (need {cost_credits}, have {available})")
                 raise ValueError(
@@ -283,7 +283,7 @@ class ReservationService:
             job_row = fetch_one(cur)
             if not job_row:
                 # Job already existed (idempotent case) - that's fine, FK will be satisfied
-                print(f"[RESERVATION] Job {job_id} already exists, proceeding with reservation")
+                pass  # print(f"[RESERVATION] Job {job_id} already exists, proceeding with reservation")
 
             # 5. Create reservation with ref_job_id pointing to the job
             cur.execute(
@@ -310,11 +310,11 @@ class ReservationService:
             new_reserved = current_reserved + cost_credits
             new_available = balance - new_reserved
 
-            print(
-                f"[RESERVATION] Created: id={reservation['id']}, job={job_id}, "
-                f"action={action_code}, credits={cost_credits}, "
-                f"balance={balance}, reserved={new_reserved}, available={new_available}"
-            )
+            # print(
+            #     f"[RESERVATION] Created: id={reservation['id']}, job={job_id}, "
+            #     f"action={action_code}, credits={cost_credits}, "
+            #     f"balance={balance}, reserved={new_reserved}, available={new_available}"
+            # )
 
             return {
                 "reservation": ReservationService._format_reservation(reservation),
@@ -356,7 +356,7 @@ class ReservationService:
 
             if not reservation:
                 # Idempotent: reservation not found (expired, cleaned up, or never existed)
-                print(f"[RESERVATION] Finalize: not found (idempotent): {reservation_id}")
+                # print(f"[RESERVATION] Finalize: not found (idempotent): {reservation_id}")
                 return {
                     "reservation": None,
                     "not_found": True,
@@ -366,7 +366,7 @@ class ReservationService:
 
             if reservation["status"] == ReservationStatus.FINALIZED:
                 # Idempotent: already finalized
-                print(f"[RESERVATION] Already finalized: {reservation_id}")
+                # print(f"[RESERVATION] Already finalized: {reservation_id}")
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_finalized": True,
@@ -377,7 +377,7 @@ class ReservationService:
             if reservation["status"] == ReservationStatus.RELEASED:
                 # Idempotent: already released (job failed/cancelled before completion)
                 # This can happen if job was cancelled while still processing
-                print(f"[RESERVATION] Finalize skipped: already released: {reservation_id}")
+                # print(f"[RESERVATION] Finalize skipped: already released: {reservation_id}")
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_released": True,
@@ -446,10 +446,10 @@ class ReservationService:
             )
 
             provider = _derive_provider_from_action_code(action_code)
-            print(
-                f"[RESERVATION] Finalized: id={reservation_id}, credits={cost_credits}, "
-                f"balance: {current_balance} -> {new_balance}"
-            )
+            # print(
+            #     f"[RESERVATION] Finalized: id={reservation_id}, credits={cost_credits}, "
+            #     f"balance: {current_balance} -> {new_balance}"
+            # )
 
             return {
                 "reservation": ReservationService._format_reservation(updated),
@@ -497,7 +497,7 @@ class ReservationService:
 
             if not reservation:
                 # Idempotent: reservation not found (expired, cleaned up, or never existed)
-                print(f"[RESERVATION] Not found (idempotent): {reservation_id}")
+                # print(f"[RESERVATION] Not found (idempotent): {reservation_id}")
                 return {
                     "reservation": None,
                     "not_found": True,
@@ -507,7 +507,7 @@ class ReservationService:
 
             if reservation["status"] == ReservationStatus.RELEASED:
                 # Idempotent: already released
-                print(f"[RESERVATION] Already released: {reservation_id}")
+                # print(f"[RESERVATION] Already released: {reservation_id}")
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_released": True,
@@ -518,7 +518,7 @@ class ReservationService:
             if reservation["status"] == ReservationStatus.FINALIZED:
                 # Idempotent: already finalized (job succeeded, credits captured)
                 # This is NOT an error - it means the job actually succeeded
-                print(f"[RESERVATION] Already finalized (job succeeded): {reservation_id}")
+                # print(f"[RESERVATION] Already finalized (job succeeded): {reservation_id}")
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_finalized": True,
@@ -544,10 +544,10 @@ class ReservationService:
             cost_credits = reservation["cost_credits"]
             provider = _derive_provider_from_action_code(action_code)
 
-            print(
-                f"[RESERVATION] Released: id={reservation_id}, reason={reason}, "
-                f"credits={cost_credits} returned to available"
-            )
+            # print(
+            #     f"[RESERVATION] Released: id={reservation_id}, reason={reason}, "
+            #     f"credits={cost_credits} returned to available"
+            # )
 
             return {
                 "reservation": ReservationService._format_reservation(updated),
@@ -584,7 +584,7 @@ class ReservationService:
             count = len(released)
 
             if count > 0:
-                print(f"[RESERVATION] Cleaned up {count} expired reservations")
+                pass  # print(f"[RESERVATION] Cleaned up {count} expired reservations")
 
             return count
 
