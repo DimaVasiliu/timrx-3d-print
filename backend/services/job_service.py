@@ -1580,6 +1580,9 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                         "art_style": payload.get("art_style"),
                         "stage": row["stage"] or payload.get("stage"),
                         "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
+                        # Include parent task IDs for lineage inheritance
+                        "source_task_id": payload.get("source_task_id"),
+                        "preview_task_id": payload.get("preview_task_id"),
                     }
 
                 # Fallback: check models table by upstream_job_id when no history_items found
@@ -1607,6 +1610,36 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                         "art_style": model_meta.get("art_style"),
                         "stage": model_row["stage"] or model_meta.get("stage"),
                         "user_id": str(model_row["identity_id"]) if model_row["identity_id"] else active_user_id,
+                    }
+
+                # Fallback: check timrx_billing.jobs table for metadata (includes source_task_id)
+                cur.execute(
+                    f"""
+                    SELECT id, identity_id, prompt, meta
+                    FROM {Tables.JOBS}
+                    WHERE id::text = %s OR upstream_job_id = %s
+                    LIMIT 1
+                    """,
+                    (job_id, job_id),
+                )
+                jobs_row = cur.fetchone()
+                if jobs_row:
+                    jobs_meta = jobs_row["meta"] if jobs_row["meta"] else {}
+                    if isinstance(jobs_meta, str):
+                        try:
+                            jobs_meta = json.loads(jobs_meta)
+                        except Exception:
+                            jobs_meta = {}
+                    return {
+                        "prompt": jobs_row["prompt"] or jobs_meta.get("prompt"),
+                        "title": jobs_meta.get("title"),
+                        "root_prompt": jobs_meta.get("root_prompt") or jobs_row["prompt"] or jobs_meta.get("prompt"),
+                        "art_style": jobs_meta.get("art_style"),
+                        "stage": jobs_meta.get("stage"),
+                        "user_id": str(jobs_row["identity_id"]) if jobs_row["identity_id"] else active_user_id,
+                        "source_task_id": jobs_meta.get("source_task_id"),
+                        "preview_task_id": jobs_meta.get("preview_task_id"),
+                        "identity_id": str(jobs_row["identity_id"]) if jobs_row["identity_id"] else None,
                     }
 
                 if active_job:
