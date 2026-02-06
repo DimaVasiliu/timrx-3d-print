@@ -54,8 +54,16 @@ class JobStatus:
     """Valid job statuses."""
     QUEUED = "queued"
     PENDING = "pending"
+    PROCESSING = "processing"  # In-progress with progress updates
     SUCCEEDED = "succeeded"
+    READY = "ready"  # Alias for succeeded (frontend compatibility)
     FAILED = "failed"
+
+    # Active statuses (job is still running)
+    ACTIVE_STATUSES = frozenset({"queued", "pending", "processing"})
+
+    # Terminal statuses (job is complete)
+    TERMINAL_STATUSES = frozenset({"succeeded", "ready", "failed"})
 
 
 class JobProvider:
@@ -271,6 +279,394 @@ class JobService:
             "action_code": action_code,
             "cost_credits": cost_credits,
         }
+
+    @staticmethod
+    def create_job_idempotent(
+        identity_id: str,
+        action_key: str,
+        payload: Dict[str, Any],
+        idempotency_key: str,
+        job_type: Optional[str] = None,
+        stage: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a job with idempotency support.
+
+        If a job with the same (identity_id, idempotency_key) already exists,
+        returns it instead of creating a new one. This prevents duplicate jobs
+        from page reloads, double clicks, or network retries.
+
+        Args:
+            identity_id: The user's identity
+            action_key: Frontend action key (e.g., 'text_to_3d_generate')
+            payload: Action-specific payload
+            idempotency_key: Unique key for this user action (UUID from frontend)
+            job_type: Optional job type label (text_to_3d, image_to_3d, etc.)
+            stage: Optional stage (preview, refine, etc.)
+
+        Returns:
+            Dict with job details + 'was_existing' flag:
+            {
+                "job_id": "uuid",
+                "reservation_id": "uuid" or null,
+                "status": "queued|pending|processing|ready|failed",
+                "was_existing": true/false,
+                ...
+            }
+        """
+        if not idempotency_key:
+            # No idempotency key provided, fall back to regular create
+            return {**JobService.create_job(identity_id, action_key, payload), "was_existing": False}
+
+        # Check for existing job with same idempotency key
+        existing_job = query_one(
+            f"""
+            SELECT id, identity_id, provider, action_code, status,
+                   cost_credits, reservation_id, upstream_job_id,
+                   prompt, meta, error_message, progress, result_refs,
+                   created_at, updated_at
+            FROM {Tables.JOBS}
+            WHERE identity_id = %s AND idempotency_key = %s
+            """,
+            (identity_id, idempotency_key),
+        )
+
+        if existing_job:
+            # Job already exists - return it
+            job = JobService._format_job(existing_job)
+            print(f"[JOB] Idempotent: returning existing job={job['id']} for idempotency_key={idempotency_key}")
+            return {
+                "job_id": job["id"],
+                "reservation_id": job.get("reservation_id"),
+                "upstream_job_id": job.get("upstream_job_id"),
+                "status": job["status"],
+                "provider": job["provider"],
+                "action_code": job["action_code"],
+                "cost_credits": job["cost_credits"],
+                "progress": job.get("meta", {}).get("progress", 0) if job.get("meta") else 0,
+                "was_existing": True,
+            }
+
+        # No existing job - create new one with idempotency key
+        # Validate action
+        provider = ACTION_PROVIDER_MAP.get(action_key)
+        if not provider:
+            raise ValueError(f"Unknown action: {action_key}")
+
+        # Get DB action code
+        action_code = PricingService.get_db_action_code(action_key)
+        if not action_code:
+            action_code = PricingService.map_job_type_to_action(action_key)
+
+        # Get cost for this action
+        cost_credits = PricingService.get_action_cost(action_key)
+        if cost_credits == 0:
+            raise ValueError(f"No cost defined for action: {action_key}")
+
+        # Extract prompt for storage
+        prompt = payload.get("prompt", "")
+
+        # Build job meta
+        job_meta = {"payload": payload}
+
+        job_id = None
+        try:
+            # Create job with idempotency key in a transaction
+            with transaction() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.JOBS}
+                    (identity_id, provider, action_code, status, cost_credits, prompt, meta,
+                     idempotency_key, job_type, stage)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (identity_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+                    DO UPDATE SET updated_at = NOW()
+                    RETURNING id, (xmax = 0) AS inserted
+                    """,
+                    (
+                        identity_id,
+                        provider,
+                        action_code,
+                        JobStatus.QUEUED,
+                        cost_credits,
+                        prompt,
+                        json.dumps(job_meta),
+                        idempotency_key,
+                        job_type or action_key,
+                        stage,
+                    ),
+                )
+                result = fetch_one(cur)
+                job_id = str(result["id"])
+                was_inserted = result.get("inserted", True)
+
+            if not was_inserted:
+                # Race condition - job was created by another request
+                existing = JobService.get_job(job_id)
+                if existing:
+                    print(f"[JOB] Idempotent race: returning job={job_id}")
+                    return {
+                        "job_id": job_id,
+                        "reservation_id": existing.get("reservation_id"),
+                        "upstream_job_id": existing.get("upstream_job_id"),
+                        "status": existing["status"],
+                        "provider": existing["provider"],
+                        "action_code": existing["action_code"],
+                        "cost_credits": existing["cost_credits"],
+                        "was_existing": True,
+                    }
+
+        except Exception as e:
+            # Check if it's a unique violation - another request created the job
+            if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                existing = query_one(
+                    f"SELECT * FROM {Tables.JOBS} WHERE identity_id = %s AND idempotency_key = %s",
+                    (identity_id, idempotency_key),
+                )
+                if existing:
+                    job = JobService._format_job(existing)
+                    return {
+                        "job_id": job["id"],
+                        "reservation_id": job.get("reservation_id"),
+                        "upstream_job_id": job.get("upstream_job_id"),
+                        "status": job["status"],
+                        "provider": job["provider"],
+                        "action_code": job["action_code"],
+                        "cost_credits": job["cost_credits"],
+                        "was_existing": True,
+                    }
+            raise
+
+        # Reserve credits
+        reservation_id = None
+        try:
+            reservation_result = ReservationService.reserve_credits(
+                identity_id=identity_id,
+                action_key=action_key,
+                job_id=job_id,
+                meta={"action_key": action_key, "provider": provider, "idempotency_key": idempotency_key},
+            )
+            reservation_id = reservation_result["reservation"]["id"]
+        except ValueError as e:
+            execute(
+                f"UPDATE {Tables.JOBS} SET status = %s, error_message = %s WHERE id = %s",
+                (JobStatus.FAILED, str(e), job_id),
+            )
+            raise
+
+        # Update job with reservation_id
+        execute(
+            f"UPDATE {Tables.JOBS} SET reservation_id = %s WHERE id = %s",
+            (reservation_id, job_id),
+        )
+
+        print(
+            f"[JOB] Created idempotent job={job_id}, idempotency_key={idempotency_key}, "
+            f"provider={provider}, action={action_code}, credits={cost_credits}"
+        )
+
+        return {
+            "job_id": job_id,
+            "reservation_id": reservation_id,
+            "upstream_job_id": None,  # Will be set when dispatch completes
+            "status": JobStatus.QUEUED,
+            "provider": provider,
+            "action_code": action_code,
+            "cost_credits": cost_credits,
+            "was_existing": False,
+        }
+
+    @staticmethod
+    def get_active_jobs_for_identity(
+        identity_id: str,
+        limit: int = 50,
+    ) -> list:
+        """
+        Get all active (queued/pending/processing) jobs for an identity.
+
+        Used for job recovery on page load - allows frontend to reconnect
+        to jobs that are still running.
+
+        Returns:
+            List of job dicts with status, progress, and result info
+        """
+        jobs = query_all(
+            f"""
+            SELECT id, identity_id, provider, action_code, status,
+                   cost_credits, reservation_id, upstream_job_id,
+                   prompt, meta, error_message, job_type, stage,
+                   progress, result_refs, created_at, updated_at
+            FROM {Tables.JOBS}
+            WHERE identity_id = %s
+              AND status IN ('queued', 'pending', 'processing')
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (identity_id, limit),
+        )
+
+        result = []
+        for job in jobs:
+            formatted = JobService._format_job(job)
+            # Add extra fields for frontend
+            formatted["job_type"] = job.get("job_type")
+            formatted["stage"] = job.get("stage")
+            formatted["progress"] = job.get("progress", 0)
+            formatted["result_refs"] = job.get("result_refs") or {}
+            result.append(formatted)
+
+        return result
+
+    @staticmethod
+    def update_job_progress(
+        job_id: str,
+        progress: int,
+        status: Optional[str] = None,
+        meta_updates: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Update job progress and optionally status/meta.
+
+        Used by polling loops to update progress as provider reports it.
+        """
+        if not USE_DB:
+            return False
+
+        try:
+            updates = ["progress = %s", "updated_at = NOW()"]
+            params = [min(100, max(0, progress))]
+
+            if status:
+                updates.append("status = %s")
+                params.append(status)
+
+            if meta_updates:
+                updates.append("meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb")
+                params.append(json.dumps(meta_updates))
+
+            params.append(job_id)
+
+            execute(
+                f"UPDATE {Tables.JOBS} SET {', '.join(updates)} WHERE id = %s",
+                tuple(params),
+            )
+            return True
+        except Exception as e:
+            print(f"[JOB] Error updating progress for {job_id}: {e}")
+            return False
+
+    @staticmethod
+    def get_stale_jobs(
+        stale_minutes: int = 10,
+        limit: int = 50,
+    ) -> list:
+        """
+        Get jobs that may be stale (pending/processing but not updated recently).
+
+        These jobs may have been interrupted by a server restart or network issue.
+        They should be checked against their provider for current status.
+
+        Args:
+            stale_minutes: Jobs not updated in this many minutes are considered stale
+            limit: Max jobs to return
+
+        Returns:
+            List of stale job dicts with upstream_job_id for provider polling
+        """
+        jobs = query_all(
+            f"""
+            SELECT id, identity_id, provider, action_code, status,
+                   upstream_job_id, reservation_id, created_at, updated_at
+            FROM {Tables.JOBS}
+            WHERE status IN ('pending', 'processing')
+              AND upstream_job_id IS NOT NULL
+              AND updated_at < NOW() - INTERVAL '%s minutes'
+            ORDER BY updated_at ASC
+            LIMIT %s
+            """,
+            (stale_minutes, limit),
+        )
+        return [JobService._format_job(job) for job in jobs]
+
+    @staticmethod
+    def recover_stale_job(
+        job_id: str,
+        provider_status: str,
+        progress: int = 0,
+        error_message: Optional[str] = None,
+        result_refs: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Recover a stale job based on provider status check.
+
+        Called after polling the provider for the actual status of a stale job.
+        Updates job to match provider state, handles credit finalization/release.
+
+        Args:
+            job_id: The internal job ID
+            provider_status: Status from provider ('done', 'processing', 'failed', etc.)
+            progress: Progress percentage from provider
+            error_message: Error message if failed
+            result_refs: Result references (model_id, image_url, etc.)
+
+        Returns:
+            Updated job dict or None if job not found
+        """
+        job = JobService.get_job(job_id)
+        if not job:
+            return None
+
+        # Map provider status to our status
+        status_map = {
+            "done": JobStatus.SUCCEEDED,
+            "succeeded": JobStatus.SUCCEEDED,
+            "ready": JobStatus.SUCCEEDED,
+            "completed": JobStatus.SUCCEEDED,
+            "failed": JobStatus.FAILED,
+            "error": JobStatus.FAILED,
+            "cancelled": JobStatus.FAILED,
+            "processing": JobStatus.PROCESSING,
+            "pending": JobStatus.PENDING,
+            "queued": JobStatus.QUEUED,
+        }
+        new_status = status_map.get(provider_status.lower(), JobStatus.PROCESSING)
+
+        # Only update if status changed or progress increased
+        current_status = job.get("status")
+        if current_status in [JobStatus.SUCCEEDED, JobStatus.FAILED]:
+            # Already terminal - don't change
+            return job
+
+        reservation_id = job.get("reservation_id")
+
+        # Update job based on provider status
+        if new_status == JobStatus.SUCCEEDED:
+            # Job completed - finalize credits
+            try:
+                JobService.complete_job(job_id, success=True)
+            except Exception as e:
+                print(f"[JOB] Error completing stale job {job_id}: {e}")
+
+            # Update result refs if provided
+            if result_refs:
+                execute(
+                    f"UPDATE {Tables.JOBS} SET result_refs = %s, finished_at = NOW() WHERE id = %s",
+                    (json.dumps(result_refs), job_id),
+                )
+
+        elif new_status == JobStatus.FAILED:
+            # Job failed - release credits
+            try:
+                JobService.complete_job(job_id, success=False, error_message=error_message)
+            except Exception as e:
+                print(f"[JOB] Error failing stale job {job_id}: {e}")
+
+        else:
+            # Still processing - just update progress
+            JobService.update_job_progress(job_id, progress, new_status)
+
+        print(f"[JOB] Recovered stale job={job_id}: {current_status} -> {new_status}")
+        return JobService.get_job(job_id)
 
     # ─────────────────────────────────────────────────────────────
     # Provider Dispatch
