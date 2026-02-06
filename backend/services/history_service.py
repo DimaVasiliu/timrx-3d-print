@@ -1468,7 +1468,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             if final_thumbnail_url:
                 payload["thumbnail_url"] = final_thumbnail_url
 
-            final_title = derive_display_title(job_meta.get("prompt"), job_meta.get("title"))
+            final_title = derive_display_title(
+                job_meta.get("prompt"),
+                job_meta.get("title"),
+                root_prompt=job_meta.get("root_prompt"),
+            )
             glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
             thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
             image_s3_key = None
