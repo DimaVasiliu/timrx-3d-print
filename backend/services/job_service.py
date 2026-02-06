@@ -1,4 +1,3 @@
-
 """
 Job Service - Manages job creation and dispatch to upstream providers.
 
@@ -273,10 +272,10 @@ class JobService:
             (upstream_job_id, JobStatus.PENDING, job_id),
         )
 
-        print(
-            f"[JOB] Created job={job_id}, upstream={upstream_job_id}, "
-            f"provider={provider}, action={action_code}, credits={cost_credits}"
-        )
+        # print(
+        #     f"[JOB] Created job={job_id}, upstream={upstream_job_id}, "
+        #     f"provider={provider}, action={action_code}, credits={cost_credits}"
+        # )
 
         return {
             "job_id": job_id,
@@ -342,7 +341,7 @@ class JobService:
         if existing_job:
             # Job already exists - return it
             job = JobService._format_job(existing_job)
-            print(f"[JOB] Idempotent: returning existing job={job['id']} for idempotency_key={idempotency_key}")
+            # print(f"[JOB] Idempotent: returning existing job={job['id']} for idempotency_key={idempotency_key}")
             return {
                 "job_id": job["id"],
                 "reservation_id": job.get("reservation_id"),
@@ -412,7 +411,7 @@ class JobService:
                 # Race condition - job was created by another request
                 existing = JobService.get_job(job_id)
                 if existing:
-                    print(f"[JOB] Idempotent race: returning job={job_id}")
+                    # print(f"[JOB] Idempotent race: returning job={job_id}")
                     return {
                         "job_id": job_id,
                         "reservation_id": existing.get("reservation_id"),
@@ -468,10 +467,10 @@ class JobService:
             (reservation_id, job_id),
         )
 
-        print(
-            f"[JOB] Created idempotent job={job_id}, idempotency_key={idempotency_key}, "
-            f"provider={provider}, action={action_code}, credits={cost_credits}"
-        )
+        # print(
+        #     f"[JOB] Created idempotent job={job_id}, idempotency_key={idempotency_key}, "
+        #     f"provider={provider}, action={action_code}, credits={cost_credits}"
+        # )
 
         return {
             "job_id": job_id,
@@ -673,7 +672,7 @@ class JobService:
             # Still processing - just update progress
             JobService.update_job_progress(job_id, progress, new_status)
 
-        print(f"[JOB] Recovered stale job={job_id}: {current_status} -> {new_status}")
+        # print(f"[JOB] Recovered stale job={job_id}: {current_status} -> {new_status}")
         return JobService.get_job(job_id)
 
     # ─────────────────────────────────────────────────────────────
@@ -720,8 +719,8 @@ class JobService:
         url = f"{base_url}{endpoint}"
         headers = JobService._meshy_auth_headers()
 
-        print(f"[JOB] Dispatching to Meshy: {url}")
-        print(f"[JOB] Payload: {json.dumps(meshy_payload)[:500]}")
+        # print(f"[JOB] Dispatching to Meshy: {url}")
+        # print(f"[JOB] Payload: {json.dumps(meshy_payload)[:500]}")
 
         resp = requests.post(url, headers=headers, json=meshy_payload, timeout=60)
 
@@ -814,7 +813,7 @@ class JobService:
         url = "https://api.openai.com/v1/images/generations"
         headers = JobService._openai_auth_headers()
 
-        print(f"[JOB] Dispatching to OpenAI: {url}")
+        # print(f"[JOB] Dispatching to OpenAI: {url}")
 
         resp = requests.post(url, headers=headers, json=openai_payload, timeout=60)
 
@@ -979,7 +978,7 @@ class JobService:
         # Idempotency check: if already completed with same status, return existing
         if current_status in [JobStatus.SUCCEEDED, JobStatus.FAILED]:
             if current_status == new_status:
-                print(f"[JOB] Idempotent: job={job_id} already {current_status}")
+                # print(f"[JOB] Idempotent: job={job_id} already {current_status}")
                 return {
                     "job": job,
                     "was_already_completed": True,
@@ -1007,9 +1006,9 @@ class JobService:
                     ReservationService.release_reservation(reservation_id, reason=error_message or "job_failed")
             except ValueError as e:
                 # Reservation already finalized/released - that's OK (idempotent)
-                print(f"[JOB] Reservation {reservation_id} handling note: {e}")
+                pass  # print(f"[JOB] Reservation {reservation_id} handling note: {e}")
 
-        print(f"[JOB] Completed job={job_id}, success={success}, reservation={reservation_id}")
+        # print(f"[JOB] Completed job={job_id}, success={success}, reservation={reservation_id}")
 
         return {
             "job": JobService.get_job(job_id),
@@ -1044,7 +1043,7 @@ class JobService:
         """
         job = JobService.get_job_by_upstream_id(provider, upstream_job_id)
         if not job:
-            print(f"[JOB] No job found for {provider}:{upstream_job_id} - may be legacy job")
+            # print(f"[JOB] No job found for {provider}:{upstream_job_id} - may be legacy job")
             return None
 
         return JobService.complete_job(
@@ -1107,7 +1106,7 @@ class JobService:
                 credits_returned = job.get("cost_credits", 0)
             except ValueError as e:
                 # Reservation already released - that's OK
-                print(f"[JOB] Reservation {reservation_id} release note: {e}")
+                pass  # print(f"[JOB] Reservation {reservation_id} release note: {e}")
 
         # Update job status to failed with cancellation reason
         JobService.update_job_status(
@@ -1116,7 +1115,7 @@ class JobService:
             error_message=f"Cancelled: {reason}",
         )
 
-        print(f"[JOB] Cancelled job={job_id}, reason={reason}, credits_returned={credits_returned}")
+        # print(f"[JOB] Cancelled job={job_id}, reason={reason}, credits_returned={credits_returned}")
 
         return {
             "job": JobService.get_job(job_id),
@@ -1982,7 +1981,7 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                     )
             conn.commit()
     except Exception as e:
-        print(f"[JOB] ERROR marking job {internal_job_id} as ready: {e}")
+        # print(f"[JOB] ERROR marking job {internal_job_id} as ready: {e}")
 
 
 def _update_job_status_failed(internal_job_id, error_message):
@@ -2001,4 +2000,4 @@ def _update_job_status_failed(internal_job_id, error_message):
                 )
             conn.commit()
     except Exception as e:
-        print(f"[JOB] ERROR marking job {internal_job_id} as failed: {e}")
+        # print(f"[JOB] ERROR marking job {internal_job_id} as failed: {e}")
