@@ -237,8 +237,8 @@ def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> Lis
     return [dict(r) for r in rows]
 
 
-def _transform_to_card(item: Dict, index: int) -> Dict[str, Any]:
-    """Transform a DB row into an inspire card."""
+def _transform_to_card(item: Dict, index: int, total_count: int = 24) -> Dict[str, Any]:
+    """Transform a DB row into an inspire card with size variety."""
     item_id = item.get("id", "")
     item_type = item.get("type", "model")
     thumb_url = item.get("thumb_url", "")
@@ -246,6 +246,22 @@ def _transform_to_card(item: Dict, index: int) -> Dict[str, Any]:
     # Skip items without thumbnails
     if not thumb_url:
         return None
+
+    # Determine card size for visual variety
+    # - Videos default to lg
+    # - First 1-2 non-video cards can be lg based on hash
+    # - Rest are sm or md
+    if item_type == "video":
+        size = "lg"
+    else:
+        # Use item hash for stable size assignment
+        hash_val = int(hashlib.md5(item_id.encode()).hexdigest(), 16)
+        if index < 3 and hash_val % 8 == 0:  # ~12.5% of first 3 items get lg
+            size = "lg"
+        elif hash_val % 3 == 0:  # ~33% get md
+            size = "md"
+        else:
+            size = "sm"
 
     card = {
         "id": f"ins-{item_type[0]}-{item_id}",
@@ -255,6 +271,7 @@ def _transform_to_card(item: Dict, index: int) -> Dict[str, Any]:
         "thumb_url": thumb_url,
         "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
         "tags": _get_tags(item.get("created_at"), item_id),
+        "size": size,
     }
 
     # Add asset URL if available
@@ -296,14 +313,20 @@ def inspire_feed() -> Response:
     """
     # Handle CORS preflight
     if request.method == "OPTIONS":
-        return Response("", status=204)
+        response = Response("", status=204)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        return response
 
     # Check database availability
     if not USE_DB:
-        return jsonify({
+        response = jsonify({
             "ok": False,
             "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}
-        }), 503
+        })
+        response.headers["Content-Type"] = "application/json"
+        return response, 503
 
     try:
         # Parse query parameters
@@ -321,12 +344,14 @@ def inspire_feed() -> Response:
 
             # Determine how many of each type to fetch
             if filter_type == "all":
-                # Balanced: fetch ceil(limit/3) of each type
-                per_type = ceil(limit / 3)
+                # Balanced distribution: ~40% models, ~40% images, ~20% videos
+                model_target = ceil(limit * 0.4)
+                image_target = ceil(limit * 0.4)
+                video_target = max(1, ceil(limit * 0.2))
 
-                models = _fetch_models(cursor, per_type, shuffle, seed)
-                images = _fetch_images(cursor, per_type, shuffle, seed)
-                videos = _fetch_videos(cursor, per_type, shuffle, seed)
+                models = _fetch_models(cursor, model_target + 5, shuffle, seed)  # fetch extra to handle missing
+                images = _fetch_images(cursor, image_target + 5, shuffle, seed)
+                videos = _fetch_videos(cursor, video_target + 3, shuffle, seed)
 
                 if mix_strategy == "balanced":
                     # Interleave for even distribution
@@ -355,30 +380,41 @@ def inspire_feed() -> Response:
 
         # Transform to cards and trim to limit
         cards = []
+        seen_ids = set()
         for idx, item in enumerate(items):
             if len(cards) >= limit:
                 break
-            card = _transform_to_card(item, idx)
+            # Skip duplicates
+            item_id = item.get("id", "")
+            if item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+
+            card = _transform_to_card(item, idx, limit)
             if card:
                 cards.append(card)
 
-        return jsonify({
+        response = jsonify({
             "ok": True,
             "prompt_of_the_day": potd,
             "cards": cards,
             "total": len(cards),
             "source": "inspire"
         })
+        response.headers["Content-Type"] = "application/json"
+        return response
 
     except Exception as e:
         print(f"[INSPIRE] Error in feed: {e}")
         import traceback
         traceback.print_exc()
 
-        return jsonify({
+        response = jsonify({
             "ok": False,
             "error": {"code": "SERVER_ERROR", "message": str(e)}
-        }), 500
+        })
+        response.headers["Content-Type"] = "application/json"
+        return response, 500
 
 
 @bp.route("/inspire/shuffle", methods=["GET", "OPTIONS"])
