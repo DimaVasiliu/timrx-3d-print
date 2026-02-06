@@ -1678,6 +1678,28 @@ def verify_job_ownership(job_id: str, identity_id: str) -> bool:
     return result["authorized"]
 
 
+def _debug_table_columns(cur, table_name: str) -> None:
+    """Debug helper: print columns for a table (only when DEBUG_SCHEMA=1)."""
+    if not os.getenv("DEBUG_SCHEMA"):
+        return
+    try:
+        # Extract schema and table from qualified name (e.g., "timrx_app.models")
+        parts = table_name.split(".")
+        schema = parts[0] if len(parts) > 1 else "public"
+        table = parts[-1]
+        cur.execute("""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position
+        """, (schema, table))
+        cols = cur.fetchall()
+        col_names = [c[0] for c in cols]
+        print(f"[DEBUG_SCHEMA] {table_name} columns: {col_names}")
+    except Exception as e:
+        print(f"[DEBUG_SCHEMA] Failed to get columns for {table_name}: {e}")
+
+
 def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
     """
     Verify job ownership with detailed result for proper HTTP status codes.
@@ -1718,13 +1740,23 @@ def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Debug: print table columns if DEBUG_SCHEMA=1
+                _debug_table_columns(cur, Tables.ACTIVE_JOBS)
+                _debug_table_columns(cur, Tables.JOBS)
+                _debug_table_columns(cur, Tables.MODELS)
+                _debug_table_columns(cur, Tables.HISTORY_ITEMS)
+
                 # Check all tables where jobs might exist
-                # Use COALESCE to handle different column names for identity
+                # Note: Each table has different column names:
+                # - active_jobs: id, upstream_job_id, identity_id
+                # - jobs: id, upstream_job_id, identity_id
+                # - models: id, upstream_job_id, identity_id (some may have upstream_id)
+                # - history_items: id, identity_id, lineage_origin_id, payload (JSONB with original_job_id, job_id)
                 cur.execute(
                     f"""
                     SELECT identity_id, 'active_jobs' as source
                     FROM {Tables.ACTIVE_JOBS}
-                    WHERE upstream_job_id = %s OR id::text = %s
+                    WHERE id::text = %s OR upstream_job_id = %s
 
                     UNION ALL
 
@@ -1736,14 +1768,14 @@ def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
 
                     SELECT identity_id, 'models' as source
                     FROM {Tables.MODELS}
-                    WHERE upstream_job_id = %s OR id::text = %s
+                    WHERE id::text = %s OR upstream_job_id = %s
 
                     UNION ALL
 
                     SELECT identity_id, 'history_items' as source
                     FROM {Tables.HISTORY_ITEMS}
                     WHERE id::text = %s
-                       OR upstream_job_id = %s
+                       OR lineage_origin_id::text = %s
                        OR payload->>'original_job_id' = %s
                        OR payload->>'job_id' = %s
 
