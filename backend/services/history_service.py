@@ -805,7 +805,7 @@ def save_image_to_normalized_db(
                     raise RuntimeError("[DB] Failed to upsert images row (no id returned)")
                 # image_row is a dict due to connection's default row_factory=dict_row
                 returned_image_id = image_row["id"]
-                print(f"[DB] image persisted: image_id={returned_image_id} image_url={image_url} thumb={image_url}")
+                # print(f"[DB] image persisted: image_id={returned_image_id} image_url={image_url} thumb={image_url}")
 
                 if existing_history_id:
                     cur.execute(
@@ -901,7 +901,7 @@ def save_image_to_normalized_db(
                         ),
                     )
             conn.commit()
-        print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
+        # print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
@@ -1063,7 +1063,7 @@ def save_video_to_normalized_db(
                 if not video_row:
                     raise RuntimeError("[DB] Failed to upsert videos row (no id returned)")
                 returned_video_id = video_row["id"]
-                print(f"[DB] video persisted: video_id={returned_video_id} video_url={final_video_url}")
+                # print(f"[DB] video persisted: video_id={returned_video_id} video_url={final_video_url}")
 
                 # Insert or update history_items
                 if existing_history_id:
@@ -1157,7 +1157,7 @@ def save_video_to_normalized_db(
                         ),
                     )
             conn.commit()
-        print(f"[DB] Saved video {video_id} -> {history_uuid} to normalized tables (user_id={user_id})")
+        # print(f"[DB] Saved video {video_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_video_id
     except Exception as e:
         print(f"[DB] Failed to save video {video_id}: {e}")
@@ -1259,7 +1259,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 asset_type = existing_history.get("item_type") or ("image" if job_type in ("image", "openai_image") else "model")
                 asset_url = existing_history.get("image_url") if asset_type == "image" else existing_history.get("glb_url")
                 if existing_history.get("status") == "finished" and is_s3_url(asset_url):
-                    print(f"[DB] save_finished_job skipped: already finished with S3 (job_id={job_id}, stage={final_stage})")
+                    # print(f"[DB] save_finished_job skipped: already finished with S3 (job_id={job_id}, stage={final_stage})")
                     cur.close()
                     return {"success": True, "db_ok": True, "skipped": True}
 
@@ -1275,9 +1275,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 )
                 existing_save = cur.fetchone()
                 if existing_save and existing_save.get("stage") == final_stage and existing_save.get("canonical_url"):
-                    print(
-                        f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})"
-                    )
+                    # print(
+                    #     f"[DB] save_finished_job skipped: already saved (provider={provider}, job_id={job_id}, stage={final_stage})"
+                    # )
                     cur.close()
                     return {"success": True, "db_ok": len(db_errors) == 0, "db_errors": db_errors or None, "skipped": True}
             except Exception as e:
@@ -1291,7 +1291,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             job_key = str(job_id)
             s3_key_name = s3_name_safe
 
-            print(f"[DB] save_finished_job: job_id={job_id}, job_type={job_type}")
+            # print(f"[DB] save_finished_job: job_id={job_id}, job_type={job_type}")
 
             model_content_hash = None
             model_s3_key_from_upload = None
@@ -1427,10 +1427,10 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             try:
                 uuid.UUID(str(job_id))
                 history_uuid = str(job_id)
-                print(f"[DB] Using job_id as history UUID: {history_uuid}")
+                # print(f"[DB] Using job_id as history UUID: {history_uuid}")
             except (ValueError, TypeError):
                 history_uuid = str(uuid.uuid4())
-                print(f"[DB] Generated new history UUID: {history_uuid} (job_id {job_id} not a valid UUID)")
+                # print(f"[DB] Generated new history UUID: {history_uuid} (job_id {job_id} not a valid UUID)")
 
             payload = {
                 "original_job_id": job_id,
@@ -2160,26 +2160,26 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             Bucket=AWS_BUCKET_MODELS,
                             Delete={"Objects": [{"Key": key} for key in cleanup_keys]},
                         )
-                        print(f"[S3] cleanup: deleted {len(cleanup_keys)} objects after DB failure")
+                        pass  # print(f"[S3] cleanup: deleted {len(cleanup_keys)} objects after DB failure")
                     except Exception as cleanup_err:
-                        print(f"[S3] cleanup failed: {cleanup_err}; keys={cleanup_keys}")
+                        print(f"[S3] cleanup failed: {cleanup_err}")
                 else:
-                    print(f"[S3] cleanup skipped; keys={cleanup_keys}")
+                    pass  # print(f"[S3] cleanup skipped; keys={cleanup_keys}")
 
             cur.close()
             conn.commit()
-        if db_save_ok and history_item_id:
-            if model_id:
-                print(f"[DB] model persisted: model_id={model_id} glb_url={final_glb_url} history_item_id={history_item_id}")
-            if image_id:
-                print(f"[DB] image persisted: image_id={image_id} image_url={image_url} history_item_id={history_item_id}")
-        if db_save_ok and model_log_info is not None:
-            print(f"[S3] model stored: key={model_log_info['key']} hash={model_log_info['hash']} reused={model_log_info['reused']}")
-        if db_save_ok and image_log_info is not None:
-            print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
-        if db_save_ok:
-            print(f"[DB] Saved finished job {job_id} -> {history_uuid} to normalized tables")
-        else:
+        # if db_save_ok and history_item_id:
+        #     if model_id:
+        #         print(f"[DB] model persisted: model_id={model_id} glb_url={final_glb_url} history_item_id={history_item_id}")
+        #     if image_id:
+        #         print(f"[DB] image persisted: image_id={image_id} image_url={image_url} history_item_id={history_item_id}")
+        # if db_save_ok and model_log_info is not None:
+        #     print(f"[S3] model stored: key={model_log_info['key']} hash={model_log_info['hash']} reused={model_log_info['reused']}")
+        # if db_save_ok and image_log_info is not None:
+        #     print(f"[S3] image stored: key={image_log_info['key']} hash={image_log_info['hash']} reused={image_log_info['reused']}")
+        # if db_save_ok:
+        #     print(f"[DB] Saved finished job {job_id} -> {history_uuid} to normalized tables")
+        if not db_save_ok:
             print(f"[DB] save_finished_job completed with db_ok=False job_id={job_id}")
 
         return {
