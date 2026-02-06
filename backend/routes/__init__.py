@@ -116,4 +116,4 @@ def register_blueprints(app):
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
 
     # Temporarily enable route map to debug inspire registration
-    _print_route_map(app)
+    # _print_route_map(app)
