@@ -18,7 +18,7 @@ from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
-from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership
+from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -206,8 +206,11 @@ def mesh_remesh_status_mod(job_id: str):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
-        return jsonify({"error": "Job not found or access denied"}), 404
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
 
     try:
         ms = mesh_get(f"/openapi/v1/remesh/{job_id}")
@@ -225,16 +228,21 @@ def mesh_remesh_status_mod(job_id: str):
             meta["user_id"] = identity_id
 
         source_id = meta.get("source_task_id") or out.get("source_task_id")
+        source_meta = None  # Initialize before conditional to prevent undefined access
         if source_id and (not meta.get("prompt") or not meta.get("title")):
             source_meta = get_job_metadata(source_id, store)
-            if not meta.get("prompt"):
-                meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
-            if not meta.get("root_prompt"):
-                meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
+            if source_meta:
+                if not meta.get("prompt"):
+                    meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
+                if not meta.get("root_prompt"):
+                    meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
 
-        if not meta.get("title"):
-            prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else "Remeshed Model"
+        if not meta.get("title") or is_generic_title(meta.get("title")):
+            meta["title"] = derive_display_title(
+                meta.get("prompt"),
+                source_meta.get("title") if source_meta else None,
+                root_prompt=meta.get("root_prompt"),
+            )
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="remesh", user_id=user_id)
@@ -413,8 +421,11 @@ def mesh_retexture_status_mod(job_id: str):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
-        return jsonify({"error": "Job not found or access denied"}), 404
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
 
     try:
         ms = mesh_get(f"/openapi/v1/retexture/{job_id}")
@@ -432,12 +443,14 @@ def mesh_retexture_status_mod(job_id: str):
             meta["user_id"] = identity_id
 
         source_id = meta.get("source_task_id") or out.get("source_task_id")
+        source_meta = None  # Initialize before conditional
         if source_id and (not meta.get("prompt") or not meta.get("title")):
             source_meta = get_job_metadata(source_id, store)
-            if not meta.get("prompt"):
-                meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
-            if not meta.get("root_prompt"):
-                meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
+            if source_meta:
+                if not meta.get("prompt"):
+                    meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
+                if not meta.get("root_prompt"):
+                    meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
 
         if not meta.get("title") or is_generic_title(meta.get("title")):
             # derive_display_title handles generic titles automatically
@@ -616,8 +629,11 @@ def mesh_rigging_status_mod(job_id: str):
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     identity_id = g.identity_id
-    if not verify_job_ownership(job_id, identity_id):
-        return jsonify({"error": "Job not found or access denied"}), 404
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
 
     try:
         ms = mesh_get(f"/openapi/v1/rigging/{job_id}")
@@ -635,16 +651,21 @@ def mesh_rigging_status_mod(job_id: str):
             meta["user_id"] = identity_id
 
         source_id = meta.get("source_task_id") or out.get("source_task_id")
+        source_meta = None  # Initialize before conditional to prevent undefined access
         if source_id and (not meta.get("prompt") or not meta.get("title")):
             source_meta = get_job_metadata(source_id, store)
-            if not meta.get("prompt"):
-                meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
-            if not meta.get("root_prompt"):
-                meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
+            if source_meta:
+                if not meta.get("prompt"):
+                    meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
+                if not meta.get("root_prompt"):
+                    meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
 
-        if not meta.get("title"):
-            prompt_for_title = meta.get("prompt") or meta.get("root_prompt") or ""
-            meta["title"] = derive_display_title(prompt_for_title, None) if prompt_for_title else source_meta.get("title") or "Rigged Model"
+        if not meta.get("title") or is_generic_title(meta.get("title")):
+            meta["title"] = derive_display_title(
+                meta.get("prompt"),
+                source_meta.get("title") if source_meta else None,
+                root_prompt=meta.get("root_prompt"),
+            )
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="rig", user_id=user_id)
