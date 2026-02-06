@@ -1,6 +1,7 @@
 """Utility helpers for the modular backend."""
 
 from .helpers import (
+    GENERIC_TITLES,
     build_canonical_url,
     clamp_int,
     compute_sha256,
@@ -8,6 +9,7 @@ from .helpers import (
     get_content_type_for_extension,
     get_content_type_from_url,
     get_extension_for_content_type,
+    is_generic_title,
     log_db_continue,
     log_generation_event,
     normalize_epoch_ms,
@@ -19,6 +21,7 @@ from .helpers import (
 )
 
 __all__ = [
+    "GENERIC_TITLES",
     "build_canonical_url",
     "clamp_int",
     "compute_sha256",
@@ -26,6 +29,7 @@ __all__ = [
     "get_content_type_for_extension",
     "get_content_type_from_url",
     "get_extension_for_content_type",
+    "is_generic_title",
     "log_db_continue",
     "log_generation_event",
     "normalize_epoch_ms",
