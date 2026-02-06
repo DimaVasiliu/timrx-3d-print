@@ -123,10 +123,9 @@ def mesh_remesh_mod():
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    # Use explicit title, or derive from prompt, or fall back to source model's title
-    title = body.get("title") or derive_display_title(original_prompt, None) if original_prompt else source_meta.get("title")
-    if not title or title == "Untitled":
-        title = source_meta.get("title") or "Remeshed Model"
+    # Derive title - derive_display_title handles generic titles automatically
+    explicit_title = body.get("title") or source_meta.get("title")
+    title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
 
     job_meta = {
         "prompt": original_prompt,
@@ -552,10 +551,9 @@ def mesh_rigging_mod():
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
-    # Use explicit title, or derive from prompt, or fall back to source model's title
-    title = body.get("title") or derive_display_title(original_prompt, None) if original_prompt else source_meta.get("title")
-    if not title or title == "Untitled":
-        title = source_meta.get("title") or "Rigged Model"
+    # Derive title - derive_display_title handles generic titles automatically
+    explicit_title = body.get("title") or source_meta.get("title")
+    title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
 
     job_meta = {
         "prompt": original_prompt,
