@@ -255,7 +255,8 @@ def image_to_3d_status_mod(job_id: str):
             reservation_id = meta.get("reservation_id")
             internal_job_id = meta.get("internal_job_id")
             if reservation_id:
-                finalize_job_credits(reservation_id, meshy_job_id, user_id)
+                # Use internal_job_id (not meshy_job_id) for credit finalization tracking
+                finalize_job_credits(reservation_id, internal_job_id or meshy_job_id, user_id)
 
             if internal_job_id:
                 _update_job_status_ready(
@@ -293,7 +294,8 @@ def image_to_3d_status_mod(job_id: str):
         error_msg = out.get("message") or out.get("error") or "Provider job failed"
 
         if reservation_id:
-            release_job_credits(reservation_id, "provider_job_failed", meshy_job_id)
+            # Use internal_job_id (not meshy_job_id) for credit release tracking
+            release_job_credits(reservation_id, "provider_job_failed", internal_job_id or meshy_job_id)
 
         if internal_job_id:
             _update_job_status_failed(internal_job_id, error_msg)
