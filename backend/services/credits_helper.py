@@ -126,17 +126,17 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
     db_action_code = CANONICAL_TO_DB.get(canonical_action, canonical_action.upper())
 
     # Log normalization if different
-    if action_key != canonical_action:
-        print(f"[CREDITS] Action normalized: '{action_key}' -> '{canonical_action}' (DB: {db_action_code})")
+    # if action_key != canonical_action:
+    #     print(f"[CREDITS] Action normalized: '{action_key}' -> '{canonical_action}' (DB: {db_action_code})")
 
-    print(f"[CREDITS:DEBUG] >>> start_paid_job: requested={action_key}, canonical={canonical_action}, db_code={db_action_code}, job_id={internal_job_id}")
+    # print(f"[CREDITS:DEBUG] >>> start_paid_job: requested={action_key}, canonical={canonical_action}, db_code={db_action_code}, job_id={internal_job_id}")
 
     if not CREDITS_AVAILABLE:
-        print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - system not available, allowing {canonical_action} job_id={internal_job_id}")
+        # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - system not available, allowing {canonical_action} job_id={internal_job_id}")
         return None, None
 
     if not identity_id:
-        print(f"[CREDITS:DEBUG] ERROR: No identity for {canonical_action} job_id={internal_job_id}")
+        # print(f"[CREDITS:DEBUG] ERROR: No identity for {canonical_action} job_id={internal_job_id}")
         return None, _make_credit_error(
             "NO_SESSION",
             "A valid session is required for this action. Please sign in or restore your session.",
@@ -146,19 +146,19 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
     try:
         # Use canonical key for cost lookup
         cost = PricingService.get_action_cost(canonical_action)
-        print(f"[CREDITS:DEBUG] PricingService.get_action_cost('{canonical_action}') = {cost}")
+        # print(f"[CREDITS:DEBUG] PricingService.get_action_cost('{canonical_action}') = {cost}")
         if cost == 0:
-            print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - No cost for {canonical_action}, no reservation needed")
+            # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - No cost for {canonical_action}, no reservation needed")
             return None, None
 
         balance = WalletService.get_balance(identity_id)
         reserved = WalletService.get_reserved_credits(identity_id)
         available = max(0, balance - reserved)
 
-        print(
-            f"[CREDITS] Reserve {canonical_action}: cost={cost}, balance={balance}, "
-            f"reserved={reserved}, available={available}, job_id={internal_job_id}"
-        )
+        # print(
+        #     f"[CREDITS] Reserve {canonical_action}: cost={cost}, balance={balance}, "
+        #     f"reserved={reserved}, available={available}, job_id={internal_job_id}"
+        # )
 
         if available < cost:
             return None, _make_credit_error(
@@ -187,12 +187,12 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
         reservation_id = result["reservation"]["id"]
         is_existing = result.get("is_existing", False)
 
-        if is_existing:
-            print(f"[CREDITS] Idempotent: existing reservation {reservation_id} for job_id={internal_job_id}")
-        else:
-            print(f"[CREDITS] Reserved {cost} credits, reservation_id={reservation_id}, job_id={internal_job_id}")
+        # if is_existing:
+        #     print(f"[CREDITS] Idempotent: existing reservation {reservation_id} for job_id={internal_job_id}")
+        # else:
+        #     print(f"[CREDITS] Reserved {cost} credits, reservation_id={reservation_id}, job_id={internal_job_id}")
 
-        print(f"[JOB] started job_id={internal_job_id} reservation_id={reservation_id} action={canonical_action} cost={cost}")
+        # print(f"[JOB] started job_id={internal_job_id} reservation_id={reservation_id} action={canonical_action} cost={cost}")
 
         # Structured logging for audit trail
         log_generation_event(
@@ -254,12 +254,12 @@ def finalize_job_credits(
     IMPORTANT: If reservation_id is missing for a successful job, this indicates a bug
     in the credit flow. The job will be marked as ready_unbilled for admin reconciliation.
     """
-    print(f"[CREDITS:DEBUG] >>> finalize_job_credits called: reservation_id={reservation_id}, job_id={job_id}")
-    print(f"[CREDITS:DEBUG] CREDITS_AVAILABLE={CREDITS_AVAILABLE}, reservation_id is truthy={bool(reservation_id)}")
+    # print(f"[CREDITS:DEBUG] >>> finalize_job_credits called: reservation_id={reservation_id}, job_id={job_id}")
+    # print(f"[CREDITS:DEBUG] CREDITS_AVAILABLE={CREDITS_AVAILABLE}, reservation_id is truthy={bool(reservation_id)}")
 
     # If credits system unavailable, silently skip (dev mode / no DB)
     if not CREDITS_AVAILABLE:
-        print(f"[CREDITS:DEBUG] !!! SKIPPING FINALIZE - CREDITS_AVAILABLE=False")
+        # print(f"[CREDITS:DEBUG] !!! SKIPPING FINALIZE - CREDITS_AVAILABLE=False")
         return False
 
     # CRITICAL: Missing reservation_id for a successful job is a BUG
@@ -287,20 +287,20 @@ def finalize_job_credits(
         return False
 
     try:
-        print(f"[CREDITS:DEBUG] Calling ReservationService.finalize_reservation({reservation_id})")
+        # print(f"[CREDITS:DEBUG] Calling ReservationService.finalize_reservation({reservation_id})")
         result = ReservationService.finalize_reservation(reservation_id)
-        print(f"[CREDITS:DEBUG] finalize_reservation result: {result}")
+        # print(f"[CREDITS:DEBUG] finalize_reservation result: {result}")
 
         if result.get("not_found"):
-            print(f"[CREDITS:DEBUG] !!! Finalize: reservation not found (idempotent): {reservation_id} job_id={job_id}")
+            pass  # print(f"[CREDITS:DEBUG] !!! Finalize: reservation not found (idempotent): {reservation_id} job_id={job_id}")
         elif result.get("was_already_finalized"):
-            print(f"[CREDITS:DEBUG] Already finalized: reservation={reservation_id} job_id={job_id}")
+            pass  # print(f"[CREDITS:DEBUG] Already finalized: reservation={reservation_id} job_id={job_id}")
         elif result.get("was_already_released"):
-            print(f"[CREDITS:DEBUG] !!! Finalize skipped (already released): reservation={reservation_id} job_id={job_id}")
+            pass  # print(f"[CREDITS:DEBUG] !!! Finalize skipped (already released): reservation={reservation_id} job_id={job_id}")
         else:
             new_balance = result.get("balance", "unknown")
-            print(f"[CREDITS:DEBUG] *** SUCCESS: Finalized reservation={reservation_id} job_id={job_id}, new_balance={new_balance}")
-            print(f"[JOB] credits_captured job_id={job_id} reservation_id={reservation_id}")
+            # print(f"[CREDITS:DEBUG] *** SUCCESS: Finalized reservation={reservation_id} job_id={job_id}, new_balance={new_balance}")
+            # print(f"[JOB] credits_captured job_id={job_id} reservation_id={reservation_id}")
 
             # Structured logging for audit trail
             log_generation_event(
@@ -314,7 +314,7 @@ def finalize_job_credits(
                 status="captured",
             )
     except Exception as e:
-        print(f"[CREDITS:DEBUG] !!! ERROR in finalize_job_credits: {e}")
+        # print(f"[CREDITS:DEBUG] !!! ERROR in finalize_job_credits: {e}")
         import traceback
         traceback.print_exc()
 
@@ -327,13 +327,13 @@ def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id:
     try:
         result = ReservationService.release_reservation(reservation_id, reason)
         if result.get("not_found"):
-            print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={job_id}")
+            pass  # print(f"[CREDITS] Release: reservation not found (idempotent): {reservation_id} job_id={job_id}")
         elif result.get("was_already_released"):
-            print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
+            pass  # print(f"[CREDITS] Already released: reservation={reservation_id} job_id={job_id} reason={reason}")
         elif result.get("was_already_finalized"):
-            print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={job_id}")
+            pass  # print(f"[CREDITS] Release skipped (already finalized - job succeeded): reservation={reservation_id} job_id={job_id}")
         else:
-            print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
+            pass  # print(f"[CREDITS] Released: reservation={reservation_id} job_id={job_id} reason={reason}")
 
             # Structured logging for audit trail
             log_generation_event(
