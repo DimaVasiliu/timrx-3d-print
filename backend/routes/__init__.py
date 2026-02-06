@@ -11,10 +11,15 @@ __all__ = [
 def _print_route_map(app):
     """Print all registered /api/* routes at startup for debugging."""
     api_routes = []
+    inspire_found = False
     for rule in app.url_map.iter_rules():
         if rule.rule.startswith("/api"):
             methods = ",".join(sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS")))
-            api_routes.append(f"  {methods:8s} {rule.rule}")
+            route_str = f"  {methods:8s} {rule.rule}"
+            api_routes.append(route_str)
+            if "inspire" in rule.rule:
+                inspire_found = True
+                print(f"[ROUTES] *** INSPIRE ROUTE FOUND: {route_str}")
 
     api_routes.sort(key=lambda x: x.split()[-1])  # Sort by path
 
@@ -22,6 +27,9 @@ def _print_route_map(app):
     for route in api_routes:
         print(route)
     print(f"[ROUTES] Total: {len(api_routes)} endpoints")
+
+    if not inspire_found:
+        print("[ROUTES] *** WARNING: No inspire routes found! Check import errors above.")
 
 
 def register_blueprints(app):
@@ -51,8 +59,17 @@ def register_blueprints(app):
         print("[ROUTES] Attempting to import inspire blueprint...")
         from backend.routes.inspire import bp as inspire_bp
         print(f"[ROUTES] Inspire import SUCCESS: {inspire_bp}")
+        print(f"[ROUTES] Inspire blueprint routes: {[r.rule for r in inspire_bp.deferred_functions] if hasattr(inspire_bp, 'deferred_functions') else 'N/A'}")
+    except ImportError as e:
+        print(f"[ROUTES] ImportError importing inspire: {e}")
+        import traceback
+        traceback.print_exc()
+    except SyntaxError as e:
+        print(f"[ROUTES] SyntaxError in inspire: {e}")
+        import traceback
+        traceback.print_exc()
     except Exception as e:
-        print(f"[ROUTES] ERROR importing inspire: {e}")
+        print(f"[ROUTES] ERROR importing inspire: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
 
@@ -78,6 +95,9 @@ def register_blueprints(app):
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api/_mod")
         print("[ROUTES] Registered inspire_bp at /api/_mod")
+        # Verify the route was actually registered
+        inspire_routes = [r.rule for r in app.url_map.iter_rules() if 'inspire' in r.rule]
+        print(f"[ROUTES] Inspire routes registered: {inspire_routes}")
     else:
         print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
     app.register_blueprint(contact_bp, url_prefix="/api")
