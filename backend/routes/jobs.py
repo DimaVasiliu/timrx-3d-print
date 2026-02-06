@@ -3,14 +3,20 @@
 
 Handles:
 - POST /api/jobs/create - Create a new job (reserve credits, dispatch to provider)
+- POST /api/jobs/start - Idempotent job start (with Idempotency-Key header)
 - POST /api/jobs/save - Save active job to DB (legacy compat)
-- GET /api/jobs/active - Get active jobs (legacy compat)
+- GET /api/jobs/active - Get active jobs for recovery on page load
 - GET /api/jobs/:id - Get job details
 - GET /api/jobs - List jobs for current identity
 - POST /api/jobs/:id/complete - Mark job as complete (user-initiated)
 - POST /api/jobs/:id/cancel - Cancel a job (user: queued only, admin: any)
 - DELETE /api/jobs/:id - Delete active job (legacy compat)
 - POST /api/jobs/callback - Internal callback for existing pipeline (by upstream_job_id)
+
+Generation Reliability Layer:
+- Jobs persist server-side independent of client connection
+- Idempotency keys prevent duplicate jobs from reloads/retries
+- Active jobs endpoint allows UI reconnection after navigation
 """
 
 from flask import Blueprint, request, jsonify, g
@@ -28,6 +34,170 @@ from backend.services.job_service import (
 from backend.services.wallet_service import WalletService
 
 bp = Blueprint("jobs", __name__)
+
+
+# ─────────────────────────────────────────────────────────────
+# Idempotent Job Start (Generation Reliability Layer)
+# ─────────────────────────────────────────────────────────────
+
+
+@bp.route("/start", methods=["POST"])
+@require_session
+def start_job_idempotent():
+    """
+    Start a job with idempotency support.
+
+    This is the preferred endpoint for starting generations. It ensures:
+    - If the same idempotency_key is sent again, returns existing job (no duplicate)
+    - Job persists on server even if client disconnects
+    - Frontend can reconnect and resume watching progress
+
+    Request headers:
+        Idempotency-Key: <uuid>  (required for idempotency)
+
+    Request body:
+    {
+        "action_key": "text_to_3d_generate",
+        "job_type": "text_to_3d",      // optional
+        "stage": "preview",             // optional
+        "payload": {
+            "prompt": "a cute robot",
+            ...
+        }
+    }
+
+    Response (success - 200):
+    {
+        "ok": true,
+        "job_id": "uuid",
+        "reservation_id": "uuid",
+        "status": "queued",
+        "was_existing": false,  // true if returning existing job
+        ...
+    }
+    """
+    data = request.get_json() or {}
+    action_key = data.get("action_key")
+    job_type = data.get("job_type")
+    stage = data.get("stage")
+    payload = data.get("payload") or {}
+
+    # Get idempotency key from header or body
+    idempotency_key = request.headers.get("Idempotency-Key") or data.get("idempotency_key")
+
+    # Validation
+    if not action_key:
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "action_key is required",
+            }
+        }), 400
+
+    if not isinstance(payload, dict):
+        return jsonify({
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "payload must be an object",
+            }
+        }), 400
+
+    try:
+        if idempotency_key:
+            result = JobService.create_job_idempotent(
+                identity_id=g.identity_id,
+                action_key=action_key,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                job_type=job_type,
+                stage=stage,
+            )
+        else:
+            # Fall back to non-idempotent create
+            result = JobService.create_job(
+                identity_id=g.identity_id,
+                action_key=action_key,
+                payload=payload,
+            )
+            result["was_existing"] = False
+
+        return jsonify({
+            "ok": True,
+            "job_id": result["job_id"],
+            "reservation_id": result.get("reservation_id"),
+            "upstream_job_id": result.get("upstream_job_id"),
+            "status": result["status"],
+            "provider": result["provider"],
+            "action_code": result["action_code"],
+            "cost_credits": result["cost_credits"],
+            "was_existing": result.get("was_existing", False),
+        })
+
+    except ValueError as e:
+        error_msg = str(e)
+
+        # Parse INSUFFICIENT_CREDITS error
+        if "INSUFFICIENT_CREDITS" in error_msg:
+            parts = error_msg.split(":")
+            error_data = {}
+            for part in parts[1:]:
+                if "=" in part:
+                    key, val = part.split("=", 1)
+                    error_data[key] = int(val)
+
+            return jsonify({
+                "error": {
+                    "code": "INSUFFICIENT_CREDITS",
+                    "message": "Not enough credits for this action",
+                    "required": error_data.get("required", 0),
+                    "balance": error_data.get("balance", 0),
+                    "available": error_data.get("available", 0),
+                }
+            }), 402
+
+        # Unknown action
+        if "Unknown action" in error_msg:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_ACTION",
+                    "message": error_msg,
+                }
+            }), 400
+
+        # No cost defined
+        if "No cost defined" in error_msg:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_ACTION",
+                    "message": error_msg,
+                }
+            }), 400
+
+        # Wallet not found
+        if "Wallet not found" in error_msg:
+            return jsonify({
+                "error": {
+                    "code": "WALLET_NOT_FOUND",
+                    "message": "User wallet not initialized",
+                }
+            }), 400
+
+        # Generic error
+        return jsonify({
+            "error": {
+                "code": "JOB_ERROR",
+                "message": error_msg,
+            }
+        }), 400
+
+    except Exception as e:
+        print(f"[JOBS] Error starting job: {e}")
+        return jsonify({
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "Failed to start job",
+            }
+        }), 500
 
 
 @bp.route("/create", methods=["POST"])
@@ -706,17 +876,76 @@ def save_active_job():
 @with_session
 def get_active_jobs():
     """
-    Legacy: Get all active jobs for current user.
-    GET /api/jobs/active
+    Get all active (queued/pending/processing) jobs for current user.
+
+    This endpoint is used for job recovery on page load. The frontend calls
+    this on startup to find any jobs that are still running and reconnect
+    to them for progress updates.
+
+    Response:
+    {
+        "ok": true,
+        "jobs": [
+            {
+                "job_id": "uuid",
+                "status": "processing",
+                "progress": 45,
+                "job_type": "text_to_3d",
+                "stage": "preview",
+                "prompt": "a cute robot",
+                "created_at": "2024-01-01T12:00:00Z",
+                ...
+            }
+        ]
+    }
     """
     if request.method == "OPTIONS":
         return ("", 204)
+
     try:
         identity_id = g.identity_id
-        jobs = get_active_jobs_from_db(identity_id)
-        return jsonify(jobs)
+
+        # Try new JobService method first (from timrx_billing.jobs)
+        try:
+            jobs = JobService.get_active_jobs_for_identity(identity_id)
+            if jobs:
+                return jsonify({
+                    "ok": True,
+                    "jobs": jobs,
+                })
+        except Exception as e:
+            print(f"[JOBS] get_active_jobs_for_identity failed: {e}")
+
+        # Fall back to legacy active_jobs table
+        legacy_jobs = get_active_jobs_from_db(identity_id)
+
+        # Merge and deduplicate by job_id
+        seen_ids = set()
+        merged = []
+
+        for job in jobs if jobs else []:
+            job_id = job.get("id") or job.get("job_id")
+            if job_id and job_id not in seen_ids:
+                seen_ids.add(job_id)
+                merged.append(job)
+
+        for job in legacy_jobs:
+            job_id = job.get("job_id")
+            if job_id and job_id not in seen_ids:
+                seen_ids.add(job_id)
+                merged.append(job)
+
+        return jsonify({
+            "ok": True,
+            "jobs": merged,
+        })
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[JOBS] Error getting active jobs: {e}")
+        return jsonify({
+            "ok": True,
+            "jobs": [],
+        })
 
 
 @bp.route("/<job_id>", methods=["DELETE", "OPTIONS"])
