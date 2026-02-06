@@ -154,10 +154,11 @@ def _get_prompt_of_the_day(cursor) -> Dict[str, Any]:
     return {"prompt": fallbacks[idx][0], "category": fallbacks[idx][1]}
 
 
-def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> List[Dict]:
-    """Fetch models with valid thumbnails."""
+def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
+    """Fetch models with valid thumbnails. Accepts various success status values."""
     order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
 
+    # Accept multiple status values: NULL, SUCCEEDED, SUCCESS, COMPLETED, DONE (case-insensitive)
     cursor.execute(f"""
         SELECT
             id::text as id,
@@ -170,18 +171,35 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> Lis
         FROM timrx_app.models
         WHERE thumbnail_url IS NOT NULL
           AND thumbnail_url != ''
-          AND status = 'SUCCEEDED'
+          AND (
+            status IS NULL
+            OR UPPER(status) IN ('SUCCEEDED', 'SUCCESS', 'COMPLETED', 'DONE', 'FINISHED')
+          )
         {order}
         LIMIT %s
     """, (limit,))
 
     rows = cursor.fetchall()
+
+    # Debug: if no models found, log distinct statuses
+    if debug and len(rows) == 0:
+        cursor.execute("""
+            SELECT status, COUNT(*) as cnt
+            FROM timrx_app.models
+            WHERE thumbnail_url IS NOT NULL AND thumbnail_url != ''
+            GROUP BY status
+            ORDER BY cnt DESC
+            LIMIT 10
+        """)
+        statuses = cursor.fetchall()
+        print(f"[INSPIRE] DEBUG: No models found. Distinct statuses with thumbnails: {[dict(s) for s in statuses]}")
+
     if seed and shuffle:
         rows = _seeded_shuffle(rows, seed + "_models")
     return [dict(r) for r in rows]
 
 
-def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> List[Dict]:
+def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
     """Fetch images with valid thumbnails or image URLs."""
     order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
 
@@ -209,7 +227,7 @@ def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> Lis
     return [dict(r) for r in rows]
 
 
-def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> List[Dict]:
+def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
     """Fetch videos with valid thumbnails."""
     order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
 
@@ -235,6 +253,60 @@ def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str]) -> Lis
     if seed and shuffle:
         rows = _seeded_shuffle(rows, seed + "_videos")
     return [dict(r) for r in rows]
+
+
+def _balanced_mix(models: List[Dict], images: List[Dict], videos: List[Dict], target: int, shuffle: bool, seed: Optional[str]) -> List[Any]:
+    """
+    Create a balanced mix of content types with fallback reallocation.
+    Target: ~1/3 each type, reallocating if a type is short.
+    """
+    per_type = ceil(target / 3)
+
+    # Take what we can from each type
+    m_take = models[:per_type]
+    i_take = images[:per_type]
+    v_take = videos[:per_type]
+
+    # Calculate shortfalls and available extras
+    m_short = per_type - len(m_take)
+    i_short = per_type - len(i_take)
+    v_short = per_type - len(v_take)
+
+    total_short = m_short + i_short + v_short
+
+    # If there's shortfall, reallocate from types with extras
+    if total_short > 0:
+        m_extra = models[per_type:]
+        i_extra = images[per_type:]
+        v_extra = videos[per_type:]
+
+        # Fill shortfalls from available extras
+        extras = m_extra + i_extra + v_extra
+        if shuffle:
+            random.shuffle(extras)
+
+        fill_count = min(total_short, len(extras))
+        fill_items = extras[:fill_count]
+
+        # Add fill items to the appropriate lists based on type
+        for item in fill_items:
+            if item.get("type") == "model":
+                m_take.append(item)
+            elif item.get("type") == "image":
+                i_take.append(item)
+            else:
+                v_take.append(item)
+
+    # Interleave for even distribution
+    result = _interleave_lists(m_take, i_take, v_take)
+
+    # Final shuffle if requested
+    if shuffle and not seed:
+        random.shuffle(result)
+    elif seed:
+        result = _seeded_shuffle(result, seed + "_mixed")
+
+    return result[:target]
 
 
 def _transform_to_card(item: Dict, index: int, total_count: int = 24) -> Dict[str, Any]:
@@ -344,18 +416,19 @@ def inspire_feed() -> Response:
 
             # Determine how many of each type to fetch
             if filter_type == "all":
-                # Balanced distribution: ~40% models, ~40% images, ~20% videos
-                model_target = ceil(limit * 0.4)
-                image_target = ceil(limit * 0.4)
-                video_target = max(1, ceil(limit * 0.2))
+                # Fetch extra to allow for balanced mixing with fallback
+                fetch_limit = limit + 10
 
-                models = _fetch_models(cursor, model_target + 5, shuffle, seed)  # fetch extra to handle missing
-                images = _fetch_images(cursor, image_target + 5, shuffle, seed)
-                videos = _fetch_videos(cursor, video_target + 3, shuffle, seed)
+                models = _fetch_models(cursor, fetch_limit, shuffle, seed, debug=True)
+                images = _fetch_images(cursor, fetch_limit, shuffle, seed, debug=True)
+                videos = _fetch_videos(cursor, fetch_limit, shuffle, seed, debug=True)
+
+                # Debug logging: counts per type
+                print(f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} videos:{len(videos)} (requested limit:{limit})")
 
                 if mix_strategy == "balanced":
-                    # Interleave for even distribution
-                    items = _interleave_lists(models, images, videos)
+                    # Use balanced mix with fallback reallocation
+                    items = _balanced_mix(models, images, videos, limit, shuffle, seed)
                 else:
                     # Sequential: models, then images, then videos
                     items = models + images + videos
@@ -365,13 +438,16 @@ def inspire_feed() -> Response:
                         items = _seeded_shuffle(items, seed)
 
             elif filter_type in ("model", "models"):
-                items = _fetch_models(cursor, limit, shuffle, seed)
+                items = _fetch_models(cursor, limit, shuffle, seed, debug=True)
+                print(f"[INSPIRE] Models-only feed: {len(items)} items")
 
             elif filter_type in ("image", "images"):
-                items = _fetch_images(cursor, limit, shuffle, seed)
+                items = _fetch_images(cursor, limit, shuffle, seed, debug=True)
+                print(f"[INSPIRE] Images-only feed: {len(items)} items")
 
             elif filter_type in ("video", "videos"):
-                items = _fetch_videos(cursor, limit, shuffle, seed)
+                items = _fetch_videos(cursor, limit, shuffle, seed, debug=True)
+                print(f"[INSPIRE] Videos-only feed: {len(items)} items")
 
             else:
                 items = []
