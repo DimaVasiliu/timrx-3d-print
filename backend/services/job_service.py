@@ -2001,4 +2001,4 @@ def _update_job_status_failed(internal_job_id, error_message):
                 )
             conn.commit()
     except Exception as e:
-        # print(f"[JOB] ERROR marking job {internal_job_id} as failed: {e}")
+        pass  # print(f"[JOB] ERROR marking job {internal_job_id} as failed: {e}")
