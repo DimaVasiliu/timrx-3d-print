@@ -88,6 +88,10 @@ def serve_index_html():
 @bp.route("/<path:filename>")
 def serve_static_file(filename):
     """Serve static files from frontend directory."""
+    # Never handle /api/* routes - let them 404 properly as JSON
+    if filename.startswith("api/") or filename.startswith("api"):
+        abort(404)
+
     if not FRONTEND_DIR:
         if _FRONTEND_BASE_URL and filename.endswith(
             (
