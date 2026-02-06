@@ -406,9 +406,9 @@ class PricingService:
                 result[alias] = result[canonical_key]
 
         # Log what we're returning for debugging
-        if result:
-            canonical_count = len(CANONICAL_TO_DB)
-            print(f"[PRICING] Action costs loaded: {canonical_count} canonical keys + {len(result) - canonical_count} aliases")
+        # if result:
+        #     canonical_count = len(CANONICAL_TO_DB)
+        #     print(f"[PRICING] Action costs loaded: {canonical_count} canonical keys + {len(result) - canonical_count} aliases")
         else:
             print("[PRICING] WARNING: No action costs found in database!")
 
@@ -521,7 +521,7 @@ class PricingService:
         """
         PricingService._action_costs_cache = {}
         PricingService.get_action_costs()  # This repopulates the cache
-        print(f"[PRICING] Refreshed action costs cache: {PricingService._action_costs_cache}")
+        # print(f"[PRICING] Refreshed action costs cache: {PricingService._action_costs_cache}")
 
     @staticmethod
     def map_job_type_to_action(job_type: str) -> str:
@@ -567,10 +567,10 @@ class PricingService:
         """
         from backend.db import is_available
 
-        print("[PRICING] Starting plan seed...")
+        # print("[PRICING] Starting plan seed...")
 
         if not is_available():
-            print("[PRICING] Database not available, skipping plan seed")
+            # print("[PRICING] Database not available, skipping plan seed")
             return 0
 
         # First verify the table exists
@@ -579,7 +579,7 @@ class PricingService:
                 f"SELECT COUNT(*) as cnt FROM {Tables.PLANS}"
             )
             existing_count = result["cnt"] if result else 0
-            print(f"[PRICING] Plans table exists, current count: {existing_count}")
+            # print(f"[PRICING] Plans table exists, current count: {existing_count}")
         except Exception as e:
             print(f"[PRICING] Plans table check failed: {e}")
             print("[PRICING] Table may not exist - ensure migrations have run")
@@ -612,13 +612,13 @@ class PricingService:
                     ),
                 )
                 seeded += 1
-                print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ £{plan['price_gbp']})")
+                # print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ £{plan['price_gbp']})")
             except Exception as e:
                 print(f"[PRICING] Error seeding plan {plan['code']}: {e}")
                 import traceback
                 traceback.print_exc()
 
-        print(f"[PRICING] Plans seed complete: {seeded}/{len(DEFAULT_PLANS)}")
+        # print(f"[PRICING] Plans seed complete: {seeded}/{len(DEFAULT_PLANS)}")
         return seeded
 
     @staticmethod
@@ -633,10 +633,10 @@ class PricingService:
         """
         from backend.db import is_available
 
-        print("[PRICING] Starting action_costs seed...")
+        # print("[PRICING] Starting action_costs seed...")
 
         if not is_available():
-            print("[PRICING] Database not available, skipping action_costs seed")
+            # print("[PRICING] Database not available, skipping action_costs seed")
             return 0
 
         try:
@@ -644,7 +644,7 @@ class PricingService:
                 f"SELECT COUNT(*) as cnt FROM {Tables.ACTION_COSTS}"
             )
             existing_count = result["cnt"] if result else 0
-            print(f"[PRICING] action_costs table exists, current count: {existing_count}")
+            # print(f"[PRICING] action_costs table exists, current count: {existing_count}")
         except Exception as e:
             print(f"[PRICING] action_costs table check failed: {e}")
             return 0
@@ -669,5 +669,5 @@ class PricingService:
         # Clear cache so next lookup fetches fresh data
         PricingService._action_costs_cache = {}
 
-        print(f"[PRICING] Action costs seed complete: {seeded} checked, {existing_count} pre-existing")
+        # print(f"[PRICING] Action costs seed complete: {seeded} checked, {existing_count} pre-existing")
         return seeded
