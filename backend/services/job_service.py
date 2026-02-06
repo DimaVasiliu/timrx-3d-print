@@ -1,3 +1,4 @@
+
 """
 Job Service - Manages job creation and dispatch to upstream providers.
 
@@ -1290,18 +1291,7 @@ def save_active_job_to_db(
         payload.setdefault("stage", stage)
         payload.setdefault("original_job_id", job_id)
 
-        try:
-            uuid.UUID(str(job_id))
-            history_id = str(job_id)
-        except (ValueError, TypeError):
-            history_id = str(uuid.uuid4())
-
-        item_type = "image" if (job_type or "").lower() in ("image", "openai_image") else "model"
-        title = derive_display_title(job_meta.get("prompt"), job_meta.get("title"))
-        prompt = job_meta.get("prompt")
-        root_prompt = job_meta.get("root_prompt")
         thumbnail_url = job_meta.get("thumbnail_url")
-        glb_url = job_meta.get("glb_url")
         image_url = job_meta.get("image_url")
 
         s3_user_id = user_id or "public"
@@ -1577,23 +1567,51 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                     )
                     row = cur.fetchone()
 
-            if row:
-                payload = row["payload"] if row["payload"] else {}
-                if isinstance(payload, str):
-                    try:
-                        payload = json.loads(payload)
-                    except Exception:
-                        payload = {}
-                return {
-                    "prompt": row["prompt"] or payload.get("prompt"),
-                    "title": row["title"] or payload.get("title"),
-                    "root_prompt": payload.get("root_prompt") or row["prompt"] or payload.get("prompt"),
-                    "art_style": payload.get("art_style"),
-                    "stage": row["stage"] or payload.get("stage"),
-                    "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
-                }
-            if active_job:
-                return {"user_id": active_user_id}
+                if row:
+                    payload = row["payload"] if row["payload"] else {}
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except Exception:
+                            payload = {}
+                    return {
+                        "prompt": row["prompt"] or payload.get("prompt"),
+                        "title": row["title"] or payload.get("title"),
+                        "root_prompt": payload.get("root_prompt") or row["prompt"] or payload.get("prompt"),
+                        "art_style": payload.get("art_style"),
+                        "stage": row["stage"] or payload.get("stage"),
+                        "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
+                    }
+
+                # Fallback: check models table by upstream_job_id when no history_items found
+                cur.execute(
+                    f"""
+                    SELECT id, title, prompt, root_prompt, stage, identity_id, meta
+                    FROM {Tables.MODELS}
+                    WHERE upstream_job_id = %s OR id::text = %s
+                    LIMIT 1
+                    """,
+                    (job_id, job_id),
+                )
+                model_row = cur.fetchone()
+                if model_row:
+                    model_meta = model_row["meta"] if model_row["meta"] else {}
+                    if isinstance(model_meta, str):
+                        try:
+                            model_meta = json.loads(model_meta)
+                        except Exception:
+                            model_meta = {}
+                    return {
+                        "prompt": model_row["prompt"] or model_meta.get("prompt"),
+                        "title": model_row["title"] or model_meta.get("title"),
+                        "root_prompt": model_row["root_prompt"] or model_row["prompt"] or model_meta.get("root_prompt"),
+                        "art_style": model_meta.get("art_style"),
+                        "stage": model_row["stage"] or model_meta.get("stage"),
+                        "user_id": str(model_row["identity_id"]) if model_row["identity_id"] else active_user_id,
+                    }
+
+                if active_job:
+                    return {"user_id": active_user_id}
     except Exception as e:
         print(f"[Metadata] ERROR: Failed to get job metadata for {job_id}: {e}")
     return meta
