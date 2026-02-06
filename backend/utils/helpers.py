@@ -66,20 +66,82 @@ def normalize_license(value: Any) -> str:
     return "cc-by-4" if raw.startswith("cc") else "private"
 
 
-def derive_display_title(prompt: str | None, explicit_title: str | None) -> str:
+# Generic/bad titles that should NOT be used as real titles
+# These get replaced by prompt or root_prompt when available
+GENERIC_TITLES = frozenset({
+    "",
+    "untitled",
+    "(untitled)",
+    "3d model",
+    "textured model",
+    "remeshed model",
+    "refined model",
+    "rigged model",
+    "image to 3d model",
+    "generated model",
+    "model",
+    "image",
+    "video",
+})
+
+# Regex to detect hex-like IDs (24+ hex chars, like Meshy task IDs)
+_HEX_ID_PATTERN = re.compile(r"^[0-9a-f]{24,}$", re.IGNORECASE)
+
+
+def is_generic_title(title: str | None) -> bool:
+    """
+    Check if a title is generic/bad and should be replaced.
+
+    Generic titles include:
+    - Empty strings
+    - Common placeholders: "Untitled", "Textured Model", etc.
+    - Hex IDs (24+ hex chars like Meshy task IDs)
+
+    Returns True if the title is generic and should NOT be used.
+    """
+    if not isinstance(title, str):
+        return True
+    t = title.strip()
+    if not t:
+        return True
+    # Check against known generic titles (case-insensitive)
+    if t.lower() in GENERIC_TITLES:
+        return True
+    # Check if it looks like a hex ID (24+ hex chars)
+    if _HEX_ID_PATTERN.match(t):
+        return True
+    return False
+
+
+def derive_display_title(
+    prompt: str | None,
+    explicit_title: str | None,
+    *,
+    root_prompt: str | None = None,
+    fallback: str = "Untitled",
+) -> str:
     """
     Derive a human-friendly display title for models/images/history items.
 
-    Rules:
-    - If explicit_title exists and non-empty -> use it
-    - Else if prompt exists and non-empty -> use prompt.strip() truncated to 100 chars
-    - Else -> "Untitled"
+    Rules (in priority order):
+    1. If explicit_title is non-generic -> use it
+    2. Else if prompt is non-empty -> use prompt.strip()[:100]
+    3. Else if root_prompt is non-empty -> use root_prompt.strip()[:100]
+    4. Else -> fallback (default "Untitled")
+
+    A title is considered "generic" if it's empty, a placeholder like
+    "Textured Model", or a hex ID string.
     """
-    if isinstance(explicit_title, str) and explicit_title.strip():
-        return explicit_title.strip()
+    # Check explicit title first (if not generic)
+    if isinstance(explicit_title, str) and not is_generic_title(explicit_title):
+        return explicit_title.strip()[:100]
+    # Try prompt
     if isinstance(prompt, str) and prompt.strip():
         return prompt.strip()[:100]
-    return "Untitled"
+    # Try root_prompt
+    if isinstance(root_prompt, str) and root_prompt.strip():
+        return root_prompt.strip()[:100]
+    return fallback
 
 
 def sanitize_filename(name: str, max_length: int = 50) -> str:
