@@ -1785,25 +1785,26 @@ def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
                 )
                 row = cur.fetchone()
 
-            if not row:
-                # Job not found in any table
-                result["found"] = False
-                result["authorized"] = False
+                # Process row inside cursor context to avoid driver issues
+                if not row:
+                    # Job not found in any table
+                    result["found"] = False
+                    result["authorized"] = False
+                    return result
+
+                result["found"] = True
+                result["source"] = row[1] if len(row) > 1 else "unknown"
+                job_user_id = str(row[0]) if row[0] else None
+                result["owner_id"] = job_user_id
+
+                if identity_id:
+                    result["authorized"] = job_user_id == identity_id or job_user_id is None
+                else:
+                    result["authorized"] = job_user_id is None
                 return result
 
-            result["found"] = True
-            result["source"] = row[1] if len(row) > 1 else "unknown"
-            job_user_id = str(row[0]) if row[0] else None
-            result["owner_id"] = job_user_id
-
-            if identity_id:
-                result["authorized"] = job_user_id == identity_id or job_user_id is None
-            else:
-                result["authorized"] = job_user_id is None
-            return result
-
     except Exception as e:
-        print(f"[DB] verify_job_ownership_detailed failed for {job_id}: {e}")
+        print(f"[DB] verify_job_ownership_detailed failed for {job_id}: {type(e).__name__}: {e}")
         # On DB error, be permissive to not block users
         result["found"] = True
         result["authorized"] = True
