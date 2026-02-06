@@ -17,6 +17,9 @@ from flask import Blueprint, jsonify, request, Response
 
 from backend.db import USE_DB, get_conn, dict_row
 
+# Debug: confirm module loads
+print("[INSPIRE] Module loaded successfully")
+
 bp = Blueprint("inspire", __name__)
 
 # =============================================================================
@@ -382,14 +385,11 @@ def inspire_feed() -> Response:
 def inspire_shuffle() -> Response:
     """
     Get a fresh shuffled set of inspiration content.
-    Shortcut for /inspire/feed?shuffle=true with a random seed.
+    Redirects to /inspire/feed with shuffle params.
     """
     if request.method == "OPTIONS":
         return Response("", status=204)
 
-    # Generate a unique seed for this shuffle request
-    request.args = request.args.copy()
-    request.args["shuffle"] = "true"
-    request.args["seed"] = str(random.randint(1, 1000000))
-
-    return inspire_feed()
+    from flask import redirect, url_for
+    seed = str(random.randint(1, 1000000))
+    return redirect(url_for('.inspire_feed', shuffle='true', seed=seed, **request.args))
