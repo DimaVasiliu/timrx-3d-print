@@ -34,6 +34,13 @@ from backend.services.reservation_service import ReservationService, Reservation
 from backend.services.pricing_service import PricingService
 
 
+def _json_default(obj):
+    """JSON serializer for objects not serializable by default json code (e.g., UUID)."""
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 class MissingIdentityError(ValueError):
     """
     Raised when a job operation requires an identity_id but none was provided.
@@ -1793,8 +1800,15 @@ def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
                     return result
 
                 result["found"] = True
-                result["source"] = row[1] if len(row) > 1 else "unknown"
-                job_user_id = str(row[0]) if row[0] else None
+                # psycopg3 with dict_row returns dict, access by column name
+                # Handle both dict rows (psycopg3 default) and tuple rows (fallback)
+                if isinstance(row, dict):
+                    result["source"] = row.get("source", "unknown")
+                    job_user_id = str(row["identity_id"]) if row.get("identity_id") else None
+                else:
+                    # Tuple row fallback (shouldn't happen with our setup, but be safe)
+                    result["source"] = row[1] if len(row) > 1 else "unknown"
+                    job_user_id = str(row[0]) if row[0] else None
                 result["owner_id"] = job_user_id
 
                 if identity_id:
@@ -1917,9 +1931,13 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
             with conn.cursor() as cursor:
                 meta_updates = {"progress": 100}
                 if model_id:
-                    meta_updates["model_id"] = model_id
+                    # Convert UUID to string to avoid JSON serialization errors
+                    meta_updates["model_id"] = str(model_id)
                 if glb_url:
                     meta_updates["glb_url"] = glb_url
+
+                # Use _json_default for safe UUID serialization
+                meta_json = json.dumps(meta_updates, default=_json_default)
 
                 if upstream_job_id:
                     cursor.execute(
@@ -1931,7 +1949,7 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                             updated_at = NOW()
                         WHERE id = %s
                         """,
-                        (upstream_job_id, json.dumps(meta_updates), internal_job_id),
+                        (upstream_job_id, meta_json, internal_job_id),
                     )
                 else:
                     cursor.execute(
@@ -1942,7 +1960,7 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                             updated_at = NOW()
                         WHERE id = %s
                         """,
-                        (json.dumps(meta_updates), internal_job_id),
+                        (meta_json, internal_job_id),
                     )
             conn.commit()
     except Exception as e:
