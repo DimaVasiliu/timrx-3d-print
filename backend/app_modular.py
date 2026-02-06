@@ -27,7 +27,7 @@ def create_app() -> Flask:
         app,
         resources={r"/api/*": {"origins": origins}},
         supports_credentials=True,
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "X-Requested-With"],
         expose_headers=["Content-Type"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
