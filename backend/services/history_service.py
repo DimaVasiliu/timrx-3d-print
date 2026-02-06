@@ -597,7 +597,7 @@ def save_image_to_normalized_db(
                             title = CASE
                                 WHEN %s IS NOT NULL
                                  AND %s <> ''
-                                 AND %s NOT IN ('3D Model', 'Untitled')
+                                 AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                 THEN %s
                                 ELSE title
                             END,
@@ -667,7 +667,7 @@ def save_image_to_normalized_db(
                         title = CASE
                             WHEN EXCLUDED.title IS NOT NULL
                              AND EXCLUDED.title <> ''
-                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                             THEN EXCLUDED.title
                             ELSE {Tables.IMAGES}.title
                         END,
@@ -729,7 +729,7 @@ def save_image_to_normalized_db(
                         title = CASE
                             WHEN EXCLUDED.title IS NOT NULL
                              AND EXCLUDED.title <> ''
-                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                             THEN EXCLUDED.title
                             ELSE {Tables.IMAGES}.title
                         END,
@@ -816,7 +816,7 @@ def save_image_to_normalized_db(
                             title = CASE
                                 WHEN %s IS NOT NULL
                                  AND %s <> ''
-                                 AND %s NOT IN ('3D Model', 'Untitled')
+                                 AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                 THEN %s
                                 ELSE title
                             END,
@@ -871,7 +871,7 @@ def save_image_to_normalized_db(
                             title = CASE
                                 WHEN EXCLUDED.title IS NOT NULL
                                  AND EXCLUDED.title <> ''
-                                 AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                 AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                 THEN EXCLUDED.title
                                 ELSE {Tables.HISTORY_ITEMS}.title
                             END,
@@ -1519,7 +1519,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     title = CASE
                                         WHEN %s IS NOT NULL
                                          AND %s <> ''
-                                         AND %s NOT IN ('3D Model', 'Untitled')
+                                         AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                         THEN %s
                                         ELSE title
                                     END,
@@ -1591,7 +1591,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     title = CASE
                                         WHEN EXCLUDED.title IS NOT NULL
                                          AND EXCLUDED.title <> ''
-                                         AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                         AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                         THEN EXCLUDED.title
                                         ELSE {Tables.MODELS}.title
                                     END,
@@ -1652,7 +1652,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     title = CASE
                                         WHEN %s IS NOT NULL
                                          AND %s <> ''
-                                         AND %s NOT IN ('3D Model', 'Untitled')
+                                         AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                         THEN %s
                                         ELSE title
                                     END,
@@ -1835,7 +1835,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 title = CASE
                                     WHEN EXCLUDED.title IS NOT NULL
                                      AND EXCLUDED.title <> ''
-                                     AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                     AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                     THEN EXCLUDED.title
                                     ELSE {Tables.IMAGES}.title
                                 END,
@@ -1891,7 +1891,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     title = CASE
                                         WHEN %s IS NOT NULL
                                          AND %s <> ''
-                                         AND %s NOT IN ('3D Model', 'Untitled')
+                                         AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                         THEN %s
                                         ELSE title
                                     END,
@@ -2025,7 +2025,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         title = CASE
                             WHEN EXCLUDED.title IS NOT NULL
                              AND EXCLUDED.title <> ''
-                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                             THEN EXCLUDED.title
                             ELSE {Tables.HISTORY_ITEMS}.title
                         END,
