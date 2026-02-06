@@ -1948,12 +1948,10 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
             with conn.cursor() as cursor:
                 meta_updates = {"progress": 100}
                 if model_id:
-                    # Convert UUID to string to avoid JSON serialization errors
                     meta_updates["model_id"] = str(model_id)
                 if glb_url:
                     meta_updates["glb_url"] = glb_url
 
-                # Use _json_default for safe UUID serialization
                 meta_json = json.dumps(meta_updates, default=_json_default)
 
                 if upstream_job_id:
@@ -1981,7 +1979,10 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                     )
             conn.commit()
     except Exception as e:
-        # print(f"[JOB] ERROR marking job {internal_job_id} as ready: {e}")
+        logger.exception(
+            "[JOB] Failed to mark job %s as ready", internal_job_id
+        )
+        raise
 
 
 def _update_job_status_failed(internal_job_id, error_message):
