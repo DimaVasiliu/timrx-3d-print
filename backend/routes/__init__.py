@@ -46,13 +46,15 @@ def register_blueprints(app):
     from backend.routes.video import bp as video_bp
 
     # Import inspire with explicit error handling for debugging
+    inspire_bp = None
     try:
+        print("[ROUTES] Attempting to import inspire blueprint...")
         from backend.routes.inspire import bp as inspire_bp
+        print(f"[ROUTES] Inspire import SUCCESS: {inspire_bp}")
     except Exception as e:
         print(f"[ROUTES] ERROR importing inspire: {e}")
         import traceback
         traceback.print_exc()
-        inspire_bp = None
 
     # Frontend routes (no prefix)
     app.register_blueprint(frontend_bp)
@@ -75,6 +77,9 @@ def register_blueprints(app):
     app.register_blueprint(video_bp, url_prefix="/api/_mod")
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api/_mod")
+        print("[ROUTES] Registered inspire_bp at /api/_mod")
+    else:
+        print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
     app.register_blueprint(contact_bp, url_prefix="/api")
 
     # Also register under /api for backward compatibility (cached frontend)
@@ -91,5 +96,5 @@ def register_blueprints(app):
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
 
-    # Route map printing disabled (use _print_route_map(app) to debug)
-    # _print_route_map(app)
+    # Temporarily enable route map to debug inspire registration
+    _print_route_map(app)
