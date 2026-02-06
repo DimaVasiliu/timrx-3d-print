@@ -61,16 +61,16 @@ def dispatch_meshy_text_to_3d_async(
     store_meta: dict,
 ):
     start_time = time.time()
-    print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=text-to-3d reservation_id={reservation_id}")
+    # print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
+    # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=text-to-3d reservation_id={reservation_id}")
 
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         meshy_task_id = resp.get("result")
 
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
+        # print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
+        # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
 
         if not meshy_task_id:
             print(f"[ASYNC] ERROR: No task_id from Meshy for job {internal_job_id}")
@@ -95,7 +95,7 @@ def dispatch_meshy_text_to_3d_async(
             identity_id,
         )
 
-        print(f"[ASYNC] Job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
+        # print(f"[ASYNC] Job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -113,22 +113,22 @@ def dispatch_meshy_refine_async(
     store_meta: dict,
 ):
     start_time = time.time()
-    print(f"[ASYNC] Starting Meshy refine dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=refine reservation_id={reservation_id}")
+    # print(f"[ASYNC] Starting Meshy refine dispatch for job {internal_job_id}")
+    # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=refine reservation_id={reservation_id}")
 
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         meshy_task_id = resp.get("result")
 
         duration_ms = int((time.time() - start_time) * 1000)
-        print(
-            f"[ASYNC] Meshy refine returned task_id={meshy_task_id} "
-            f"for job {internal_job_id} in {duration_ms}ms"
-        )
-        print(
-            f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} "
-            f"upstream_id={meshy_task_id} status=accepted"
-        )
+        # print(
+        #     f"[ASYNC] Meshy refine returned task_id={meshy_task_id} "
+        #     f"for job {internal_job_id} in {duration_ms}ms"
+        # )
+        # print(
+        #     f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} "
+        #     f"upstream_id={meshy_task_id} status=accepted"
+        # )
 
         if not meshy_task_id:
             error_msg = "Meshy refine returned no task ID"
@@ -154,16 +154,16 @@ def dispatch_meshy_refine_async(
             identity_id,
         )
 
-        print(
-            f"[ASYNC] Refine job {internal_job_id} dispatched successfully, "
-            f"meshy_task_id={meshy_task_id}"
-        )
+        # print(
+        #     f"[ASYNC] Refine job {internal_job_id} dispatched successfully, "
+        #     f"meshy_task_id={meshy_task_id}"
+        # )
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         err_text = str(e)
         print(
-            f"[ASYNC] ERROR: Meshy refine call failed for job {internal_job_id} "
+            f"[ASYNC] ERROR: Meshy refine failed for job {internal_job_id} "
             f"after {duration_ms}ms: {err_text}"
         )
         if reservation_id:
@@ -180,8 +180,8 @@ def dispatch_meshy_image_to_3d_async(
     image_url: str,
 ):
     start_time = time.time()
-    print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
+    # print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
+    # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
 
     try:
         user_id = identity_id
@@ -214,8 +214,8 @@ def dispatch_meshy_image_to_3d_async(
         meshy_task_id = resp.get("result") or resp.get("id")
 
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Meshy image-to-3d returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
+        # print(f"[ASYNC] Meshy image-to-3d returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
+        # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
 
         if not meshy_task_id:
             print(f"[ASYNC] ERROR: No task_id from Meshy image-to-3d for job {internal_job_id}")
@@ -238,9 +238,9 @@ def dispatch_meshy_image_to_3d_async(
                     key_base=f"source_images/{user_id or 'public'}/{meshy_task_id}",
                     provider="user",
                 )
-                print(f"[ASYNC] Uploaded source image to S3: {s3_image_url}")
+                pass  # print(f"[ASYNC] Uploaded source image to S3: {s3_image_url}")
             except Exception as e:
-                print(f"[ASYNC] Failed to upload source image to S3: {e}, using original URL")
+                print(f"[ASYNC] WARNING: Failed to upload source image to S3: {e}")
 
         store = load_store()
         store_meta["upstream_job_id"] = meshy_task_id
@@ -257,11 +257,11 @@ def dispatch_meshy_image_to_3d_async(
             identity_id,
         )
 
-        print(f"[ASYNC] Image-to-3d job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
+        # print(f"[ASYNC] Image-to-3d job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy image-to-3d call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[ASYNC] ERROR: Meshy image-to-3d failed for job {internal_job_id} after {duration_ms}ms: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         update_job_status_failed(internal_job_id, str(e))
@@ -279,15 +279,15 @@ def dispatch_openai_image_async(
     store_meta: dict,
 ):
     start_time = time.time()
-    print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=openai action=image-gen reservation_id={reservation_id}")
+    # print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
+    # print(f"[JOB] provider_started job_id={internal_job_id} provider=openai action=image-gen reservation_id={reservation_id}")
 
     try:
         resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
 
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
+        # print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
+        # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
 
         data_list = resp.get("data") or []
         urls: list[str] = []
@@ -319,7 +319,7 @@ def dispatch_openai_image_async(
             user_id=identity_id,
             provider="openai",  # Explicit: saves to images/openai/{hash}.png
         )
-        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=openai")
+        # print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=openai")
 
         store = load_store()
         store_meta["status"] = "done"
@@ -330,12 +330,12 @@ def dispatch_openai_image_async(
         save_store(store)
 
         # Finalize credits (handles missing reservation_id as ready_unbilled bug)
-        print(f"[OPENAI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
+        # print(f"[OPENAI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
         finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
-        if finalized:
-            print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
-        elif reservation_id is None:
-            print(f"[OPENAI_IMAGE:DEBUG] !!! NO RESERVATION_ID - job marked as ready_unbilled")
+        # if finalized:
+        #     print(f"[ASYNC] Credits captured for OpenAI image job {internal_job_id}")
+        # elif reservation_id is None:
+        #     print(f"[OPENAI_IMAGE:DEBUG] !!! NO RESERVATION_ID - job marked as ready_unbilled")
 
         update_job_status_ready(
             internal_job_id,
@@ -344,11 +344,11 @@ def dispatch_openai_image_async(
             image_url=urls[0],
         )
 
-        print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
+        # print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: OpenAI call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[ASYNC] ERROR: OpenAI failed for job {internal_job_id} after {duration_ms}ms: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "openai_api_error", internal_job_id)
         update_job_status_failed(internal_job_id, str(e))
@@ -371,8 +371,8 @@ def dispatch_gemini_image_async(
     with job_id + reservation_id, so frontend can see the held credits.
     """
     start_time = time.time()
-    print(f"[ASYNC] Starting Gemini image dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} provider=google action=image-gen reservation_id={reservation_id}")
+    # print(f"[ASYNC] Starting Gemini image dispatch for job {internal_job_id}")
+    # print(f"[JOB] provider_started job_id={internal_job_id} provider=google action=image-gen reservation_id={reservation_id}")
 
     try:
         # Call Gemini API
@@ -384,8 +384,8 @@ def dispatch_gemini_image_async(
         )
 
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Gemini returned for job {internal_job_id} in {duration_ms}ms")
-        print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
+        # print(f"[ASYNC] Gemini returned for job {internal_job_id} in {duration_ms}ms")
+        # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} status=complete")
 
         # Extract image URLs
         image_url = result.get("image_url")
@@ -410,7 +410,7 @@ def dispatch_gemini_image_async(
             user_id=identity_id,
             provider="google",
         )
-        print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=google")
+        # print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=google")
 
         # Update in-memory store
         store = load_store()
@@ -422,12 +422,12 @@ def dispatch_gemini_image_async(
         save_store(store)
 
         # Finalize credits (handles missing reservation_id as ready_unbilled bug)
-        print(f"[GEMINI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
+        # print(f"[GEMINI_IMAGE:DEBUG] >>> async_dispatch success path: reservation_id={reservation_id}, job_id={internal_job_id}")
         finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
-        if finalized:
-            print(f"[ASYNC] Credits captured for Gemini image job {internal_job_id}")
-        elif reservation_id is None:
-            print(f"[GEMINI_IMAGE:DEBUG] !!! NO RESERVATION_ID - job marked as ready_unbilled")
+        # if finalized:
+        #     print(f"[ASYNC] Credits captured for Gemini image job {internal_job_id}")
+        # elif reservation_id is None:
+        #     print(f"[GEMINI_IMAGE:DEBUG] !!! NO RESERVATION_ID - job marked as ready_unbilled")
 
         # Update job status to ready
         update_job_status_ready(
@@ -437,7 +437,7 @@ def dispatch_gemini_image_async(
             image_url=image_url or image_urls[0],
         )
 
-        print(f"[ASYNC] Gemini image job {internal_job_id} completed successfully")
+        # print(f"[ASYNC] Gemini image job {internal_job_id} completed successfully")
 
     except GeminiImageConfigError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -493,10 +493,10 @@ def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
             conn.commit()
 
             if result:
-                print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
+                # print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
                 return True
             else:
-                print(f"[ASYNC] WARNING: No job row found to update for job_id={job_id}")
+                print(f"[ASYNC] WARNING: No job row to update for job_id={job_id}")
                 return False
     except Exception as e:
         print(f"[ASYNC] ERROR updating job {job_id}: {e}")
@@ -518,10 +518,10 @@ def update_job_status_failed(job_id: str, error_message: str):
                     (error_message[:500] if error_message else None, job_id),
                 )
             conn.commit()
-            print(
-                "[JOB] Marked job %s as failed: %s"
-                % (job_id, error_message[:100] if error_message else "no message")
-            )
+            # print(
+            #     "[JOB] Marked job %s as failed: %s"
+            #     % (job_id, error_message[:100] if error_message else "no message")
+            # )
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as failed: {e}")
 
@@ -574,7 +574,7 @@ def update_job_status_ready(
                         (json.dumps(meta_updates), job_id),
                     )
             conn.commit()
-            print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
+            # print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
 
@@ -648,7 +648,7 @@ def _redispatch_to_runway(
         if not upstream_id:
             raise RuntimeError("Runway returned no task_id")
 
-        print(f"[ASYNC] Runway fallback started for {internal_job_id}: upstream_id={upstream_id}")
+        # print(f"[ASYNC] Runway fallback started for {internal_job_id}: upstream_id={upstream_id}")
 
         update_job_with_upstream_id(internal_job_id, upstream_id)
 
@@ -744,8 +744,8 @@ def dispatch_gemini_video_async(
     """
     start_time = time.time()
     task = payload.get("task", "text2video")
-    print(f"[ASYNC] Starting video {task} dispatch for job {internal_job_id}")
-    print(f"[JOB] provider_started job_id={internal_job_id} action={task} reservation_id={reservation_id}")
+    # print(f"[ASYNC] Starting video {task} dispatch for job {internal_job_id}")
+    # print(f"[JOB] provider_started job_id={internal_job_id} action={task} reservation_id={reservation_id}")
 
     try:
         # Extract parameters (use new names, fallback to old for compatibility)
@@ -764,7 +764,7 @@ def dispatch_gemini_video_async(
         except (ValueError, TypeError):
             duration_seconds = 6  # Safe default
 
-        print(f"[ASYNC] Video params: aspect_ratio={aspect_ratio}, resolution={resolution}, duration_seconds={duration_seconds} (type={type(duration_seconds).__name__})")
+        # print(f"[ASYNC] Video params: aspect_ratio={aspect_ratio}, resolution={resolution}, duration_seconds={duration_seconds}")
 
         # Build common params for the router
         route_params = dict(
@@ -802,8 +802,8 @@ def dispatch_gemini_video_async(
 
         if upstream_id:
             # Long-running operation - need to poll for status
-            print(f"[ASYNC] Video returned upstream_id={upstream_id} for job {internal_job_id} via {provider_used} in {duration_ms}ms")
-            print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={upstream_id} provider={provider_used} status=processing")
+            # print(f"[ASYNC] Video returned upstream_id={upstream_id} for job {internal_job_id} via {provider_used} in {duration_ms}ms")
+            # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={upstream_id} provider={provider_used} status=processing")
 
             # Update job with upstream identifier
             update_job_with_upstream_id(internal_job_id, upstream_id)
@@ -906,7 +906,7 @@ def _poll_gemini_video_completion(
     This runs in the background thread and updates job status.
     Veo typically completes in 1-2 minutes for standard videos.
     """
-    print(f"[ASYNC] Starting poll for Veo operation {operation_name}")
+    # print(f"[ASYNC] Starting poll for Veo operation {operation_name}")
 
     consecutive_errors = 0
     max_consecutive_errors = 5
@@ -918,7 +918,7 @@ def _poll_gemini_video_completion(
             status_resp = gemini_video_status(operation_name)
             status = status_resp.get("status", "unknown")
 
-            print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id}: status={status}")
+            # print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id}: status={status}")
 
             # Reset error counter on successful poll
             consecutive_errors = 0
@@ -1060,7 +1060,7 @@ def _poll_video_completion(
         update_job_status_failed(internal_job_id, f"unknown_provider: {provider_name}")
         return
 
-    print(f"[ASYNC] Starting {provider_name} poll for upstream_id={upstream_id}")
+    # print(f"[ASYNC] Starting {provider_name} poll for upstream_id={upstream_id}")
 
     consecutive_errors = 0
     max_consecutive_errors = 5
@@ -1072,7 +1072,7 @@ def _poll_video_completion(
             status_resp = provider.check_status(upstream_id)
             status = status_resp.get("status", "unknown")
 
-            print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id} ({provider_name}): status={status}")
+            # print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id} ({provider_name}): status={status}")
 
             # Reset error counter on successful poll
             consecutive_errors = 0
@@ -1172,7 +1172,7 @@ def _finalize_video_success(
     Works for any provider — uses the VideoRouter to get the right
     download method.
     """
-    print(f"[ASYNC] Video completed for job {internal_job_id} ({provider_name}): {video_url[:100]}...")
+    # print(f"[ASYNC] Video completed for job {internal_job_id} ({provider_name}): {video_url[:100]}...")
 
     final_video_url = video_url
     s3_video_url = None
@@ -1183,7 +1183,7 @@ def _finalize_video_success(
         try:
             provider = video_router.get_provider(provider_name)
 
-            print(f"[ASYNC] Downloading video from {provider_name} for S3 upload...")
+            # print(f"[ASYNC] Downloading video from {provider_name} for S3 upload...")
             if provider:
                 video_bytes, content_type = provider.download_video(video_url)
             else:
@@ -1209,7 +1209,7 @@ def _finalize_video_success(
             )
 
             if s3_video_url:
-                print(f"[ASYNC] Uploaded video to S3: {s3_video_url}")
+                # print(f"[ASYNC] Uploaded video to S3: {s3_video_url}")
                 final_video_url = s3_video_url
 
                 # Extract and upload thumbnail
@@ -1231,7 +1231,7 @@ def _finalize_video_success(
                             provider=provider_name,
                         )
                         if s3_thumbnail_url:
-                            print(f"[ASYNC] Uploaded thumbnail to S3: {s3_thumbnail_url}")
+                            pass  # print(f"[ASYNC] Uploaded thumbnail to S3: {s3_thumbnail_url}")
                 except Exception as thumb_err:
                     print(f"[ASYNC] Thumbnail extraction failed: {thumb_err}")
             else:
@@ -1254,11 +1254,11 @@ def _finalize_video_success(
     save_store(store)
 
     # Finalize credits (handles missing reservation_id as ready_unbilled bug)
-    finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
-    if finalized:
-        print(f"[ASYNC] Credits captured for {provider_name} video job {internal_job_id}")
-    elif reservation_id is None:
-        print(f"[ASYNC] !!! NO RESERVATION_ID for video job {internal_job_id} - marked as ready_unbilled")
+    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    # if finalized:
+    #     print(f"[ASYNC] Credits captured for {provider_name} video job {internal_job_id}")
+    # elif reservation_id is None:
+    #     print(f"[ASYNC] !!! NO RESERVATION_ID for video job {internal_job_id} - marked as ready_unbilled")
 
     # Save to normalized tables (videos + history_items)
     # This creates the video row and history_items row with video_id
@@ -1314,7 +1314,7 @@ def _finalize_video_success(
         except Exception as e:
             print(f"[ASYNC] Error updating video_url for {internal_job_id}: {e}")
 
-    print(f"[ASYNC] {provider_name} video job {internal_job_id} completed successfully")
+    # print(f"[ASYNC] {provider_name} video job {internal_job_id} completed successfully")
 
 
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
