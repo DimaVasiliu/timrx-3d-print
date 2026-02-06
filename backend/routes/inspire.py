@@ -154,12 +154,14 @@ def _get_prompt_of_the_day(cursor) -> Dict[str, Any]:
     return {"prompt": fallbacks[idx][0], "category": fallbacks[idx][1]}
 
 
-def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
+def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
     """
     Fetch models with valid thumbnails. Accepts various success status values.
     Returns thumb_preview (always) and thumb_refined (if a refined/textured version exists).
+    If limit is None, fetches ALL models.
     """
-    order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY m.created_at DESC"
+    order = "ORDER BY m.created_at DESC"
+    limit_clause = f"LIMIT {limit}" if limit else ""
 
     # Query models with optional refined/textured thumbnail via self-join on upstream_job_id
     # Preview stage thumbnail + look for refined/textured versions
@@ -208,8 +210,8 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
         FROM base_models m
         WHERE m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', 'image3d', '')
         {order}
-        LIMIT %s
-    """, (limit,))
+        {limit_clause}
+    """)
 
     rows = cursor.fetchall()
 
@@ -229,17 +231,17 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
             info = cursor.fetchall()
             print(f"[INSPIRE] DEBUG: No models matched. Existing status/stage combos: {[dict(s) for s in info]}")
 
-    if seed and shuffle:
-        rows = _seeded_shuffle(rows, seed + "_models")
     return [dict(r) for r in rows]
 
 
-def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
+def _fetch_images(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
     """
     Fetch images with valid thumbnails or image URLs.
     Returns thumb_preview (thumbnail or image_url) and thumb_refined (full image_url if different).
+    If limit is None, fetches ALL images.
     """
-    order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
+    order = "ORDER BY created_at DESC"
+    limit_clause = f"LIMIT {limit}" if limit else ""
 
     cursor.execute(f"""
         SELECT
@@ -261,21 +263,21 @@ def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
         WHERE (thumbnail_url IS NOT NULL AND thumbnail_url != '')
            OR (image_url IS NOT NULL AND image_url != '')
         {order}
-        LIMIT %s
-    """, (limit,))
+        {limit_clause}
+    """)
 
     rows = cursor.fetchall()
-    if seed and shuffle:
-        rows = _seeded_shuffle(rows, seed + "_images")
     return [dict(r) for r in rows]
 
 
-def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
+def _fetch_videos(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
     """
     Fetch videos with valid thumbnails.
     Videos don't have refined thumbnails, so thumb_refined is always null.
+    If limit is None, fetches ALL videos.
     """
-    order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
+    order = "ORDER BY created_at DESC"
+    limit_clause = f"LIMIT {limit}" if limit else ""
 
     cursor.execute(f"""
         SELECT
@@ -293,12 +295,10 @@ def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
           AND thumbnail_url != ''
           AND video_url IS NOT NULL
         {order}
-        LIMIT %s
-    """, (limit,))
+        {limit_clause}
+    """)
 
     rows = cursor.fetchall()
-    if seed and shuffle:
-        rows = _seeded_shuffle(rows, seed + "_videos")
     return [dict(r) for r in rows]
 
 
@@ -468,7 +468,6 @@ def inspire_feed() -> Response:
         shuffle = request.args.get("shuffle", "true").lower() == "true"
         seed = request.args.get("seed")
         filter_type = request.args.get("type", "all").lower()
-        mix_strategy = request.args.get("mix", "balanced").lower()
 
         with get_conn() as conn:
             cursor = conn.cursor(row_factory=dict_row)
@@ -476,45 +475,42 @@ def inspire_feed() -> Response:
             # Get prompt of the day
             potd = _get_prompt_of_the_day(cursor)
 
-            # Determine how many of each type to fetch
+            # Fetch ALL items from DB (no limit), then shuffle and slice
             if filter_type == "all":
-                # Fetch extra to allow for balanced mixing with fallback
-                fetch_limit = limit + 10
+                # Fetch ALL items from each table
+                models = _fetch_models(cursor, limit=None, debug=True)
+                images = _fetch_images(cursor, limit=None, debug=True)
+                videos = _fetch_videos(cursor, limit=None, debug=True)
 
-                models = _fetch_models(cursor, fetch_limit, shuffle, seed, debug=True)
-                images = _fetch_images(cursor, fetch_limit, shuffle, seed, debug=True)
-                videos = _fetch_videos(cursor, fetch_limit, shuffle, seed, debug=True)
+                # Combine all items
+                items = models + images + videos
 
                 # Debug logging: counts per type
-                print(f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} videos:{len(videos)} (requested limit:{limit})")
-
-                if mix_strategy == "balanced":
-                    # Use balanced mix with fallback reallocation
-                    items = _balanced_mix(models, images, videos, limit, shuffle, seed)
-                else:
-                    # Sequential: models, then images, then videos
-                    items = models + images + videos
-                    if shuffle and not seed:
-                        random.shuffle(items)
-                    elif seed:
-                        items = _seeded_shuffle(items, seed)
+                print(f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} videos:{len(videos)} total:{len(items)}")
 
             elif filter_type in ("model", "models"):
-                items = _fetch_models(cursor, limit, shuffle, seed, debug=True)
+                items = _fetch_models(cursor, limit=None, debug=True)
                 print(f"[INSPIRE] Models-only feed: {len(items)} items")
 
             elif filter_type in ("image", "images"):
-                items = _fetch_images(cursor, limit, shuffle, seed, debug=True)
+                items = _fetch_images(cursor, limit=None, debug=True)
                 print(f"[INSPIRE] Images-only feed: {len(items)} items")
 
             elif filter_type in ("video", "videos"):
-                items = _fetch_videos(cursor, limit, shuffle, seed, debug=True)
+                items = _fetch_videos(cursor, limit=None, debug=True)
                 print(f"[INSPIRE] Videos-only feed: {len(items)} items")
 
             else:
                 items = []
 
             cursor.close()
+
+        # Shuffle ALL items together
+        if shuffle:
+            if seed:
+                items = _seeded_shuffle(items, seed)
+            else:
+                random.shuffle(items)
 
         # Transform to cards and trim to limit
         cards = []
@@ -537,6 +533,7 @@ def inspire_feed() -> Response:
             "prompt_of_the_day": potd,
             "cards": cards,
             "total": len(cards),
+            "total_available": len(items),
             "source": "inspire"
         })
         response.headers["Content-Type"] = "application/json"
