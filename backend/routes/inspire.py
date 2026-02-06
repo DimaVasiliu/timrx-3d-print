@@ -155,44 +155,73 @@ def _get_prompt_of_the_day(cursor) -> Dict[str, Any]:
 
 
 def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
-    """Fetch models with valid thumbnails. Accepts various success status values."""
-    order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
+    """
+    Fetch models with valid thumbnails. Accepts various success status values.
+    Returns thumb_preview (always) and thumb_refined (if a refined/textured version exists).
+    """
+    order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY m.created_at DESC"
 
-    # Accept multiple status values: NULL, SUCCEEDED, SUCCESS, COMPLETED, DONE (case-insensitive)
+    # Query models with optional refined/textured thumbnail via self-join on upstream_job_id
+    # Preview stage thumbnail + look for refined/textured versions
     cursor.execute(f"""
+        WITH base_models AS (
+            SELECT
+                id,
+                title,
+                prompt,
+                thumbnail_url,
+                stage,
+                upstream_job_id,
+                created_at
+            FROM timrx_app.models
+            WHERE thumbnail_url IS NOT NULL
+              AND thumbnail_url != ''
+              AND (
+                status IS NULL
+                OR UPPER(status) IN ('SUCCEEDED', 'SUCCESS', 'COMPLETED', 'DONE', 'FINISHED')
+              )
+        )
         SELECT
-            id::text as id,
+            m.id::text as id,
             'model' as type,
-            title,
-            prompt,
-            thumbnail_url as thumb_url,
-            glb_url as asset_url,
-            created_at
-        FROM timrx_app.models
-        WHERE thumbnail_url IS NOT NULL
-          AND thumbnail_url != ''
-          AND (
-            status IS NULL
-            OR UPPER(status) IN ('SUCCEEDED', 'SUCCESS', 'COMPLETED', 'DONE', 'FINISHED')
-          )
+            m.title,
+            m.prompt,
+            m.thumbnail_url as thumb_preview,
+            -- Find refined/textured thumbnail: prefer textured > refined > null
+            COALESCE(
+                (SELECT thumbnail_url FROM base_models r
+                 WHERE r.upstream_job_id = m.upstream_job_id
+                   AND r.id != m.id
+                   AND LOWER(r.stage) IN ('texture', 'retexture', 'textured')
+                 ORDER BY r.created_at DESC LIMIT 1),
+                (SELECT thumbnail_url FROM base_models r
+                 WHERE r.upstream_job_id = m.upstream_job_id
+                   AND r.id != m.id
+                   AND LOWER(r.stage) IN ('refine', 'refined', 'remesh')
+                 ORDER BY r.created_at DESC LIMIT 1)
+            ) as thumb_refined,
+            m.stage,
+            m.created_at
+        FROM base_models m
+        WHERE m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', '')
         {order}
         LIMIT %s
     """, (limit,))
 
     rows = cursor.fetchall()
 
-    # Debug: if no models found, log distinct statuses
+    # Debug: if no models found, log distinct statuses and stages
     if debug and len(rows) == 0:
         cursor.execute("""
-            SELECT status, COUNT(*) as cnt
+            SELECT status, stage, COUNT(*) as cnt
             FROM timrx_app.models
             WHERE thumbnail_url IS NOT NULL AND thumbnail_url != ''
-            GROUP BY status
+            GROUP BY status, stage
             ORDER BY cnt DESC
             LIMIT 10
         """)
-        statuses = cursor.fetchall()
-        print(f"[INSPIRE] DEBUG: No models found. Distinct statuses with thumbnails: {[dict(s) for s in statuses]}")
+        info = cursor.fetchall()
+        print(f"[INSPIRE] DEBUG: No models found. Status/stage combos: {[dict(s) for s in info]}")
 
     if seed and shuffle:
         rows = _seeded_shuffle(rows, seed + "_models")
@@ -200,7 +229,10 @@ def _fetch_models(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
 
 
 def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
-    """Fetch images with valid thumbnails or image URLs."""
+    """
+    Fetch images with valid thumbnails or image URLs.
+    Returns thumb_preview (thumbnail or image_url) and thumb_refined (full image_url if different).
+    """
     order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
 
     cursor.execute(f"""
@@ -209,8 +241,13 @@ def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
             'image' as type,
             title,
             prompt,
-            COALESCE(thumbnail_url, image_url) as thumb_url,
-            image_url as asset_url,
+            COALESCE(thumbnail_url, image_url) as thumb_preview,
+            -- For images: use full image_url as "refined" if different from thumbnail
+            CASE
+                WHEN thumbnail_url IS NOT NULL AND image_url IS NOT NULL AND thumbnail_url != image_url
+                THEN image_url
+                ELSE NULL
+            END as thumb_refined,
             width,
             height,
             created_at
@@ -228,7 +265,10 @@ def _fetch_images(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
 
 
 def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str], debug: bool = False) -> List[Dict]:
-    """Fetch videos with valid thumbnails."""
+    """
+    Fetch videos with valid thumbnails.
+    Videos don't have refined thumbnails, so thumb_refined is always null.
+    """
     order = "ORDER BY RANDOM()" if shuffle and not seed else "ORDER BY created_at DESC"
 
     cursor.execute(f"""
@@ -237,8 +277,9 @@ def _fetch_videos(cursor, limit: int, shuffle: bool, seed: Optional[str], debug:
             'video' as type,
             title,
             prompt,
-            thumbnail_url as thumb_url,
-            video_url as asset_url,
+            thumbnail_url as thumb_preview,
+            NULL as thumb_refined,
+            video_url,
             duration_seconds,
             created_at
         FROM timrx_app.videos
@@ -310,13 +351,19 @@ def _balanced_mix(models: List[Dict], images: List[Dict], videos: List[Dict], ta
 
 
 def _transform_to_card(item: Dict, index: int, total_count: int = 24) -> Dict[str, Any]:
-    """Transform a DB row into an inspire card with size variety."""
+    """
+    Transform a DB row into an inspire card with size variety.
+    Returns normalized thumbnail fields for hover swap functionality.
+    """
     item_id = item.get("id", "")
     item_type = item.get("type", "model")
-    thumb_url = item.get("thumb_url", "")
+
+    # Get thumbnail URLs - support both old and new field names
+    thumb_preview = item.get("thumb_preview") or item.get("thumb_url") or ""
+    thumb_refined = item.get("thumb_refined")  # May be None
 
     # Skip items without thumbnails
-    if not thumb_url:
+    if not thumb_preview:
         return None
 
     # Determine card size for visual variety
@@ -340,15 +387,20 @@ def _transform_to_card(item: Dict, index: int, total_count: int = 24) -> Dict[st
         "type": item_type,
         "title": item.get("title") or item.get("prompt") or "Untitled",
         "prompt": item.get("prompt") or item.get("title") or "Untitled creation",
-        "thumb_url": thumb_url,
+        # Normalized thumbnail fields for frontend hover swap
+        "thumb_preview": thumb_preview,
+        "thumb_refined": thumb_refined,  # null if no refined version exists
+        "has_refine": thumb_refined is not None and thumb_refined != "",
+        # Legacy field for backwards compatibility
+        "thumb_url": thumb_preview,
         "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
         "tags": _get_tags(item.get("created_at"), item_id),
         "size": size,
     }
 
-    # Add asset URL if available
-    if item.get("asset_url"):
-        card["asset_url"] = item["asset_url"]
+    # Add video URL for videos
+    if item_type == "video" and item.get("video_url"):
+        card["video_url"] = item["video_url"]
 
     # Add aspect ratio for images
     if item_type == "image":
