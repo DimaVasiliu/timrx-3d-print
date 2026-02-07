@@ -199,6 +199,31 @@ DEFAULT_PLANS = [
         "credit_grant": 600,
         "includes_priority": True,
     },
+    # Video credit packs
+    {
+        "code": "video_starter_250",
+        "name": "Video Starter",
+        "description": "Best for testing & casual video creators.",
+        "price_gbp": 9.99,
+        "credit_grant": 250,
+        "includes_priority": False,
+    },
+    {
+        "code": "video_creator_750",
+        "name": "Video Creator",
+        "description": "For regular short-form creators.",
+        "price_gbp": 24.99,
+        "credit_grant": 750,
+        "includes_priority": False,
+    },
+    {
+        "code": "video_studio_1600",
+        "name": "Video Studio",
+        "description": "Heavy use / content batches. Priority queue.",
+        "price_gbp": 44.99,
+        "credit_grant": 1600,
+        "includes_priority": True,
+    },
 ]
 
 
