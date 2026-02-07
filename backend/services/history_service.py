@@ -1250,8 +1250,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             # PARENT METADATA INHERITANCE for derived jobs (texture/refine/etc)
             # When Meshy returns root_prompt=null, inherit from parent job
             # ─────────────────────────────────────────────────────────────────
+            # Use original_job_id from Meshy response (status_data) or job_meta for parent lookup
             parent_task_id = (
-                job_meta.get("source_task_id")
+                job_meta.get("original_job_id")
+                or status_data.get("original_job_id")
+                or job_meta.get("source_task_id")
                 or job_meta.get("preview_task_id")
                 or status_data.get("preview_task_id")
             )
@@ -1260,6 +1263,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             parent_root_prompt = None
             if parent_task_id:
                 try:
+                    # First try history_items (by id or payload->original_job_id)
                     cur.execute(
                         f"""
                         SELECT title, prompt, root_prompt
@@ -1270,14 +1274,26 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         (str(parent_task_id), str(parent_task_id)),
                     )
                     parent_row = cur.fetchone()
+                    # Fallback: check models table by upstream_job_id (more reliable for parent lookup)
+                    if not parent_row:
+                        cur.execute(
+                            f"""
+                            SELECT title, prompt, root_prompt
+                            FROM {Tables.MODELS}
+                            WHERE upstream_job_id = %s OR upstream_id = %s
+                            LIMIT 1
+                            """,
+                            (str(parent_task_id), str(parent_task_id)),
+                        )
+                        parent_row = cur.fetchone()
                     if parent_row:
                         parent_title = parent_row.get("title")
                         parent_prompt = parent_row.get("prompt")
                         parent_root_prompt = parent_row.get("root_prompt")
-                        # Inherit from parent when current values are missing
-                        if not final_prompt and parent_prompt:
+                        # Inherit from parent when current values are missing or generic
+                        if (not final_prompt or is_generic_title(final_prompt)) and parent_prompt:
                             final_prompt = parent_prompt
-                        if not root_prompt and (parent_root_prompt or parent_prompt):
+                        if (not root_prompt or is_generic_title(root_prompt)) and (parent_root_prompt or parent_prompt):
                             root_prompt = parent_root_prompt or parent_prompt
                 except Exception as parent_lookup_err:
                     log_db_continue("parent_metadata_lookup", parent_lookup_err)
@@ -1496,7 +1512,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             payload = {
                 "original_job_id": job_id,
                 "job_type": job_type,
-                "root_prompt": job_meta.get("root_prompt") or job_meta.get("prompt"),
+                "root_prompt": root_prompt or job_meta.get("root_prompt") or job_meta.get("prompt"),
                 "art_style": job_meta.get("art_style"),
                 "ai_model": job_meta.get("model") or job_meta.get("ai_model"),
                 "license": job_meta.get("license", "private"),
@@ -1523,6 +1539,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "model_urls": model_urls,
                 "textured_model_urls": textured_model_urls,
             }
+            # Persist parent_task_id for lineage tracking (for derived jobs like texture/remesh/rig)
+            if parent_task_id:
+                payload["parent_job_id"] = parent_task_id
             if final_glb_url:
                 payload["glb_url"] = final_glb_url
             if image_url:
@@ -1531,10 +1550,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 payload["thumbnail_url"] = final_thumbnail_url
 
             # Use inherited values (final_prompt/root_prompt may have been set from parent)
-            # Also use parent_title as fallback for explicit title
+            # Use parent_title when job_meta.title is generic (e.g., "Untitled")
+            incoming_title = job_meta.get("title")
+            explicit_title = incoming_title if (incoming_title and not is_generic_title(incoming_title)) else parent_title
             final_title = derive_display_title(
                 final_prompt or job_meta.get("prompt"),
-                job_meta.get("title") or parent_title,
+                explicit_title,
                 root_prompt=root_prompt or job_meta.get("root_prompt"),
             )
             glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
@@ -1561,6 +1582,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         "stage": final_stage,
                         "s3_bucket": s3_bucket,
                     }
+                    # Store parent reference for lineage tracking (derived jobs like texture/remesh/rig)
+                    if parent_task_id:
+                        model_meta["parent_job_id"] = parent_task_id
 
                     existing_by_hash_id = None
                     if model_content_hash:
