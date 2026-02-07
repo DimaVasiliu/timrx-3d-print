@@ -329,12 +329,14 @@ def mesh_retexture_mod():
             return validation_error
 
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
-    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
-    root_prompt = source_meta.get("root_prompt") or original_prompt
+    # Use texture_prompt as fallback for prompt/root_prompt (often contains original description)
+    texture_prompt_text = prompt or ""  # texture prompt from body
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or texture_prompt_text or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt or texture_prompt_text or ""
     # Use explicit title, or derive from prompt/root_prompt
     # derive_display_title handles generic titles (like "Textured Model") automatically
     explicit_title = body.get("title") or source_meta.get("title")
-    title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
+    title = derive_display_title(original_prompt or texture_prompt_text, explicit_title, root_prompt=root_prompt or texture_prompt_text)
 
     job_meta = {
         "prompt": original_prompt,
@@ -461,12 +463,20 @@ def mesh_retexture_status_mod(job_id: str):
                 if not meta.get("root_prompt"):
                     meta["root_prompt"] = source_meta.get("root_prompt") or meta.get("prompt")
 
+        # Fallback: use texture_prompt for title derivation when no prompt/root_prompt available
+        texture_prompt_fallback = meta.get("texture_prompt") or ""
+        if not meta.get("prompt") and texture_prompt_fallback:
+            meta["prompt"] = texture_prompt_fallback
+        if not meta.get("root_prompt") and texture_prompt_fallback:
+            meta["root_prompt"] = texture_prompt_fallback
+
         if not meta.get("title") or is_generic_title(meta.get("title")):
             # derive_display_title handles generic titles automatically
+            prompt_for_title = meta.get("prompt") or texture_prompt_fallback
             meta["title"] = derive_display_title(
-                meta.get("prompt"),
+                prompt_for_title,
                 source_meta.get("title") if source_meta else None,
-                root_prompt=meta.get("root_prompt"),
+                root_prompt=meta.get("root_prompt") or texture_prompt_fallback,
             )
 
         # Persist original_job_id for lineage tracking
