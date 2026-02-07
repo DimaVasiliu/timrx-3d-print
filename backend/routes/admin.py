@@ -28,7 +28,7 @@ from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_admin
 from backend.services.admin_service import AdminService
-from backend.db import DatabaseError
+from backend.db import DatabaseError, query_all, query_one
 
 bp = Blueprint("admin", __name__)
 
@@ -1150,4 +1150,183 @@ def debug_magic_code():
         print(f"[ADMIN] Debug magic-code error: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSCRIPTION CRON ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/subscriptions/process-credits", methods=["POST"])
+@require_admin
+def process_subscription_credits():
+    """
+    Process due credit allocations for subscriptions (cron-callable endpoint).
+
+    Call this endpoint periodically (e.g., every hour) from:
+    - A Render cron job
+    - An external scheduler (e.g., cron.org, EasyCron)
+    - A background worker
+
+    This finds subscriptions where next_credit_date <= NOW() and:
+    1. Grants the monthly credits
+    2. Updates next_credit_date to next month
+    3. Sends notification email
+    4. For yearly plans, decrements credits_remaining_months
+
+    Returns:
+        - processed: Number of subscriptions checked
+        - granted: Number of successful credit grants
+        - errors: Number of errors encountered
+
+    Safe to call frequently - idempotent credit grants.
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Subscription credit processing triggered by {admin_email or 'token'}")
+
+        result = SubscriptionService.process_due_credit_allocations()
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Subscription credit processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/check-expired", methods=["POST"])
+@require_admin
+def check_expired_subscriptions():
+    """
+    Check and expire cancelled subscriptions past their period (cron-callable endpoint).
+
+    Call this endpoint periodically (e.g., every hour) to:
+    - Find cancelled subscriptions past their current_period_end
+    - Mark them as 'expired'
+    - Send expiration notification emails
+
+    Returns:
+        - expired: Number of subscriptions expired
+
+    Safe to call frequently - only processes subscriptions once.
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Subscription expiration check triggered by {admin_email or 'token'}")
+
+        expired = SubscriptionService.check_expired_subscriptions()
+
+        return jsonify({"ok": True, "expired": expired})
+    except Exception as e:
+        print(f"[ADMIN] Subscription expiration check error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/run-all", methods=["POST"])
+@require_admin
+def run_all_subscription_jobs():
+    """
+    Run all subscription maintenance jobs (cron-callable endpoint).
+
+    This is a convenience endpoint that runs:
+    1. Credit allocation processing (process_due_credit_allocations)
+    2. Expired subscription check (check_expired_subscriptions)
+
+    Recommended frequency: every 1-6 hours
+
+    Returns:
+        - credits: Credit allocation results
+        - expired: Number of subscriptions expired
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] All subscription jobs triggered by {admin_email or 'token'}")
+
+        # Process credit allocations
+        credit_result = SubscriptionService.process_due_credit_allocations()
+
+        # Check expired subscriptions
+        expired_count = SubscriptionService.check_expired_subscriptions()
+
+        return jsonify({
+            "ok": True,
+            "credits": {
+                "processed": credit_result.get("processed", 0),
+                "granted": credit_result.get("granted", 0),
+                "errors": credit_result.get("errors", 0),
+            },
+            "expired": expired_count,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Subscription jobs error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/stats", methods=["GET"])
+@require_admin
+def subscription_stats():
+    """
+    Get subscription statistics for monitoring.
+
+    Returns:
+        - total: Total subscription count
+        - by_status: Subscription counts by status (active, past_due, cancelled, expired)
+        - by_plan: Subscription counts by plan_code
+        - due_for_credits: Subscriptions due for credit allocation (next_credit_date <= NOW)
+        - past_due_count: Number of subscriptions with failed payments
+    """
+    try:
+        # Get counts by status
+        stats_row = query_one(
+            """
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'active') as active,
+                COUNT(*) FILTER (WHERE status = 'past_due') as past_due,
+                COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,
+                COUNT(*) FILTER (WHERE status = 'expired') as expired,
+                COUNT(*) FILTER (WHERE status = 'active' AND next_credit_date <= NOW()) as due_for_credits
+            FROM timrx_billing.subscriptions
+            """,
+        )
+
+        # Get counts by plan
+        plan_rows = query_all(
+            """
+            SELECT plan_code, COUNT(*) as count
+            FROM timrx_billing.subscriptions
+            WHERE status = 'active'
+            GROUP BY plan_code
+            ORDER BY count DESC
+            """,
+        )
+
+        by_plan = {row["plan_code"]: row["count"] for row in (plan_rows or [])}
+
+        return jsonify({
+            "ok": True,
+            "total": stats_row["total"] if stats_row else 0,
+            "by_status": {
+                "active": stats_row["active"] if stats_row else 0,
+                "past_due": stats_row["past_due"] if stats_row else 0,
+                "cancelled": stats_row["cancelled"] if stats_row else 0,
+                "expired": stats_row["expired"] if stats_row else 0,
+            },
+            "by_plan": by_plan,
+            "due_for_credits": stats_row["due_for_credits"] if stats_row else 0,
+            "past_due_count": stats_row["past_due"] if stats_row else 0,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Subscription stats error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
