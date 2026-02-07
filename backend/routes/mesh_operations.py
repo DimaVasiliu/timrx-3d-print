@@ -227,10 +227,12 @@ def mesh_remesh_status_mod(job_id: str):
             meta["identity_id"] = identity_id
             meta["user_id"] = identity_id
 
-        source_id = meta.get("source_task_id") or out.get("source_task_id")
+        # Use original_job_id from Meshy response (parent reference) or fallback to source_task_id
+        parent_job_id = out.get("original_job_id") or meta.get("source_task_id") or meta.get("preview_task_id")
         source_meta = None  # Initialize before conditional to prevent undefined access
-        if source_id and (not meta.get("prompt") or not meta.get("title")):
-            source_meta = get_job_metadata(source_id, store)
+        # Always fetch source_meta when title is generic (e.g., "Untitled") to enable inheritance
+        if parent_job_id and (not meta.get("prompt") or not meta.get("title") or is_generic_title(meta.get("title"))):
+            source_meta = get_job_metadata(parent_job_id, store)
             if source_meta:
                 if not meta.get("prompt"):
                     meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
@@ -243,6 +245,10 @@ def mesh_remesh_status_mod(job_id: str):
                 source_meta.get("title") if source_meta else None,
                 root_prompt=meta.get("root_prompt"),
             )
+
+        # Persist original_job_id for lineage tracking
+        if parent_job_id:
+            meta["original_job_id"] = parent_job_id
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="remesh", user_id=user_id)
@@ -443,10 +449,12 @@ def mesh_retexture_status_mod(job_id: str):
             meta["identity_id"] = identity_id
             meta["user_id"] = identity_id
 
-        source_id = meta.get("source_task_id") or out.get("source_task_id")
+        # Use original_job_id from Meshy response (parent reference) or fallback to source_task_id
+        parent_job_id = out.get("original_job_id") or meta.get("source_task_id") or meta.get("preview_task_id")
         source_meta = None  # Initialize before conditional
-        if source_id and (not meta.get("prompt") or not meta.get("title")):
-            source_meta = get_job_metadata(source_id, store)
+        # Always fetch source_meta when title is generic (e.g., "Untitled") to enable inheritance
+        if parent_job_id and (not meta.get("prompt") or not meta.get("title") or is_generic_title(meta.get("title"))):
+            source_meta = get_job_metadata(parent_job_id, store)
             if source_meta:
                 if not meta.get("prompt"):
                     meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
@@ -460,6 +468,10 @@ def mesh_retexture_status_mod(job_id: str):
                 source_meta.get("title") if source_meta else None,
                 root_prompt=meta.get("root_prompt"),
             )
+
+        # Persist original_job_id for lineage tracking
+        if parent_job_id:
+            meta["original_job_id"] = parent_job_id
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="texture", user_id=user_id)
@@ -651,10 +663,12 @@ def mesh_rigging_status_mod(job_id: str):
             meta["identity_id"] = identity_id
             meta["user_id"] = identity_id
 
-        source_id = meta.get("source_task_id") or out.get("source_task_id")
+        # Use original_job_id from Meshy response (parent reference) or fallback to source_task_id
+        parent_job_id = out.get("original_job_id") or meta.get("source_task_id") or meta.get("preview_task_id")
         source_meta = None  # Initialize before conditional to prevent undefined access
-        if source_id and (not meta.get("prompt") or not meta.get("title")):
-            source_meta = get_job_metadata(source_id, store)
+        # Always fetch source_meta when title is generic (e.g., "Untitled") to enable inheritance
+        if parent_job_id and (not meta.get("prompt") or not meta.get("title") or is_generic_title(meta.get("title"))):
+            source_meta = get_job_metadata(parent_job_id, store)
             if source_meta:
                 if not meta.get("prompt"):
                     meta["prompt"] = source_meta.get("prompt") or source_meta.get("root_prompt") or out.get("prompt") or ""
@@ -667,6 +681,10 @@ def mesh_rigging_status_mod(job_id: str):
                 source_meta.get("title") if source_meta else None,
                 root_prompt=meta.get("root_prompt"),
             )
+
+        # Persist original_job_id for lineage tracking
+        if parent_job_id:
+            meta["original_job_id"] = parent_job_id
 
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="rig", user_id=user_id)
