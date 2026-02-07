@@ -1025,3 +1025,557 @@ Need help? Reply to this email or contact support@timrx.live
             print(f"[EMAIL] send_subscription_confirmation send_raw error: {e}, falling back to simple send")
 
     return send_email(to_email, subject, html_body, text_body)
+
+
+def send_credits_delivered_email(
+    to_email: str,
+    plan_code: str,
+    credits_granted: int,
+    is_first_grant: bool,
+    next_credit_date,  # datetime
+    remaining_months: Optional[int] = None,
+) -> bool:
+    """
+    Send email notification when monthly credits are delivered.
+
+    Sent on each credit allocation for both monthly and yearly plans.
+    """
+    from datetime import datetime, timezone
+
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    subject = f"Your {credits_granted:,} TimrX Credits Are Ready"
+
+    # Load logo for inline CID embedding
+    logo_bytes = _load_logo()
+
+    # Format next credit date
+    if hasattr(next_credit_date, 'strftime'):
+        next_date_str = next_credit_date.strftime("%B %d, %Y")
+    else:
+        next_date_str = str(next_credit_date)[:10]
+
+    # Build summary rows
+    summary_rows = [
+        ("Plan", plan_name),
+        ("Credits delivered", f"{credits_granted:,}"),
+        ("Next delivery", next_date_str),
+    ]
+
+    if remaining_months is not None:
+        summary_rows.append(("Months remaining", f"{remaining_months}"))
+
+    summary_card = render_detail_card(summary_rows, header="Credit Details")
+
+    # Success banner
+    if is_first_grant:
+        banner_title = "Welcome! Your first credits are ready"
+        banner_text = f"Your subscription is now active with {credits_granted:,} credits."
+    else:
+        banner_title = "Monthly credits delivered"
+        banner_text = f"Your {credits_granted:,} credits for this month have been added."
+
+    success_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f0fdf4;border:1px solid #86efac;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        &#10003; {banner_title}
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        {banner_text}
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    body_html = f'''
+        {success_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    {summary_card}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding-top:24px;">
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your credits are ready to use. Start creating amazing 3D content!
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Credits Delivered",
+        intro=banner_text,
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    remaining_text = f"\nMonths remaining: {remaining_months}" if remaining_months is not None else ""
+
+    text_body = f"""Credits Delivered - TimrX
+
+{banner_title}
+
+{banner_text}
+
+Credit Details:
+  Plan: {plan_name}
+  Credits delivered: {credits_granted:,}
+  Next delivery: {next_date_str}{remaining_text}
+
+Your credits are ready to use. Start creating amazing 3D content!
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
+def send_payment_failed_email(
+    to_email: str,
+    plan_code: str,
+    failure_count: int,
+) -> bool:
+    """
+    Send email notification when subscription payment fails.
+
+    Alerts the user to update their payment method.
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    subject = "Action Required: Payment Failed for Your TimrX Subscription"
+
+    # Load logo
+    logo_bytes = _load_logo()
+
+    # Warning banner
+    warning_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#fef2f2;border:1px solid #fca5a5;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#991b1b;font-family:Arial,Helvetica,sans-serif;">
+                        &#9888; Payment Failed
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#991b1b;font-family:Arial,Helvetica,sans-serif;">
+                        We couldn't process your payment for the {plan_name} subscription.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    urgency_text = "Please update your payment method as soon as possible to continue receiving credits." if failure_count == 1 else f"This is attempt {failure_count}. Your subscription will be suspended if payment continues to fail."
+
+    body_html = f'''
+        {warning_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        {urgency_text}
+                    </p>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>What to do:</strong>
+                    </p>
+                    <ul style="margin:0 0 16px 0;padding-left:20px;font-size:14px;line-height:1.8;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <li>Check that your card details are up to date</li>
+                        <li>Ensure sufficient funds are available</li>
+                        <li>Contact your bank if the problem persists</li>
+                    </ul>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Payment Failed",
+        intro=f"We couldn't process your payment for your {plan_name} subscription.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Payment Failed - TimrX
+
+We couldn't process your payment for the {plan_name} subscription.
+
+{urgency_text}
+
+What to do:
+- Check that your card details are up to date
+- Ensure sufficient funds are available
+- Contact your bank if the problem persists
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
+def send_subscription_reactivated_email(
+    to_email: str,
+    plan_code: str,
+) -> bool:
+    """
+    Send email when subscription is reactivated after payment resolved.
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    subject = f"Your TimrX {plan_name} Subscription is Active Again"
+
+    logo_bytes = _load_logo()
+
+    success_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f0fdf4;border:1px solid #86efac;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        &#10003; Subscription Reactivated
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        Your payment has been processed and your {plan_name} subscription is active again.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    body_html = f'''
+        {success_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Thank you for resolving the payment issue. Your monthly credit allocations will continue as normal.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Subscription Reactivated",
+        intro=f"Great news! Your {plan_name} subscription is active again.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Subscription Reactivated - TimrX
+
+Great news! Your {plan_name} subscription is active again.
+
+Your payment has been processed and your monthly credit allocations will continue as normal.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
+def send_subscription_renewed_email(
+    to_email: str,
+    plan_code: str,
+    next_billing_date,  # datetime
+) -> bool:
+    """
+    Send email when subscription is renewed.
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+        cadence = plan_info.get("cadence", "monthly")
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+        cadence = "monthly" if "monthly" in plan_code else "yearly"
+
+    subject = f"Your TimrX {plan_name} Subscription Has Been Renewed"
+
+    logo_bytes = _load_logo()
+
+    # Format next billing date
+    if hasattr(next_billing_date, 'strftime'):
+        next_date_str = next_billing_date.strftime("%B %d, %Y")
+    else:
+        next_date_str = str(next_billing_date)[:10]
+
+    success_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f0fdf4;border:1px solid #86efac;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        &#10003; Subscription Renewed
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        Your {plan_name} subscription has been successfully renewed.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    summary_card = render_detail_card([
+        ("Plan", plan_name),
+        ("Billing period", cadence.title()),
+        ("Next billing date", next_date_str),
+    ], header="Renewal Details")
+
+    body_html = f'''
+        {success_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    {summary_card}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding-top:24px;">
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your credits will continue to be delivered monthly as part of your subscription.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Subscription Renewed",
+        intro=f"Your {plan_name} subscription has been successfully renewed.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Subscription Renewed - TimrX
+
+Your {plan_name} subscription has been successfully renewed.
+
+Renewal Details:
+  Plan: {plan_name}
+  Billing period: {cadence.title()}
+  Next billing date: {next_date_str}
+
+Your credits will continue to be delivered monthly as part of your subscription.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
+def send_subscription_cancelled_email(
+    to_email: str,
+    plan_code: str,
+    access_until,  # datetime or None
+) -> bool:
+    """
+    Send email when subscription is cancelled.
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    subject = f"Your TimrX {plan_name} Subscription Has Been Cancelled"
+
+    logo_bytes = _load_logo()
+
+    # Format access until date
+    if access_until and hasattr(access_until, 'strftime'):
+        access_date_str = access_until.strftime("%B %d, %Y")
+        access_text = f"You can continue using your remaining credits until {access_date_str}."
+    else:
+        access_text = "Your remaining credits will be available until the end of your current billing period."
+
+    info_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#fef3c7;border:1px solid #fcd34d;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#92400e;font-family:Arial,Helvetica,sans-serif;">
+                        Subscription Cancelled
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#92400e;font-family:Arial,Helvetica,sans-serif;">
+                        Your {plan_name} subscription has been cancelled as requested.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    body_html = f'''
+        {info_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        {access_text}
+                    </p>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        We're sorry to see you go! If you change your mind, you can resubscribe anytime from your account.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Subscription Cancelled",
+        intro=f"Your {plan_name} subscription has been cancelled.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Subscription Cancelled - TimrX
+
+Your {plan_name} subscription has been cancelled as requested.
+
+{access_text}
+
+We're sorry to see you go! If you change your mind, you can resubscribe anytime from your account.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
+def send_subscription_expired_email(
+    to_email: str,
+    plan_code: str,
+) -> bool:
+    """
+    Send email when subscription expires.
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    subject = f"Your TimrX {plan_name} Subscription Has Expired"
+
+    logo_bytes = _load_logo()
+
+    info_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#374151;font-family:Arial,Helvetica,sans-serif;">
+                        Subscription Expired
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#6b7280;font-family:Arial,Helvetica,sans-serif;">
+                        Your {plan_name} subscription period has ended.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    body_html = f'''
+        {info_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your monthly credit allocations have ended. Any remaining credits in your account can still be used.
+                    </p>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Want to continue creating? You can resubscribe anytime or purchase a one-time credit pack from your account.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Subscription Expired",
+        intro=f"Your {plan_name} subscription period has ended.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Subscription Expired - TimrX
+
+Your {plan_name} subscription period has ended.
+
+Your monthly credit allocations have ended. Any remaining credits in your account can still be used.
+
+Want to continue creating? You can resubscribe anytime or purchase a one-time credit pack from your account.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
+# ─────────────────────────────────────────────────────────────
+# Helper for sending emails with logo
+# ─────────────────────────────────────────────────────────────
+def _send_with_logo(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: str,
+    logo_bytes: Optional[bytes],
+) -> bool:
+    """Helper to send email with inline logo, falling back to simple send."""
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_raw failed: {result.message}, falling back to simple send")
+        except Exception as e:
+            print(f"[EMAIL] send_raw error: {e}, falling back to simple send")
+
+    return send_email(to_email, subject, html_body, text_body)
