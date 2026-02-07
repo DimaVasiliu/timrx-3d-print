@@ -896,3 +896,132 @@ def notify_restore_request(email: str) -> bool:
         "A user has requested an account restore code.",
         {"Email": email},
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# Subscription Emails
+# ─────────────────────────────────────────────────────────────
+def send_subscription_confirmation(
+    to_email: str,
+    plan_name: str,
+    plan_code: str,  # noqa: ARG001 - reserved for future invoice generation
+    credits_per_month: int,
+    price_gbp: float,
+    cadence: str = "monthly",
+) -> bool:
+    """
+    Send a subscription confirmation email to the user.
+
+    Sent when a user completes a subscription checkout (monthly or yearly).
+    """
+    from datetime import datetime, timezone
+
+    subject = f"TimrX Subscription Confirmed - {plan_name}"
+    start_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Load logo for inline CID embedding
+    logo_bytes = _load_logo()
+
+    # Calculate billing info
+    if cadence == "yearly":
+        price_display = f"£{price_gbp:.2f}/year"
+        next_billing = "in 12 months"
+    else:
+        price_display = f"£{price_gbp:.2f}/month"
+        next_billing = "in 30 days"
+
+    # Build subscription summary card
+    summary_card = render_detail_card([
+        ("Plan", plan_name),
+        ("Credits", f"{credits_per_month:,} per month"),
+        ("Billing", price_display),
+        ("Started", start_date),
+        ("Next billing", next_billing),
+    ], header="Subscription Details")
+
+    # Success banner
+    success_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f0fdf4;border:1px solid #86efac;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        &#10003; Subscription Active
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
+                        Your first {credits_per_month:,} credits have been added to your account.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    body_html = f'''
+        {success_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    {summary_card}
+                </td>
+            </tr>
+            <tr>
+                <td style="padding-top:24px;">
+                    <p style="margin:0 0 8px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Your subscription is now active. You'll receive {credits_per_month:,} credits at the start of each billing period.
+                    </p>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        You can manage your subscription anytime from your account settings.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Subscription Confirmed",
+        intro=f"Welcome to {plan_name}! Your subscription is now active.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Subscription Confirmed - TimrX
+
+Welcome to {plan_name}! Your subscription is now active.
+
+Subscription Details:
+  Plan: {plan_name}
+  Credits: {credits_per_month:,} per month
+  Billing: {price_display}
+  Started: {start_date}
+  Next billing: {next_billing}
+
+Your first {credits_per_month:,} credits have been added to your account.
+
+You can manage your subscription anytime from your account settings.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    # Use send_raw with inline logo if logo available
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_subscription_confirmation send_raw failed: {result.message}, falling back to simple send")
+        except Exception as e:
+            print(f"[EMAIL] send_subscription_confirmation send_raw error: {e}, falling back to simple send")
+
+    return send_email(to_email, subject, html_body, text_body)
