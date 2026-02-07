@@ -53,6 +53,7 @@ class CanonicalActions:
     VIDEO_GENERATE = "video_generate"
     VIDEO_TEXT_GENERATE = "video_text_generate"
     VIDEO_IMAGE_ANIMATE = "video_image_animate"
+    GEMINI_VIDEO = "gemini_video"
 
 
 # Canonical key -> DB action code mapping
@@ -67,6 +68,7 @@ CANONICAL_TO_DB = {
     CanonicalActions.VIDEO_GENERATE: "VIDEO_GENERATE",
     CanonicalActions.VIDEO_TEXT_GENERATE: "VIDEO_TEXT_GENERATE",
     CanonicalActions.VIDEO_IMAGE_ANIMATE: "VIDEO_IMAGE_ANIMATE",
+    CanonicalActions.GEMINI_VIDEO: "GEMINI_VIDEO",
 }
 
 # Alias -> Canonical key mapping (for backwards compatibility)
@@ -169,6 +171,7 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "VIDEO_GENERATE", "cost_credits": 60, "provider": "video"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 60, "provider": "video"},
     {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 60, "provider": "video"},
+    {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "google"},
 ]
 
 DEFAULT_PLANS = [
