@@ -255,6 +255,8 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
         "rigged_character_glb_url": rigged_glb,
         "rigged_character_fbx_url": rigged_fbx,
         "created_at": normalize_epoch_ms(_pick_first(containers, ["created_at", "created_at_ts", "created_time"])),
+        # Parent job reference for derived jobs (texture/remesh/rig) - used for metadata inheritance
+        "original_job_id": _pick_first(containers, ["original_job_id", "source_task_id", "preview_task_id", "input_task_id"]),
     }
 
 
