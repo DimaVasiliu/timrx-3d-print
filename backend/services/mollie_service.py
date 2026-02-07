@@ -975,6 +975,42 @@ class MollieService:
             except Exception as e:
                 print(f"[MOLLIE] Warning: could not attach email: {e}")
 
+        # Send subscription confirmation email + admin notification
+        if customer_email:
+            try:
+                from backend.emailer import send_subscription_confirmation, notify_admin
+                from backend.services.subscription_service import SUBSCRIPTION_PLANS
+                plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+                plan_name = plan_info.get("name", plan_code)
+                credits_per_month = plan_info.get("credits_per_month", 0)
+                price_gbp = plan_info.get("price_gbp", 0)
+
+                send_subscription_confirmation(
+                    to_email=customer_email,
+                    plan_name=plan_name,
+                    plan_code=plan_code,
+                    credits_per_month=credits_per_month,
+                    price_gbp=price_gbp,
+                    cadence=cadence,
+                )
+                print(f"[MOLLIE] Subscription confirmation email sent to {customer_email}")
+
+                # Admin notification
+                notify_admin(
+                    subject="New Subscription",
+                    message=f"A user has subscribed to the {plan_name} plan ({cadence}).",
+                    data={
+                        "Identity ID": identity_id,
+                        "Email": customer_email,
+                        "Plan": plan_name,
+                        "Cadence": cadence,
+                        "Credits/month": f"{credits_per_month:,}",
+                        "Price": f"£{price_gbp:.2f}/{cadence}",
+                    },
+                )
+            except Exception as email_err:
+                print(f"[MOLLIE] WARNING: Subscription email failed: {email_err}")
+
         return {"purchase_id": sub_id, "was_existing": False}
 
     # ─────────────────────────────────────────────────────────────
