@@ -1035,7 +1035,7 @@ def subscription_cancel():
     if not sub or sub["status"] != "active":
         return jsonify({"error": "no_active_subscription", "message": "No active subscription to cancel"}), 404
 
-    ok = SubscriptionService.cancel_subscription(str(sub["id"]))
+    ok = SubscriptionService.cancel_subscription_with_email(str(sub["id"]))
     if ok:
         return jsonify({
             "ok": True,
