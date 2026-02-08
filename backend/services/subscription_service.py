@@ -125,6 +125,7 @@ class SubscriptionService:
         provider_subscription_id: Optional[str] = None,
         period_start: Optional[datetime] = None,
         period_end: Optional[datetime] = None,
+        customer_email: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Create a new subscription row.  Returns the row dict or None."""
         if not USE_DB:
@@ -136,11 +137,15 @@ class SubscriptionService:
             return None
 
         now = period_start or _now_utc()
+        billing_day = now.day
         if period_end is None:
             if plan["cadence"] == "yearly":
                 period_end = now + timedelta(days=365)
             else:
                 period_end = now + timedelta(days=30)
+
+        # Calculate next credit date for monthly allocation tracking
+        next_credit_date = SubscriptionService.calculate_next_credit_date(now, billing_day)
 
         try:
             with get_conn() as conn:
@@ -150,8 +155,9 @@ class SubscriptionService:
                         INSERT INTO {Tables.SUBSCRIPTIONS}
                             (identity_id, plan_code, status, provider,
                              provider_subscription_id,
-                             current_period_start, current_period_end)
-                        VALUES (%s, %s, 'active', %s, %s, %s, %s)
+                             current_period_start, current_period_end,
+                             customer_email, billing_day, next_credit_date)
+                        VALUES (%s, %s, 'active', %s, %s, %s, %s, %s, %s, %s)
                         RETURNING *
                         """,
                         (
@@ -161,11 +167,14 @@ class SubscriptionService:
                             provider_subscription_id,
                             now,
                             period_end,
+                            customer_email,
+                            billing_day,
+                            next_credit_date,
                         ),
                     )
                     row = cur.fetchone()
                 conn.commit()
-                print(f"[SUB] Created subscription {row['id']} for {identity_id} plan={plan_code}")
+                print(f"[SUB] Created subscription {row['id']} for {identity_id} plan={plan_code} email={customer_email}")
                 return row
         except Exception as e:
             print(f"[SUB] Error creating subscription: {e}")
