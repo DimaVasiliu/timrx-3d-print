@@ -676,6 +676,248 @@ def reconciliation_detect():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@bp.route("/reconcile/mollie", methods=["POST"])
+@require_admin
+def reconcile_mollie():
+    """
+    Run Mollie payment reconciliation.
+
+    Fetches payments from Mollie API and compares to database. Creates missing
+    purchases, grants missing subscription credits, and applies missing refunds.
+
+    Query params:
+        - days: How many days back to scan (default: 30, max: 90)
+        - dry_run: If 'true', detect issues but don't fix them (default: false)
+        - run_type: Type of run - 'full', 'mollie_only', 'subscriptions_only' (default: full)
+
+    Returns:
+        Summary of reconciliation run including:
+        - scanned_count: Total payments scanned from Mollie
+        - fixed_count: Total fixes applied
+        - purchases_fixed: One-time purchases created
+        - subscriptions_fixed: Subscription credits granted
+        - refunds_fixed: Refund entries applied
+
+    Safe to call frequently - all fixes are idempotent via unique constraint.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        days = min(request.args.get("days", 30, type=int), 90)
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+        run_type = request.args.get("run_type", "full")
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Mollie reconciliation triggered by {admin_email or 'token'} (days={days}, dry_run={dry_run}, run_type={run_type})")
+
+        result = ReconciliationService.reconcile_mollie_payments(
+            days_back=days,
+            dry_run=dry_run,
+            run_type=run_type,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Mollie reconciliation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/full", methods=["POST"])
+@require_admin
+def reconcile_full():
+    """
+    Run full reconciliation (safety checks + Mollie API comparison).
+
+    Combines both reconciliation types:
+    1. Safety reconciliation: DB internal consistency checks
+    2. Mollie reconciliation: Compare Mollie payments to DB
+
+    Query params:
+        - days: How many days back to scan Mollie (default: 30, max: 90)
+        - dry_run: If 'true', detect issues but don't fix them (default: false)
+        - send_alert: If 'true', send admin email on fixes (default: true)
+
+    Returns:
+        Combined summary from both reconciliation types.
+
+    This is the recommended endpoint for daily cron jobs.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        days = min(request.args.get("days", 30, type=int), 90)
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+        send_alert = request.args.get("send_alert", "true").lower() != "false"
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Full reconciliation triggered by {admin_email or 'token'} (days={days}, dry_run={dry_run})")
+
+        result = ReconciliationService.reconcile_full(
+            days_back=days,
+            dry_run=dry_run,
+            send_alert=send_alert,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Full reconciliation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/runs", methods=["GET"])
+@require_admin
+def reconciliation_runs():
+    """
+    Get recent reconciliation run history.
+
+    Query params:
+        - limit: Number of runs to return (default: 20, max: 100)
+        - status: Filter by status - 'running', 'completed', 'failed' (optional)
+
+    Returns:
+        List of recent reconciliation runs with their statistics.
+    """
+    try:
+        from backend.db import query_all
+
+        limit = min(request.args.get("limit", 20, type=int), 100)
+        status_filter = request.args.get("status")
+
+        if status_filter:
+            runs = query_all(
+                """
+                SELECT id, started_at, finished_at, status, run_type, days_back,
+                       scanned_count, fixed_count, errors_count,
+                       purchases_fixed, subscriptions_fixed, refunds_fixed, wallets_fixed,
+                       notes
+                FROM timrx_billing.reconciliation_runs
+                WHERE status = %s
+                ORDER BY started_at DESC
+                LIMIT %s
+                """,
+                [status_filter, limit],
+            )
+        else:
+            runs = query_all(
+                """
+                SELECT id, started_at, finished_at, status, run_type, days_back,
+                       scanned_count, fixed_count, errors_count,
+                       purchases_fixed, subscriptions_fixed, refunds_fixed, wallets_fixed,
+                       notes
+                FROM timrx_billing.reconciliation_runs
+                ORDER BY started_at DESC
+                LIMIT %s
+                """,
+                [limit],
+            )
+
+        return jsonify({
+            "ok": True,
+            "runs": [
+                {
+                    "id": str(r["id"]),
+                    "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                    "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+                    "status": r["status"],
+                    "run_type": r["run_type"],
+                    "days_back": r["days_back"],
+                    "scanned_count": r["scanned_count"],
+                    "fixed_count": r["fixed_count"],
+                    "errors_count": r["errors_count"],
+                    "purchases_fixed": r["purchases_fixed"],
+                    "subscriptions_fixed": r["subscriptions_fixed"],
+                    "refunds_fixed": r["refunds_fixed"],
+                    "wallets_fixed": r["wallets_fixed"],
+                    "notes": r["notes"],
+                }
+                for r in runs
+            ],
+        })
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation runs error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/fixes", methods=["GET"])
+@require_admin
+def reconciliation_fixes():
+    """
+    Get recent reconciliation fixes applied.
+
+    Query params:
+        - limit: Number of fixes to return (default: 50, max: 200)
+        - run_id: Filter by specific run ID (optional)
+        - identity_id: Filter by identity ID (optional)
+        - fix_type: Filter by fix type (optional)
+
+    Returns:
+        List of individual fixes applied during reconciliation.
+    """
+    try:
+        from backend.db import query_all
+
+        limit = min(request.args.get("limit", 50, type=int), 200)
+        run_id = request.args.get("run_id")
+        identity_id = request.args.get("identity_id")
+        fix_type = request.args.get("fix_type")
+
+        conditions = []
+        params = []
+
+        if run_id:
+            conditions.append("run_id = %s")
+            params.append(run_id)
+        if identity_id:
+            conditions.append("identity_id = %s")
+            params.append(identity_id)
+        if fix_type:
+            conditions.append("fix_type = %s")
+            params.append(fix_type)
+
+        where_clause = " AND ".join(conditions) if conditions else "TRUE"
+        params.append(limit)
+
+        fixes = query_all(
+            f"""
+            SELECT id, run_id, provider, provider_payment_id, fix_type,
+                   identity_id, credits_delta, plan_code, amount_gbp,
+                   mollie_status, created_at
+            FROM timrx_billing.reconciliation_fixes
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            params,
+        )
+
+        return jsonify({
+            "ok": True,
+            "fixes": [
+                {
+                    "id": str(f["id"]),
+                    "run_id": str(f["run_id"]) if f["run_id"] else None,
+                    "provider": f["provider"],
+                    "provider_payment_id": f["provider_payment_id"],
+                    "fix_type": f["fix_type"],
+                    "identity_id": str(f["identity_id"]) if f["identity_id"] else None,
+                    "credits_delta": f["credits_delta"],
+                    "plan_code": f["plan_code"],
+                    "amount_gbp": float(f["amount_gbp"]) if f["amount_gbp"] else None,
+                    "mollie_status": f["mollie_status"],
+                    "created_at": f["created_at"].isoformat() if f["created_at"] else None,
+                }
+                for f in fixes
+            ],
+        })
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation fixes error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERNAL DEBUG ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1329,4 +1571,249 @@ def subscription_stats():
         })
     except Exception as e:
         print(f"[ADMIN] Subscription stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WALLET DRIFT AUDIT ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/wallet-drift/audit", methods=["POST"])
+@require_admin
+def wallet_drift_audit():
+    """
+    Run wallet drift audit (cron-callable endpoint).
+
+    Detects wallets where balance_credits != SUM(ledger_entries) and repairs them.
+    The ledger is the immutable source of truth; the wallet balance is a cache.
+
+    Query params:
+        - dry_run: If 'true', detect drifts but don't repair (default: false)
+
+    Returns:
+        - total_wallets: Number of wallets checked
+        - drifts_found: Number of wallets with drift
+        - repairs_applied: Number of repairs made (0 if dry_run)
+        - total_drift_amount: Sum of absolute drift values
+
+    Safe to call frequently - all repairs are idempotent.
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Wallet drift audit triggered by {admin_email or 'token'} (dry_run={dry_run})")
+
+        result = WalletDriftService.run_daily_wallet_audit(dry_run=dry_run)
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift audit error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/drifts", methods=["GET"])
+@require_admin
+def wallet_drift_list():
+    """
+    List wallets with drift (detection only).
+
+    Query params:
+        - limit: Max results (default: 100, max: 500)
+        - offset: Pagination offset (default: 0)
+
+    Returns:
+        - drifts: List of wallets where balance != ledger_sum
+        - count: Total drifts found (up to limit)
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        limit = min(request.args.get("limit", 100, type=int), 500)
+        offset = request.args.get("offset", 0, type=int)
+
+        drifts = WalletDriftService.find_drifts(limit=limit, offset=offset)
+        total = WalletDriftService.count_drifts()
+
+        return jsonify({
+            "ok": True,
+            "drifts": [
+                {
+                    "identity_id": str(d["identity_id"]),
+                    "wallet_id": str(d["wallet_id"]) if d.get("wallet_id") else None,
+                    "cached_balance": d.get("cached_balance", 0),
+                    "ledger_sum": d.get("ledger_sum", 0),
+                    "drift": d.get("drift", 0),
+                    "entry_count": d.get("entry_count", 0),
+                }
+                for d in drifts
+            ],
+            "count": len(drifts),
+            "total": total,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift list error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/repair/<identity_id>", methods=["POST"])
+@require_admin
+def wallet_drift_repair(identity_id):
+    """
+    Repair drift for a specific wallet.
+
+    Args:
+        identity_id: The identity UUID to repair
+
+    Body (optional):
+        - reason: Reason for repair (default: 'admin_repair')
+
+    Returns:
+        - repaired: bool - True if repair was applied
+        - old_balance: Balance before repair
+        - new_balance: Balance after repair
+        - drift_amount: Difference corrected
+        - repair_id: UUID of repair record (if applied)
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        data = request.get_json() or {}
+        reason = data.get("reason", "admin_repair")
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Wallet drift repair for {identity_id} by {admin_email or 'token'}")
+
+        result = WalletDriftService.repair_wallet(
+            identity_id=identity_id,
+            reason=reason,
+            trigger_source="admin_endpoint",
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift repair error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/check/<identity_id>", methods=["GET"])
+@require_admin
+def wallet_drift_check(identity_id):
+    """
+    Check drift for a specific identity.
+
+    Returns wallet vs ledger comparison without making any changes.
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        comparison = WalletDriftService.get_wallet_comparison(identity_id)
+        if not comparison:
+            return jsonify({
+                "ok": False,
+                "error": "Wallet not found for this identity"
+            }), 404
+
+        return jsonify({
+            "ok": True,
+            "identity_id": str(comparison["identity_id"]),
+            "wallet_id": str(comparison["wallet_id"]) if comparison.get("wallet_id") else None,
+            "cached_balance": comparison.get("cached_balance", 0),
+            "ledger_sum": comparison.get("ledger_sum", 0),
+            "drift": comparison.get("drift", 0),
+            "has_drift": comparison.get("has_drift", False),
+            "entry_count": comparison.get("entry_count", 0),
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift check error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/repairs", methods=["GET"])
+@require_admin
+def wallet_drift_repairs():
+    """
+    Get recent wallet repair history.
+
+    Query params:
+        - identity_id: Filter by identity (optional)
+        - limit: Max results (default: 50, max: 200)
+        - offset: Pagination offset (default: 0)
+
+    Returns:
+        - repairs: List of repair records
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        identity_id = request.args.get("identity_id")
+        limit = min(request.args.get("limit", 50, type=int), 200)
+        offset = request.args.get("offset", 0, type=int)
+
+        repairs = WalletDriftService.get_recent_repairs(
+            identity_id=identity_id,
+            limit=limit,
+            offset=offset,
+        )
+
+        return jsonify({
+            "ok": True,
+            "repairs": [
+                {
+                    "id": str(r["id"]),
+                    "identity_id": str(r["identity_id"]),
+                    "wallet_id": str(r["wallet_id"]) if r.get("wallet_id") else None,
+                    "old_balance": r.get("old_balance", 0),
+                    "new_balance": r.get("new_balance", 0),
+                    "drift_amount": r.get("drift_amount", 0),
+                    "reason": r.get("reason"),
+                    "trigger_source": r.get("trigger_source"),
+                    "ledger_entry_count": r.get("ledger_entry_count"),
+                    "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                }
+                for r in repairs
+            ],
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift repairs error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/stats", methods=["GET"])
+@require_admin
+def wallet_drift_stats():
+    """
+    Get wallet drift and repair statistics.
+
+    Query params:
+        - days: Number of days to look back (default: 30)
+
+    Returns:
+        - current_drifts: Number of wallets currently with drift
+        - total_repairs: Repairs in the period
+        - total_drift_corrected: Sum of absolute drift amounts corrected
+        - by_reason: Breakdown by repair reason
+        - by_trigger: Breakdown by trigger source
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        days = request.args.get("days", 30, type=int)
+
+        current_drifts = WalletDriftService.count_drifts()
+        stats = WalletDriftService.get_repair_stats(days=days)
+
+        return jsonify({
+            "ok": True,
+            "current_drifts": current_drifts,
+            **stats,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift stats error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
