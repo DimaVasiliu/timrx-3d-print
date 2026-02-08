@@ -16,7 +16,7 @@ Handles:
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from backend.middleware import require_session, require_email, no_cache
+from backend.middleware import require_session, require_email, require_verified_email, no_cache
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService
 from backend.services.reservation_service import ReservationService
@@ -334,7 +334,7 @@ def reserve_credits():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/checkout", methods=["POST"])
-@require_session
+@require_verified_email
 def create_mollie_checkout():
     """
     Create a Mollie payment for purchasing credits.
@@ -576,7 +576,7 @@ def confirm_payment():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/checkout/start", methods=["POST"])
-@require_session
+@require_verified_email
 def create_checkout():
     """
     Create a Stripe checkout session.
@@ -951,7 +951,7 @@ def subscription_me():
 
 
 @bp.route("/subscriptions/checkout", methods=["POST"])
-@require_session
+@require_verified_email
 def subscription_checkout():
     """
     Create a Mollie payment for a subscription plan.
