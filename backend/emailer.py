@@ -1547,6 +1547,115 @@ Need help? Reply to this email or contact support@timrx.live
     return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
 
 
+def send_past_due_reminder_email(
+    to_email: str,
+    plan_code: str,
+    days_past_due: int,
+    is_final_warning: bool = False,
+) -> bool:
+    """
+    Send reminder email for past_due subscription.
+
+    Args:
+        to_email: Customer email
+        plan_code: The subscription plan code
+        days_past_due: Number of days the payment has been overdue
+        is_final_warning: If True, this is the last warning before expiration
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    if is_final_warning:
+        subject = f"Final Notice: Your TimrX {plan_name} Subscription Will Expire Soon"
+        urgency_text = "This is your final reminder"
+        urgency_color = "#dc2626"  # Red
+    else:
+        subject = f"Reminder: Payment Required for Your TimrX {plan_name} Subscription"
+        urgency_text = "Payment reminder"
+        urgency_color = "#f59e0b"  # Amber
+
+    logo_bytes = _load_logo()
+
+    info_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#fef3c7;border:1px solid #f59e0b;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:{urgency_color};font-family:Arial,Helvetica,sans-serif;">
+                        {urgency_text}
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#92400e;font-family:Arial,Helvetica,sans-serif;">
+                        Your subscription payment is {days_past_due} days overdue.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    expiry_warning = ""
+    if is_final_warning:
+        expiry_warning = f'''
+            <p style="margin:16px 0 0 0;font-size:14px;line-height:1.6;color:#dc2626;font-weight:600;font-family:Arial,Helvetica,sans-serif;">
+                Your subscription will expire in 2 days if payment is not received.
+            </p>
+        '''
+
+    body_html = f'''
+        {info_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        We were unable to process your subscription payment for the {plan_name} plan.
+                        Your monthly credit allocation is paused until payment is resolved.
+                    </p>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        To continue receiving credits, please update your payment method or ensure sufficient funds are available.
+                    </p>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        <a href="https://timrx.live/settings/billing" style="color:#3b82f6;text-decoration:underline;">Update payment method</a>
+                    </p>
+                    {expiry_warning}
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Payment Required",
+        intro=f"Your {plan_name} subscription payment is overdue.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    final_text = ""
+    if is_final_warning:
+        final_text = "\nIMPORTANT: Your subscription will expire in 2 days if payment is not received.\n"
+
+    text_body = f"""Payment Required - TimrX
+
+{urgency_text}
+
+Your {plan_name} subscription payment is {days_past_due} days overdue.
+
+We were unable to process your subscription payment. Your monthly credit allocation is paused until payment is resolved.
+
+To continue receiving credits, please update your payment method or ensure sufficient funds are available.
+
+Update payment method: https://timrx.live/settings/billing
+{final_text}
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
 # ─────────────────────────────────────────────────────────────
 # Helper for sending emails with logo
 # ─────────────────────────────────────────────────────────────
