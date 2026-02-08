@@ -571,14 +571,22 @@ def verify_email():
             }), 409
         email_attached = True
     else:
-        # Identity has a DIFFERENT email - this is unusual, reject
-        print(f"[AUTH] verify_email failed: identity {identity_id} has different email")
-        return jsonify({
-            "error": {
-                "code": "EMAIL_MISMATCH",
-                "message": "This account already has a different email attached.",
-            }
-        }), 400
+        # Identity has a DIFFERENT email - user is changing their email
+        # This is allowed if they can verify ownership of the new email via code.
+        # Check if new email belongs to another identity first.
+        existing = IdentityService.get_identity_by_email(email)
+        if existing and str(existing["id"]) != identity_id:
+            # New email belongs to another identity - cannot change to it
+            print(f"[AUTH] verify_email failed: new email={_mask_email(email)} belongs to another identity")
+            return jsonify({
+                "error": {
+                    "code": "EMAIL_IN_USE",
+                    "message": "This email is already associated with another account. Use 'Restore Account' to access it.",
+                }
+            }), 409
+        # Email change is allowed - will update email and set verified=TRUE
+        email_attached = True
+        print(f"[AUTH] Email change requested: identity {identity_id} from {_mask_email(current_email)} to {_mask_email(email)}")
 
     # ── Commit: mark code consumed & attach/verify email ──
     with transaction() as cur:
@@ -615,13 +623,37 @@ def verify_email():
     # Invalidate other pending codes for this email
     MagicCodeService.invalidate_codes_for_email(email)
 
-    print(f"[AUTH] Email verified for identity {identity_id}: {_mask_email(email)} (attached={email_attached})")
+    # Resume any subscriptions paused due to email_unverified
+    subscriptions_resumed = 0
+    try:
+        with transaction() as cur:
+            cur.execute(
+                f"""
+                UPDATE {Tables.SUBSCRIPTIONS}
+                SET pause_reason = NULL,
+                    paused_at = NULL,
+                    updated_at = NOW()
+                WHERE identity_id::text = %s
+                  AND pause_reason = 'email_unverified'
+                RETURNING id
+                """,
+                (identity_id,),
+            )
+            resumed = cur.fetchall() or []
+            subscriptions_resumed = len(resumed)
+            for row in resumed:
+                print(f"[AUTH] Resumed subscription {row['id']} after email verification")
+    except Exception as e:
+        print(f"[AUTH] Error resuming subscriptions for {identity_id}: {e}")
+
+    print(f"[AUTH] Email verified for identity {identity_id}: {_mask_email(email)} (attached={email_attached}, subs_resumed={subscriptions_resumed})")
 
     return jsonify({
         "ok": True,
         "message": "Email verified successfully",
         "email_verified": True,
         "email_attached": email_attached,
+        "subscriptions_resumed": subscriptions_resumed,
     })
 
 
