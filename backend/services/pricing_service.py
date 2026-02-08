@@ -15,9 +15,9 @@ CANONICAL ACTION KEYS (use these in new code):
 - remesh               (10c) - Remesh 3D model (same cost as refine)
 - retexture            (15c) - Apply new texture to 3D model
 - rigging              (25c) - Add skeleton/rig to 3D model
-- video_generate       (60c) - Generic video generation
-- video_text_generate  (60c) - Text-to-video generation
-- video_image_animate  (60c) - Image-to-video animation
+- video_generate       (70c) - Generic video generation
+- video_text_generate  (70c) - Text-to-video generation
+- video_image_animate  (70c) - Image-to-video animation
 
 LEGACY ALIASES (backwards compatibility only):
 - preview, text-to-3d, text-to-3d-preview -> text_to_3d_generate
@@ -168,9 +168,9 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
     {"action_code": "MESHY_RIG", "cost_credits": 25, "provider": "meshy"},
     {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},
-    {"action_code": "VIDEO_GENERATE", "cost_credits": 60, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 60, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 60, "provider": "video"},
+    {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
+    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "google"},
 ]
 
@@ -400,9 +400,9 @@ class PricingService:
             "remesh": 10,
             "retexture": 15,
             "rigging": 25,
-            "video_generate": 60,
-            "video_text_generate": 60,
-            "video_image_animate": 60
+            "video_generate": 70,
+            "video_text_generate": 70,
+            "video_image_animate": 70
         }
         """
         # Use cache if available
