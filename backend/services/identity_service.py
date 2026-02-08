@@ -429,6 +429,7 @@ class IdentityService:
     ATTACH_REASON_SUCCESS = "success"
     ATTACH_REASON_ALREADY_ATTACHED = "already_attached"
     ATTACH_REASON_BELONGS_TO_OTHER = "belongs_to_other"  # Anti-enumeration: logged only
+    ATTACH_REASON_EMAIL_CHANGED = "email_changed"  # Email changed, verification reset
 
     @staticmethod
     def attach_email(identity_id: str, email: str) -> Tuple[Dict[str, Any], bool, str]:
@@ -483,15 +484,43 @@ class IdentityService:
             )
             return current, False, IdentityService.ATTACH_REASON_BELONGS_TO_OTHER
 
-        result = execute_returning(
-            f"""
-            UPDATE {Tables.IDENTITIES}
-            SET email = %s, last_seen_at = NOW()
-            WHERE id = %s
-            RETURNING *
-            """,
-            (normalized_email, identity_id),
-        )
+        # Check if this is an email CHANGE (identity already has a different email)
+        # vs first email attachment (identity has no email yet)
+        old_email = current.get("email")
+        is_email_change = old_email is not None and old_email != normalized_email
+
+        if is_email_change:
+            # EMAIL CHANGE: Set email_verified = FALSE to require re-verification
+            # This prevents users from changing to an unverified email and continuing
+            # to use paid features. They must verify the new email first.
+            result = execute_returning(
+                f"""
+                UPDATE {Tables.IDENTITIES}
+                SET email = %s, email_verified = FALSE, last_seen_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (normalized_email, identity_id),
+            )
+            reason = IdentityService.ATTACH_REASON_EMAIL_CHANGED
+            print(
+                f"[IDENTITY] Email CHANGED for identity {identity_id}: "
+                f"{old_email} -> {normalized_email} (verification reset)"
+            )
+        else:
+            # FIRST EMAIL ATTACHMENT: email_verified stays FALSE (default)
+            # until user completes verification via magic code
+            result = execute_returning(
+                f"""
+                UPDATE {Tables.IDENTITIES}
+                SET email = %s, last_seen_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (normalized_email, identity_id),
+            )
+            reason = IdentityService.ATTACH_REASON_SUCCESS
+            print(f"[IDENTITY] Attached email to identity {identity_id}: {normalized_email}")
 
         if not result:
             raise ValueError(f"Identity {identity_id} not found")
@@ -502,8 +531,7 @@ class IdentityService:
         except Exception as email_err:
             print(f"[IDENTITY] WARNING: Admin notification failed: {email_err}")
 
-        print(f"[IDENTITY] Attached email to identity {identity_id}: {normalized_email}")
-        return result, True, IdentityService.ATTACH_REASON_SUCCESS
+        return result, True, reason
 
     @staticmethod
     def touch_identity(identity_id: str) -> bool:
