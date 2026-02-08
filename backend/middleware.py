@@ -341,6 +341,69 @@ def require_email(f):
     return decorated
 
 
+def require_verified_email(f):
+    """
+    Decorator that requires a valid session with a VERIFIED email.
+    Returns 401 if no session, 403 if no email or email not verified.
+
+    Use for paid actions (checkout, subscriptions) that require verified email.
+
+    Error codes:
+        - UNAUTHORIZED: No valid session
+        - EMAIL_REQUIRED: No email attached to identity
+        - EMAIL_NOT_VERIFIED: Email attached but not yet verified
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Lazy imports to avoid circular import at module load time
+        IdentityService = _get_identity_service()
+        DatabaseError = _get_database_error()
+
+        try:
+            identity = IdentityService.get_current_identity(request)
+
+            if not identity:
+                return jsonify({
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Valid session required"
+                    }
+                }), 401
+
+            if not identity.get("email"):
+                return jsonify({
+                    "error": {
+                        "code": "EMAIL_REQUIRED",
+                        "message": "Email address required for this action"
+                    }
+                }), 403
+
+            if not identity.get("email_verified"):
+                return jsonify({
+                    "error": {
+                        "code": "EMAIL_NOT_VERIFIED",
+                        "message": "Please verify your email address before making purchases"
+                    }
+                }), 403
+
+            g.session_id = IdentityService.get_session_id_from_request(request)
+            g.identity_id = str(identity["id"])
+            g.identity = identity
+
+            return f(*args, **kwargs)
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in require_verified_email: {e}")
+            return jsonify({
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "Database error occurred"
+                }
+            }), 500
+
+    return decorated
+
+
 def get_identity_from_request():
     """
     Helper function to get identity from current request.
