@@ -949,6 +949,7 @@ class MollieService:
             provider_subscription_id=payment_id,
             period_start=now,
             period_end=period_end,
+            customer_email=customer_email,
         )
 
         if not sub:
