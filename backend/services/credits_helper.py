@@ -13,9 +13,9 @@ Use these canonical keys when calling start_paid_job():
 - remesh               (10c) - Remesh 3D model
 - retexture            (15c) - Retexture 3D model
 - rigging              (25c) - Rig 3D model
-- video_generate       (60c) - Video generation
-- video_text_generate  (60c) - Text to video
-- video_image_animate  (60c) - Image to video
+- video_generate       (70c) - Video generation
+- video_text_generate  (70c) - Text to video
+- video_image_animate  (70c) - Image to video
 
 Legacy aliases are supported for backwards compatibility but will be
 normalized to canonical keys internally.
