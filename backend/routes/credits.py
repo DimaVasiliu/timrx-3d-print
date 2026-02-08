@@ -88,7 +88,7 @@ def _resolve_action_cost(action: str) -> tuple[str, int]:
 def get_wallet():
     """
     Get current wallet credits for the active identity.
-    Returns balance, reserved, and available credits.
+    Returns balance, reserved, and available credits for both general and video credits.
 
     Response (200):
     {
@@ -96,7 +96,10 @@ def get_wallet():
         "identity_id": "uuid",
         "credits_balance": 150,
         "reserved_credits": 20,
-        "available_credits": 130
+        "available_credits": 130,
+        "video_credits_balance": 60,
+        "video_reserved_credits": 0,
+        "video_available_credits": 60
     }
 
     Response (401 - no session):
@@ -105,18 +108,29 @@ def get_wallet():
     }
     """
     try:
+        # General credits
         balance = WalletService.get_balance(g.identity_id)
         reserved = WalletService.get_reserved_credits(g.identity_id)
         available = max(0, balance - reserved)
 
-        # print(f"[CREDITS] Wallet fetch: identity={g.identity_id}, balance={balance}, reserved={reserved}, available={available}")
+        # Video credits (separate pool)
+        video_balance = WalletService.get_balance(g.identity_id, "video")
+        video_reserved = WalletService.get_reserved_credits(g.identity_id, "video")
+        video_available = max(0, video_balance - video_reserved)
+
+        # print(f"[CREDITS] Wallet fetch: identity={g.identity_id}, balance={balance}, reserved={reserved}, available={available}, video_balance={video_balance}")
 
         return jsonify({
             "ok": True,
             "identity_id": g.identity_id,
+            # General credits
             "credits_balance": balance,
             "reserved_credits": reserved,
             "available_credits": available,
+            # Video credits (separate pool)
+            "video_credits_balance": video_balance,
+            "video_reserved_credits": video_reserved,
+            "video_available_credits": video_available,
         })
     except Exception as e:
         print(f"[CREDITS] Error fetching wallet: {e}")
