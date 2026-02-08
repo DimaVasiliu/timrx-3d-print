@@ -25,25 +25,40 @@ def get_me():
     """
     Get current session info.
     Creates anonymous identity if none exists.
-    Returns identity_id, email (if set), wallet balance, etc.
+    Returns identity_id, email (if set), wallet balances (general + video), etc.
     """
     identity = g.identity
 
-    # Fetch wallet balance from wallets table (not from identity join)
+    # Fetch wallet balances from wallets table (both general and video credits)
     balance = 0
+    video_balance = 0
     reserved = 0
+    video_reserved = 0
+
     if g.identity_id:
-        balance = WalletService.get_balance(g.identity_id)
-        reserved = WalletService.get_reserved_credits(g.identity_id)
+        # Get all balances at once
+        balances = WalletService.get_all_balances(g.identity_id)
+        balance = balances["general"]
+        video_balance = balances["video"]
+
+        # Get all reserved credits at once
+        reserved_credits = WalletService.get_all_reserved_credits(g.identity_id)
+        reserved = reserved_credits["general"]
+        video_reserved = reserved_credits["video"]
 
     return jsonify({
         "ok": True,
         "identity_id": g.identity_id,
         "email": identity.get("email") if identity else None,
         "email_verified": identity.get("email_verified", False) if identity else False,
+        # General credits (3D + images)
         "balance_credits": balance,
         "reserved_credits": reserved,
         "available_credits": max(0, balance - reserved),
+        # Video credits (separate balance)
+        "balance_video_credits": video_balance,
+        "reserved_video_credits": video_reserved,
+        "available_video_credits": max(0, video_balance - video_reserved),
         "created_at": identity.get("created_at").isoformat() if identity and identity.get("created_at") else None,
     })
 
@@ -95,25 +110,37 @@ def attach_email():
 def get_wallet():
     """
     Get wallet information for Buy modal and action gating.
-    Returns balance, reserved, available, and updated_at.
+    Returns balance info for both general and video credits.
     """
     try:
         wallet = WalletService.get_wallet(g.identity_id)
         if wallet:
             balance = wallet.get("balance_credits", 0) or 0
+            video_balance = wallet.get("balance_video_credits", 0) or 0
             updated_at = wallet.get("updated_at")
         else:
             balance = 0
+            video_balance = 0
             updated_at = None
 
-        reserved = WalletService.get_reserved_credits(g.identity_id)
+        # Get reserved credits for both types
+        reserved_credits = WalletService.get_all_reserved_credits(g.identity_id)
+        reserved = reserved_credits["general"]
+        video_reserved = reserved_credits["video"]
+
         available = max(0, balance - reserved)
+        video_available = max(0, video_balance - video_reserved)
 
         return jsonify({
             "ok": True,
+            # General credits (3D + images)
             "balance": balance,
             "reserved": reserved,
             "available": available,
+            # Video credits
+            "video_balance": video_balance,
+            "video_reserved": video_reserved,
+            "video_available": video_available,
             "currency": "GBP",
             "updated_at": updated_at.isoformat() if updated_at else None,
         })
@@ -124,6 +151,9 @@ def get_wallet():
             "balance": 0,
             "reserved": 0,
             "available": 0,
+            "video_balance": 0,
+            "video_reserved": 0,
+            "video_available": 0,
             "currency": "GBP",
             "updated_at": None,
         })
