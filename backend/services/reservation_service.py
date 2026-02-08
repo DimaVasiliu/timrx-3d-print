@@ -24,7 +24,7 @@ import json
 import uuid
 
 from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
-from backend.services.wallet_service import WalletService, LedgerEntryType
+from backend.services.wallet_service import WalletService, LedgerEntryType, CreditType, get_credit_type_for_action
 from backend.services.pricing_service import PricingService
 from backend.config import config
 
@@ -35,7 +35,7 @@ def _derive_provider_from_action_code(action_code: str) -> str:
         return "meshy"
     elif action_code.startswith("OPENAI_"):
         return "openai"
-    elif action_code.startswith("VIDEO_"):
+    elif action_code.startswith("VIDEO_") or action_code == "GEMINI_VIDEO":
         return "video"
     else:
         return "unknown"
@@ -186,13 +186,14 @@ class ReservationService:
             # Try using action_key directly as action_code
             action_code = action_key
 
+        # Determine credit type based on action (video actions need video credits)
+        credit_type = get_credit_type_for_action(action_code)
+
         # Get the cost for this action
         if amount_override is not None:
             cost_credits = amount_override
-            # print(f"[RESERVATION] Using override cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
         else:
             cost_credits = PricingService.get_action_cost(action_key)
-            # print(f"[RESERVATION] Looked up cost: action_key={action_key}, action_code={action_code}, cost={cost_credits}")
             if cost_credits == 0:
                 raise ValueError(f"Unknown action: {action_key}")
 
@@ -202,26 +203,33 @@ class ReservationService:
         )
         if existing:
             wallet = WalletService.get_wallet(identity_id)
-            balance = wallet.get("balance_credits", 0) if wallet else 0
-            reserved = WalletService.get_reserved_credits(identity_id)
+            # Return balance for the relevant credit type
+            if credit_type == CreditType.VIDEO:
+                balance = wallet.get("balance_video_credits", 0) if wallet else 0
+            else:
+                balance = wallet.get("balance_credits", 0) if wallet else 0
+            reserved = WalletService.get_reserved_credits(identity_id, credit_type)
 
-            # print(f"[RESERVATION] Idempotent return for job {job_id}, reservation {existing['id']}")
             return {
                 "reservation": ReservationService._format_reservation(existing),
                 "balance": balance,
                 "reserved": reserved,
                 "available": max(0, balance - reserved),
                 "is_existing": True,
+                "credit_type": credit_type,
             }
 
         meta_json = json.dumps(meta) if meta else None
         expiry_minutes = getattr(config, 'RESERVATION_EXPIRY_MINUTES', ReservationService.DEFAULT_EXPIRY_MINUTES)
 
+        # Determine which balance column to check
+        balance_column = "balance_video_credits" if credit_type == CreditType.VIDEO else "balance_credits"
+
         with transaction() as cur:
-            # 1. Lock wallet and check balance
+            # 1. Lock wallet and check balance for the correct credit type
             cur.execute(
                 f"""
-                SELECT identity_id, balance_credits
+                SELECT identity_id, balance_credits, balance_video_credits
                 FROM {Tables.WALLETS}
                 WHERE identity_id = %s
                 FOR UPDATE
@@ -233,25 +241,21 @@ class ReservationService:
             if not wallet:
                 raise ValueError(f"Wallet not found for identity {identity_id}")
 
-            balance = wallet.get("balance_credits", 0) or 0
+            balance = wallet.get(balance_column, 0) or 0
 
-            # 2. Get current reserved amount (excluding expired)
-            # CRITICAL: Lock all held reservations for this identity to prevent race condition.
-            # Without FOR UPDATE, two concurrent requests could both pass balance check and
-            # create reservations, potentially going over the available balance.
-            #
-            # NOTE: PostgreSQL does NOT allow FOR UPDATE with aggregate functions (SUM).
-            # So we first lock all the rows, then sum in Python.
+            # 2. Get current reserved amount for this credit type (excluding expired)
+            # CRITICAL: Lock all held reservations for this identity/credit_type to prevent race condition.
             cur.execute(
                 f"""
                 SELECT id, cost_credits
                 FROM {Tables.CREDIT_RESERVATIONS}
                 WHERE identity_id = %s
                   AND status = %s
+                  AND credit_type = %s
                   AND expires_at > NOW()
                 FOR UPDATE
                 """,
-                (identity_id, ReservationStatus.HELD),
+                (identity_id, ReservationStatus.HELD, credit_type),
             )
             locked_reservations = fetch_all(cur)
             current_reserved = sum(
@@ -259,13 +263,13 @@ class ReservationService:
                 for r in locked_reservations
             )
 
-            # 3. Check available balance
+            # 3. Check available balance for this credit type
             available = balance - current_reserved
-            # print(f"[RESERVATION] Credit check: action={action_key}, required={cost_credits}, balance={balance}, reserved={current_reserved}, available={available}")
             if available < cost_credits:
-                print(f"[RESERVATION] REJECTED: insufficient credits for {action_key} (need {cost_credits}, have {available})")
+                credit_type_label = "video" if credit_type == CreditType.VIDEO else "general"
+                print(f"[RESERVATION] REJECTED: insufficient {credit_type_label} credits for {action_key} (need {cost_credits}, have {available})")
                 raise ValueError(
-                    f"INSUFFICIENT_CREDITS:required={cost_credits}:balance={balance}:reserved={current_reserved}:available={available}"
+                    f"INSUFFICIENT_{credit_type_label.upper()}_CREDITS:required={cost_credits}:balance={balance}:reserved={current_reserved}:available={available}"
                 )
 
             # 4. Create job row FIRST (to satisfy FK constraint on credit_reservations.ref_job_id)
@@ -283,19 +287,20 @@ class ReservationService:
             job_row = fetch_one(cur)
             if not job_row:
                 # Job already existed (idempotent case) - that's fine, FK will be satisfied
-                pass  # print(f"[RESERVATION] Job {job_id} already exists, proceeding with reservation")
+                pass
 
-            # 5. Create reservation with ref_job_id pointing to the job
+            # 5. Create reservation with ref_job_id pointing to the job, including credit_type
             cur.execute(
                 f"""
                 INSERT INTO {Tables.CREDIT_RESERVATIONS}
-                (identity_id, action_code, cost_credits, status, created_at, expires_at, ref_job_id, meta)
-                VALUES (%s, %s, %s, %s, NOW(), NOW() + INTERVAL '%s minutes', %s, %s)
+                (identity_id, action_code, cost_credits, status, credit_type, created_at, expires_at, ref_job_id, meta)
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW() + INTERVAL '%s minutes', %s, %s)
                 RETURNING *
                 """,
-                (identity_id, action_code, cost_credits, ReservationStatus.HELD, expiry_minutes, job_id, meta_json),
+                (identity_id, action_code, cost_credits, ReservationStatus.HELD, credit_type, expiry_minutes, job_id, meta_json),
             )
             reservation = fetch_one(cur)
+            assert reservation is not None, "Reservation insert failed"
 
             # 6. Update job with reservation_id for bidirectional link
             cur.execute(
@@ -310,18 +315,13 @@ class ReservationService:
             new_reserved = current_reserved + cost_credits
             new_available = balance - new_reserved
 
-            # print(
-            #     f"[RESERVATION] Created: id={reservation['id']}, job={job_id}, "
-            #     f"action={action_code}, credits={cost_credits}, "
-            #     f"balance={balance}, reserved={new_reserved}, available={new_available}"
-            # )
-
             return {
                 "reservation": ReservationService._format_reservation(reservation),
                 "balance": balance,
                 "reserved": new_reserved,
                 "available": new_available,
                 "is_existing": False,
+                "credit_type": credit_type,
             }
 
     @staticmethod
@@ -342,10 +342,10 @@ class ReservationService:
             Dict with finalized reservation and new balance (never raises for idempotent cases)
         """
         with transaction() as cur:
-            # Lock and fetch reservation
+            # Lock and fetch reservation including credit_type
             cur.execute(
                 f"""
-                SELECT id, identity_id, action_code, cost_credits, status, ref_job_id
+                SELECT id, identity_id, action_code, cost_credits, status, ref_job_id, credit_type
                 FROM {Tables.CREDIT_RESERVATIONS}
                 WHERE id = %s
                 FOR UPDATE
@@ -355,8 +355,6 @@ class ReservationService:
             reservation = fetch_one(cur)
 
             if not reservation:
-                # Idempotent: reservation not found (expired, cleaned up, or never existed)
-                # print(f"[RESERVATION] Finalize: not found (idempotent): {reservation_id}")
                 return {
                     "reservation": None,
                     "not_found": True,
@@ -365,8 +363,6 @@ class ReservationService:
                 }
 
             if reservation["status"] == ReservationStatus.FINALIZED:
-                # Idempotent: already finalized
-                # print(f"[RESERVATION] Already finalized: {reservation_id}")
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_finalized": True,
@@ -375,9 +371,6 @@ class ReservationService:
                 }
 
             if reservation["status"] == ReservationStatus.RELEASED:
-                # Idempotent: already released (job failed/cancelled before completion)
-                # This can happen if job was cancelled while still processing
-                # print(f"[RESERVATION] Finalize skipped: already released: {reservation_id}")
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_released": True,
@@ -389,6 +382,10 @@ class ReservationService:
             cost_credits = reservation["cost_credits"]
             action_code = reservation["action_code"]
             job_id = str(reservation["ref_job_id"]) if reservation.get("ref_job_id") else None
+            credit_type = reservation.get("credit_type", CreditType.GENERAL)
+
+            # Determine which balance column to update
+            balance_column = "balance_video_credits" if credit_type == CreditType.VIDEO else "balance_credits"
 
             # Update reservation status
             cur.execute(
@@ -404,10 +401,9 @@ class ReservationService:
 
             # Create ledger entry (deduct from wallet)
             # Note: We're inside a transaction, so we need to do this manually
-            # rather than using WalletService.add_ledger_entry which opens its own transaction
             cur.execute(
                 f"""
-                SELECT balance_credits
+                SELECT balance_credits, balance_video_credits
                 FROM {Tables.WALLETS}
                 WHERE identity_id = %s
                 FOR UPDATE
@@ -415,15 +411,15 @@ class ReservationService:
                 (identity_id,),
             )
             wallet = fetch_one(cur)
-            current_balance = wallet.get("balance_credits", 0) if wallet else 0
+            current_balance = wallet.get(balance_column, 0) if wallet else 0
             new_balance = current_balance - cost_credits
 
-            # Insert ledger entry
+            # Insert ledger entry with credit_type
             cur.execute(
                 f"""
                 INSERT INTO {Tables.LEDGER_ENTRIES}
-                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, credit_type, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 """,
                 (
                     identity_id,
@@ -432,24 +428,21 @@ class ReservationService:
                     "reservations",
                     reservation_id,
                     json.dumps({"action_code": action_code, "job_id": job_id}),
+                    credit_type,
                 ),
             )
 
-            # Update wallet balance
+            # Update wallet balance for the correct credit type
             cur.execute(
                 f"""
                 UPDATE {Tables.WALLETS}
-                SET balance_credits = %s, updated_at = NOW()
+                SET {balance_column} = %s, updated_at = NOW()
                 WHERE identity_id = %s
                 """,
                 (new_balance, identity_id),
             )
 
             provider = _derive_provider_from_action_code(action_code)
-            # print(
-            #     f"[RESERVATION] Finalized: id={reservation_id}, credits={cost_credits}, "
-            #     f"balance: {current_balance} -> {new_balance}"
-            # )
 
             return {
                 "reservation": ReservationService._format_reservation(updated),
@@ -457,11 +450,11 @@ class ReservationService:
                 "was_already_finalized": False,
                 "was_already_released": False,
                 "not_found": False,
-                # Additional fields for structured logging
                 "identity_id": identity_id,
                 "action_code": action_code,
                 "cost": cost_credits,
                 "provider": provider,
+                "credit_type": credit_type,
             }
 
     @staticmethod
@@ -608,9 +601,13 @@ class ReservationService:
         if cost_credits == 0:
             return False, 0, 0, 0
 
-        # Get balance info
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
+        # Determine credit type from action
+        action_code = PricingService.get_db_action_code(action_key) or action_key
+        credit_type = get_credit_type_for_action(action_code)
+
+        # Get balance info for the correct credit type
+        balance = WalletService.get_balance(identity_id, credit_type)
+        reserved = WalletService.get_reserved_credits(identity_id, credit_type)
         available = max(0, balance - reserved)
 
         can_reserve = available >= cost_credits
@@ -629,6 +626,7 @@ class ReservationService:
             "action_code": reservation["action_code"],
             "cost_credits": reservation["cost_credits"],
             "status": reservation["status"],
+            "credit_type": reservation.get("credit_type", "general"),
             "job_id": str(reservation["ref_job_id"]) if reservation.get("ref_job_id") else None,
             "created_at": reservation["created_at"].isoformat() if reservation.get("created_at") else None,
             "expires_at": reservation["expires_at"].isoformat() if reservation.get("expires_at") else None,
