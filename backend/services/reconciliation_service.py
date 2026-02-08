@@ -20,7 +20,7 @@ from datetime import datetime, timezone, timedelta
 import json
 
 from backend.db import (
-    fetch_one, fetch_all, transaction, query_one, query_all, execute, Tables
+    fetch_one, transaction, query_one, query_all, execute, execute_returning, Tables
 )
 from backend.services.wallet_service import WalletService, LedgerEntryType
 from backend.services.reservation_service import ReservationService, ReservationStatus
@@ -1396,3 +1396,960 @@ class ReconciliationService:
             "stale_reservations": stale_reservations["count"] if stale_reservations else 0,
             "ready_unbilled_jobs": ready_unbilled["count"] if ready_unbilled else 0,
         }
+
+    # ═══════════════════════════════════════════════════════════════
+    # MOLLIE PAYMENT RECONCILIATION
+    # Compares Mollie API payments to our DB and fixes discrepancies
+    # ═══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def reconcile_mollie_payments(
+        days_back: int = 30,
+        dry_run: bool = False,
+        run_type: str = "full",
+    ) -> Dict[str, Any]:
+        """
+        Reconcile Mollie payments against our database.
+
+        Fetches recent payments from Mollie API and ensures:
+        1. Paid one-time purchases have corresponding purchase + ledger + wallet
+        2. Paid subscriptions have corresponding subscription + cycles + wallet
+        3. Refunded/charged-back payments have proper revocation entries
+
+        Args:
+            days_back: How many days of payments to scan (default 30)
+            dry_run: If True, detect issues but don't fix them
+            run_type: Type of run for logging (full, mollie_only, manual)
+
+        Returns:
+            Summary of reconciliation with fixes applied
+        """
+        import requests
+        from backend.config import config
+
+        start_time = datetime.now(timezone.utc)
+        run_id = None
+
+        # Create reconciliation run record
+        if not dry_run:
+            run_id = ReconciliationService._create_reconciliation_run(
+                run_type=run_type,
+                days_back=days_back,
+            )
+
+        results = {
+            "run_id": str(run_id) if run_id else None,
+            "run_at": start_time.isoformat(),
+            "days_back": days_back,
+            "dry_run": dry_run,
+            "scanned_count": 0,
+            "fixed_count": 0,
+            "errors_count": 0,
+            "purchases_fixed": [],
+            "subscriptions_fixed": [],
+            "refunds_fixed": [],
+            "wallets_fixed": [],
+            "errors": [],
+        }
+
+        # Check if Mollie is configured
+        if not config.MOLLIE_CONFIGURED:
+            results["errors"].append({"error": "Mollie not configured"})
+            results["errors_count"] = 1
+            print("[RECONCILE:MOLLIE] Mollie not configured, skipping")
+            return results
+
+        print(f"[RECONCILE:MOLLIE] Starting reconciliation (days_back={days_back}, dry_run={dry_run})")
+
+        try:
+            # Fetch payments from Mollie API
+            payments = ReconciliationService._fetch_mollie_payments(days_back)
+            results["scanned_count"] = len(payments)
+            print(f"[RECONCILE:MOLLIE] Fetched {len(payments)} payments from Mollie")
+
+            # Process each payment
+            for payment in payments:
+                try:
+                    fix_result = ReconciliationService._reconcile_mollie_payment(
+                        payment=payment,
+                        run_id=run_id,
+                        dry_run=dry_run,
+                    )
+
+                    if fix_result and fix_result.get("fixed"):
+                        results["fixed_count"] += 1
+                        fix_type = fix_result.get("fix_type", "unknown")
+
+                        if fix_type == "purchase_created":
+                            results["purchases_fixed"].append(fix_result)
+                        elif fix_type == "subscription_granted":
+                            results["subscriptions_fixed"].append(fix_result)
+                        elif fix_type in ("refund_applied", "chargeback_applied"):
+                            results["refunds_fixed"].append(fix_result)
+                        elif fix_type == "ledger_created":
+                            results["wallets_fixed"].append(fix_result)
+
+                except Exception as payment_err:
+                    print(f"[RECONCILE:MOLLIE] Error processing payment {payment.get('id')}: {payment_err}")
+                    results["errors"].append({
+                        "payment_id": payment.get("id"),
+                        "error": str(payment_err),
+                    })
+                    results["errors_count"] += 1
+
+        except Exception as e:
+            print(f"[RECONCILE:MOLLIE] Fatal error: {e}")
+            results["errors"].append({"error": str(e)})
+            results["errors_count"] += 1
+
+        # Finalize reconciliation run
+        end_time = datetime.now(timezone.utc)
+        duration_ms = int((end_time - start_time).total_seconds() * 1000)
+        results["duration_ms"] = duration_ms
+
+        if run_id and not dry_run:
+            ReconciliationService._finalize_reconciliation_run(
+                run_id=run_id,
+                results=results,
+            )
+
+        # Send admin alert if fixes were applied
+        if results["fixed_count"] > 0 and not dry_run:
+            ReconciliationService._send_mollie_reconciliation_alert(results)
+
+        print(
+            f"[RECONCILE:MOLLIE] Completed: scanned={results['scanned_count']}, "
+            f"fixed={results['fixed_count']}, errors={results['errors_count']}, "
+            f"duration={duration_ms}ms"
+        )
+
+        return results
+
+    @staticmethod
+    def _fetch_mollie_payments(days_back: int = 30) -> List[Dict[str, Any]]:
+        """
+        Fetch recent payments from Mollie API.
+
+        Args:
+            days_back: Number of days to look back
+
+        Returns:
+            List of Mollie payment objects
+        """
+        import requests
+        from backend.config import config
+
+        payments = []
+        from_date = datetime.now(timezone.utc) - timedelta(days=days_back)
+
+        headers = {
+            "Authorization": f"Bearer {config.MOLLIE_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # Mollie API pagination
+        url = "https://api.mollie.com/v2/payments"
+        params = {"limit": 250}  # Max per page
+
+        while url:
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+
+                if response.status_code != 200:
+                    print(f"[RECONCILE:MOLLIE] API error: {response.status_code} - {response.text}")
+                    break
+
+                data = response.json()
+                page_payments = data.get("_embedded", {}).get("payments", [])
+
+                for payment in page_payments:
+                    # Parse created_at and check if within range
+                    created_at_str = payment.get("createdAt", "")
+                    if created_at_str:
+                        try:
+                            created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                            if created_at < from_date:
+                                # Payments are sorted by date desc, so we can stop here
+                                url = None
+                                break
+                            payments.append(payment)
+                        except ValueError:
+                            payments.append(payment)  # Include if date parse fails
+                    else:
+                        payments.append(payment)
+
+                # Get next page URL
+                if url:
+                    links = data.get("_links", {})
+                    next_link = links.get("next", {})
+                    url = next_link.get("href") if next_link else None
+                    params = None  # URL already has params
+
+            except requests.RequestException as e:
+                print(f"[RECONCILE:MOLLIE] Request error: {e}")
+                break
+
+        return payments
+
+    @staticmethod
+    def _reconcile_mollie_payment(
+        payment: Dict[str, Any],
+        run_id: Optional[str],
+        dry_run: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile a single Mollie payment against our database.
+
+        Args:
+            payment: Mollie payment object
+            run_id: Reconciliation run ID for logging
+            dry_run: If True, detect but don't fix
+
+        Returns:
+            Dict with fix info if fixed, None if no fix needed
+        """
+        status = payment.get("status")
+        metadata = payment.get("metadata", {}) or {}
+
+        # Skip non-actionable statuses
+        if status not in ("paid", "refunded", "charged_back"):
+            return None
+
+        identity_id = metadata.get("identity_id")
+        payment_type = metadata.get("type", "purchase")  # 'purchase' or 'subscription'
+
+        if not identity_id:
+            # No identity_id in metadata - can't reconcile
+            return None
+
+        # Handle based on status
+        if status == "paid":
+            if payment_type == "subscription":
+                return ReconciliationService._reconcile_subscription_payment(
+                    payment=payment,
+                    run_id=run_id,
+                    dry_run=dry_run,
+                )
+            else:
+                return ReconciliationService._reconcile_purchase_payment(
+                    payment=payment,
+                    run_id=run_id,
+                    dry_run=dry_run,
+                )
+        elif status in ("refunded", "charged_back"):
+            return ReconciliationService._reconcile_refund_payment(
+                payment=payment,
+                run_id=run_id,
+                dry_run=dry_run,
+            )
+
+        return None
+
+    @staticmethod
+    def _reconcile_purchase_payment(
+        payment: Dict[str, Any],
+        run_id: Optional[str],
+        dry_run: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile a paid one-time purchase payment.
+
+        Checks if purchase row exists. If not, creates it with ledger entry.
+        """
+        from backend.services.purchase_service import PurchaseService
+
+        payment_id = payment.get("id")
+        metadata = payment.get("metadata", {}) or {}
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        plan_id = metadata.get("plan_id")
+        credits_str = metadata.get("credits", "0")
+        customer_email = metadata.get("email")
+
+        if not identity_id or not plan_code or not payment_id:
+            return None
+
+        credits_amount = int(credits_str) if credits_str else 0
+        amount_data = payment.get("amount", {})
+        amount_gbp = float(amount_data.get("value", 0))
+
+        # Check if purchase already exists
+        existing = PurchaseService.get_purchase_by_provider_id(payment_id)
+        if existing:
+            # Already processed - check if ledger entry exists
+            ledger_check = ReconciliationService._check_purchase_has_ledger(str(existing["id"]))
+            if ledger_check:
+                return None  # All good
+
+            # Purchase exists but no ledger - will be caught by existing reconciliation
+            print(f"[RECONCILE:MOLLIE] Purchase {payment_id} exists but missing ledger (will be fixed by safety job)")
+            return None
+
+        # Purchase doesn't exist - need to create it
+        print(f"[RECONCILE:MOLLIE] Found paid payment {payment_id} without purchase record")
+
+        if dry_run:
+            return {
+                "fixed": True,
+                "dry_run": True,
+                "fix_type": "purchase_created",
+                "payment_id": payment_id,
+                "identity_id": identity_id,
+                "plan_code": plan_code,
+                "credits": credits_amount,
+                "amount_gbp": amount_gbp,
+            }
+
+        # Create the purchase
+        try:
+            from backend.services.mollie_service import MollieService
+            result = MollieService._record_mollie_purchase(
+                identity_id=identity_id,
+                plan_id=plan_id or "",
+                plan_code=plan_code,
+                provider_payment_id=payment_id,
+                amount_gbp=amount_gbp,
+                credits_granted=credits_amount,
+                customer_email=customer_email,
+            )
+
+            if result and not result.get("was_existing"):
+                # Log the fix
+                ReconciliationService._log_reconciliation_fix(
+                    run_id=run_id,
+                    provider="mollie",
+                    provider_payment_id=payment_id,
+                    fix_type="purchase_created",
+                    identity_id=identity_id,
+                    credits_delta=credits_amount,
+                    plan_code=plan_code,
+                    amount_gbp=amount_gbp,
+                    mollie_status="paid",
+                    details={
+                        "customer_email": customer_email,
+                        "purchase_id": result["purchase"]["id"],
+                    },
+                )
+
+                print(f"[RECONCILE:MOLLIE] Created missing purchase for payment {payment_id}: credits={credits_amount}")
+
+                return {
+                    "fixed": True,
+                    "fix_type": "purchase_created",
+                    "payment_id": payment_id,
+                    "identity_id": identity_id,
+                    "plan_code": plan_code,
+                    "credits": credits_amount,
+                    "purchase_id": result["purchase"]["id"],
+                }
+
+        except Exception as e:
+            print(f"[RECONCILE:MOLLIE] Error creating purchase for {payment_id}: {e}")
+            raise
+
+        return None
+
+    @staticmethod
+    def _reconcile_subscription_payment(
+        payment: Dict[str, Any],
+        run_id: Optional[str],
+        dry_run: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile a paid subscription payment.
+
+        PERIOD-SAFE: Grants credits for the correct monthly cycle based on billing_day.
+        ID-CORRECT: Does NOT confuse payment IDs (tr_*) with subscription IDs (sub_*).
+
+        Logic:
+        1. Parse payment timestamp (paidAt or createdAt)
+        2. Find subscription by metadata.subscription_id or identity_id + plan_code lookup
+        3. Calculate correct monthly period using billing_day
+        4. Check if this payment already granted a cycle (by provider_payment_id)
+        5. Check if this period already has a cycle (by subscription_id + period_start)
+        6. Grant monthly credits (never 365-day cycles, even for yearly plans)
+        """
+        from backend.services.subscription_service import SubscriptionService, SUBSCRIPTION_PLANS
+
+        payment_id = payment.get("id")
+        metadata = payment.get("metadata", {}) or {}
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        subscription_id_from_meta = metadata.get("subscription_id")  # Internal UUID if present
+
+        if not identity_id or not plan_code or not payment_id:
+            return None
+
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if not plan:
+            print(f"[RECONCILE:SUB] Unknown plan_code: {plan_code}")
+            return None
+
+        credits_per_month = plan.get("credits_per_month", 0)
+
+        # ── Step 1: Parse payment timestamp ───────────────────────
+        paid_at_str = payment.get("paidAt") or payment.get("createdAt")
+        if not paid_at_str:
+            print(f"[RECONCILE:SUB] Payment {payment_id} has no timestamp")
+            return None
+
+        try:
+            payment_ts = datetime.fromisoformat(paid_at_str.replace("Z", "+00:00"))
+        except ValueError:
+            print(f"[RECONCILE:SUB] Payment {payment_id} has invalid timestamp: {paid_at_str}")
+            return None
+
+        # ── Step 2: Find the subscription ─────────────────────────
+        subscription = None
+
+        # Priority 1: Use subscription_id from metadata (most reliable)
+        if subscription_id_from_meta:
+            subscription = query_one(
+                f"""
+                SELECT id, identity_id, plan_code, status, billing_day,
+                       credits_remaining_months, customer_email
+                FROM {Tables.SUBSCRIPTIONS}
+                WHERE id::text = %s
+                """,
+                (subscription_id_from_meta,),
+            )
+            if subscription:
+                print(f"[RECONCILE:SUB] Found subscription {subscription_id_from_meta} from metadata")
+
+        # Priority 2: Look up by identity_id + plan_code
+        if not subscription:
+            subscription = SubscriptionService.find_subscription_for_payment(
+                identity_id=identity_id,
+                plan_code=plan_code,
+                provider="mollie",
+            )
+            if subscription:
+                print(f"[RECONCILE:SUB] Found subscription {subscription['id']} by identity+plan lookup")
+
+        # Priority 3: No subscription found - need to create one
+        if not subscription:
+            print(f"[RECONCILE:SUB] No subscription found for payment {payment_id}, creating new one")
+
+            if dry_run:
+                return {
+                    "fixed": True,
+                    "dry_run": True,
+                    "fix_type": "subscription_cycle_granted",
+                    "payment_id": payment_id,
+                    "identity_id": identity_id,
+                    "plan_code": plan_code,
+                    "credits": credits_per_month,
+                    "note": "Would create new subscription and grant cycle",
+                }
+
+            try:
+                from backend.services.mollie_service import MollieService
+                result = MollieService._handle_subscription_paid(payment)
+
+                if result and not result.get("was_existing"):
+                    ReconciliationService._log_reconciliation_fix(
+                        run_id=run_id,
+                        provider="mollie",
+                        provider_payment_id=payment_id,
+                        fix_type="subscription_cycle_granted",
+                        identity_id=identity_id,
+                        credits_delta=credits_per_month,
+                        plan_code=plan_code,
+                        amount_gbp=plan.get("price_gbp", 0),
+                        mollie_status="paid",
+                        details={
+                            "subscription_id": result.get("purchase_id"),
+                            "note": "Created new subscription",
+                        },
+                    )
+
+                    return {
+                        "fixed": True,
+                        "fix_type": "subscription_cycle_granted",
+                        "payment_id": payment_id,
+                        "identity_id": identity_id,
+                        "plan_code": plan_code,
+                        "credits": credits_per_month,
+                        "subscription_id": result.get("purchase_id"),
+                    }
+
+            except Exception as e:
+                print(f"[RECONCILE:SUB] Error creating subscription for {payment_id}: {e}")
+                raise
+
+            return None
+
+        # ── Step 3: Check if payment already granted a cycle ──────
+        subscription_id = str(subscription["id"])
+
+        if SubscriptionService.check_payment_already_granted("mollie", payment_id):
+            print(f"[RECONCILE:SUB] Payment {payment_id} already granted a cycle")
+            return None
+
+        # ── Step 4: Calculate correct monthly period ──────────────
+        billing_day = subscription.get("billing_day") or payment_ts.day
+
+        period_start, period_end = SubscriptionService.calculate_cycle_period(
+            payment_ts=payment_ts,
+            billing_day=billing_day,
+        )
+
+        print(
+            f"[RECONCILE:SUB] Payment {payment_id} maps to period "
+            f"{period_start.date()} → {period_end.date()} (billing_day={billing_day})"
+        )
+
+        # ── Step 5: Check if cycle already exists for this period ─
+        if SubscriptionService.check_cycle_exists(subscription_id, period_start):
+            print(f"[RECONCILE:SUB] Cycle already exists for {subscription_id} period {period_start.date()}")
+            return None
+
+        # ── Step 6: Grant the monthly credits ─────────────────────
+        print(
+            f"[RECONCILE:SUB] Granting {credits_per_month} credits for subscription "
+            f"{subscription_id} period {period_start.date()} → {period_end.date()}"
+        )
+
+        if dry_run:
+            return {
+                "fixed": True,
+                "dry_run": True,
+                "fix_type": "subscription_cycle_granted",
+                "payment_id": payment_id,
+                "identity_id": identity_id,
+                "plan_code": plan_code,
+                "credits": credits_per_month,
+                "subscription_id": subscription_id,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+            }
+
+        try:
+            grant_result = SubscriptionService.grant_subscription_credits(
+                subscription_id=subscription_id,
+                period_start=period_start,
+                period_end=period_end,
+                provider="mollie",
+                provider_payment_id=payment_id,
+            )
+
+            if grant_result and grant_result.get("credits_granted"):
+                ReconciliationService._log_reconciliation_fix(
+                    run_id=run_id,
+                    provider="mollie",
+                    provider_payment_id=payment_id,
+                    fix_type="subscription_cycle_granted",
+                    identity_id=identity_id,
+                    credits_delta=credits_per_month,
+                    plan_code=plan_code,
+                    amount_gbp=plan.get("price_gbp", 0),
+                    mollie_status="paid",
+                    details={
+                        "subscription_id": subscription_id,
+                        "cycle_id": grant_result.get("cycle_id"),
+                        "period_start": period_start.isoformat(),
+                        "period_end": period_end.isoformat(),
+                    },
+                )
+
+                return {
+                    "fixed": True,
+                    "fix_type": "subscription_cycle_granted",
+                    "payment_id": payment_id,
+                    "identity_id": identity_id,
+                    "plan_code": plan_code,
+                    "credits": credits_per_month,
+                    "subscription_id": subscription_id,
+                    "cycle_id": grant_result.get("cycle_id"),
+                }
+
+        except Exception as e:
+            print(f"[RECONCILE:SUB] Error granting subscription credits for {payment_id}: {e}")
+            raise
+
+        return None
+
+    @staticmethod
+    def _reconcile_refund_payment(
+        payment: Dict[str, Any],
+        run_id: Optional[str],
+        dry_run: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Reconcile a refunded or charged-back payment.
+
+        Checks if revocation ledger entry exists. If not, applies it.
+        """
+        from backend.services.mollie_service import MollieService
+
+        payment_id = payment.get("id")
+        status = payment.get("status")
+        metadata = payment.get("metadata", {}) or {}
+        identity_id = metadata.get("identity_id")
+
+        if not identity_id:
+            return None
+
+        # Check if refund ledger entry already exists
+        entry_type = "chargeback" if status == "charged_back" else "refund"
+        existing_refund = query_one(
+            f"""
+            SELECT id FROM {Tables.LEDGER_ENTRIES}
+            WHERE identity_id = %s
+              AND entry_type = %s
+              AND meta->>'payment_id' = %s
+            """,
+            (identity_id, entry_type, payment_id),
+        )
+
+        if existing_refund:
+            return None  # Already processed
+
+        print(f"[RECONCILE:MOLLIE] Found {status} payment {payment_id} without revocation entry")
+
+        if dry_run:
+            return {
+                "fixed": True,
+                "dry_run": True,
+                "fix_type": f"{entry_type}_applied",
+                "payment_id": payment_id,
+                "identity_id": identity_id,
+            }
+
+        # Apply the refund
+        try:
+            result = MollieService._handle_payment_refunded(payment)
+
+            if result and not result.get("was_existing"):
+                ReconciliationService._log_reconciliation_fix(
+                    run_id=run_id,
+                    provider="mollie",
+                    provider_payment_id=payment_id,
+                    fix_type=f"{entry_type}_applied",
+                    identity_id=identity_id,
+                    credits_delta=-result.get("credits_revoked", 0),
+                    mollie_status=status,
+                    details={"new_balance": result.get("new_balance")},
+                )
+
+                return {
+                    "fixed": True,
+                    "fix_type": f"{entry_type}_applied",
+                    "payment_id": payment_id,
+                    "identity_id": identity_id,
+                    "credits_revoked": result.get("credits_revoked", 0),
+                }
+
+        except Exception as e:
+            print(f"[RECONCILE:MOLLIE] Error applying {status} for {payment_id}: {e}")
+            raise
+
+        return None
+
+    @staticmethod
+    def _check_purchase_has_ledger(purchase_id: str) -> bool:
+        """Check if a purchase has a corresponding ledger entry."""
+        result = query_one(
+            f"""
+            SELECT id FROM {Tables.LEDGER_ENTRIES}
+            WHERE ref_type = 'purchase' AND ref_id = %s AND entry_type = %s
+            """,
+            (purchase_id, LedgerEntryType.PURCHASE_CREDIT),
+        )
+        return result is not None
+
+    # ────────────────────────────────────────────────��────────────
+    # Reconciliation Run Management
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _create_reconciliation_run(run_type: str, days_back: int) -> Optional[str]:
+        """Create a new reconciliation run record."""
+        try:
+            result = execute_returning(
+                """
+                INSERT INTO timrx_billing.reconciliation_runs
+                (run_type, days_back, status, started_at)
+                VALUES (%s, %s, 'running', NOW())
+                RETURNING id
+                """,
+                (run_type, days_back),
+            )
+            if result:
+                return str(result["id"])
+        except Exception as e:
+            print(f"[RECONCILE] Error creating run record: {e}")
+        return None
+
+    @staticmethod
+    def _finalize_reconciliation_run(run_id: str, results: Dict[str, Any]):
+        """Update reconciliation run with final results."""
+        try:
+            notes = f"Scanned {results['scanned_count']} payments, fixed {results['fixed_count']}"
+            if results['errors_count'] > 0:
+                notes += f", {results['errors_count']} errors"
+
+            execute(
+                """
+                UPDATE timrx_billing.reconciliation_runs
+                SET finished_at = NOW(),
+                    status = %s,
+                    scanned_count = %s,
+                    fixed_count = %s,
+                    errors_count = %s,
+                    purchases_fixed = %s,
+                    subscriptions_fixed = %s,
+                    refunds_fixed = %s,
+                    wallets_fixed = %s,
+                    notes = %s,
+                    error_details = %s
+                WHERE id = %s
+                """,
+                (
+                    "failed" if results["errors_count"] > 0 and results["fixed_count"] == 0 else "completed",
+                    results["scanned_count"],
+                    results["fixed_count"],
+                    results["errors_count"],
+                    len(results.get("purchases_fixed", [])),
+                    len(results.get("subscriptions_fixed", [])),
+                    len(results.get("refunds_fixed", [])),
+                    len(results.get("wallets_fixed", [])),
+                    notes,
+                    json.dumps(results.get("errors", [])) if results.get("errors") else None,
+                    run_id,
+                ),
+            )
+        except Exception as e:
+            print(f"[RECONCILE] Error finalizing run record: {e}")
+
+    @staticmethod
+    def _log_reconciliation_fix(
+        run_id: Optional[str],
+        provider: str,
+        provider_payment_id: str,
+        fix_type: str,
+        identity_id: Optional[str] = None,
+        credits_delta: int = 0,
+        plan_code: Optional[str] = None,
+        amount_gbp: Optional[float] = None,
+        mollie_status: Optional[str] = None,
+        details: Optional[Dict] = None,
+    ):
+        """Log a reconciliation fix (idempotent via unique constraint)."""
+        try:
+            execute(
+                """
+                INSERT INTO timrx_billing.reconciliation_fixes
+                (run_id, provider, provider_payment_id, fix_type,
+                 identity_id, credits_delta, plan_code, amount_gbp,
+                 mollie_status, details_json, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (provider, provider_payment_id, fix_type) DO NOTHING
+                """,
+                (
+                    run_id,
+                    provider,
+                    provider_payment_id,
+                    fix_type,
+                    identity_id,
+                    credits_delta,
+                    plan_code,
+                    amount_gbp,
+                    mollie_status,
+                    json.dumps(details) if details else None,
+                ),
+            )
+        except Exception as e:
+            print(f"[RECONCILE] Error logging fix: {e}")
+
+    @staticmethod
+    def _send_mollie_reconciliation_alert(results: Dict[str, Any]):
+        """Send admin email about Mollie reconciliation fixes."""
+        try:
+            from backend.emailer import notify_admin
+
+            fixes_summary = []
+
+            if results.get("purchases_fixed"):
+                count = len(results["purchases_fixed"])
+                total_credits = sum(f.get("credits", 0) for f in results["purchases_fixed"])
+                fixes_summary.append(f"- {count} missing purchase(s) created (+{total_credits:,} credits)")
+
+            if results.get("subscriptions_fixed"):
+                count = len(results["subscriptions_fixed"])
+                total_credits = sum(f.get("credits", 0) for f in results["subscriptions_fixed"])
+                fixes_summary.append(f"- {count} missing subscription credits granted (+{total_credits:,} credits)")
+
+            if results.get("refunds_fixed"):
+                count = len(results["refunds_fixed"])
+                total_credits = sum(f.get("credits_revoked", 0) for f in results["refunds_fixed"])
+                fixes_summary.append(f"- {count} refund/chargeback(s) applied (-{total_credits:,} credits)")
+
+            if results.get("wallets_fixed"):
+                count = len(results["wallets_fixed"])
+                fixes_summary.append(f"- {count} wallet balance(s) corrected")
+
+            if not fixes_summary:
+                return
+
+            message = "The Mollie reconciliation job applied the following fixes:\n\n"
+            message += "\n".join(fixes_summary)
+            message += f"\n\nPayments scanned: {results['scanned_count']}"
+            message += f"\nDuration: {results.get('duration_ms', 0)}ms"
+
+            data = {
+                "Run ID": results.get("run_id", "N/A"),
+                "Days Back": results.get("days_back", 30),
+                "Scanned": results["scanned_count"],
+                "Fixed": results["fixed_count"],
+                "Errors": results["errors_count"],
+            }
+
+            # Add sample fixes
+            if results.get("purchases_fixed"):
+                sample = results["purchases_fixed"][:3]
+                data["Purchases Fixed (sample)"] = json.dumps(sample, default=str)
+
+            if results.get("subscriptions_fixed"):
+                sample = results["subscriptions_fixed"][:3]
+                data["Subscriptions Fixed (sample)"] = json.dumps(sample, default=str)
+
+            notify_admin(
+                subject="Mollie Reconciliation: Fixes Applied",
+                message=message,
+                data=data,
+            )
+
+            print("[RECONCILE:MOLLIE] Admin alert sent")
+
+        except Exception as e:
+            print(f"[RECONCILE:MOLLIE] Failed to send admin alert: {e}")
+
+    # ─────────────────────────────────────────────────────────────
+    # Full Reconciliation (Safety + Mollie)
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def reconcile_full(
+        days_back: int = 30,
+        dry_run: bool = False,
+        send_alert: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Run full reconciliation: both safety checks AND Mollie API comparison.
+
+        This is the recommended daily job.
+
+        Args:
+            days_back: Days of Mollie payments to scan
+            dry_run: If True, detect issues but don't fix
+            send_alert: If True, send admin email if fixes applied
+
+        Returns:
+            Combined results from both reconciliation phases
+        """
+        print(f"[RECONCILE] Starting full reconciliation (days_back={days_back}, dry_run={dry_run})")
+
+        start_time = datetime.now(timezone.utc)
+
+        results = {
+            "run_at": start_time.isoformat(),
+            "dry_run": dry_run,
+            "safety_results": {},
+            "mollie_results": {},
+            "total_fixes": 0,
+            "total_errors": 0,
+        }
+
+        # Phase 1: Safety reconciliation (existing DB checks)
+        try:
+            safety_results = ReconciliationService.reconcile_safety(
+                dry_run=dry_run,
+                send_alert=False,  # We'll send combined alert
+            )
+            results["safety_results"] = safety_results
+            results["total_fixes"] += safety_results.get("total_fixes", 0)
+            results["total_errors"] += safety_results.get("total_errors", 0)
+        except Exception as e:
+            print(f"[RECONCILE] Safety reconciliation error: {e}")
+            results["safety_results"] = {"error": str(e)}
+            results["total_errors"] += 1
+
+        # Phase 2: Mollie API reconciliation
+        try:
+            mollie_results = ReconciliationService.reconcile_mollie_payments(
+                days_back=days_back,
+                dry_run=dry_run,
+                run_type="full",
+            )
+            results["mollie_results"] = mollie_results
+            results["total_fixes"] += mollie_results.get("fixed_count", 0)
+            results["total_errors"] += mollie_results.get("errors_count", 0)
+        except Exception as e:
+            print(f"[RECONCILE] Mollie reconciliation error: {e}")
+            results["mollie_results"] = {"error": str(e)}
+            results["total_errors"] += 1
+
+        end_time = datetime.now(timezone.utc)
+        results["duration_ms"] = int((end_time - start_time).total_seconds() * 1000)
+
+        print(
+            f"[RECONCILE] Full reconciliation completed: fixes={results['total_fixes']}, "
+            f"errors={results['total_errors']}, duration={results['duration_ms']}ms"
+        )
+
+        # Send combined admin alert if requested and fixes were applied
+        if send_alert and results["total_fixes"] > 0 and not dry_run:
+            ReconciliationService._send_full_reconciliation_alert(results)
+
+        return results
+
+    @staticmethod
+    def _send_full_reconciliation_alert(results: Dict[str, Any]):
+        """Send admin email summarizing full reconciliation."""
+        try:
+            from backend.emailer import notify_admin
+
+            safety = results.get("safety_results", {})
+            mollie = results.get("mollie_results", {})
+
+            message = "Full reconciliation completed:\n\n"
+
+            # Safety phase summary
+            safety_fixes = safety.get("total_fixes", 0)
+            if safety_fixes > 0:
+                message += f"Safety Phase: {safety_fixes} fix(es)\n"
+                if safety.get("purchases_missing_ledger"):
+                    message += f"  - {len(safety['purchases_missing_ledger'])} ledger entries created\n"
+                if safety.get("wallet_mismatches_fixed"):
+                    message += f"  - {len(safety['wallet_mismatches_fixed'])} wallet balances fixed\n"
+                if safety.get("stale_reservations_released"):
+                    message += f"  - {len(safety['stale_reservations_released'])} reservations released\n"
+
+            # Mollie phase summary
+            mollie_fixes = mollie.get("fixed_count", 0)
+            if mollie_fixes > 0:
+                message += f"\nMollie Phase: {mollie_fixes} fix(es)\n"
+                if mollie.get("purchases_fixed"):
+                    message += f"  - {len(mollie['purchases_fixed'])} missing purchases created\n"
+                if mollie.get("subscriptions_fixed"):
+                    message += f"  - {len(mollie['subscriptions_fixed'])} subscription credits granted\n"
+                if mollie.get("refunds_fixed"):
+                    message += f"  - {len(mollie['refunds_fixed'])} refunds applied\n"
+
+            message += f"\nTotal fixes: {results['total_fixes']}"
+            message += f"\nDuration: {results.get('duration_ms', 0)}ms"
+
+            notify_admin(
+                subject="Reconciliation Complete: Fixes Applied",
+                message=message,
+                data={
+                    "Total Fixes": results["total_fixes"],
+                    "Safety Fixes": safety_fixes,
+                    "Mollie Fixes": mollie_fixes,
+                    "Errors": results["total_errors"],
+                },
+            )
+
+        except Exception as e:
+            print(f"[RECONCILE] Failed to send full reconciliation alert: {e}")
