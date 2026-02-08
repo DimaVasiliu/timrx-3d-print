@@ -24,7 +24,7 @@ import json
 from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
 from backend.config import config
 from backend.services.pricing_service import PricingService
-from backend.services.wallet_service import WalletService, LedgerEntryType
+from backend.services.wallet_service import WalletService, LedgerEntryType, CreditType, get_credit_type_for_plan
 from backend.services.identity_service import IdentityService
 from backend.services.email_outbox_service import EmailOutboxService
 
@@ -376,6 +376,10 @@ class PurchaseService:
         Returns:
             Dict with purchase and wallet info, or None on failure
         """
+        # Determine credit type based on plan code
+        credit_type = get_credit_type_for_plan(plan_code) if plan_code else CreditType.GENERAL
+        balance_column = "balance_video_credits" if credit_type == CreditType.VIDEO else "balance_credits"
+
         with transaction() as cur:
             # 1. Create purchase record (IDEMPOTENT: ON CONFLICT prevents double-grant on webhook retry)
             cur.execute(
@@ -418,7 +422,7 @@ class PurchaseService:
             # 2. Lock wallet for update
             cur.execute(
                 f"""
-                SELECT identity_id, balance_credits
+                SELECT identity_id, balance_credits, balance_video_credits
                 FROM {Tables.WALLETS}
                 WHERE identity_id = %s
                 FOR UPDATE
@@ -428,11 +432,11 @@ class PurchaseService:
             wallet = fetch_one(cur)
 
             if not wallet:
-                # Create wallet if doesn't exist
+                # Create wallet if doesn't exist (with both credit types)
                 cur.execute(
                     f"""
-                    INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
-                    VALUES (%s, 0, NOW())
+                    INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, balance_video_credits, updated_at)
+                    VALUES (%s, 0, 0, NOW())
                     ON CONFLICT (identity_id) DO NOTHING
                     RETURNING *
                     """,
@@ -447,15 +451,15 @@ class PurchaseService:
                     )
                     wallet = fetch_one(cur)
 
-            current_balance = wallet.get("balance_credits", 0) or 0
+            current_balance = wallet.get(balance_column, 0) or 0
             new_balance = current_balance + credits_granted
 
-            # 3. Insert ledger entry
+            # 3. Insert ledger entry with credit_type
             cur.execute(
                 f"""
                 INSERT INTO {Tables.LEDGER_ENTRIES}
-                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, credit_type, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING *
                 """,
                 (
@@ -464,16 +468,17 @@ class PurchaseService:
                     credits_granted,  # Positive amount
                     "purchase",
                     purchase_id,
-                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp}),
+                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "credit_type": credit_type}),
+                    credit_type,
                 ),
             )
             ledger_entry = fetch_one(cur)
 
-            # 4. Update wallet balance
+            # 4. Update wallet balance for the correct credit type
             cur.execute(
                 f"""
                 UPDATE {Tables.WALLETS}
-                SET balance_credits = %s, updated_at = NOW()
+                SET {balance_column} = %s, updated_at = NOW()
                 WHERE identity_id = %s
                 """,
                 (new_balance, identity_id),
