@@ -725,8 +725,12 @@ class MollieService:
         This is similar to PurchaseService.record_purchase but uses 'mollie' as provider.
         """
         from backend.db import fetch_one, transaction, Tables
-        from backend.services.wallet_service import LedgerEntryType
+        from backend.services.wallet_service import LedgerEntryType, CreditType, get_credit_type_for_plan
         from backend.services.purchase_service import PurchaseStatus, PurchaseService
+
+        # Determine credit type based on plan code
+        credit_type = get_credit_type_for_plan(plan_code) if plan_code else CreditType.GENERAL
+        balance_column = "balance_video_credits" if credit_type == CreditType.VIDEO else "balance_credits"
 
         with transaction() as cur:
             # 1. Create purchase record (idempotent via ON CONFLICT DO NOTHING)
@@ -778,7 +782,7 @@ class MollieService:
             # 2. Lock wallet for update
             cur.execute(
                 f"""
-                SELECT identity_id, balance_credits
+                SELECT identity_id, balance_credits, balance_video_credits
                 FROM {Tables.WALLETS}
                 WHERE identity_id = %s
                 FOR UPDATE
@@ -788,11 +792,11 @@ class MollieService:
             wallet = fetch_one(cur)
 
             if not wallet:
-                # Create wallet if doesn't exist
+                # Create wallet if doesn't exist (with both credit types)
                 cur.execute(
                     f"""
-                    INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
-                    VALUES (%s, 0, NOW())
+                    INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, balance_video_credits, updated_at)
+                    VALUES (%s, 0, 0, NOW())
                     ON CONFLICT (identity_id) DO NOTHING
                     RETURNING *
                     """,
@@ -807,15 +811,15 @@ class MollieService:
                     )
                     wallet = fetch_one(cur)
 
-            current_balance = wallet.get("balance_credits", 0) or 0
+            current_balance = wallet.get(balance_column, 0) or 0
             new_balance = current_balance + credits_granted
 
-            # 3. Insert ledger entry
+            # 3. Insert ledger entry with credit_type
             cur.execute(
                 f"""
                 INSERT INTO {Tables.LEDGER_ENTRIES}
-                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, credit_type, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING *
                 """,
                 (
@@ -824,16 +828,17 @@ class MollieService:
                     credits_granted,  # Positive amount
                     "purchase",
                     purchase_id,
-                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "provider": "mollie"}),
+                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "provider": "mollie", "credit_type": credit_type}),
+                    credit_type,
                 ),
             )
             ledger_entry = fetch_one(cur)
 
-            # 4. Update wallet balance
+            # 4. Update wallet balance for the correct credit type
             cur.execute(
                 f"""
                 UPDATE {Tables.WALLETS}
-                SET balance_credits = %s, updated_at = NOW()
+                SET {balance_column} = %s, updated_at = NOW()
                 WHERE identity_id = %s
                 """,
                 (new_balance, identity_id),
@@ -1024,6 +1029,7 @@ class MollieService:
         plan_code: str,
         email: str,
         success_url: Optional[str] = None,
+        subscription_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Create a Mollie one-off payment for a subscription plan.
@@ -1031,6 +1037,14 @@ class MollieService:
         We use a single payment (not Mollie Subscriptions API) so the
         webhook can activate + grant credits.  Recurring billing can be
         added later by converting to Mollie mandates/subscriptions.
+
+        Args:
+            identity_id: User's identity UUID
+            plan_code: Subscription plan code
+            email: Customer email
+            success_url: Optional redirect URL after payment
+            subscription_id: Optional existing subscription ID for renewals
+                           (makes reconciliation more reliable)
 
         Returns: { checkout_url, payment_id }
         """
@@ -1068,6 +1082,10 @@ class MollieService:
             "credits_per_month": str(credits),
             "email": email,
         }
+
+        # Include subscription_id for renewals (makes reconciliation deterministic)
+        if subscription_id:
+            metadata["subscription_id"] = subscription_id
 
         payment_data = {
             "amount": {
