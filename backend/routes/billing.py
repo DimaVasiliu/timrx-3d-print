@@ -20,6 +20,7 @@ from backend.middleware import require_session, require_email, require_verified_
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService
 from backend.services.reservation_service import ReservationService
+from backend.services.expense_guard import ExpenseGuard
 from backend.services.purchase_service import PurchaseService
 from backend.services.mollie_service import MollieService, MollieCreateError
 from backend.services.subscription_service import SubscriptionService
@@ -1448,3 +1449,33 @@ def debug_email_preview():
         )
 
     return Response(html, mimetype="text/html")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPENSE GUARDRAILS STATUS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/guardrails/status", methods=["GET"])
+@require_session
+@no_cache
+def expense_guardrails_status():
+    """
+    Get current expense guardrails status.
+
+    Returns:
+    {
+        "ok": true,
+        "guardrails": {
+            "enabled": true,
+            "active_jobs": 2,
+            "max_concurrent_jobs": 5,
+            "limits": {...},
+            "costs": {...}
+        }
+    }
+    """
+    status = ExpenseGuard.get_status()
+    return jsonify({
+        "ok": True,
+        "guardrails": status,
+    })
