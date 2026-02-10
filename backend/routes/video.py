@@ -26,6 +26,7 @@ from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor
 from backend.services.credits_helper import start_paid_job
+from backend.services.expense_guard import ExpenseGuard
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
 from backend.services.gemini_video_service import (
@@ -177,6 +178,20 @@ def generate_video():
             }), 400
         prompt = motion or "Animate this image with natural, smooth motion"
 
+    # Stability guardrails: check API limits and concurrent jobs
+    guard_error = ExpenseGuard.check_video_request(duration_seconds=duration_seconds)
+    if guard_error:
+        return guard_error
+
+    # Idempotency check: return cached response if duplicate
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", task, prompt,
+        aspect_ratio=aspect_ratio, resolution=resolution, duration_seconds=duration_seconds
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
     # Generate internal job ID
     internal_job_id = str(uuid.uuid4())
 
@@ -252,6 +267,9 @@ def generate_video():
     # Import here to avoid circular imports
     from backend.services.async_dispatch import dispatch_gemini_video_async
 
+    # Register active job for concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id)
+
     # Dispatch async task
     get_executor().submit(
         dispatch_gemini_video_async,
@@ -265,7 +283,7 @@ def generate_video():
     log_event("video/generate:dispatched", {"internal_job_id": internal_job_id, "task": task})
 
     # D1: Return fast — skip balance query (frontend caches wallet separately)
-    return jsonify({
+    response_data = {
         "ok": True,
         "job_id": internal_job_id,
         "video_id": internal_job_id,
@@ -279,7 +297,12 @@ def generate_video():
             "duration_seconds": duration_seconds,
         },
         "source": "modular",
-    })
+    }
+
+    # Cache response for idempotency
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+
+    return jsonify(response_data)
 
 
 def _dispatch_video_job(
