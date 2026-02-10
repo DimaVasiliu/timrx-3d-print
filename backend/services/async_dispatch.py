@@ -17,6 +17,7 @@ from typing import Optional
 from backend.config import AWS_BUCKET_MODELS
 from backend.db import USE_DB, get_conn, Tables
 from backend.services.credits_helper import finalize_job_credits, release_job_credits
+from backend.services.expense_guard import ExpenseGuard
 from backend.services.history_service import save_image_to_normalized_db, save_video_to_normalized_db
 from backend.services.job_service import load_store, save_active_job_to_db, save_store
 from backend.services.meshy_service import mesh_post
@@ -344,6 +345,9 @@ def dispatch_openai_image_async(
             image_url=urls[0],
         )
 
+        # Unregister active job
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
         # print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
 
     except Exception as e:
@@ -352,6 +356,8 @@ def dispatch_openai_image_async(
         if reservation_id:
             release_job_credits(reservation_id, "openai_api_error", internal_job_id)
         update_job_status_failed(internal_job_id, str(e))
+        # Unregister active job on failure
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
 
 def dispatch_gemini_image_async(
@@ -437,6 +443,9 @@ def dispatch_gemini_image_async(
             image_url=image_url or image_urls[0],
         )
 
+        # Unregister active job
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
         # print(f"[ASYNC] Gemini image job {internal_job_id} completed successfully")
 
     except GeminiImageConfigError as e:
@@ -445,6 +454,7 @@ def dispatch_gemini_image_async(
         if reservation_id:
             release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiImageValidationError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -452,6 +462,7 @@ def dispatch_gemini_image_async(
         if reservation_id:
             release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiImageAuthError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -459,6 +470,7 @@ def dispatch_gemini_image_async(
         if reservation_id:
             release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -466,6 +478,7 @@ def dispatch_gemini_image_async(
         if reservation_id:
             release_job_credits(reservation_id, "gemini_api_error", internal_job_id)
         update_job_status_failed(internal_job_id, str(e))
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
 
 def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
@@ -853,6 +866,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "no_provider_available", internal_job_id)
         update_job_status_failed(internal_job_id, f"no_provider_available: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiConfigError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -860,6 +874,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "provider_not_configured", internal_job_id)
         update_job_status_failed(internal_job_id, f"provider_not_configured: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiValidationError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -867,6 +882,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "validation_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"invalid_params: {e.message}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiAuthError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -874,6 +890,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "provider_auth_failed", internal_job_id)
         update_job_status_failed(internal_job_id, f"provider_auth_failed: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except RuntimeError as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -882,6 +899,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "video_failed", internal_job_id)
         update_job_status_failed(internal_job_id, error_str)
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
@@ -889,6 +907,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "video_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"video_failed: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
 
 
 def _poll_gemini_video_completion(
@@ -1005,6 +1024,7 @@ def _poll_gemini_video_completion(
                 if reservation_id:
                     release_job_credits(reservation_id, error_code, internal_job_id)
                 update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
+                ExpenseGuard.unregister_active_job(internal_job_id)
                 return
 
         except Exception as e:
@@ -1017,6 +1037,7 @@ def _poll_gemini_video_completion(
                 if reservation_id:
                     release_job_credits(reservation_id, "gemini_poll_error", internal_job_id)
                 update_job_status_failed(internal_job_id, f"gemini_poll_error: {e}")
+                ExpenseGuard.unregister_active_job(internal_job_id)
                 return
 
     # Timeout - max polls reached
@@ -1025,6 +1046,7 @@ def _poll_gemini_video_completion(
     if reservation_id:
         release_job_credits(reservation_id, "gemini_timeout", internal_job_id)
     update_job_status_failed(internal_job_id, f"gemini_timeout: Video generation did not complete within {timeout_seconds} seconds")
+    ExpenseGuard.unregister_active_job(internal_job_id)
 
 
 def _poll_video_completion(
@@ -1058,6 +1080,7 @@ def _poll_video_completion(
         if reservation_id:
             release_job_credits(reservation_id, "unknown_provider", internal_job_id)
         update_job_status_failed(internal_job_id, f"unknown_provider: {provider_name}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
         return
 
     # print(f"[ASYNC] Starting {provider_name} poll for upstream_id={upstream_id}")
@@ -1129,6 +1152,7 @@ def _poll_video_completion(
                 if reservation_id:
                     release_job_credits(reservation_id, error_code, internal_job_id)
                 update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
+                ExpenseGuard.unregister_active_job(internal_job_id)
                 return
 
         except Exception as e:
@@ -1140,6 +1164,7 @@ def _poll_video_completion(
                 if reservation_id:
                     release_job_credits(reservation_id, f"{provider_name}_poll_error", internal_job_id)
                 update_job_status_failed(internal_job_id, f"{provider_name}_poll_error: {e}")
+                ExpenseGuard.unregister_active_job(internal_job_id)
                 return
 
     # Timeout
@@ -1151,6 +1176,7 @@ def _poll_video_completion(
         internal_job_id,
         f"{provider_name}_timeout: Video generation did not complete within {timeout_seconds} seconds",
     )
+    ExpenseGuard.unregister_active_job(internal_job_id)
 
 
 def _finalize_video_success(
@@ -1288,6 +1314,9 @@ def _finalize_video_success(
         internal_job_id,
         upstream_job_id=store_meta.get("upstream_id") or store_meta.get("operation_name"),
     )
+
+    # Unregister active job
+    ExpenseGuard.unregister_active_job(internal_job_id)
 
     # Also update meta with video_url in jobs table
     if USE_DB:
