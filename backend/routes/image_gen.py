@@ -20,6 +20,7 @@ from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, dispatch_gemini_image_async, update_job_status_ready, update_job_status_failed
 from backend.services.credits_helper import get_current_balance, start_paid_job
+from backend.services.expense_guard import ExpenseGuard
 from backend.services.gemini_image_service import (
     gemini_generate_image,
     check_gemini_configured,
@@ -127,6 +128,20 @@ def _handle_gemini_image_generate(body: dict):
     image_size = body.get("image_size") or body.get("imageSize") or "1K"
     sample_count = int(body.get("sample_count") or body.get("sampleCount") or body.get("n") or 1)
 
+    # Stability guardrails: check API limits and concurrent jobs
+    guard_error = ExpenseGuard.check_image_request(n=sample_count)
+    if guard_error:
+        return guard_error
+
+    # Idempotency check: return cached response if duplicate
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="google", aspect_ratio=aspect_ratio, image_size=image_size, n=sample_count
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
     # Validate aspect_ratio
     if aspect_ratio not in ALLOWED_ASPECT_RATIOS:
         return jsonify({
@@ -193,6 +208,9 @@ def _handle_gemini_image_generate(body: dict):
         status="queued",
     )
 
+    # Register active job for concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id)
+
     # Dispatch async - Gemini API call happens in background thread
     get_executor().submit(
         dispatch_gemini_image_async,
@@ -211,7 +229,7 @@ def _handle_gemini_image_generate(body: dict):
     # Return immediately with job_id for polling
     # Credits are now held in DB - frontend can see via /api/credits/wallet
     balance_info = get_current_balance(identity_id)
-    return jsonify({
+    response_data = {
         "ok": True,
         "job_id": internal_job_id,
         "image_id": internal_job_id,
@@ -220,7 +238,12 @@ def _handle_gemini_image_generate(body: dict):
         "status": "queued",
         "model": "imagen-4.0",
         "provider": "google",
-    })
+    }
+
+    # Cache response for idempotency
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+
+    return jsonify(response_data)
 
 
 def _handle_openai_image_generate(body: dict):
@@ -258,6 +281,20 @@ def _handle_openai_image_generate(body: dict):
     model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1").strip()
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
+
+    # Stability guardrails: check API limits and concurrent jobs
+    guard_error = ExpenseGuard.check_image_request(n=n)
+    if guard_error:
+        return guard_error
+
+    # Idempotency check: return cached response if duplicate
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="openai", size=size, model=model, n=n
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
 
     internal_job_id = str(uuid.uuid4())
     action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
@@ -302,6 +339,9 @@ def _handle_openai_image_generate(body: dict):
         status="queued",
     )
 
+    # Register active job for concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id)
+
     get_executor().submit(
         _dispatch_openai_image_async,
         internal_job_id,
@@ -314,7 +354,7 @@ def _handle_openai_image_generate(body: dict):
     log_event("image/generate:openai", {"internal_job_id": internal_job_id})
 
     balance_info = get_current_balance(identity_id)
-    return jsonify({
+    response_data = {
         "ok": True,
         "job_id": internal_job_id,
         "image_id": internal_job_id,
@@ -324,7 +364,12 @@ def _handle_openai_image_generate(body: dict):
         "model": model,
         "size": size,
         "provider": "openai",
-    })
+    }
+
+    # Cache response for idempotency
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+
+    return jsonify(response_data)
 
 
 @bp.route("/image/gemini", methods=["POST", "OPTIONS"])
