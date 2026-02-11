@@ -254,7 +254,6 @@ class PricingService:
         "MESHY_IMAGE_TO_3D": CanonicalActions.IMAGE_TO_3D_GENERATE,
         "MESHY_REFINE": CanonicalActions.REFINE,
         "MESHY_RETEXTURE": CanonicalActions.RETEXTURE,
-        "MESHY_RIG": CanonicalActions.RIGGING,
         "OPENAI_IMAGE": CanonicalActions.IMAGE_GENERATE,
         "VIDEO_GENERATE": CanonicalActions.VIDEO_GENERATE,
         "VIDEO_TEXT_GENERATE": CanonicalActions.VIDEO_TEXT_GENERATE,
