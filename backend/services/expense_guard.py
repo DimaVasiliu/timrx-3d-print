@@ -107,15 +107,66 @@ class ExpenseGuard:
     Call before dispatching image/video generation jobs.
 
     NOTE: Does NOT enforce cost limits. Credits system handles that.
+
+    Tier-based concurrency limits (Feb 2026):
+      Free:    2 concurrent jobs
+      Starter: 5 concurrent jobs
+      Creator: 10 concurrent jobs
+      Studio:  20 concurrent jobs
     """
 
     @staticmethod
-    def check_image_request(n: int = 1) -> Optional[Tuple]:
+    def get_max_concurrent_for_identity(identity_id: Optional[str] = None) -> int:
+        """
+        Get max concurrent jobs allowed for an identity based on their subscription tier.
+
+        Args:
+            identity_id: User's identity UUID (None = free tier)
+
+        Returns:
+            Max concurrent jobs allowed
+        """
+        if not identity_id:
+            return 2  # Free tier default
+
+        try:
+            from backend.services.subscription_service import SubscriptionService
+            perks = SubscriptionService.get_tier_perks(identity_id)
+            return perks.get("max_concurrent_jobs", 2)
+        except Exception as e:
+            print(f"[EXPENSE] Error getting tier perks: {e}")
+            return 2  # Fallback to free tier
+
+    @staticmethod
+    def get_queue_priority_for_identity(identity_id: Optional[str] = None) -> str:
+        """
+        Get queue priority for an identity based on their subscription tier.
+
+        Args:
+            identity_id: User's identity UUID (None = free tier)
+
+        Returns:
+            Queue priority: 'standard' | 'medium' | 'high' | 'pro'
+        """
+        if not identity_id:
+            return "standard"  # Free tier default
+
+        try:
+            from backend.services.subscription_service import SubscriptionService
+            perks = SubscriptionService.get_tier_perks(identity_id)
+            return perks.get("queue_priority", "standard")
+        except Exception as e:
+            print(f"[EXPENSE] Error getting tier perks: {e}")
+            return "standard"  # Fallback to free tier
+
+    @staticmethod
+    def check_image_request(n: int = 1, identity_id: Optional[str] = None) -> Optional[Tuple]:
         """
         Check if an image generation request is allowed (stability only).
 
         Args:
             n: Number of images requested
+            identity_id: User's identity UUID (for tier-based limits)
 
         Returns:
             None if allowed, error response tuple if blocked.
@@ -133,26 +184,28 @@ class ExpenseGuard:
                 maximum=config.MAX_IMAGES_PER_REQUEST,
             )
 
-        # Concurrent job limit (queue stability)
+        # Concurrent job limit (tier-based)
         _cleanup_caches()
-        if len(_active_jobs) >= config.MAX_CONCURRENT_JOBS:
+        max_concurrent = ExpenseGuard.get_max_concurrent_for_identity(identity_id)
+        if len(_active_jobs) >= max_concurrent:
             return _make_error(
                 "TOO_MANY_JOBS",
                 f"Too many jobs in progress ({len(_active_jobs)}). Wait for current jobs to complete.",
                 429,
                 active_jobs=len(_active_jobs),
-                maximum=config.MAX_CONCURRENT_JOBS,
+                maximum=max_concurrent,
             )
 
         return None
 
     @staticmethod
-    def check_video_request(duration_seconds: int = 6) -> Optional[Tuple]:
+    def check_video_request(duration_seconds: int = 6, identity_id: Optional[str] = None) -> Optional[Tuple]:
         """
         Check if a video generation request is allowed (stability only).
 
         Args:
             duration_seconds: Video duration in seconds
+            identity_id: User's identity UUID (for tier-based limits)
 
         Returns:
             None if allowed, error response tuple if blocked.
@@ -170,15 +223,16 @@ class ExpenseGuard:
                 maximum=config.MAX_VIDEO_SECONDS,
             )
 
-        # Concurrent job limit (queue stability)
+        # Concurrent job limit (tier-based)
         _cleanup_caches()
-        if len(_active_jobs) >= config.MAX_CONCURRENT_JOBS:
+        max_concurrent = ExpenseGuard.get_max_concurrent_for_identity(identity_id)
+        if len(_active_jobs) >= max_concurrent:
             return _make_error(
                 "TOO_MANY_JOBS",
                 f"Too many jobs in progress ({len(_active_jobs)}). Wait for current jobs to complete.",
                 429,
                 active_jobs=len(_active_jobs),
-                maximum=config.MAX_CONCURRENT_JOBS,
+                maximum=max_concurrent,
             )
 
         return None
