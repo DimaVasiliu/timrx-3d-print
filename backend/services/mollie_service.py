@@ -26,7 +26,7 @@ Environment variables:
 import json
 import requests
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from backend.config import config
 from backend.db import get_conn, Tables
