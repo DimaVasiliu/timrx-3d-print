@@ -235,10 +235,10 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
 
 
 def finalize_job_credits(
-    reservation_id: str,
+    reservation_id: Optional[str],
     job_id: str | None = None,
     identity_id: str | None = None,
-) -> bool:
+) -> dict:
     """
     Finalize (capture) credits after successful job completion.
 
@@ -248,7 +248,10 @@ def finalize_job_credits(
         identity_id: The user identity ID (for logging unbilled cases)
 
     Returns:
-        True if credits were finalized, False if skipped (no reservation or system unavailable)
+        dict with:
+            - success: True if credits were finalized
+            - new_balance: The user's new credit balance after finalization (or None)
+            - cost: The cost that was charged (or None)
 
     IMPORTANT: If reservation_id is missing for a successful job, this indicates a bug
     in the credit flow. The job will be marked as ready_unbilled for admin reconciliation.
@@ -258,7 +261,7 @@ def finalize_job_credits(
     # If credits system unavailable, silently skip (dev mode / no DB)
     if not CREDITS_AVAILABLE:
         print(f"[CREDITS] FINALIZE SKIPPED - CREDITS_AVAILABLE=False")
-        return False
+        return {"success": False, "new_balance": None, "cost": None}
 
     # CRITICAL: Missing reservation_id for a successful job is a BUG
     # This means credits were never reserved but the job completed anyway
@@ -282,23 +285,31 @@ def finalize_job_credits(
             status="ready_unbilled",
             error="missing_reservation_id",
         )
-        return False
+        return {"success": False, "new_balance": None, "cost": None}
 
     try:
         result = ReservationService.finalize_reservation(reservation_id)
 
         if result.get("not_found"):
             print(f"[CREDITS] FINALIZE: reservation not found (expired or never existed): reservation_id={reservation_id} job_id={job_id}")
-            return False
+            return {"success": False, "new_balance": None, "cost": None}
         elif result.get("was_already_finalized"):
             print(f"[CREDITS] FINALIZE: already finalized (idempotent): reservation_id={reservation_id} job_id={job_id}")
-            return True  # Already finalized = success
+            # Already finalized = success, but we don't have the balance from this call
+            # Fetch current balance for the caller
+            current_balance = None
+            if identity_id:
+                try:
+                    current_balance = WalletService.get_balance(identity_id)
+                except Exception:
+                    pass
+            return {"success": True, "new_balance": current_balance, "cost": result.get("cost")}
         elif result.get("was_already_released"):
             print(f"[CREDITS] FINALIZE FAILED: already released (job was cancelled/failed): reservation_id={reservation_id} job_id={job_id}")
-            return False
+            return {"success": False, "new_balance": None, "cost": None}
         else:
-            new_balance = result.get("balance", "unknown")
-            cost = result.get("cost", "unknown")
+            new_balance = result.get("balance")
+            cost = result.get("cost")
             print(f"[CREDITS] *** FINALIZE SUCCESS: reservation_id={reservation_id} job_id={job_id} cost={cost} new_balance={new_balance}")
 
             # Structured logging for audit trail
@@ -309,15 +320,15 @@ def finalize_job_credits(
                 identity_id=result.get("identity_id"),
                 job_id=job_id,
                 reservation_id=reservation_id,
-                cost=result.get("cost"),
+                cost=cost,
                 status="captured",
             )
-            return True
+            return {"success": True, "new_balance": new_balance, "cost": cost}
     except Exception as e:
         print(f"[CREDITS] !!! FINALIZE ERROR: reservation_id={reservation_id} job_id={job_id} error={e}")
         import traceback
         traceback.print_exc()
-        return False
+        return {"success": False, "new_balance": None, "cost": None}
 
 
 def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id: str | None = None) -> None:
