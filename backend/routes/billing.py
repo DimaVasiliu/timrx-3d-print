@@ -1035,6 +1035,58 @@ def subscription_me():
     })
 
 
+@bp.route("/subscriptions/payment-methods", methods=["GET"])
+@require_session
+@no_cache
+def subscription_payment_methods():
+    """
+    Get payment methods that support recurring billing (subscriptions).
+
+    Only returns methods that can establish a mandate for automatic future charges:
+    - Credit/Debit Card (creditcard)
+    - SEPA Direct Debit (directdebit)
+    - PayPal (paypal)
+
+    Methods like iDEAL, Bancontact, Bank Transfer do NOT support recurring
+    and will NOT be returned.
+
+    Query params:
+        plan_code: Optional - to get methods for specific plan amount
+
+    Returns:
+        {
+            "ok": true,
+            "methods": [
+                {"id": "creditcard", "description": "Credit card", ...},
+                {"id": "directdebit", "description": "SEPA Direct Debit", ...},
+                {"id": "paypal", "description": "PayPal", ...},
+            ],
+            "count": 3,
+            "note": "Only payment methods supporting recurring billing are shown."
+        }
+    """
+    from backend.services.subscription_service import SUBSCRIPTION_PLANS
+
+    plan_code = request.args.get("plan_code", "").strip()
+
+    # Default amount for method availability check
+    amount_gbp = 9.99  # Starter monthly price
+
+    if plan_code:
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if plan:
+            amount_gbp = plan.get("price_gbp", 9.99)
+
+    result = MollieService.get_recurring_payment_methods(amount_gbp)
+
+    return jsonify({
+        "ok": True,
+        "methods": result.get("methods", []),
+        "count": result.get("count", 0),
+        "note": "Only payment methods supporting recurring billing are shown.",
+    })
+
+
 @bp.route("/subscriptions/checkout", methods=["POST"])
 @require_verified_email
 def subscription_checkout():
@@ -1055,12 +1107,17 @@ def subscription_checkout():
         return jsonify({"error": "invalid_plan", "message": f"Unknown plan: {plan_code}"}), 400
 
     # Check if user already has an active subscription
+    # Block checkout to prevent duplicate active subscriptions per identity
     existing = SubscriptionService.get_active_subscription(g.identity_id)
-    if existing and existing["status"] == "active":
+    if existing and existing["status"] in ("active", "pending_payment"):
+        msg = "You already have an active subscription. Manage it in Billing."
+        if existing["status"] == "pending_payment":
+            msg = "You have a subscription payment in progress. Please wait for it to complete or manage it in Billing."
         return jsonify({
             "error": "already_subscribed",
-            "message": "You already have an active subscription. Cancel it first.",
+            "message": msg,
             "current_plan": existing["plan_code"],
+            "current_status": existing["status"],
         }), 409
 
     if not MollieService.is_available():
@@ -1289,6 +1346,105 @@ def subscription_status():
         "subscription": subscription_data,
         "billing": billing_data,
         "tier_perks": tier_perks,
+    })
+
+
+@bp.route("/subscriptions/summary", methods=["GET"])
+@require_session
+@no_cache
+def subscription_summary():
+    """
+    Get a concise subscription summary for the current user.
+
+    This endpoint provides the essential subscription fields for UI display
+    and decision-making. Use /subscriptions/status for full details.
+
+    Response (with subscription):
+    {
+        "ok": true,
+        "has_subscription": true,
+        "status": "active",              // processing, active, past_due, cancelled, suspended, expired
+        "plan_code": "creator_monthly",
+        "interval": "monthly",           // monthly or yearly
+        "next_credit_date": "2026-03-01T00:00:00Z",
+        "ends_at": null,                 // Set when cancelled - when access truly ends
+        "prepaid_until": null,           // Yearly only - when prepaid period ends
+        "credits_remaining_months": null, // Yearly only - months of credits left
+        "last_payment_status": "paid",   // pending, paid, failed
+        "last_payment_at": "2026-02-01T12:00:00Z",
+        "suspend_reason": null           // Set if suspended (refunded, charged_back, fraud, manual)
+    }
+
+    Response (no subscription):
+    {
+        "ok": true,
+        "has_subscription": false
+    }
+    """
+    # Get any subscription (active, cancelled, pending_payment, suspended)
+    sub = None
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT s.*,
+                           (SELECT sc.payment_status FROM {Tables.SUBSCRIPTION_CYCLES} sc
+                            WHERE sc.subscription_id = s.id
+                            ORDER BY sc.created_at DESC LIMIT 1) as last_payment_status,
+                           (SELECT sc.created_at FROM {Tables.SUBSCRIPTION_CYCLES} sc
+                            WHERE sc.subscription_id = s.id
+                            ORDER BY sc.created_at DESC LIMIT 1) as last_payment_at
+                    FROM {Tables.SUBSCRIPTIONS} s
+                    WHERE s.identity_id = %s
+                      AND s.status IN ('active', 'cancelled', 'pending_payment', 'suspended', 'past_due')
+                    ORDER BY
+                        CASE s.status
+                            WHEN 'active' THEN 1
+                            WHEN 'pending_payment' THEN 2
+                            WHEN 'cancelled' THEN 3
+                            WHEN 'suspended' THEN 4
+                            WHEN 'past_due' THEN 5
+                        END,
+                        s.created_at DESC
+                    LIMIT 1
+                    """,
+                    (g.identity_id,),
+                )
+                sub = cur.fetchone()
+    except Exception as e:
+        print(f"[BILLING] Error fetching subscription summary: {e}")
+        return jsonify({"ok": False, "error": "internal_error"}), 500
+
+    if not sub:
+        return jsonify({
+            "ok": True,
+            "has_subscription": False,
+        })
+
+    # Map DB status to user-friendly status
+    db_status = sub.get("status")
+    display_status = db_status
+    if db_status == "pending_payment":
+        display_status = "processing"
+
+    # Determine interval from plan_code
+    plan_code = sub.get("plan_code", "")
+    interval = "yearly" if plan_code.endswith("_yearly") else "monthly"
+
+    return jsonify({
+        "ok": True,
+        "has_subscription": True,
+        "status": display_status,
+        "plan_code": plan_code,
+        "interval": interval,
+        "next_credit_date": sub["next_credit_date"].isoformat() if sub.get("next_credit_date") else None,
+        "ends_at": sub["ends_at"].isoformat() if sub.get("ends_at") else None,
+        "prepaid_until": sub["prepaid_until"].isoformat() if sub.get("prepaid_until") else None,
+        "credits_remaining_months": sub.get("credits_remaining_months"),
+        "last_payment_status": sub.get("last_payment_status"),
+        "last_payment_at": sub["last_payment_at"].isoformat() if sub.get("last_payment_at") else None,
+        "suspend_reason": sub.get("suspend_reason"),
     })
 
 
@@ -1693,3 +1849,119 @@ def expense_guardrails_status():
         "ok": True,
         "guardrails": status,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FX RATES (Public - for multi-currency price display)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import time
+import requests as http_requests
+
+# In-memory cache for FX rates (24 hours)
+_fx_cache = {
+    "rates": None,
+    "fetched_at": 0,
+}
+_FX_CACHE_TTL = 86400  # 24 hours in seconds
+
+# Fallback rates if API fails (updated periodically)
+_FX_FALLBACK_RATES = {
+    "USD": 1.26,
+    "EUR": 1.17,
+    "CAD": 1.71,
+    "AUD": 1.93,
+}
+
+
+def _fetch_fx_rates():
+    """
+    Fetch current FX rates from exchangerate-api.com (free tier).
+    Returns rates dict with GBP as base, or None on failure.
+    """
+    try:
+        # Free API - no key required for GBP base
+        resp = http_requests.get(
+            "https://api.exchangerate-api.com/v4/latest/GBP",
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if "rates" in data:
+                return {
+                    "USD": round(data["rates"].get("USD", 1.26), 4),
+                    "EUR": round(data["rates"].get("EUR", 1.17), 4),
+                    "CAD": round(data["rates"].get("CAD", 1.71), 4),
+                    "AUD": round(data["rates"].get("AUD", 1.93), 4),
+                }
+    except Exception as e:
+        print(f"[FX] Failed to fetch rates: {e}")
+    return None
+
+
+def get_fx_rates_cached():
+    """
+    Get FX rates with 24h caching.
+    Returns cached rates or fetches fresh rates if cache expired.
+    Falls back to hardcoded rates if fetch fails.
+    """
+    global _fx_cache
+    now = time.time()
+
+    # Check if cache is still valid
+    if _fx_cache["rates"] and (now - _fx_cache["fetched_at"]) < _FX_CACHE_TTL:
+        return _fx_cache["rates"]
+
+    # Try to fetch fresh rates
+    rates = _fetch_fx_rates()
+    if rates:
+        _fx_cache["rates"] = rates
+        _fx_cache["fetched_at"] = now
+        print(f"[FX] Rates updated: {rates}")
+        return rates
+
+    # If fetch failed but we have stale cache, use it
+    if _fx_cache["rates"]:
+        print("[FX] Using stale cached rates")
+        return _fx_cache["rates"]
+
+    # Last resort: hardcoded fallback
+    print("[FX] Using fallback rates")
+    return _FX_FALLBACK_RATES
+
+
+@bp.route("/public/fx", methods=["GET"])
+def public_fx_rates():
+    """
+    Public endpoint for FX rates (no auth required).
+
+    Used by frontend to display estimated prices in user's local currency.
+    All billing remains in GBP - this is display only.
+
+    Returns:
+    {
+        "ok": true,
+        "base": "GBP",
+        "rates": {
+            "USD": 1.26,
+            "EUR": 1.17,
+            "CAD": 1.71,
+            "AUD": 1.93
+        },
+        "as_of": "2026-02-11"
+    }
+    """
+    from datetime import date
+
+    rates = get_fx_rates_cached()
+
+    response = jsonify({
+        "ok": True,
+        "base": "GBP",
+        "rates": rates,
+        "as_of": date.today().isoformat(),
+    })
+
+    # Allow caching by CDN/browser for 1 hour (rates don't change fast)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
