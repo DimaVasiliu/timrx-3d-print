@@ -1,4 +1,3 @@
-
 """
 /api/billing routes - Credits and purchases.
 
@@ -18,6 +17,7 @@ Handles:
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import require_session, require_email, require_verified_email, no_cache
+from backend.db import get_conn, Tables
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService
 from backend.services.reservation_service import ReservationService
@@ -1090,7 +1090,8 @@ def subscription_checkout():
         frontend_url = (config.FRONTEND_BASE_URL or config.PUBLIC_BASE_URL or "").rstrip("/")
         success_url = f"{frontend_url}/hub.html?checkout=success&type=subscription&plan={plan_code}"
 
-        result = MollieService.create_subscription_checkout(
+        # Use TRUE RECURRING checkout - establishes mandate for automatic billing
+        result = MollieService.create_recurring_subscription_checkout(
             identity_id=g.identity_id,
             plan_code=plan_code,
             email=email,
@@ -1101,6 +1102,7 @@ def subscription_checkout():
             "ok": True,
             "checkout_url": result["checkout_url"],
             "payment_id": result.get("payment_id"),
+            "mollie_customer_id": result.get("mollie_customer_id"),
         })
 
     except (MollieCreateError, ValueError) as e:
@@ -1111,6 +1113,185 @@ def subscription_checkout():
         return jsonify({"error": "checkout_failed", "message": "Failed to create checkout"}), 500
 
 
+@bp.route("/subscriptions/status", methods=["GET"])
+@require_session
+@no_cache
+def subscription_status():
+    """
+    Get detailed subscription status for the current user.
+
+    This provides comprehensive information about the user's subscription,
+    including billing status, next payment date, credit allocation info,
+    and whether automatic recurring is active.
+
+    Response (with active subscription):
+    {
+        "ok": true,
+        "has_subscription": true,
+        "subscription": {
+            "id": "uuid",
+            "plan_code": "creator_monthly",
+            "plan_name": "Creator",
+            "status": "active",
+            "credits_per_month": 1300,
+            "cadence": "monthly",
+            "tier": "creator",
+            "current_period_start": "2026-02-01T...",
+            "current_period_end": "2026-03-01T...",
+            "next_credit_date": "2026-03-01T...",
+            "billing_day": 1,
+            "is_mollie_recurring": true,
+            "cancelled_at": null,
+            "credits_remaining_months": null  // Only for yearly
+        },
+        "billing": {
+            "is_automatic": true,
+            "next_payment_date": "2026-03-01",
+            "payment_method": "card",
+            "mandate_status": "valid"
+        },
+        "tier_perks": {...}
+    }
+
+    Response (pending payment - SEPA processing):
+    {
+        "ok": true,
+        "has_subscription": true,
+        "subscription": {
+            "status": "processing",
+            "status_message": "Your payment is being processed. SEPA payments typically take 1-2 business days. Credits will be unlocked once payment is confirmed.",
+            ...
+        },
+        "billing": {
+            "payment_pending": true,
+            ...
+        }
+    }
+
+    Response (no subscription):
+    {
+        "ok": true,
+        "has_subscription": false,
+        "subscription": null,
+        "tier_perks": {...}
+    }
+    """
+    from backend.services.subscription_service import SUBSCRIPTION_PLANS
+
+    # Get active subscription (includes pending_payment status)
+    sub = SubscriptionService.get_active_subscription(g.identity_id)
+
+    # Also check for pending_payment subscriptions if no active found
+    if not sub:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT * FROM {Tables.SUBSCRIPTIONS}
+                        WHERE identity_id = %s
+                          AND status = 'pending_payment'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (g.identity_id,),
+                    )
+                    sub = cur.fetchone()
+        except Exception as e:
+            print(f"[BILLING] Error checking pending subscriptions: {e}")
+
+    # Get tier perks (works even without subscription - returns free tier)
+    tier_perks = SubscriptionService.get_tier_perks(g.identity_id)
+
+    if not sub:
+        return jsonify({
+            "ok": True,
+            "has_subscription": False,
+            "subscription": None,
+            "billing": None,
+            "tier_perks": tier_perks,
+        })
+
+    plan_code = sub.get("plan_code")
+    plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+    db_status = sub.get("status")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SEPA PENDING PAYMENT HANDLING
+    # Show "processing" status with user-friendly message
+    # ═══════════════════════════════════════════════════════════════════════════
+    display_status = db_status
+    status_message = None
+
+    if db_status == "pending_payment":
+        display_status = "processing"
+        status_message = (
+            "Your payment is being processed. SEPA and bank transfer payments "
+            "typically take 1-2 business days. Your credits will be unlocked "
+            "automatically once payment is confirmed."
+        )
+
+    # Build subscription response
+    subscription_data = {
+        "id": str(sub["id"]),
+        "plan_code": plan_code,
+        "plan_name": plan_info.get("name", plan_code),
+        "status": display_status,
+        "status_message": status_message,
+        "credits_per_month": plan_info.get("credits_per_month", 0),
+        "cadence": plan_info.get("cadence", "monthly"),
+        "tier": plan_info.get("tier", "free"),
+        "current_period_start": sub["current_period_start"].isoformat() if sub.get("current_period_start") else None,
+        "current_period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
+        "next_credit_date": sub["next_credit_date"].isoformat() if sub.get("next_credit_date") else None,
+        "billing_day": sub.get("billing_day"),
+        "is_mollie_recurring": sub.get("is_mollie_recurring", False),
+        "cancelled_at": sub["cancelled_at"].isoformat() if sub.get("cancelled_at") else None,
+        "credits_remaining_months": sub.get("credits_remaining_months"),
+    }
+
+    # Build billing info
+    billing_data = {
+        "is_automatic": sub.get("is_mollie_recurring", False),
+        "next_payment_date": None,
+        "payment_method": None,
+        "mandate_status": None,
+        "payment_pending": db_status == "pending_payment",
+    }
+
+    # If using Mollie recurring and subscription is active, fetch additional billing details
+    if sub.get("is_mollie_recurring") and sub.get("mollie_customer_id") and db_status == "active":
+        try:
+            mollie_customer_id = sub.get("mollie_customer_id")
+            mollie_sub_id = sub.get("provider_subscription_id")
+
+            # Get subscription status from Mollie
+            if mollie_sub_id:
+                mollie_status = MollieService.get_mollie_subscription_status(
+                    mollie_customer_id, mollie_sub_id
+                )
+                if mollie_status:
+                    billing_data["next_payment_date"] = mollie_status.get("next_payment_date")
+                    billing_data["mollie_status"] = mollie_status.get("status")
+
+            # Get mandate info
+            mandate = MollieService.get_mandate_for_customer(mollie_customer_id)
+            if mandate:
+                billing_data["mandate_status"] = mandate.get("status")
+                billing_data["payment_method"] = mandate.get("method")
+
+        except Exception as e:
+            print(f"[BILLING] Error fetching Mollie billing details: {e}")
+
+    return jsonify({
+        "ok": True,
+        "has_subscription": True,
+        "subscription": subscription_data,
+        "billing": billing_data,
+        "tier_perks": tier_perks,
+    })
+
+
 @bp.route("/subscriptions/cancel", methods=["POST"])
 @require_session
 def subscription_cancel():
@@ -1119,7 +1300,25 @@ def subscription_cancel():
     if not sub or sub["status"] != "active":
         return jsonify({"error": "no_active_subscription", "message": "No active subscription to cancel"}), 404
 
-    ok = SubscriptionService.cancel_subscription_with_email(str(sub["id"]))
+    sub_id = str(sub["id"])
+
+    # If this is a Mollie recurring subscription, cancel the Mollie subscription first
+    # This stops future automatic charges
+    if sub.get("is_mollie_recurring") and sub.get("mollie_customer_id") and sub.get("provider_subscription_id"):
+        try:
+            mollie_cancelled = MollieService.cancel_mollie_subscription(
+                mollie_customer_id=sub["mollie_customer_id"],
+                mollie_subscription_id=sub["provider_subscription_id"],
+            )
+            if mollie_cancelled:
+                print(f"[BILLING] Cancelled Mollie subscription {sub['provider_subscription_id']}")
+            else:
+                print(f"[BILLING] Warning: Failed to cancel Mollie subscription {sub['provider_subscription_id']}")
+        except Exception as e:
+            print(f"[BILLING] Error cancelling Mollie subscription: {e}")
+            # Continue with local cancellation even if Mollie fails
+
+    ok = SubscriptionService.cancel_subscription_with_email(sub_id)
     if ok:
         return jsonify({
             "ok": True,
