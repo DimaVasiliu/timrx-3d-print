@@ -473,7 +473,7 @@ class Config:
     DEFAULT_MODEL_TITLE: str = "3D Model"
     # Maps route-level action names to CANONICAL action keys
     # CANONICAL KEYS: image_generate, text_to_3d_generate, image_to_3d_generate,
-    #                 refine, remesh, retexture, rigging,
+    #                 refine, remesh, retexture,
     #                 video_generate, video_text_generate, video_image_animate
     ACTION_KEYS: dict = field(
         default_factory=lambda: {
@@ -483,7 +483,6 @@ class Config:
             "image-to-3d": "image_to_3d_generate",        # Canonical
             "remesh": "remesh",                           # Already canonical
             "retexture": "retexture",                     # Already canonical
-            "rigging": "rigging",                         # Already canonical
             "openai-image": "image_generate",             # Canonical
             # Additional canonical mappings
             "image_generate": "image_generate",
