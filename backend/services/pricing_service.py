@@ -171,8 +171,8 @@ def get_db_action_code_from_canonical(canonical_key: str) -> Optional[str]:
 # Default action costs to seed into the database
 DEFAULT_ACTION_COSTS = [
     # 3D Generation
-    {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 18, "provider": "meshy"},
-    {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 25, "provider": "meshy"},
+    {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
+    {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
     {"action_code": "MESHY_REFINE", "cost_credits": 8, "provider": "meshy"},
     {"action_code": "MESHY_RETEXTURE", "cost_credits": 12, "provider": "meshy"},
     # Image Generation (tiered by resolution)
@@ -413,8 +413,8 @@ class PricingService:
                 "perks": {"priority": false, "retention_days": 30},
                 "estimates": {
                     "ai_images": 50,      # credits / 5
-                    "text_to_3d": 13,     # credits / 18
-                    "image_to_3d": 10     # credits / 25
+                    "text_to_3d": 12,     # credits / 20
+                    "image_to_3d": 8      # credits / 30
                 }
             },
             ...
@@ -426,8 +426,8 @@ class PricingService:
         # Get action costs for estimates (use new lower costs)
         costs = PricingService.get_action_costs()
         image_cost = costs.get("image_generate", 5)           # Standard image
-        text_to_3d_cost = costs.get("text_to_3d_generate", 18)
-        image_to_3d_cost = costs.get("image_to_3d_generate", 25)
+        text_to_3d_cost = costs.get("text_to_3d_generate", 20)
+        image_to_3d_cost = costs.get("image_to_3d_generate", 30)
 
         # Add estimates to each plan
         for plan in plans:
