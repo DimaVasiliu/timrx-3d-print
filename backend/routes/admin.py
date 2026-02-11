@@ -1574,6 +1574,195 @@ def subscription_stats():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@bp.route("/subscriptions/audit", methods=["GET"])
+@require_admin
+def subscription_audit():
+    """
+    Audit a specific subscription or identity for debugging/support.
+
+    Query params:
+        - identity_id: User's identity UUID (optional)
+        - subscription_id: Subscription UUID (optional)
+
+    Returns detailed subscription info including:
+        - Active plan, status, Mollie subscription ID
+        - Current period start/end
+        - Last 5 subscription grant ledger entries
+        - Next refill date
+        - Anomalies: duplicates/missing periods
+
+    Example:
+        GET /api/admin/subscriptions/audit?identity_id=123e4567-...
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+        from backend.db import query_one, query_all, Tables
+
+        identity_id = request.args.get("identity_id")
+        subscription_id = request.args.get("subscription_id")
+
+        if not identity_id and not subscription_id:
+            return jsonify({
+                "ok": False,
+                "error": "Provide identity_id or subscription_id parameter",
+            }), 400
+
+        result = {
+            "ok": True,
+            "identity_id": identity_id,
+            "subscription": None,
+            "cycles": [],
+            "anomalies": [],
+            "tier_perks": None,
+        }
+
+        # Get subscription (by ID or by identity)
+        if subscription_id:
+            sub = query_one(
+                f"""
+                SELECT s.*, i.email as identity_email, i.email_verified
+                FROM {Tables.SUBSCRIPTIONS} s
+                LEFT JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
+                WHERE s.id::text = %s
+                """,
+                (subscription_id,),
+            )
+            if sub:
+                identity_id = str(sub["identity_id"])
+        else:
+            sub = query_one(
+                f"""
+                SELECT s.*, i.email as identity_email, i.email_verified
+                FROM {Tables.SUBSCRIPTIONS} s
+                LEFT JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
+                WHERE s.identity_id::text = %s
+                  AND s.status IN ('active', 'cancelled', 'past_due')
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                (identity_id,),
+            )
+
+        if sub:
+            result["identity_id"] = str(sub["identity_id"])
+            result["subscription"] = {
+                "id": str(sub["id"]),
+                "plan_code": sub["plan_code"],
+                "status": sub["status"],
+                "provider": sub.get("provider"),
+                "provider_subscription_id": sub.get("provider_subscription_id"),
+                "current_period_start": sub["current_period_start"].isoformat() if sub.get("current_period_start") else None,
+                "current_period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
+                "next_credit_date": sub["next_credit_date"].isoformat() if sub.get("next_credit_date") else None,
+                "billing_day": sub.get("billing_day"),
+                "credits_remaining_months": sub.get("credits_remaining_months"),
+                "customer_email": sub.get("customer_email"),
+                "identity_email": sub.get("identity_email"),
+                "email_verified": sub.get("email_verified"),
+                "cancelled_at": sub["cancelled_at"].isoformat() if sub.get("cancelled_at") else None,
+                "created_at": sub["created_at"].isoformat() if sub.get("created_at") else None,
+            }
+
+            # Get last 5 cycles
+            cycles = query_all(
+                f"""
+                SELECT id, period_start, period_end, credits_granted, granted_at,
+                       provider, provider_payment_id
+                FROM {Tables.SUBSCRIPTION_CYCLES}
+                WHERE subscription_id::text = %s
+                ORDER BY period_start DESC
+                LIMIT 5
+                """,
+                (str(sub["id"]),),
+            )
+            result["cycles"] = [
+                {
+                    "id": str(c["id"]),
+                    "period_start": c["period_start"].isoformat() if c.get("period_start") else None,
+                    "period_end": c["period_end"].isoformat() if c.get("period_end") else None,
+                    "credits_granted": c["credits_granted"],
+                    "granted_at": c["granted_at"].isoformat() if c.get("granted_at") else None,
+                    "provider_payment_id": c.get("provider_payment_id"),
+                }
+                for c in (cycles or [])
+            ]
+
+            # Check for anomalies
+            anomalies = []
+
+            # 1. Check for duplicate periods
+            dup_check = query_one(
+                f"""
+                SELECT period_start, COUNT(*) as cnt
+                FROM {Tables.SUBSCRIPTION_CYCLES}
+                WHERE subscription_id::text = %s
+                GROUP BY period_start
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """,
+                (str(sub["id"]),),
+            )
+            if dup_check:
+                anomalies.append({
+                    "type": "duplicate_period",
+                    "message": f"Duplicate grants found for period {dup_check['period_start']}",
+                    "period_start": str(dup_check["period_start"]),
+                })
+
+            # 2. Check for missing months (gaps > 35 days between cycles)
+            gap_check = query_all(
+                f"""
+                SELECT period_start, LAG(period_start) OVER (ORDER BY period_start) as prev_start,
+                       period_start - LAG(period_start) OVER (ORDER BY period_start) as gap
+                FROM {Tables.SUBSCRIPTION_CYCLES}
+                WHERE subscription_id::text = %s
+                ORDER BY period_start
+                """,
+                (str(sub["id"]),),
+            )
+            for gap in (gap_check or []):
+                if gap.get("gap") and gap["gap"].days > 35:
+                    anomalies.append({
+                        "type": "missing_period",
+                        "message": f"Gap of {gap['gap'].days} days between cycles",
+                        "gap_after": str(gap["prev_start"]) if gap.get("prev_start") else None,
+                    })
+
+            # 3. Check for future next_credit_date being too far out
+            if sub.get("next_credit_date"):
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                days_until = (sub["next_credit_date"] - now).days
+                if days_until > 35:
+                    anomalies.append({
+                        "type": "next_credit_far",
+                        "message": f"Next credit date is {days_until} days away",
+                        "next_credit_date": sub["next_credit_date"].isoformat(),
+                    })
+
+            # 4. Check email verification status
+            if not sub.get("email_verified"):
+                anomalies.append({
+                    "type": "email_unverified",
+                    "message": "Identity email is not verified - credits may be paused",
+                })
+
+            result["anomalies"] = anomalies
+
+        # Get tier perks for identity
+        if identity_id:
+            perks = SubscriptionService.get_tier_perks(identity_id)
+            result["tier_perks"] = perks
+
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[ADMIN] Subscription audit error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WALLET DRIFT AUDIT ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
