@@ -140,24 +140,26 @@ def generate_video():
     if resolution == "4K":
         resolution = "4k"
 
-    # Normalize video parameters (provider-agnostic — each provider
-    # handles its own ratio/duration constraints via mapping).
+    # Validate video parameters STRICTLY - reject invalid combinations
+    # Valid combinations:
+    # - 720p: 4s, 6s, 8s
+    # - 1080p: 8s only
+    # - 4k: 8s only
     try:
         aspect_ratio, resolution, duration_seconds = validate_video_params(
             aspect_ratio, resolution, duration_seconds
         )
-    except GeminiValidationError:
-        # Gemini-specific validation failed — may still be valid for other providers.
-        # Normalize duration to int and let the router pick the right provider.
-        try:
-            if isinstance(duration_seconds, str):
-                duration_seconds = int(duration_seconds.lower().replace("sec", "").replace("s", "").strip())
-            else:
-                duration_seconds = int(duration_seconds)
-        except (ValueError, TypeError):
-            duration_seconds = 6
-        if duration_seconds not in (2, 4, 6, 8, 10):
-            duration_seconds = 6
+    except GeminiValidationError as e:
+        # Return 400 with clear error message for invalid combinations
+        print(f"[VIDEO] Validation failed: {e.message}")
+        return jsonify({
+            "ok": False,
+            "error": "invalid_params",
+            "message": e.message,
+            "field": e.field,
+            "value": e.value,
+            "allowed": e.allowed,
+        }), 400
 
     # Task-specific validation
     if task == "text2video":
@@ -330,24 +332,26 @@ def _dispatch_video_job(
 
     Returns a Flask response tuple.
     """
-    # Normalize video parameters (provider-agnostic — each provider
-    # handles its own ratio/duration constraints via mapping).
+    # Validate video parameters STRICTLY - reject invalid combinations
+    # Valid combinations:
+    # - 720p: 4s, 6s, 8s
+    # - 1080p: 8s only
+    # - 4k: 8s only
     try:
         aspect_ratio, resolution, duration_seconds = validate_video_params(
             aspect_ratio, resolution, duration_seconds
         )
-    except GeminiValidationError:
-        # Gemini-specific validation failed — may still be valid for other providers.
-        # Normalize duration to int and let the router pick the right provider.
-        try:
-            if isinstance(duration_seconds, str):
-                duration_seconds = int(duration_seconds.lower().replace("sec", "").replace("s", "").strip())
-            else:
-                duration_seconds = int(duration_seconds)
-        except (ValueError, TypeError):
-            duration_seconds = 6
-        if duration_seconds not in (2, 4, 6, 8, 10):
-            duration_seconds = 6
+    except GeminiValidationError as e:
+        # Return 400 with clear error message for invalid combinations
+        print(f"[VIDEO] Validation failed: {e.message}")
+        return jsonify({
+            "ok": False,
+            "error": "invalid_params",
+            "message": e.message,
+            "field": e.field,
+            "value": e.value,
+            "allowed": e.allowed,
+        }), 400
 
     internal_job_id = str(uuid.uuid4())
 
