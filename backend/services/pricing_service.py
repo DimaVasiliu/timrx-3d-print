@@ -179,12 +179,83 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "OPENAI_IMAGE", "cost_credits": 5, "provider": "openai"},       # Standard
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 7, "provider": "openai"},    # 2K
     {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 10, "provider": "openai"},   # 4K
-    # Video Generation (separate credit pool)
+    # Video Generation - Variant costs by duration/resolution
+    # Text-to-Video variants
+    {"action_code": "VIDEO_TEXT_GENERATE_4S_720P", "cost_credits": 70, "provider": "video"},
+    {"action_code": "VIDEO_TEXT_GENERATE_6S_720P", "cost_credits": 90, "provider": "video"},
+    {"action_code": "VIDEO_TEXT_GENERATE_8S_720P", "cost_credits": 110, "provider": "video"},
+    {"action_code": "VIDEO_TEXT_GENERATE_8S_1080P", "cost_credits": 130, "provider": "video"},
+    {"action_code": "VIDEO_TEXT_GENERATE_8S_4K", "cost_credits": 160, "provider": "video"},
+    # Image-to-Video (animate) variants
+    {"action_code": "VIDEO_IMAGE_ANIMATE_4S_720P", "cost_credits": 70, "provider": "video"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE_6S_720P", "cost_credits": 90, "provider": "video"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE_8S_720P", "cost_credits": 110, "provider": "video"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE_8S_1080P", "cost_credits": 130, "provider": "video"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE_8S_4K", "cost_credits": 160, "provider": "video"},
+    # Legacy fallback codes (for backwards compatibility)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "google"},
 ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VIDEO VARIANT COST MAPPING
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Video credit costs by resolution and duration (must match frontend)
+VIDEO_CREDIT_COSTS = {
+    "720p": {4: 70, 6: 90, 8: 110},
+    "1080p": {8: 130},
+    "4k": {8: 160},
+}
+
+# Valid durations per resolution (Gemini/Veo constraints)
+VIDEO_VALID_DURATIONS = {
+    "720p": [4, 6, 8],
+    "1080p": [8],
+    "4k": [8],
+}
+
+
+def get_video_action_code(task: str, duration_seconds: int, resolution: str) -> str:
+    """
+    Build the video action code for a specific variant.
+
+    Args:
+        task: "text2video" or "image2video"
+        duration_seconds: 4, 6, or 8
+        resolution: "720p", "1080p", or "4k"
+
+    Returns:
+        Action code like "VIDEO_TEXT_GENERATE_4S_720P" or "VIDEO_IMAGE_ANIMATE_8S_4K"
+    """
+    # Normalize inputs
+    task_part = "TEXT_GENERATE" if task.lower() in ("text2video", "text_to_video", "text") else "IMAGE_ANIMATE"
+    duration_part = f"{duration_seconds}S"
+    resolution_part = resolution.upper().replace("P", "P")  # Ensure 720P, 1080P, 4K
+
+    return f"VIDEO_{task_part}_{duration_part}_{resolution_part}"
+
+
+def get_video_credit_cost(duration_seconds: int, resolution: str) -> int:
+    """
+    Get the credit cost for a video variant.
+
+    Args:
+        duration_seconds: 4, 6, or 8
+        resolution: "720p", "1080p", or "4k"
+
+    Returns:
+        Credit cost (70, 90, 110, 130, or 160)
+    """
+    resolution = resolution.lower()
+    duration = int(duration_seconds)
+
+    # Get cost from mapping, fallback to 70 if not found
+    resolution_costs = VIDEO_CREDIT_COSTS.get(resolution, {})
+    return resolution_costs.get(duration, 70)
 
 DEFAULT_PLANS = [
     {
@@ -488,11 +559,16 @@ class PricingService:
             if canonical_key in result:
                 result[alias] = result[canonical_key]
 
+        # IMPORTANT: Include ALL DB codes directly (for video variants like VIDEO_TEXT_GENERATE_4S_720P)
+        # This allows direct lookup by DB action_code without requiring a canonical mapping
+        for db_code, cost in db_costs.items():
+            # Add DB code as-is (uppercase)
+            result[db_code] = cost
+            # Also add lowercase version for flexibility
+            result[db_code.lower()] = cost
+
         # Log what we're returning for debugging
-        # if result:
-        #     canonical_count = len(CANONICAL_TO_DB)
-        #     print(f"[PRICING] Action costs loaded: {canonical_count} canonical keys + {len(result) - canonical_count} aliases")
-        else:
+        if not db_costs:
             print("[PRICING] WARNING: No action costs found in database!")
 
         # Cache the result
