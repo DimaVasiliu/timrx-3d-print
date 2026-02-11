@@ -67,8 +67,9 @@ GENERAL_ACTION_CODES = {
     "MESHY_IMAGE_TO_3D",
     "MESHY_REFINE",
     "MESHY_RETEXTURE",
-    "MESHY_RIG",
     "OPENAI_IMAGE",
+    "OPENAI_IMAGE_2K",
+    "OPENAI_IMAGE_4K",
 }
 
 # All known action codes (union of video + general)
@@ -93,9 +94,9 @@ VIDEO_PLAN_CODES = {
 
 # Plan codes that grant GENERAL credits
 GENERAL_PLAN_CODES = {
-    "starter_80",
-    "creator_300",
-    "studio_600",
+    "starter_250",
+    "creator_900",
+    "studio_2200",
 }
 
 # All known plan codes (union of video + general)
