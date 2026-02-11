@@ -19,48 +19,100 @@ from backend.db import USE_DB, get_conn, Tables
 
 
 # ── Plan config (credits granted per month) ──────────────────
+# Monthly: Credits granted each billing cycle
+# Yearly: Credits granted monthly over 12 months (not all at once)
+#
+# PRICING (Feb 2026):
+#   Monthly: Starter £9.99 (400c), Creator £24.99 (1300c), Studio £49.99 (3200c)
+#   Yearly:  Starter £99 (4800c/yr), Creator £249 (15600c/yr), Studio £499 (38400c/yr)
+#   (Yearly = ~2 months free equivalent)
+#
+# TIER PERKS:
+#   Free:    2 concurrent jobs, standard queue
+#   Starter: 5 concurrent jobs, medium priority
+#   Creator: 10 concurrent jobs, high priority
+#   Studio:  20 concurrent jobs, pro priority
+
 SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
+    # ── MONTHLY PLANS ──
     "starter_monthly": {
         "name": "Starter",
-        "credits_per_month": 120,
-        "price_gbp": 5.99,
+        "credits_per_month": 400,
+        "price_gbp": 9.99,
         "cadence": "monthly",
         "tier": "starter",
+        "max_concurrent_jobs": 5,
+        "queue_priority": "medium",
     },
     "creator_monthly": {
         "name": "Creator",
-        "credits_per_month": 300,
-        "price_gbp": 14.99,
+        "credits_per_month": 1300,
+        "price_gbp": 24.99,
         "cadence": "monthly",
         "tier": "creator",
+        "max_concurrent_jobs": 10,
+        "queue_priority": "high",
     },
     "studio_monthly": {
         "name": "Studio",
-        "credits_per_month": 700,
-        "price_gbp": 29.99,
+        "credits_per_month": 3200,
+        "price_gbp": 49.99,
         "cadence": "monthly",
         "tier": "studio",
+        "max_concurrent_jobs": 20,
+        "queue_priority": "pro",
     },
+    # ── YEARLY PLANS (monthly credit distribution) ──
+    # Credits distributed monthly: 400/1300/3200 per month for 12 months
     "starter_yearly": {
         "name": "Starter",
-        "credits_per_month": 100,
-        "price_gbp": 69.99,
+        "credits_per_month": 400,       # 4800/year ÷ 12 months
+        "credits_total_yearly": 4800,   # Total for UI display
+        "price_gbp": 99.00,
         "cadence": "yearly",
         "tier": "starter",
+        "max_concurrent_jobs": 5,
+        "queue_priority": "medium",
     },
     "creator_yearly": {
         "name": "Creator",
-        "credits_per_month": 300,
-        "price_gbp": 149.99,
+        "credits_per_month": 1300,      # 15600/year ÷ 12 months
+        "credits_total_yearly": 15600,
+        "price_gbp": 249.00,
         "cadence": "yearly",
         "tier": "creator",
+        "max_concurrent_jobs": 10,
+        "queue_priority": "high",
     },
     "studio_yearly": {
         "name": "Studio",
-        "credits_per_month": 700,
-        "price_gbp": 299.99,
+        "credits_per_month": 3200,      # 38400/year ÷ 12 months
+        "credits_total_yearly": 38400,
+        "price_gbp": 499.00,
         "cadence": "yearly",
         "tier": "studio",
+        "max_concurrent_jobs": 20,
+        "queue_priority": "pro",
+    },
+}
+
+# ── Tier perks lookup (derived from subscription or free tier) ──
+TIER_PERKS: Dict[str, Dict[str, Any]] = {
+    "free": {
+        "max_concurrent_jobs": 2,
+        "queue_priority": "standard",
+    },
+    "starter": {
+        "max_concurrent_jobs": 5,
+        "queue_priority": "medium",
+    },
+    "creator": {
+        "max_concurrent_jobs": 10,
+        "queue_priority": "high",
+    },
+    "studio": {
+        "max_concurrent_jobs": 20,
+        "queue_priority": "pro",
     },
 }
 
@@ -86,6 +138,49 @@ class SubscriptionService:
             {"plan_code": code, **info}
             for code, info in SUBSCRIPTION_PLANS.items()
         ]
+
+    @staticmethod
+    def get_tier_perks(identity_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get tier perks for a user based on their active subscription.
+
+        Returns:
+            Dict with:
+                tier: 'free' | 'starter' | 'creator' | 'studio'
+                max_concurrent_jobs: int
+                queue_priority: 'standard' | 'medium' | 'high' | 'pro'
+                plan_code: str or None
+        """
+        # Default to free tier
+        result = {
+            "tier": "free",
+            "max_concurrent_jobs": TIER_PERKS["free"]["max_concurrent_jobs"],
+            "queue_priority": TIER_PERKS["free"]["queue_priority"],
+            "plan_code": None,
+        }
+
+        if not identity_id:
+            return result
+
+        # Check for active subscription
+        sub = SubscriptionService.get_active_subscription(identity_id)
+        if not sub or sub.get("status") not in ("active", "cancelled"):
+            return result
+
+        # Get plan info
+        plan_code = sub.get("plan_code")
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if not plan:
+            return result
+
+        # Return tier perks from plan
+        tier = plan.get("tier", "free")
+        return {
+            "tier": tier,
+            "max_concurrent_jobs": plan.get("max_concurrent_jobs", TIER_PERKS.get(tier, TIER_PERKS["free"])["max_concurrent_jobs"]),
+            "queue_priority": plan.get("queue_priority", TIER_PERKS.get(tier, TIER_PERKS["free"])["queue_priority"]),
+            "plan_code": plan_code,
+        }
 
     @staticmethod
     def get_active_subscription(identity_id: str) -> Optional[Dict[str, Any]]:
