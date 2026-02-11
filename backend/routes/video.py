@@ -40,6 +40,7 @@ from backend.services.video_prompts import (
     get_style_presets,
     get_motion_presets,
 )
+from backend.services.pricing_service import get_video_action_code, get_video_credit_cost
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("video", __name__)
@@ -195,8 +196,12 @@ def generate_video():
     # Generate internal job ID
     internal_job_id = str(uuid.uuid4())
 
-    # Determine action key for credits (canonical keys)
-    action_key = "video_text_generate" if task == "text2video" else "video_image_animate"
+    # Determine action key for credits - use variant code based on duration/resolution
+    # Format: VIDEO_TEXT_GENERATE_4S_720P or VIDEO_IMAGE_ANIMATE_8S_4K
+    action_key = get_video_action_code(task, duration_seconds, resolution)
+    expected_cost = get_video_credit_cost(duration_seconds, resolution)
+
+    print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
     # Reserve credits
     reservation_id, credit_error = start_paid_job(
@@ -209,6 +214,7 @@ def generate_video():
             "prompt": prompt[:100] if prompt else None,
             "duration_seconds": duration_seconds,
             "resolution": resolution,
+            "expected_cost": expected_cost,
         },
     )
     if credit_error:
@@ -344,8 +350,12 @@ def _dispatch_video_job(
             duration_seconds = 6
 
     internal_job_id = str(uuid.uuid4())
-    # Canonical action keys for video generation
-    action_key = "video_text_generate" if task == "text2video" else "video_image_animate"
+
+    # Use variant action code based on duration/resolution
+    action_key = get_video_action_code(task, duration_seconds, resolution)
+    expected_cost = get_video_credit_cost(duration_seconds, resolution)
+
+    print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
     reservation_id, credit_error = start_paid_job(
         identity_id,
@@ -358,6 +368,7 @@ def _dispatch_video_job(
             "resolution": resolution,
             "style_preset": style_preset,
             "motion_preset": motion_preset,
+            "expected_cost": expected_cost,
         },
     )
     if credit_error:
