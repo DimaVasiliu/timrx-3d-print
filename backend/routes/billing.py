@@ -204,19 +204,35 @@ def get_action_costs():
         print(f"[BILLING] Error fetching action costs: {e}")
         import traceback
         traceback.print_exc()
-        # Return hardcoded fallback if DB fails
+        # Return hardcoded fallback if DB fails (must match DEFAULT_ACTION_COSTS in pricing_service.py)
         return jsonify({
             "ok": True,
             "action_costs": [
+                # 3D generation
                 {"action_key": "text_to_3d_generate", "credits": 20},
                 {"action_key": "image_to_3d_generate", "credits": 30},
-                {"action_key": "refine", "credits": 10},
-                {"action_key": "remesh", "credits": 10},
-                {"action_key": "texture", "credits": 10},
-                {"action_key": "rig", "credits": 10},
-                {"action_key": "image_studio_generate", "credits": 12},
-                {"action_key": "video", "credits": 60},
-                {"action_key": "video_generate", "credits": 60},
+                {"action_key": "refine", "credits": 8},
+                {"action_key": "remesh", "credits": 8},
+                {"action_key": "retexture", "credits": 12},
+                # Image generation
+                {"action_key": "image_generate", "credits": 5},
+                {"action_key": "image_generate_2k", "credits": 7},
+                {"action_key": "image_generate_4k", "credits": 10},
+                # Video generation - base costs (minimum)
+                {"action_key": "video_generate", "credits": 70},
+                {"action_key": "video_text_generate", "credits": 70},
+                {"action_key": "video_image_animate", "credits": 70},
+                # Video variant costs (duration x resolution)
+                {"action_key": "video_text_generate_4s_720p", "credits": 70},
+                {"action_key": "video_text_generate_6s_720p", "credits": 90},
+                {"action_key": "video_text_generate_8s_720p", "credits": 110},
+                {"action_key": "video_text_generate_8s_1080p", "credits": 130},
+                {"action_key": "video_text_generate_8s_4k", "credits": 160},
+                {"action_key": "video_image_animate_4s_720p", "credits": 70},
+                {"action_key": "video_image_animate_6s_720p", "credits": 90},
+                {"action_key": "video_image_animate_8s_720p", "credits": 110},
+                {"action_key": "video_image_animate_8s_1080p", "credits": 130},
+                {"action_key": "video_image_animate_8s_4k", "credits": 160},
             ],
         })
 
