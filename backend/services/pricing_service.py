@@ -134,6 +134,7 @@ def normalize_action_key(action_key: str) -> str:
         normalize_action_key("openai-image") -> "image_generate"
         normalize_action_key("image_generate") -> "image_generate"
         normalize_action_key("text-to-3d-preview") -> "text_to_3d_generate"
+        normalize_action_key("video_image_animate_8s_1080p") -> "video_image_animate_8s_1080p"
     """
     # Already canonical?
     if action_key in CANONICAL_TO_DB:
@@ -150,9 +151,44 @@ def normalize_action_key(action_key: str) -> str:
     if normalized in ALIAS_TO_CANONICAL:
         return ALIAS_TO_CANONICAL[normalized]
 
+    # Video variant codes are canonical by design (e.g., video_text_generate_4s_720p)
+    # Pattern: video_{task}_{duration}s_{resolution}
+    # These map directly to DB action_costs table entries
+    if _is_video_variant_code(normalized):
+        return normalized
+
     # Unknown - log warning and return as-is
     print(f"[PRICING] WARNING: Unknown action key '{action_key}', cannot normalize")
     return action_key
+
+
+def _is_video_variant_code(action_key: str) -> bool:
+    """
+    Check if an action key is a video variant code.
+
+    Video variant codes follow the pattern:
+    - video_text_generate_{duration}s_{resolution}
+    - video_image_animate_{duration}s_{resolution}
+
+    Where duration is 4, 6, or 8 and resolution is 720p, 1080p, or 4k.
+    """
+    if not action_key.startswith("video_"):
+        return False
+
+    # Valid prefixes
+    valid_prefixes = ("video_text_generate_", "video_image_animate_")
+    if not any(action_key.startswith(p) for p in valid_prefixes):
+        return False
+
+    # Extract suffix after prefix (e.g., "8s_1080p" from "video_image_animate_8s_1080p")
+    for prefix in valid_prefixes:
+        if action_key.startswith(prefix):
+            suffix = action_key[len(prefix):]
+            # Valid suffixes: 4s_720p, 6s_720p, 8s_720p, 8s_1080p, 8s_4k
+            valid_suffixes = {"4s_720p", "6s_720p", "8s_720p", "8s_1080p", "8s_4k"}
+            return suffix in valid_suffixes
+
+    return False
 
 
 def get_db_action_code_from_canonical(canonical_key: str) -> Optional[str]:
@@ -697,19 +733,26 @@ class PricingService:
             job_type: Any job type string (legacy or current)
 
         Returns:
-            DB action code (e.g., 'MESHY_TEXT_TO_3D')
+            DB action code (e.g., 'MESHY_TEXT_TO_3D' or 'video_image_animate_8s_1080p')
 
         Example:
             map_job_type_to_action('text-to-3d') -> 'MESHY_TEXT_TO_3D'
             map_job_type_to_action('openai-image') -> 'OPENAI_IMAGE'
+            map_job_type_to_action('video_image_animate_8s_1080p') -> 'video_image_animate_8s_1080p'
         """
         if not job_type:
             return "MESHY_TEXT_TO_3D"  # Default
 
-        # Normalize and get DB code
+        # Normalize the action key
         canonical = normalize_action_key(job_type)
-        db_code = CANONICAL_TO_DB.get(canonical)
 
+        # Video variant codes ARE the DB action codes (lowercase canonical format)
+        # e.g., video_text_generate_4s_720p, video_image_animate_8s_1080p
+        if _is_video_variant_code(canonical):
+            return canonical
+
+        # For other actions, look up the DB code mapping
+        db_code = CANONICAL_TO_DB.get(canonical)
         if db_code:
             return db_code
 
