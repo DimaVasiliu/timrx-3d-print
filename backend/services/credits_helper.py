@@ -6,13 +6,14 @@ incrementally without changing the credit/identity pipeline semantics.
 
 CANONICAL ACTION KEYS:
 Use these canonical keys when calling start_paid_job():
-- image_generate       (10c) - All 2D image providers
+- image_generate       (5c)  - Standard AI image
+- image_generate_2k    (7c)  - 2K AI image
+- image_generate_4k    (10c) - 4K AI image
 - text_to_3d_generate  (20c) - Text to 3D preview
 - image_to_3d_generate (30c) - Image to 3D
 - refine               (10c) - Refine 3D model
 - remesh               (10c) - Remesh 3D model
 - retexture            (15c) - Retexture 3D model
-- rigging              (25c) - Rig 3D model
 - video_generate       (70c) - Video generation
 - video_text_generate  (70c) - Text to video
 - video_image_animate  (70c) - Image to video
@@ -375,7 +376,6 @@ ACTION_KEYS = CONFIG_ACTION_KEYS or {
     CanonicalActions.REFINE: CanonicalActions.REFINE,
     CanonicalActions.REMESH: CanonicalActions.REMESH,
     CanonicalActions.RETEXTURE: CanonicalActions.RETEXTURE,
-    CanonicalActions.RIGGING: CanonicalActions.RIGGING,
     CanonicalActions.VIDEO_GENERATE: CanonicalActions.VIDEO_GENERATE,
     CanonicalActions.VIDEO_TEXT_GENERATE: CanonicalActions.VIDEO_TEXT_GENERATE,
     CanonicalActions.VIDEO_IMAGE_ANIMATE: CanonicalActions.VIDEO_IMAGE_ANIMATE,
@@ -385,7 +385,6 @@ ACTION_KEYS = CONFIG_ACTION_KEYS or {
     "text-to-3d-remesh": CanonicalActions.REMESH,
     "image-to-3d": CanonicalActions.IMAGE_TO_3D_GENERATE,
     "texture": CanonicalActions.RETEXTURE,
-    "rig": CanonicalActions.RIGGING,
     "image_studio_generate": CanonicalActions.IMAGE_GENERATE,
     "image-studio": CanonicalActions.IMAGE_GENERATE,
     "openai-image": CanonicalActions.IMAGE_GENERATE,
