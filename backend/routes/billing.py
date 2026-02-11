@@ -1391,10 +1391,10 @@ def subscription_summary():
                     SELECT s.*,
                            (SELECT sc.payment_status FROM {Tables.SUBSCRIPTION_CYCLES} sc
                             WHERE sc.subscription_id = s.id
-                            ORDER BY sc.created_at DESC LIMIT 1) as last_payment_status,
-                           (SELECT sc.created_at FROM {Tables.SUBSCRIPTION_CYCLES} sc
+                            ORDER BY sc.granted_at DESC NULLS LAST, sc.period_start DESC LIMIT 1) as last_payment_status,
+                           (SELECT sc.granted_at FROM {Tables.SUBSCRIPTION_CYCLES} sc
                             WHERE sc.subscription_id = s.id
-                            ORDER BY sc.created_at DESC LIMIT 1) as last_payment_at
+                            ORDER BY sc.granted_at DESC NULLS LAST, sc.period_start DESC LIMIT 1) as last_payment_at
                     FROM {Tables.SUBSCRIPTIONS} s
                     WHERE s.identity_id = %s
                       AND s.status IN ('active', 'cancelled', 'pending_payment', 'suspended', 'past_due')
