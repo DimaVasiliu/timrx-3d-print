@@ -929,6 +929,7 @@ def _poll_gemini_video_completion(
 
     consecutive_errors = 0
     max_consecutive_errors = 5
+    zero_progress_polls = 0  # Track polls with 0% progress
 
     for poll_num in range(1, max_polls + 1):
         try:
@@ -945,6 +946,16 @@ def _poll_gemini_video_completion(
             # Update progress in store
             if status == "processing":
                 progress = status_resp.get("progress", 0)
+
+                # Track stuck operations (0% progress for > 5 polls)
+                if progress == 0:
+                    zero_progress_polls += 1
+                    if zero_progress_polls == 5:
+                        print(f"[ASYNC] WARNING: Job {internal_job_id} stuck at 0% progress after {zero_progress_polls} polls")
+                    elif zero_progress_polls > 5 and zero_progress_polls % 10 == 0:
+                        print(f"[ASYNC] WARNING: Job {internal_job_id} still at 0% after {zero_progress_polls} polls")
+                else:
+                    zero_progress_polls = 0  # Reset if progress advances
                 store = load_store()
                 store_meta["progress"] = progress
                 store_meta["status"] = "processing"
@@ -977,6 +988,8 @@ def _poll_gemini_video_completion(
                         internal_job_id, identity_id, reservation_id, video_url, store_meta
                     )
                 else:
+                    # Log missing video_url in response
+                    print(f"[ASYNC] ERROR: Job {internal_job_id} status=done but video_url missing from response: {status_resp}")
                     raise RuntimeError("gemini_video_failed: Operation done but no video_url")
                 return
 
@@ -1087,6 +1100,7 @@ def _poll_video_completion(
 
     consecutive_errors = 0
     max_consecutive_errors = 5
+    zero_progress_polls = 0  # Track polls with 0% progress
 
     for poll_num in range(1, max_polls + 1):
         try:
@@ -1103,6 +1117,16 @@ def _poll_video_completion(
             # Processing — update progress
             if status == "processing":
                 progress = status_resp.get("progress", 0)
+
+                # Track stuck operations (0% progress for > 5 polls)
+                if progress == 0:
+                    zero_progress_polls += 1
+                    if zero_progress_polls == 5:
+                        print(f"[ASYNC] WARNING: Job {internal_job_id} ({provider_name}) stuck at 0% progress after {zero_progress_polls} polls")
+                    elif zero_progress_polls > 5 and zero_progress_polls % 10 == 0:
+                        print(f"[ASYNC] WARNING: Job {internal_job_id} ({provider_name}) still at 0% after {zero_progress_polls} polls")
+                else:
+                    zero_progress_polls = 0  # Reset if progress advances
                 store = load_store()
                 store_meta["progress"] = progress
                 store_meta["status"] = "processing"
@@ -1135,11 +1159,14 @@ def _poll_video_completion(
                         video_url, store_meta, provider_name=provider_name,
                     )
                 else:
+                    # Log missing video_url in response
+                    print(f"[ASYNC] ERROR: Job {internal_job_id} ({provider_name}) status=done but video_url missing from response: {status_resp}")
                     raise RuntimeError(f"{provider_name}_video_failed: Task done but no video_url")
                 return
 
             elif status in ("failed", "error"):
                 error_code = status_resp.get("error", f"{provider_name}_video_failed")
+                print(f"[ASYNC] ERROR: Job {internal_job_id} ({provider_name}) failed: {error_code} - {status_resp.get('message', 'Unknown error')}")
                 error_msg = status_resp.get("message", "Video generation failed")
                 is_retryable = status == "error"
 
@@ -1258,10 +1285,18 @@ def _finalize_video_success(
                         )
                         if s3_thumbnail_url:
                             pass  # print(f"[ASYNC] Uploaded thumbnail to S3: {s3_thumbnail_url}")
+                    else:
+                        # Fallback: Use video URL as thumbnail (browser will show first frame)
+                        print(f"[ASYNC] WARNING: Thumbnail extraction returned None for {internal_job_id}, using video URL as fallback")
+                        s3_thumbnail_url = s3_video_url
                 except Exception as thumb_err:
-                    print(f"[ASYNC] Thumbnail extraction failed: {thumb_err}")
+                    # Fallback: Use video URL as thumbnail when extraction fails
+                    print(f"[ASYNC] WARNING: Thumbnail extraction failed for {internal_job_id}: {thumb_err}, using video URL as fallback")
+                    s3_thumbnail_url = s3_video_url
             else:
                 print(f"[ASYNC] S3 upload returned no URL, using original {provider_name} URL")
+                # Use original video URL as thumbnail fallback
+                s3_thumbnail_url = video_url
 
         except Exception as e:
             print(f"[ASYNC] Failed to upload video to S3: {e}, using original {provider_name} URL")
