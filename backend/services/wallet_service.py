@@ -138,22 +138,26 @@ KNOWN_PLAN_CODES = VIDEO_PLAN_CODES | GENERAL_PLAN_CODES | SUBSCRIPTION_PLAN_COD
 def get_credit_type_for_action(action_code: str) -> str:
     """
     Determine credit type based on action code.
-    Video actions require video credits, general actions use general credits.
 
-    FAIL-CLOSED: Raises ValueError for unknown action codes to prevent
-    accidentally allowing video actions to use general credits.
+    UNIFIED CREDITS MODEL (Feb 2026):
+    All actions now use GENERAL credits. Video actions previously required separate
+    video credits, but this caused UX confusion. Now everything uses one unified
+    credit pool for simplicity.
+
+    FAIL-CLOSED: Raises ValueError for unknown action codes.
 
     Args:
         action_code: DB action code (e.g., "VIDEO_GENERATE", "MESHY_TEXT_TO_3D")
 
     Returns:
-        CreditType.VIDEO or CreditType.GENERAL
+        CreditType.GENERAL (always - unified credits model)
 
     Raises:
         ValueError: If action_code is not in KNOWN_ACTION_CODES
     """
+    # UNIFIED: All actions use general credits (single pool)
     if action_code in VIDEO_ACTION_CODES:
-        return CreditType.VIDEO
+        return CreditType.GENERAL  # Video actions now use unified pool
     if action_code in GENERAL_ACTION_CODES:
         return CreditType.GENERAL
     raise ValueError(
@@ -165,26 +169,32 @@ def get_credit_type_for_action(action_code: str) -> str:
 def get_credit_type_for_plan(plan_code: str) -> str:
     """
     Determine credit type based on plan code.
-    Video plans grant video credits, general plans grant general credits.
+
+    UNIFIED CREDITS MODEL (Feb 2026):
+    All plans now grant GENERAL credits. Video plans previously granted separate
+    video credits, but this caused UX confusion (users couldn't see their balance
+    because UI only displayed general credits). Now everything uses one unified
+    credit pool for simplicity.
 
     FAIL-CLOSED: Raises ValueError for unknown plan codes to prevent
-    accidentally granting wrong credit type.
+    accidentally granting credits for invalid plans.
 
     Args:
-        plan_code: Plan code (e.g., "video_starter_250", "starter_80")
+        plan_code: Plan code (e.g., "video_starter_300", "starter_250")
 
     Returns:
-        CreditType.VIDEO or CreditType.GENERAL
+        CreditType.GENERAL (always - unified credits model)
 
     Raises:
         ValueError: If plan_code is not in KNOWN_PLAN_CODES
     """
+    # UNIFIED: All plans grant general credits (single pool)
     if plan_code in VIDEO_PLAN_CODES:
-        return CreditType.VIDEO
+        return CreditType.GENERAL  # Video plans now use unified pool
     if plan_code in GENERAL_PLAN_CODES:
         return CreditType.GENERAL
     if plan_code in SUBSCRIPTION_PLAN_CODES:
-        return CreditType.GENERAL  # Subscriptions grant general credits
+        return CreditType.GENERAL
     raise ValueError(
         f"Unknown plan code: {plan_code}. "
         f"Add to VIDEO_PLAN_CODES or GENERAL_PLAN_CODES in wallet_service.py"
