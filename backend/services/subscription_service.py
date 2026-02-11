@@ -1073,23 +1073,26 @@ class SubscriptionService:
                 with conn.cursor() as cur:
                     # Find subscriptions with due credit allocations
                     # HARDENED: Only grant credits if subscription is truly valid:
-                    #   - status = 'active'
+                    #   - status = 'active' or 'cancelled' (cancelled subs get credits until ends_at)
                     #   - next_credit_date is due
                     #   - current_period_end is in the future (not expired)
-                    #   - not cancelled
-                    #   - not expired
+                    #   - ends_at not passed (if set via cancellation)
+                    #   - prepaid_until not passed (for yearly plans)
+                    #   - not expired or suspended (refund/chargeback)
                     cur.execute(
                         f"""
                         SELECT s.*,
                                (SELECT COUNT(*) FROM {Tables.SUBSCRIPTION_CYCLES} c
                                 WHERE c.subscription_id = s.id) as cycles_count
                         FROM {Tables.SUBSCRIPTIONS} s
-                        WHERE s.status = 'active'
+                        WHERE s.status IN ('active', 'cancelled')
                           AND s.next_credit_date IS NOT NULL
                           AND s.next_credit_date <= NOW()
                           AND (s.current_period_end IS NULL OR s.current_period_end >= NOW())
-                          AND s.cancelled_at IS NULL
+                          AND (s.ends_at IS NULL OR s.ends_at > NOW())
+                          AND (s.prepaid_until IS NULL OR s.prepaid_until > NOW())
                           AND s.expired_at IS NULL
+                          AND s.suspended_at IS NULL
                         ORDER BY s.next_credit_date ASC
                         LIMIT 100
                         """,
@@ -1889,7 +1892,12 @@ class SubscriptionService:
         """
         Cancel a subscription and send confirmation email.
 
-        The user can continue using remaining credits until period end.
+        CANCELLATION SEMANTICS:
+        - Stops renewal charges immediately (Mollie subscription cancelled)
+        - User continues receiving credits until ends_at:
+          - Monthly plans: ends_at = current_period_end
+          - Yearly plans: ends_at = prepaid_until (full year of credits)
+        - Status changes to 'cancelled' but tier perks continue until ends_at
         """
         if not USE_DB:
             return False
@@ -1897,16 +1905,44 @@ class SubscriptionService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
+                    # First fetch the subscription to determine ends_at
+                    cur.execute(
+                        f"""
+                        SELECT id, identity_id, customer_email, plan_code,
+                               current_period_end, prepaid_until
+                        FROM {Tables.SUBSCRIPTIONS}
+                        WHERE id::text = %s AND status IN ('active', 'past_due')
+                        """,
+                        (subscription_id,),
+                    )
+                    sub = cur.fetchone()
+
+                    if not sub:
+                        return False
+
+                    # Determine ends_at based on plan cadence
+                    plan_code = sub["plan_code"]
+                    is_yearly = "_yearly" in plan_code
+
+                    if is_yearly:
+                        # Yearly: user keeps access until prepaid_until (full year of credits)
+                        ends_at = sub.get("prepaid_until") or sub.get("current_period_end")
+                    else:
+                        # Monthly: user keeps access until current_period_end
+                        ends_at = sub.get("current_period_end")
+
+                    # Update subscription with cancellation and ends_at
                     cur.execute(
                         f"""
                         UPDATE {Tables.SUBSCRIPTIONS}
                         SET status = 'cancelled',
                             cancelled_at = NOW(),
+                            ends_at = %s,
                             updated_at = NOW()
-                        WHERE id::text = %s AND status IN ('active', 'past_due')
-                        RETURNING id, identity_id, customer_email, plan_code, current_period_end
+                        WHERE id::text = %s
+                        RETURNING id, identity_id, customer_email, plan_code, ends_at
                         """,
-                        (subscription_id,),
+                        (ends_at, subscription_id),
                     )
                     sub = cur.fetchone()
                 conn.commit()
@@ -1915,21 +1951,21 @@ class SubscriptionService:
                 # Send cancellation email to customer
                 customer_email = sub.get("customer_email")
                 plan_code = sub["plan_code"]
+                access_until = sub.get("ends_at")
+
                 if customer_email:
                     SubscriptionService._send_subscription_cancelled_email(
                         customer_email=customer_email,
                         plan_code=plan_code,
-                        access_until=sub.get("current_period_end"),
+                        access_until=access_until,
                     )
 
                 # Notify admin about cancellation
                 try:
                     from backend.emailer import notify_admin
 
-                    # Parse plan details for admin notification
                     plan_name = plan_code.replace("_monthly", "").replace("_yearly", "").title()
                     cadence = "yearly" if "_yearly" in plan_code else "monthly"
-                    access_until = sub.get("current_period_end")
 
                     notify_admin(
                         subject="Subscription Cancelled",
@@ -1948,10 +1984,11 @@ class SubscriptionService:
 
                 # Log event
                 SubscriptionService._log_event(subscription_id, "cancelled", {
-                    "access_until": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
+                    "ends_at": sub["ends_at"].isoformat() if sub.get("ends_at") else None,
+                    "cadence": "yearly" if "_yearly" in plan_code else "monthly",
                 })
 
-                print(f"[SUB] Cancelled subscription {subscription_id}")
+                print(f"[SUB] Cancelled subscription {subscription_id}, access until {access_until}")
                 return True
 
             return False
