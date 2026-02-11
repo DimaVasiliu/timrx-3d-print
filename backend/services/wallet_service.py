@@ -92,15 +92,28 @@ VIDEO_PLAN_CODES = {
     "video_studio_1600",
 }
 
-# Plan codes that grant GENERAL credits
+# Plan codes that grant GENERAL credits (one-time purchases)
 GENERAL_PLAN_CODES = {
     "starter_250",
     "creator_900",
     "studio_2200",
 }
 
-# All known plan codes (union of video + general)
-KNOWN_PLAN_CODES = VIDEO_PLAN_CODES | GENERAL_PLAN_CODES
+# Subscription plan codes that grant GENERAL credits (recurring)
+# Credit amounts defined in subscription_service.py SUBSCRIPTION_PLANS
+SUBSCRIPTION_PLAN_CODES = {
+    # Monthly subscriptions
+    "starter_monthly",   # 400 credits/month
+    "creator_monthly",   # 1300 credits/month
+    "studio_monthly",    # 3200 credits/month
+    # Yearly subscriptions (credits released monthly)
+    "starter_yearly",    # 400 credits/month × 12
+    "creator_yearly",    # 1300 credits/month × 12
+    "studio_yearly",     # 3200 credits/month × 12
+}
+
+# All known plan codes (union of video + general + subscription)
+KNOWN_PLAN_CODES = VIDEO_PLAN_CODES | GENERAL_PLAN_CODES | SUBSCRIPTION_PLAN_CODES
 
 
 def get_credit_type_for_action(action_code: str) -> str:
@@ -151,6 +164,8 @@ def get_credit_type_for_plan(plan_code: str) -> str:
         return CreditType.VIDEO
     if plan_code in GENERAL_PLAN_CODES:
         return CreditType.GENERAL
+    if plan_code in SUBSCRIPTION_PLAN_CODES:
+        return CreditType.GENERAL  # Subscriptions grant general credits
     raise ValueError(
         f"Unknown plan code: {plan_code}. "
         f"Add to VIDEO_PLAN_CODES or GENERAL_PLAN_CODES in wallet_service.py"
