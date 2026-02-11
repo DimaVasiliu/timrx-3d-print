@@ -1,3 +1,4 @@
+
 """
 /api/billing routes - Credits and purchases.
 
@@ -117,7 +118,10 @@ def _add_cache_headers(response, max_age: int = CACHE_TTL_SECONDS):
 def get_plans():
     """
     List available credit plans for purchase.
-    Returns active plans with prices, credits, and perks.
+    Returns active plans with prices, credits, perks, and estimated outputs.
+
+    Query params:
+    - estimates: Set to "true" to include output estimates (default: true)
 
     Response:
     {
@@ -125,13 +129,18 @@ def get_plans():
         "plans": [
             {
                 "id": "uuid",
-                "code": "starter_80",
+                "code": "starter_250",
                 "name": "Starter",
                 "price_gbp": 7.99,
-                "credits": 80,
+                "credits": 250,
                 "perks": {
                     "priority": false,
                     "retention_days": 30
+                },
+                "estimates": {
+                    "ai_images": 50,
+                    "text_to_3d": 13,
+                    "image_to_3d": 10
                 }
             },
             ...
@@ -139,7 +148,13 @@ def get_plans():
     }
     """
     try:
-        plans = PricingService.get_plans_with_perks(active_only=True)
+        include_estimates = request.args.get("estimates", "true").lower() != "false"
+
+        if include_estimates:
+            plans = PricingService.get_plans_with_estimates(active_only=True)
+        else:
+            plans = PricingService.get_plans_with_perks(active_only=True)
+
         response = make_response(jsonify({
             "ok": True,
             "plans": plans,
@@ -418,13 +433,13 @@ def create_mollie_checkout():
 
     Request body:
     {
-        "plan": "creator_300",   // plan code (e.g., starter_80, creator_300, studio_600)
+        "plan": "creator_900",   // plan code (e.g., starter_250, creator_900, studio_2200)
         "email": "user@example.com"
     }
 
     Alternative (backward compat):
     {
-        "plan_code": "creator_300",
+        "plan_code": "creator_900",
         "email": "user@example.com"
     }
 
@@ -657,7 +672,7 @@ def create_checkout():
 
     Request body:
     {
-        "plan_code": "starter_80",
+        "plan_code": "starter_250",
         "email": "user@example.com",
         "success_url": "https://app.timrx.com/checkout/success",  (optional)
         "cancel_url": "https://app.timrx.com/checkout/cancel"     (optional)
@@ -884,7 +899,7 @@ def get_purchase(purchase_id):
         "ok": true,
         "purchase": {
             "id": "uuid",
-            "plan_code": "starter_80",
+            "plan_code": "starter_250",
             "plan_name": "Starter",
             "amount": 7.99,
             "currency": "GBP",
