@@ -26,9 +26,10 @@ Environment variables:
 import json
 import requests
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from backend.config import config
+from backend.db import get_conn, Tables
 from backend.services.pricing_service import PricingService
 
 
@@ -228,11 +229,36 @@ class MollieService:
         identity_id = metadata.get("identity_id", "unknown")
         plan_code = metadata.get("plan_code", "unknown")
         credits = metadata.get("credits", "0")
+        payment_type = metadata.get("type", "one_time")
+        subscription_id = payment.get("subscriptionId")  # Set for recurring payments
+
+        # Determine sequence type for logging
+        seq_type = "recurring" if subscription_id else ("first" if payment_type == "subscription_first" else "one_time")
 
         print(
-            f"[MOLLIE] Webhook received: payment_id={payment_id}, status={status}, "
-            f"identity_id={identity_id}, plan_code={plan_code}, credits={credits}"
+            f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+            f"type={payment_type} identity={identity_id} plan={plan_code}"
         )
+
+        # ─────────────────────────────────────────────────────────────
+        # PAYMENT STATUS HANDLING
+        # ─────────────────────────────────────────────────────────────
+        # SEPA/Bank payments may be "pending" or "open" before becoming "paid"
+        # We ONLY grant credits when status == "paid"
+
+        if status in ("pending", "open"):
+            # Payment is processing (common for SEPA, bank transfers)
+            # Do NOT grant credits yet - wait for "paid" status
+            print(
+                f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                f"granted=false reason=awaiting_payment"
+            )
+            return {
+                "ok": True,
+                "status": status,
+                "message": f"Payment is {status} - waiting for confirmation",
+                "granted": False,
+            }
 
         # Handle different payment statuses
         if status == "paid":
@@ -459,8 +485,19 @@ class MollieService:
         metadata = payment.get("metadata", {})
 
         # Subscription payments are handled separately
-        if metadata.get("type") == "subscription":
+        payment_type = metadata.get("type")
+        if payment_type == "subscription":
             return MollieService._handle_subscription_paid(payment)
+
+        # TRUE RECURRING: First payment establishes mandate, then create Mollie subscription
+        if payment_type == "subscription_first":
+            return MollieService._handle_subscription_first_paid(payment)
+
+        # RECURRING PAYMENT: Automatic charge from Mollie subscription
+        # Mollie sets subscriptionId field for payments created by subscriptions
+        subscription_id = payment.get("subscriptionId")
+        if subscription_id:
+            return MollieService._handle_subscription_recurring_paid(payment)
 
         # Extract metadata
         identity_id = metadata.get("identity_id")
@@ -1019,6 +1056,467 @@ class MollieService:
 
         return {"purchase_id": sub_id, "was_existing": False}
 
+    @staticmethod
+    def _handle_subscription_first_paid(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle first payment for TRUE RECURRING subscription.
+
+        This is triggered when a payment with type=subscription_first is paid.
+        It:
+        1. Gets the mandate established by this payment
+        2. Creates a Mollie Subscription for automatic future charges
+        3. Updates pending subscription to active (or creates if not exists)
+        4. Grants first month credits
+
+        The Mollie Subscription will automatically charge monthly/yearly and
+        send webhooks for each payment, which triggers credit grants.
+        """
+        from backend.services.subscription_service import SubscriptionService, SUBSCRIPTION_PLANS
+        from backend.db import execute_query, Tables
+        from datetime import datetime, timezone, timedelta
+
+        payment_id = payment.get("id")
+        metadata = payment.get("metadata", {})
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        cadence = metadata.get("cadence", "monthly")
+        customer_email = metadata.get("email")
+
+        if not identity_id or not plan_code:
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=first "
+                f"granted=false reason=missing_metadata"
+            )
+            return None
+
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if not plan:
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=first "
+                f"granted=false reason=unknown_plan plan={plan_code}"
+            )
+            return None
+
+        # Get mandateId from payment (Mollie sets this after first payment)
+        mandate_id = payment.get("mandateId")
+        customer_id = payment.get("customerId")  # Should be cst_xxx
+
+        if not mandate_id or not customer_id:
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=first "
+                f"granted=false reason=missing_mandate_or_customer "
+                f"mandate={mandate_id} customer={customer_id}"
+            )
+            # Fall back to legacy one-time subscription handling
+            return MollieService._handle_subscription_paid(payment)
+
+        # Idempotency: check if we already processed this first payment (active subscription exists)
+        existing_sub = SubscriptionService.get_subscription_by_provider_id("mollie", payment_id)
+        if existing_sub and existing_sub.get("status") == "active":
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=first "
+                f"sub_id={existing_sub['id']} granted=false reason=already_processed"
+            )
+            return {"purchase_id": str(existing_sub["id"]), "was_existing": True}
+
+        # Check if there's a pending subscription waiting for this payment
+        pending_sub = None
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT * FROM {Tables.SUBSCRIPTIONS}
+                        WHERE identity_id = %s
+                          AND mollie_first_payment_id = %s
+                          AND status = 'pending_payment'
+                        LIMIT 1
+                        """,
+                        (identity_id, payment_id),
+                    )
+                    pending_sub = cur.fetchone()
+        except Exception as e:
+            print(f"[SUB] Error checking for pending subscription: {e}")
+
+        try:
+            # Create Mollie Subscription for automatic recurring charges
+            mollie_sub = MollieService.create_mollie_subscription(
+                mollie_customer_id=customer_id,
+                plan_code=plan_code,
+                mandate_id=mandate_id,
+                identity_id=identity_id,
+            )
+            mollie_subscription_id = mollie_sub["mollie_subscription_id"]
+            next_payment_date = mollie_sub.get("next_payment_date")
+
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=first "
+                f"mollie_sub_id={mollie_subscription_id} identity={identity_id} "
+                f"next_payment={next_payment_date} action=created_mollie_subscription"
+            )
+
+        except Exception as e:
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=first "
+                f"granted=false reason=mollie_sub_create_failed error={e}"
+            )
+            # Fall back to legacy handling - at least grant first credits
+            return MollieService._handle_subscription_paid(payment)
+
+        # Create or update subscription record
+        now = datetime.now(timezone.utc)
+        billing_day = now.day
+
+        if cadence == "yearly":
+            period_end = now + timedelta(days=365)
+            credits_remaining_months = 12
+        else:
+            # For monthly, period_end is next billing date
+            period_end = SubscriptionService.calculate_next_credit_date(now, billing_day)
+            credits_remaining_months = None
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    if pending_sub:
+                        # UPDATE existing pending subscription to active
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.SUBSCRIPTIONS}
+                            SET status = 'active',
+                                provider_subscription_id = %s,
+                                mollie_mandate_id = %s,
+                                current_period_start = %s,
+                                current_period_end = %s,
+                                billing_day = %s,
+                                next_credit_date = %s,
+                                credits_remaining_months = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            RETURNING *
+                            """,
+                            (
+                                mollie_subscription_id,
+                                mandate_id,
+                                now,
+                                period_end,
+                                billing_day,
+                                SubscriptionService.calculate_next_credit_date(now, billing_day),
+                                credits_remaining_months,
+                                pending_sub["id"],
+                            ),
+                        )
+                        sub = cur.fetchone()
+                        print(
+                            f"[SUB] payment_id={payment_id} action=activated_pending_subscription "
+                            f"sub_id={pending_sub['id']} mollie_sub_id={mollie_subscription_id}"
+                        )
+                    else:
+                        # CREATE new subscription (fallback if pending wasn't created)
+                        cur.execute(
+                            f"""
+                            INSERT INTO {Tables.SUBSCRIPTIONS}
+                                (identity_id, plan_code, status, provider,
+                                 provider_subscription_id, mollie_customer_id, mollie_mandate_id,
+                                 mollie_first_payment_id, is_mollie_recurring,
+                                 current_period_start, current_period_end,
+                                 billing_day, next_credit_date,
+                                 credits_remaining_months, customer_email)
+                            VALUES (%s, %s, 'active', 'mollie',
+                                    %s, %s, %s, %s, TRUE,
+                                    %s, %s, %s, %s, %s, %s)
+                            RETURNING *
+                            """,
+                            (
+                                identity_id,
+                                plan_code,
+                                mollie_subscription_id,  # provider_subscription_id = Mollie sub ID
+                                customer_id,
+                                mandate_id,
+                                payment_id,  # First payment ID
+                                now,
+                                period_end,
+                                billing_day,
+                                SubscriptionService.calculate_next_credit_date(now, billing_day),
+                                credits_remaining_months,
+                                customer_email,
+                            ),
+                        )
+                        sub = cur.fetchone()
+                conn.commit()
+
+            if not sub:
+                print(f"[MOLLIE] Failed to create/update subscription for {payment_id}")
+                return None
+
+            sub_id = str(sub["id"])
+
+            # Grant first month credits (payment already confirmed)
+            first_period_end = SubscriptionService.calculate_next_credit_date(now, billing_day)
+            cycle_result = SubscriptionService.grant_subscription_credits(
+                sub_id, now, first_period_end,
+                provider="mollie",
+                provider_payment_id=payment_id,
+            )
+
+            if cycle_result:
+                print(f"[MOLLIE] First credits granted for recurring subscription {sub_id}")
+
+                # Mark cycle as paid (it's the first payment)
+                try:
+                    execute_query(
+                        f"""
+                        UPDATE {Tables.SUBSCRIPTION_CYCLES}
+                        SET payment_status = 'paid'
+                        WHERE id = %s
+                        """,
+                        (cycle_result["cycle_id"],),
+                    )
+                except Exception:
+                    pass  # Non-critical
+
+            # Log event
+            SubscriptionService._log_event(sub_id, "created", {
+                "plan_code": plan_code,
+                "cadence": cadence,
+                "is_mollie_recurring": True,
+                "mollie_subscription_id": mollie_subscription_id,
+                "first_payment_id": payment_id,
+            })
+
+            # Send confirmation email
+            if customer_email:
+                try:
+                    from backend.emailer import send_subscription_confirmation, notify_admin
+                    plan_name = plan.get("name", plan_code)
+                    credits_per_month = plan.get("credits_per_month", 0)
+                    price_gbp = plan.get("price_gbp", 0)
+
+                    send_subscription_confirmation(
+                        to_email=customer_email,
+                        plan_name=plan_name,
+                        plan_code=plan_code,
+                        credits_per_month=credits_per_month,
+                        price_gbp=price_gbp,
+                        cadence=cadence,
+                    )
+
+                    # Admin notification
+                    notify_admin(
+                        subject="New Recurring Subscription",
+                        message=f"A user has subscribed to the {plan_name} plan ({cadence}) with automatic billing.",
+                        data={
+                            "Identity ID": identity_id,
+                            "Email": customer_email,
+                            "Plan": plan_name,
+                            "Cadence": cadence,
+                            "Credits/month": f"{credits_per_month:,}",
+                            "Price": f"£{price_gbp:.2f}/{cadence}",
+                            "Mollie Sub ID": mollie_subscription_id,
+                            "Next Payment": next_payment_date or "N/A",
+                        },
+                    )
+                except Exception as email_err:
+                    print(f"[MOLLIE] WARNING: Subscription email failed: {email_err}")
+
+            return {"purchase_id": sub_id, "was_existing": False}
+
+        except Exception as e:
+            print(f"[MOLLIE] Error creating internal subscription: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    def _handle_subscription_recurring_paid(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle a recurring payment from an active Mollie subscription.
+
+        This is triggered when Mollie charges the customer automatically
+        based on the subscription interval. We:
+        1. Find the internal subscription by mollie_subscription_id
+        2. Calculate the billing period for this payment
+        3. Grant credits for that period (idempotent by payment_id)
+        4. Update subscription period dates
+        """
+        from backend.services.subscription_service import SubscriptionService, SUBSCRIPTION_PLANS
+        from backend.db import get_conn, Tables
+        from datetime import datetime, timezone
+
+        payment_id = payment.get("id")
+        subscription_id = payment.get("subscriptionId")  # Mollie subscription ID (sub_xxx)
+        metadata = payment.get("metadata", {})
+
+        if not subscription_id:
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=recurring "
+                f"granted=false reason=missing_subscription_id"
+            )
+            return None
+
+        # Parse payment timestamp
+        paid_at_str = payment.get("paidAt") or payment.get("createdAt")
+        try:
+            paid_at = datetime.fromisoformat(paid_at_str.replace("Z", "+00:00"))
+        except Exception:
+            paid_at = datetime.now(timezone.utc)
+
+        # Find our subscription by Mollie subscription ID
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        SELECT * FROM {Tables.SUBSCRIPTIONS}
+                        WHERE provider = 'mollie'
+                          AND provider_subscription_id = %s
+                          AND is_mollie_recurring = TRUE
+                        LIMIT 1
+                        """,
+                        (subscription_id,),
+                    )
+                    sub = cur.fetchone()
+        except Exception as e:
+            print(f"[MOLLIE] Error finding subscription for {subscription_id}: {e}")
+            return None
+
+        if not sub:
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=recurring "
+                f"mollie_sub_id={subscription_id} granted=false reason=subscription_not_found"
+            )
+            return None
+
+        sub_id = str(sub["id"])
+        plan_code = sub["plan_code"]
+        billing_day = sub.get("billing_day") or paid_at.day
+        is_yearly = "_yearly" in plan_code
+
+        # Calculate period for this payment
+        period_start, period_end = SubscriptionService.calculate_cycle_period(paid_at, billing_day)
+
+        # Check if this payment already granted credits
+        if SubscriptionService.check_payment_already_granted("mollie", payment_id):
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=recurring "
+                f"sub_id={sub_id} granted=false reason=already_processed"
+            )
+            return {"purchase_id": sub_id, "was_existing": True}
+
+        # ─────────────────────────────────────────────────────────────
+        # YEARLY RENEWAL: Reset credits_remaining_months for new year
+        # When Mollie charges for year 2+, reset the 12-month counter
+        # ─────────────────────────────────────────────────────────────
+        if is_yearly:
+            current_remaining = sub.get("credits_remaining_months", 0) or 0
+            if current_remaining <= 0:
+                # This is a yearly renewal payment - reset to 12 months
+                print(
+                    f"[SUB] payment_id={payment_id} seq=recurring sub_id={sub_id} "
+                    f"action=yearly_renewal resetting_credits_remaining_months=12"
+                )
+                try:
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                f"""
+                                UPDATE {Tables.SUBSCRIPTIONS}
+                                SET credits_remaining_months = 12,
+                                    current_period_end = %s,
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                (paid_at + timedelta(days=365), sub_id),
+                            )
+                        conn.commit()
+                except Exception as e:
+                    print(f"[SUB] Error resetting yearly credits for {sub_id}: {e}")
+
+        # Grant credits for this period
+        cycle_result = SubscriptionService.grant_subscription_credits(
+            sub_id, period_start, period_end,
+            provider="mollie",
+            provider_payment_id=payment_id,
+        )
+
+        if cycle_result:
+            # Mark as paid
+            try:
+                from backend.db import execute_query
+                execute_query(
+                    f"""
+                    UPDATE {Tables.SUBSCRIPTION_CYCLES}
+                    SET payment_status = 'paid'
+                    WHERE id = %s
+                    """,
+                    (cycle_result["cycle_id"],),
+                )
+            except Exception:
+                pass
+
+            # Update subscription dates
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.SUBSCRIPTIONS}
+                            SET current_period_start = %s,
+                                current_period_end = %s,
+                                next_credit_date = %s,
+                                failed_at = NULL,
+                                failure_count = 0,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (
+                                period_start,
+                                period_end,
+                                SubscriptionService.calculate_next_credit_date(period_start, billing_day),
+                                sub_id,
+                            ),
+                        )
+                    conn.commit()
+            except Exception as e:
+                print(f"[MOLLIE] Error updating subscription dates: {e}")
+
+            # Send credits delivered email
+            customer_email = sub.get("customer_email")
+            if customer_email:
+                plan = SUBSCRIPTION_PLANS.get(plan_code, {})
+                SubscriptionService._send_credits_delivered_email(
+                    subscription_id=sub_id,
+                    customer_email=customer_email,
+                    plan_code=plan_code,
+                    credits_granted=plan.get("credits_per_month", 0),
+                    is_first_grant=False,
+                    next_credit_date=period_end,
+                )
+
+            # Log event
+            SubscriptionService._log_event(sub_id, "recurring_payment_received", {
+                "payment_id": payment_id,
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "credits": cycle_result.get("credits_granted", 0),
+            })
+
+            plan = SUBSCRIPTION_PLANS.get(plan_code, {})
+            credits = plan.get("credits_per_month", 0)
+            print(
+                f"[SUB] payment_id={payment_id} status=paid seq=recurring "
+                f"sub_id={sub_id} granted=true credits={credits} "
+                f"period={period_start.date()}→{period_end.date()}"
+            )
+
+            return {"purchase_id": sub_id, "was_existing": False}
+
+        print(
+            f"[SUB] payment_id={payment_id} status=paid seq=recurring "
+            f"sub_id={sub_id} granted=false reason=grant_failed"
+        )
+        return None
+
     # ─────────────────────────────────────────────────────────────
     # Subscription Checkout
     # ─────────────────────────────────────────────────────────────
@@ -1130,3 +1628,487 @@ class MollieService:
         except requests.RequestException as e:
             print(f"[MOLLIE] Request error creating subscription payment: {e}")
             raise ValueError(f"Payment service error: {str(e)}")
+
+    # ─────────────────────────────────────────────────────────────
+    # TRUE RECURRING SUBSCRIPTIONS (Mollie Subscriptions API)
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_or_create_customer(
+        identity_id: str,
+        email: str,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get or create a Mollie customer for recurring subscriptions.
+
+        Args:
+            identity_id: User's identity UUID
+            email: Customer email
+            name: Optional customer name
+
+        Returns:
+            { mollie_customer_id: "cst_xxx", email: "...", is_new: bool }
+        """
+        if not MOLLIE_AVAILABLE:
+            raise ValueError("Mollie is not configured")
+
+        from backend.db import query_one, execute_query, Tables
+
+        # Check if customer exists in DB
+        existing = query_one(
+            f"""
+            SELECT mollie_customer_id, email
+            FROM {Tables.MOLLIE_CUSTOMERS}
+            WHERE identity_id::text = %s
+            """,
+            (identity_id,),
+        )
+
+        if existing:
+            return {
+                "mollie_customer_id": existing["mollie_customer_id"],
+                "email": existing["email"],
+                "is_new": False,
+            }
+
+        # Create customer in Mollie
+        customer_data = {
+            "email": email,
+            "metadata": {"identity_id": identity_id},
+        }
+        if name:
+            customer_data["name"] = name
+
+        try:
+            response = requests.post(
+                f"{MollieService.MOLLIE_API_BASE}/customers",
+                headers=MollieService._get_headers(),
+                json=customer_data,
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 201):
+                error_data = response.json() if response.content else {}
+                raise MollieCreateError(error_data.get("detail", response.text))
+
+            customer = response.json()
+            mollie_customer_id = customer["id"]
+
+            # Save to DB
+            execute_query(
+                f"""
+                INSERT INTO {Tables.MOLLIE_CUSTOMERS}
+                    (identity_id, mollie_customer_id, email, name)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (identity_id) DO UPDATE SET
+                    mollie_customer_id = EXCLUDED.mollie_customer_id,
+                    email = EXCLUDED.email,
+                    updated_at = NOW()
+                """,
+                (identity_id, mollie_customer_id, email, name),
+            )
+
+            print(f"[MOLLIE] Created customer {mollie_customer_id} for identity {identity_id}")
+
+            return {
+                "mollie_customer_id": mollie_customer_id,
+                "email": email,
+                "is_new": True,
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error creating customer: {e}")
+            raise ValueError(f"Payment service error: {str(e)}")
+
+    @staticmethod
+    def create_recurring_subscription_checkout(
+        identity_id: str,
+        plan_code: str,
+        email: str,
+        success_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a first payment to establish mandate, then create recurring subscription.
+
+        This is a two-phase flow:
+        1. Create first payment with sequenceType=first
+        2. Create "pending_payment" subscription record immediately
+        3. On payment.paid webhook, transition to "active" and create Mollie subscription
+
+        This ensures SEPA payments (which can be pending 1-2 days) show proper
+        "processing" status to users.
+
+        Args:
+            identity_id: User's identity UUID
+            plan_code: Subscription plan code
+            email: Customer email
+            success_url: Redirect URL after payment
+
+        Returns:
+            { checkout_url, payment_id, mollie_customer_id, subscription_id }
+        """
+        if not MOLLIE_AVAILABLE:
+            raise ValueError("Mollie is not configured")
+
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS, SubscriptionService
+
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if not plan:
+            raise ValueError(f"Unknown subscription plan: {plan_code}")
+
+        # Get or create Mollie customer
+        customer_result = MollieService.get_or_create_customer(identity_id, email)
+        mollie_customer_id = customer_result["mollie_customer_id"]
+
+        price_gbp = plan["price_gbp"]
+        plan_name = plan["name"]
+        cadence = plan["cadence"]
+        credits = plan["credits_per_month"]
+
+        description = f"{plan_name} Subscription ({cadence.title()}) - {credits} credits/mo"
+
+        frontend_url = config.FRONTEND_BASE_URL.rstrip("/") if config.FRONTEND_BASE_URL else ""
+        if not frontend_url:
+            frontend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+
+        if not success_url:
+            success_url = f"{frontend_url}/hub.html?checkout=success&type=subscription&plan={plan_code}"
+
+        backend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        webhook_url = f"{backend_url}/api/billing/webhook/mollie"
+
+        # Mollie interval format
+        interval = "1 month" if cadence == "monthly" else "12 months"
+
+        metadata = {
+            "identity_id": identity_id,
+            "type": "subscription_first",  # Marks this as first payment for recurring
+            "plan_code": plan_code,
+            "cadence": cadence,
+            "credits_per_month": str(credits),
+            "email": email,
+            "interval": interval,
+        }
+
+        # Create first payment with sequenceType=first to establish mandate
+        payment_data = {
+            "amount": {
+                "currency": "GBP",
+                "value": f"{price_gbp:.2f}",
+            },
+            "customerId": mollie_customer_id,
+            "sequenceType": "first",  # CRITICAL: Establishes mandate for recurring
+            "description": description,
+            "redirectUrl": success_url,
+            "webhookUrl": webhook_url,
+            "metadata": metadata,
+            "locale": "en_GB",
+        }
+
+        try:
+            response = requests.post(
+                f"{MollieService.MOLLIE_API_BASE}/payments",
+                headers=MollieService._get_headers(),
+                json=payment_data,
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 201):
+                error_data = response.json() if response.content else {}
+                raise MollieCreateError(error_data.get("detail", response.text))
+
+            payment = response.json()
+            payment_id = payment["id"]
+            checkout_url = payment["_links"]["checkout"]["href"]
+
+            print(
+                f"[MOLLIE] Recurring subscription first payment created: "
+                f"payment_id={payment_id}, customer={mollie_customer_id}, plan={plan_code}"
+            )
+
+            # ═══════════════════════════════════════════════════════════════════
+            # CREATE PENDING SUBSCRIPTION RECORD
+            # This ensures SEPA users see "processing" status while payment clears
+            # ═══════════════════════════════════════════════════════════════════
+            subscription_id = None
+            try:
+                now = datetime.now(timezone.utc)
+                billing_day = now.day
+
+                if cadence == "yearly":
+                    period_end = now + timedelta(days=365)
+                    credits_remaining_months = 12
+                else:
+                    period_end = SubscriptionService.calculate_next_credit_date(now, billing_day)
+                    credits_remaining_months = None
+
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        # Create subscription with status='pending_payment'
+                        # Will be activated when payment webhook shows status=paid
+                        cur.execute(
+                            f"""
+                            INSERT INTO {Tables.SUBSCRIPTIONS}
+                                (identity_id, plan_code, status, provider,
+                                 mollie_customer_id, mollie_first_payment_id,
+                                 is_mollie_recurring,
+                                 current_period_start, current_period_end,
+                                 billing_day, next_credit_date,
+                                 credits_remaining_months, customer_email)
+                            VALUES (%s, %s, 'pending_payment', 'mollie',
+                                    %s, %s, TRUE,
+                                    %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (identity_id) WHERE status IN ('pending_payment')
+                            DO UPDATE SET
+                                plan_code = EXCLUDED.plan_code,
+                                mollie_customer_id = EXCLUDED.mollie_customer_id,
+                                mollie_first_payment_id = EXCLUDED.mollie_first_payment_id,
+                                updated_at = NOW()
+                            RETURNING id
+                            """,
+                            (
+                                identity_id,
+                                plan_code,
+                                mollie_customer_id,
+                                payment_id,  # Track which payment this is waiting for
+                                now,
+                                period_end,
+                                billing_day,
+                                SubscriptionService.calculate_next_credit_date(now, billing_day),
+                                credits_remaining_months,
+                                email,
+                            ),
+                        )
+                        result = cur.fetchone()
+                        if result:
+                            subscription_id = str(result["id"])
+                    conn.commit()
+
+                if subscription_id:
+                    print(
+                        f"[SUB] Created pending subscription: sub_id={subscription_id} "
+                        f"payment_id={payment_id} plan={plan_code} status=pending_payment"
+                    )
+                    # Log event
+                    SubscriptionService._log_event(subscription_id, "checkout_started", {
+                        "plan_code": plan_code,
+                        "cadence": cadence,
+                        "payment_id": payment_id,
+                        "mollie_customer_id": mollie_customer_id,
+                    })
+
+            except Exception as e:
+                # Non-fatal - subscription will be created on paid webhook if this fails
+                print(f"[SUB] Warning: Could not create pending subscription: {e}")
+
+            return {
+                "checkout_url": checkout_url,
+                "payment_id": payment_id,
+                "mollie_customer_id": mollie_customer_id,
+                "subscription_id": subscription_id,
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error creating recurring subscription checkout: {e}")
+            raise ValueError(f"Payment service error: {str(e)}")
+
+    @staticmethod
+    def create_mollie_subscription(
+        mollie_customer_id: str,
+        plan_code: str,
+        mandate_id: str,
+        identity_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Create a Mollie Subscription object for automatic recurring billing.
+
+        Called after first payment succeeds and mandate is established.
+
+        Args:
+            mollie_customer_id: Mollie customer ID (cst_xxx)
+            plan_code: Subscription plan code
+            mandate_id: Mollie mandate ID (mdt_xxx) from first payment
+            identity_id: User's identity UUID
+
+        Returns:
+            { mollie_subscription_id, interval, next_payment_date }
+        """
+        if not MOLLIE_AVAILABLE:
+            raise ValueError("Mollie is not configured")
+
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+
+        plan = SUBSCRIPTION_PLANS.get(plan_code)
+        if not plan:
+            raise ValueError(f"Unknown subscription plan: {plan_code}")
+
+        price_gbp = plan["price_gbp"]
+        plan_name = plan["name"]
+        cadence = plan["cadence"]
+        credits = plan["credits_per_month"]
+
+        # Mollie interval format
+        interval = "1 month" if cadence == "monthly" else "12 months"
+
+        description = f"{plan_name} Subscription - {credits} credits/mo"
+
+        backend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
+        webhook_url = f"{backend_url}/api/billing/webhook/mollie"
+
+        subscription_data = {
+            "amount": {
+                "currency": "GBP",
+                "value": f"{price_gbp:.2f}",
+            },
+            "interval": interval,
+            "description": description,
+            "webhookUrl": webhook_url,
+            "mandateId": mandate_id,
+            "metadata": {
+                "identity_id": identity_id,
+                "plan_code": plan_code,
+                "type": "subscription_recurring",
+            },
+        }
+
+        try:
+            response = requests.post(
+                f"{MollieService.MOLLIE_API_BASE}/customers/{mollie_customer_id}/subscriptions",
+                headers=MollieService._get_headers(),
+                json=subscription_data,
+                timeout=30,
+            )
+
+            if response.status_code not in (200, 201):
+                error_data = response.json() if response.content else {}
+                raise MollieCreateError(error_data.get("detail", response.text))
+
+            subscription = response.json()
+            mollie_subscription_id = subscription["id"]
+            next_payment_date = subscription.get("nextPaymentDate")
+
+            print(
+                f"[MOLLIE] Created Mollie subscription {mollie_subscription_id} "
+                f"for customer {mollie_customer_id}, interval={interval}"
+            )
+
+            return {
+                "mollie_subscription_id": mollie_subscription_id,
+                "interval": interval,
+                "next_payment_date": next_payment_date,
+                "status": subscription.get("status"),
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error creating Mollie subscription: {e}")
+            raise ValueError(f"Payment service error: {str(e)}")
+
+    @staticmethod
+    def get_mandate_for_customer(mollie_customer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the valid mandate for a customer (established by first payment).
+
+        Returns:
+            { mandate_id, status, method } or None
+        """
+        if not MOLLIE_AVAILABLE:
+            return None
+
+        try:
+            response = requests.get(
+                f"{MollieService.MOLLIE_API_BASE}/customers/{mollie_customer_id}/mandates",
+                headers=MollieService._get_headers(),
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                return None
+
+            mandates = response.json()
+            # Find first valid (active) mandate
+            for mandate in mandates.get("_embedded", {}).get("mandates", []):
+                if mandate.get("status") == "valid":
+                    return {
+                        "mandate_id": mandate["id"],
+                        "status": mandate["status"],
+                        "method": mandate.get("method"),
+                    }
+
+            return None
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error getting mandates: {e}")
+            return None
+
+    @staticmethod
+    def cancel_mollie_subscription(
+        mollie_customer_id: str,
+        mollie_subscription_id: str,
+    ) -> bool:
+        """
+        Cancel a Mollie subscription (stops future charges).
+
+        Args:
+            mollie_customer_id: Mollie customer ID
+            mollie_subscription_id: Mollie subscription ID (sub_xxx)
+
+        Returns:
+            True if cancelled successfully
+        """
+        if not MOLLIE_AVAILABLE:
+            return False
+
+        try:
+            response = requests.delete(
+                f"{MollieService.MOLLIE_API_BASE}/customers/{mollie_customer_id}/subscriptions/{mollie_subscription_id}",
+                headers=MollieService._get_headers(),
+                timeout=30,
+            )
+
+            if response.status_code in (200, 204):
+                print(f"[MOLLIE] Cancelled subscription {mollie_subscription_id}")
+                return True
+            else:
+                print(f"[MOLLIE] Failed to cancel subscription: {response.status_code}")
+                return False
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error cancelling subscription: {e}")
+            return False
+
+    @staticmethod
+    def get_mollie_subscription_status(
+        mollie_customer_id: str,
+        mollie_subscription_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get current status of a Mollie subscription.
+
+        Returns:
+            { status, next_payment_date, times, ... } or None
+        """
+        if not MOLLIE_AVAILABLE:
+            return None
+
+        try:
+            response = requests.get(
+                f"{MollieService.MOLLIE_API_BASE}/customers/{mollie_customer_id}/subscriptions/{mollie_subscription_id}",
+                headers=MollieService._get_headers(),
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                return None
+
+            sub = response.json()
+            return {
+                "status": sub.get("status"),  # active, pending, canceled, suspended, completed
+                "next_payment_date": sub.get("nextPaymentDate"),
+                "times": sub.get("times"),  # number of times charged
+                "description": sub.get("description"),
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error getting subscription status: {e}")
+            return None
