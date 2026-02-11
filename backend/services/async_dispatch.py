@@ -1314,12 +1314,15 @@ def _finalize_video_success(
     store[internal_job_id] = store_meta
     save_store(store)
 
-    # Finalize credits (handles missing reservation_id as ready_unbilled bug)
-    finalize_job_credits(reservation_id, internal_job_id, identity_id)
-    # if finalized:
-    #     print(f"[ASYNC] Credits captured for {provider_name} video job {internal_job_id}")
-    # elif reservation_id is None:
-    #     print(f"[ASYNC] !!! NO RESERVATION_ID for video job {internal_job_id} - marked as ready_unbilled")
+    # Finalize credits (capture permanently - MUST happen before any code that could throw)
+    # This marks the reservation as 'finalized' in DB, which prevents release from refunding
+    finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    if finalized:
+        print(f"[ASYNC] Credits CAPTURED for {provider_name} video job {internal_job_id} reservation_id={reservation_id}")
+    elif reservation_id:
+        print(f"[ASYNC] WARNING: Credits finalize returned False for job {internal_job_id} reservation_id={reservation_id}")
+    else:
+        print(f"[ASYNC] No reservation_id for video job {internal_job_id} - marked as ready_unbilled")
 
     # Save to normalized tables (videos + history_items)
     # This creates the video row and history_items row with video_id
