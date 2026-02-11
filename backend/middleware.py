@@ -45,7 +45,7 @@ def _log_session_debug(endpoint_name: str):
 
         # Only log for specific endpoints to reduce noise
         path = request.path
-        if not any(p in path for p in ["/api/me", "/api/billing/checkout", "/api/auth/"]):
+        if not any(p in path for p in ["/api/me", "/api/billing/checkout", "/api/billing/subscriptions", "/api/auth/"]):
             return
 
         # Get raw Cookie header
@@ -258,13 +258,20 @@ def require_session(f):
             identity = IdentityService.get_current_identity(request)
 
             if not identity:
-                # DEBUG: Log why we're returning 401 (only when SESSION_DEBUG=1)
-                if SESSION_DEBUG:
+                # DEBUG: Log subscription auth failures always (production debugging)
+                # For other paths, only log when SESSION_DEBUG=1
+                is_subscription_path = "/subscriptions" in request.path
+                cookie_present = bool(request.cookies.get("timrx_sid"))
+                origin = request.headers.get("Origin", "(no origin)")
+
+                if is_subscription_path or SESSION_DEBUG:
                     print(
                         f"[MIDDLEWARE] require_session 401: "
-                        f"session_id={session_id[:16] + '...' if session_id else 'None'}, "
                         f"path={request.path}, "
-                        f"identity=None (session invalid/expired/revoked)"
+                        f"origin={origin}, "
+                        f"cookie_present={cookie_present}, "
+                        f"session_id={session_id[:16] + '...' if session_id else 'None'}, "
+                        f"identity=None (session invalid/expired/not_found)"
                     )
                 return jsonify({
                     "error": {
