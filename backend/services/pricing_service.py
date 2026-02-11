@@ -8,13 +8,14 @@ Responsibilities:
 - Normalize action keys to canonical form
 
 CANONICAL ACTION KEYS (use these in new code):
-- image_generate       (10c) - All 2D image providers (OpenAI, Gemini, etc.)
-- text_to_3d_generate  (20c) - Text to 3D preview generation
-- image_to_3d_generate (30c) - Image to 3D conversion
-- refine               (10c) - Refine/upscale 3D model
-- remesh               (10c) - Remesh 3D model (same cost as refine)
-- retexture            (15c) - Apply new texture to 3D model
-- rigging              (25c) - Add skeleton/rig to 3D model
+- image_generate       (5c)  - Standard AI image generation
+- image_generate_2k    (7c)  - 2K resolution AI image
+- image_generate_4k    (10c) - 4K resolution AI image
+- text_to_3d_generate  (18c) - Text to 3D preview generation
+- image_to_3d_generate (25c) - Image to 3D conversion
+- refine               (8c)  - Refine/upscale 3D model
+- remesh               (8c)  - Remesh 3D model (same cost as refine)
+- retexture            (12c) - Apply new texture to 3D model
 - video_generate       (70c) - Generic video generation
 - video_text_generate  (70c) - Text-to-video generation
 - video_image_animate  (70c) - Image-to-video animation
@@ -24,7 +25,6 @@ LEGACY ALIASES (backwards compatibility only):
 - image-to-3d -> image_to_3d_generate
 - text-to-3d-refine, upscale -> refine
 - texture -> retexture
-- rig -> rigging
 - image_studio_generate, openai-image, text-to-image -> image_generate
 - video, video-generate -> video_generate
 - text2video, video-text-generate -> video_text_generate
@@ -43,13 +43,17 @@ from backend.db import query_one, query_all, execute, Tables
 # Canonical action keys (use these in all new code)
 class CanonicalActions:
     """Canonical action key constants."""
-    IMAGE_GENERATE = "image_generate"
+    # Image generation (tiered by resolution)
+    IMAGE_GENERATE = "image_generate"           # Standard (5c)
+    IMAGE_GENERATE_2K = "image_generate_2k"     # 2K resolution (7c)
+    IMAGE_GENERATE_4K = "image_generate_4k"     # 4K resolution (10c)
+    # 3D generation
     TEXT_TO_3D_GENERATE = "text_to_3d_generate"
     IMAGE_TO_3D_GENERATE = "image_to_3d_generate"
     REFINE = "refine"
     REMESH = "remesh"
     RETEXTURE = "retexture"
-    RIGGING = "rigging"
+    # Video generation (separate credits)
     VIDEO_GENERATE = "video_generate"
     VIDEO_TEXT_GENERATE = "video_text_generate"
     VIDEO_IMAGE_ANIMATE = "video_image_animate"
@@ -58,13 +62,17 @@ class CanonicalActions:
 
 # Canonical key -> DB action code mapping
 CANONICAL_TO_DB = {
-    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",
+    # Image generation (tiered)
+    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",           # Standard 5c
+    CanonicalActions.IMAGE_GENERATE_2K: "OPENAI_IMAGE_2K",     # 2K 7c
+    CanonicalActions.IMAGE_GENERATE_4K: "OPENAI_IMAGE_4K",     # 4K 10c
+    # 3D generation
     CanonicalActions.TEXT_TO_3D_GENERATE: "MESHY_TEXT_TO_3D",
     CanonicalActions.IMAGE_TO_3D_GENERATE: "MESHY_IMAGE_TO_3D",
     CanonicalActions.REFINE: "MESHY_REFINE",
     CanonicalActions.REMESH: "MESHY_REFINE",  # Remesh uses same cost as refine
     CanonicalActions.RETEXTURE: "MESHY_RETEXTURE",
-    CanonicalActions.RIGGING: "MESHY_RIG",
+    # Video generation
     CanonicalActions.VIDEO_GENERATE: "VIDEO_GENERATE",
     CanonicalActions.VIDEO_TEXT_GENERATE: "VIDEO_TEXT_GENERATE",
     CanonicalActions.VIDEO_IMAGE_ANIMATE: "VIDEO_IMAGE_ANIMATE",
@@ -74,12 +82,15 @@ CANONICAL_TO_DB = {
 # Alias -> Canonical key mapping (for backwards compatibility)
 # All variations map to canonical keys
 ALIAS_TO_CANONICAL = {
-    # Image generation aliases
+    # Image generation aliases (standard resolution)
     "image_studio_generate": CanonicalActions.IMAGE_GENERATE,
     "openai-image": CanonicalActions.IMAGE_GENERATE,
     "text-to-image": CanonicalActions.IMAGE_GENERATE,
     "image-studio": CanonicalActions.IMAGE_GENERATE,
     "nano-image": CanonicalActions.IMAGE_GENERATE,
+    # Tiered image aliases
+    "image-2k": CanonicalActions.IMAGE_GENERATE_2K,
+    "image-4k": CanonicalActions.IMAGE_GENERATE_4K,
 
     # Text-to-3D aliases
     "preview": CanonicalActions.TEXT_TO_3D_GENERATE,
@@ -98,9 +109,6 @@ ALIAS_TO_CANONICAL = {
 
     # Retexture aliases
     "texture": CanonicalActions.RETEXTURE,
-
-    # Rigging aliases
-    "rig": CanonicalActions.RIGGING,
 
     # Video aliases
     "video": CanonicalActions.VIDEO_GENERATE,
@@ -160,14 +168,18 @@ def get_db_action_code_from_canonical(canonical_key: str) -> Optional[str]:
     return CANONICAL_TO_DB.get(canonical_key)
 
 
-# Default plans to seed into the database
+# Default action costs to seed into the database
 DEFAULT_ACTION_COSTS = [
-    {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
-    {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
-    {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
-    {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
-    {"action_code": "MESHY_RIG", "cost_credits": 25, "provider": "meshy"},
-    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},
+    # 3D Generation
+    {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 18, "provider": "meshy"},
+    {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 25, "provider": "meshy"},
+    {"action_code": "MESHY_REFINE", "cost_credits": 8, "provider": "meshy"},
+    {"action_code": "MESHY_RETEXTURE", "cost_credits": 12, "provider": "meshy"},
+    # Image Generation (tiered by resolution)
+    {"action_code": "OPENAI_IMAGE", "cost_credits": 5, "provider": "openai"},       # Standard
+    {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 7, "provider": "openai"},    # 2K
+    {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 10, "provider": "openai"},   # 4K
+    # Video Generation (separate credit pool)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "video"},
@@ -176,27 +188,27 @@ DEFAULT_ACTION_COSTS = [
 
 DEFAULT_PLANS = [
     {
-        "code": "starter_80",
+        "code": "starter_250",
         "name": "Starter",
-        "description": "Try the tools. Great for a few generations.",
+        "description": "Perfect for exploring AI-powered 3D creation.",
         "price_gbp": 7.99,
-        "credit_grant": 80,
+        "credit_grant": 250,
         "includes_priority": False,
     },
     {
-        "code": "creator_300",
+        "code": "creator_900",
         "name": "Creator",
-        "description": "Regular use. Better value bundle.",
+        "description": "For serious creators building their portfolio.",
         "price_gbp": 19.99,
-        "credit_grant": 300,
+        "credit_grant": 900,
         "includes_priority": False,
     },
     {
-        "code": "studio_600",
+        "code": "studio_2200",
         "name": "Studio",
-        "description": "Heavy use. Best value. Priority queue access.",
-        "price_gbp": 34.99,
-        "credit_grant": 600,
+        "description": "Maximum value for professional workflows.",
+        "price_gbp": 37.99,
+        "credit_grant": 2200,
         "includes_priority": True,
     },
     # Video credit packs
@@ -334,10 +346,10 @@ class PricingService:
         [
             {
                 "id": "uuid",
-                "code": "starter_80",
+                "code": "starter_250",
                 "name": "Starter",
                 "price_gbp": 7.99,
-                "credits": 80,
+                "credits": 250,
                 "perks": {
                     "priority": false,
                     "retention_days": 30
@@ -384,6 +396,50 @@ class PricingService:
             }
             for plan in plans
         ]
+
+    @staticmethod
+    def get_plans_with_estimates(active_only: bool = True) -> List[Dict[str, Any]]:
+        """
+        Get available credit plans with estimated outputs based on current action costs.
+        Returns plans with credits and example outputs for UI display.
+
+        Response format:
+        [
+            {
+                "id": "uuid",
+                "code": "starter_250",
+                "name": "Starter",
+                "price_gbp": 7.99,
+                "credits": 250,
+                "perks": {"priority": false, "retention_days": 30},
+                "estimates": {
+                    "ai_images": 50,      # credits / 5
+                    "text_to_3d": 13,     # credits / 18
+                    "image_to_3d": 10     # credits / 25
+                }
+            },
+            ...
+        ]
+        """
+        # Get base plans with perks
+        plans = PricingService.get_plans_with_perks(active_only)
+
+        # Get action costs for estimates (use new lower costs)
+        costs = PricingService.get_action_costs()
+        image_cost = costs.get("image_generate", 5)           # Standard image
+        text_to_3d_cost = costs.get("text_to_3d_generate", 18)
+        image_to_3d_cost = costs.get("image_to_3d_generate", 25)
+
+        # Add estimates to each plan
+        for plan in plans:
+            plan_credits = plan.get("credits", 0)
+            plan["estimates"] = {
+                "ai_images": plan_credits // image_cost if image_cost > 0 else 0,
+                "text_to_3d": plan_credits // text_to_3d_cost if text_to_3d_cost > 0 else 0,
+                "image_to_3d": plan_credits // image_to_3d_cost if image_to_3d_cost > 0 else 0,
+            }
+
+        return plans
 
     @staticmethod
     def get_action_costs() -> Dict[str, int]:
