@@ -2006,3 +2006,145 @@ def wallet_drift_stats():
     except Exception as e:
         print(f"[ADMIN] Wallet drift stats error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BILLING HEALTH VIEW (UI + Read-Only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/billing/health", methods=["GET"])
+@require_admin
+def billing_health():
+    """
+    Get billing health overview for admin dashboard.
+
+    Returns the last 200 subscriptions with status indicators for monitoring.
+    This is a read-only endpoint for the admin billing health UI.
+
+    Query params:
+        - limit: Max subscriptions to return (default: 200, max: 500)
+        - status: Filter by status (active, cancelled, past_due, suspended, expired)
+        - offset: Pagination offset (default: 0)
+
+    Returns:
+        - subscriptions: List of subscription records with row_hint colors
+        - stats: Summary counts by status
+        - total: Total subscription count
+
+    Row hints (for UI color coding):
+        - "green": active subscriptions
+        - "amber": cancelled (still has access until period end)
+        - "red": past_due, suspended, or expired
+    """
+    try:
+        limit = min(request.args.get("limit", 200, type=int), 500)
+        offset = request.args.get("offset", 0, type=int)
+        status_filter = request.args.get("status")
+
+        # Build query with optional status filter
+        conditions = []
+        params = []
+
+        if status_filter:
+            conditions.append("s.status = %s")
+            params.append(status_filter)
+
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        # Fetch subscriptions with identity email
+        subscriptions = query_all(
+            f"""
+            SELECT
+                s.id,
+                s.identity_id,
+                i.email,
+                s.plan_code,
+                s.status,
+                s.provider,
+                s.provider_subscription_id,
+                s.current_period_start,
+                s.current_period_end,
+                s.next_credit_date,
+                s.billing_day,
+                s.credits_remaining_months,
+                s.customer_email,
+                s.cancelled_at,
+                s.suspend_reason,
+                s.created_at
+            FROM timrx_billing.subscriptions s
+            LEFT JOIN timrx_billing.identities i ON i.id = s.identity_id
+            {where_clause}
+            ORDER BY s.created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            params + [limit, offset],
+        )
+
+        # Get status counts for summary
+        stats_rows = query_all(
+            """
+            SELECT status, COUNT(*) as count
+            FROM timrx_billing.subscriptions
+            GROUP BY status
+            """,
+        )
+        stats = {row["status"]: row["count"] for row in (stats_rows or [])}
+
+        # Get total count
+        total_row = query_one("SELECT COUNT(*) as total FROM timrx_billing.subscriptions")
+        total = total_row["total"] if total_row else 0
+
+        # Format response with row hints
+        def get_row_hint(status):
+            if status == "active":
+                return "green"
+            elif status == "cancelled":
+                return "amber"
+            elif status in ("past_due", "suspended", "expired"):
+                return "red"
+            return "default"
+
+        formatted_subscriptions = [
+            {
+                "id": str(s["id"]),
+                "identity_id": str(s["identity_id"]),
+                "email": _mask_email(s["email"]) if s.get("email") else None,
+                "plan_code": s["plan_code"],
+                "status": s["status"],
+                "provider": s.get("provider"),
+                "provider_subscription_id": s.get("provider_subscription_id"),
+                "current_period_start": s["current_period_start"].isoformat() if s.get("current_period_start") else None,
+                "current_period_end": s["current_period_end"].isoformat() if s.get("current_period_end") else None,
+                "next_credit_date": s["next_credit_date"].isoformat() if s.get("next_credit_date") else None,
+                "billing_day": s.get("billing_day"),
+                "credits_remaining_months": s.get("credits_remaining_months"),
+                "customer_email": _mask_email(s["customer_email"]) if s.get("customer_email") else None,
+                "cancelled_at": s["cancelled_at"].isoformat() if s.get("cancelled_at") else None,
+                "suspend_reason": s.get("suspend_reason"),
+                "created_at": s["created_at"].isoformat() if s.get("created_at") else None,
+                "row_hint": get_row_hint(s["status"]),
+            }
+            for s in (subscriptions or [])
+        ]
+
+        return jsonify({
+            "ok": True,
+            "subscriptions": formatted_subscriptions,
+            "stats": {
+                "active": stats.get("active", 0),
+                "cancelled": stats.get("cancelled", 0),
+                "past_due": stats.get("past_due", 0),
+                "suspended": stats.get("suspended", 0),
+                "expired": stats.get("expired", 0),
+                "pending_payment": stats.get("pending_payment", 0),
+            },
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        })
+
+    except Exception as e:
+        print(f"[ADMIN] Billing health error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
