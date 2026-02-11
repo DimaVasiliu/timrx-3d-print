@@ -179,24 +179,28 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "OPENAI_IMAGE", "cost_credits": 5, "provider": "openai"},       # Standard
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 7, "provider": "openai"},    # 2K
     {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 10, "provider": "openai"},   # 4K
-    # Video Generation - Variant costs by duration/resolution
+    # Video Generation - Variant costs by duration/resolution (lowercase canonical)
     # Text-to-Video variants
-    {"action_code": "VIDEO_TEXT_GENERATE_4S_720P", "cost_credits": 70, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE_6S_720P", "cost_credits": 90, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE_8S_720P", "cost_credits": 110, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE_8S_1080P", "cost_credits": 130, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE_8S_4K", "cost_credits": 160, "provider": "video"},
+    {"action_code": "video_text_generate_4s_720p", "cost_credits": 70, "provider": "video"},
+    {"action_code": "video_text_generate_6s_720p", "cost_credits": 90, "provider": "video"},
+    {"action_code": "video_text_generate_8s_720p", "cost_credits": 110, "provider": "video"},
+    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 130, "provider": "video"},
+    {"action_code": "video_text_generate_8s_4k", "cost_credits": 160, "provider": "video"},
     # Image-to-Video (animate) variants
-    {"action_code": "VIDEO_IMAGE_ANIMATE_4S_720P", "cost_credits": 70, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE_6S_720P", "cost_credits": 90, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE_8S_720P", "cost_credits": 110, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE_8S_1080P", "cost_credits": 130, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE_8S_4K", "cost_credits": 160, "provider": "video"},
+    {"action_code": "video_image_animate_4s_720p", "cost_credits": 70, "provider": "video"},
+    {"action_code": "video_image_animate_6s_720p", "cost_credits": 90, "provider": "video"},
+    {"action_code": "video_image_animate_8s_720p", "cost_credits": 110, "provider": "video"},
+    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 130, "provider": "video"},
+    {"action_code": "video_image_animate_8s_4k", "cost_credits": 160, "provider": "video"},
     # Legacy fallback codes (for backwards compatibility)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "google"},
+    # Lowercase legacy codes
+    {"action_code": "video_generate", "cost_credits": 70, "provider": "video"},
+    {"action_code": "video_text_generate", "cost_credits": 70, "provider": "video"},
+    {"action_code": "video_image_animate", "cost_credits": 70, "provider": "video"},
 ]
 
 
@@ -222,6 +226,7 @@ VIDEO_VALID_DURATIONS = {
 def get_video_action_code(task: str, duration_seconds: int, resolution: str) -> str:
     """
     Build the video action code for a specific variant.
+    Uses lowercase snake_case as canonical format.
 
     Args:
         task: "text2video" or "image2video"
@@ -229,14 +234,14 @@ def get_video_action_code(task: str, duration_seconds: int, resolution: str) -> 
         resolution: "720p", "1080p", or "4k"
 
     Returns:
-        Action code like "VIDEO_TEXT_GENERATE_4S_720P" or "VIDEO_IMAGE_ANIMATE_8S_4K"
+        Action code like "video_text_generate_4s_720p" or "video_image_animate_8s_4k"
     """
-    # Normalize inputs
-    task_part = "TEXT_GENERATE" if task.lower() in ("text2video", "text_to_video", "text") else "IMAGE_ANIMATE"
-    duration_part = f"{duration_seconds}S"
-    resolution_part = resolution.upper().replace("P", "P")  # Ensure 720P, 1080P, 4K
+    # Normalize inputs - use lowercase canonical format
+    task_part = "text_generate" if task.lower() in ("text2video", "text_to_video", "text") else "image_animate"
+    duration_part = f"{duration_seconds}s"
+    resolution_part = resolution.lower()  # Ensure 720p, 1080p, 4k
 
-    return f"VIDEO_{task_part}_{duration_part}_{resolution_part}"
+    return f"video_{task_part}_{duration_part}_{resolution_part}"
 
 
 def get_video_credit_cost(duration_seconds: int, resolution: str) -> int:
