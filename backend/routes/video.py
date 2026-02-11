@@ -197,7 +197,7 @@ def generate_video():
     internal_job_id = str(uuid.uuid4())
 
     # Determine action key for credits - use variant code based on duration/resolution
-    # Format: VIDEO_TEXT_GENERATE_4S_720P or VIDEO_IMAGE_ANIMATE_8S_4K
+    # Format: video_text_generate_4s_720p or video_image_animate_8s_4k (lowercase canonical)
     action_key = get_video_action_code(task, duration_seconds, resolution)
     expected_cost = get_video_credit_cost(duration_seconds, resolution)
 
