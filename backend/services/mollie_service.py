@@ -1346,7 +1346,7 @@ class MollieService:
         send webhooks for each payment, which triggers credit grants.
         """
         from backend.services.subscription_service import SubscriptionService, SUBSCRIPTION_PLANS
-        from backend.db import execute_query, Tables
+        from backend.db import get_conn, Tables
         from datetime import datetime, timezone, timedelta
 
         payment_id = payment.get("id")
@@ -1550,14 +1550,17 @@ class MollieService:
 
                 # Mark cycle as paid (it's the first payment)
                 try:
-                    execute_query(
-                        f"""
-                        UPDATE {Tables.SUBSCRIPTION_CYCLES}
-                        SET payment_status = 'paid'
-                        WHERE id = %s
-                        """,
-                        (cycle_result["cycle_id"],),
-                    )
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                f"""
+                                UPDATE {Tables.SUBSCRIPTION_CYCLES}
+                                SET payment_status = 'paid'
+                                WHERE id = %s
+                                """,
+                                (cycle_result["cycle_id"],),
+                            )
+                        conn.commit()
                 except Exception:
                     pass  # Non-critical
 
@@ -1728,15 +1731,17 @@ class MollieService:
         if cycle_result:
             # Mark as paid
             try:
-                from backend.db import execute_query
-                execute_query(
-                    f"""
-                    UPDATE {Tables.SUBSCRIPTION_CYCLES}
-                    SET payment_status = 'paid'
-                    WHERE id = %s
-                    """,
-                    (cycle_result["cycle_id"],),
-                )
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.SUBSCRIPTION_CYCLES}
+                            SET payment_status = 'paid'
+                            WHERE id = %s
+                            """,
+                            (cycle_result["cycle_id"],),
+                        )
+                    conn.commit()
             except Exception:
                 pass
 
@@ -1939,7 +1944,7 @@ class MollieService:
         if not MOLLIE_AVAILABLE:
             raise ValueError("Mollie is not configured")
 
-        from backend.db import query_one, execute_query, Tables
+        from backend.db import query_one, get_conn, Tables
 
         # Check if customer exists in DB
         existing = query_one(
@@ -1982,18 +1987,21 @@ class MollieService:
             mollie_customer_id = customer["id"]
 
             # Save to DB
-            execute_query(
-                f"""
-                INSERT INTO {Tables.MOLLIE_CUSTOMERS}
-                    (identity_id, mollie_customer_id, email, name)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (identity_id) DO UPDATE SET
-                    mollie_customer_id = EXCLUDED.mollie_customer_id,
-                    email = EXCLUDED.email,
-                    updated_at = NOW()
-                """,
-                (identity_id, mollie_customer_id, email, name),
-            )
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.MOLLIE_CUSTOMERS}
+                            (identity_id, mollie_customer_id, email, name)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (identity_id) DO UPDATE SET
+                            mollie_customer_id = EXCLUDED.mollie_customer_id,
+                            email = EXCLUDED.email,
+                            updated_at = NOW()
+                        """,
+                        (identity_id, mollie_customer_id, email, name),
+                    )
+                conn.commit()
 
             print(f"[MOLLIE] Created customer {mollie_customer_id} for identity {identity_id}")
 
