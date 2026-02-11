@@ -1316,9 +1316,14 @@ def _finalize_video_success(
 
     # Finalize credits (capture permanently - MUST happen before any code that could throw)
     # This marks the reservation as 'finalized' in DB, which prevents release from refunding
-    finalized = finalize_job_credits(reservation_id, internal_job_id, identity_id)
-    if finalized:
-        print(f"[ASYNC] Credits CAPTURED for {provider_name} video job {internal_job_id} reservation_id={reservation_id}")
+    finalize_result = finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    new_balance = finalize_result.get("new_balance")
+
+    if finalize_result.get("success"):
+        print(f"[ASYNC] Credits CAPTURED for {provider_name} video job {internal_job_id} reservation_id={reservation_id} new_balance={new_balance}")
+        # Store new_balance in metadata so status endpoint can return it to frontend
+        store_meta["new_balance"] = new_balance
+        store_meta["credits_charged"] = finalize_result.get("cost")
     elif reservation_id:
         print(f"[ASYNC] WARNING: Credits finalize returned False for job {internal_job_id} reservation_id={reservation_id}")
     else:
@@ -1366,6 +1371,11 @@ def _finalize_video_success(
             }
             if s3_video_url:
                 meta_update["s3_video_url"] = s3_video_url
+            # Include new_balance so frontend can update credits display
+            if new_balance is not None:
+                meta_update["new_balance"] = new_balance
+            if store_meta.get("credits_charged") is not None:
+                meta_update["credits_charged"] = store_meta.get("credits_charged")
 
             with get_conn() as conn:
                 with conn.cursor() as cursor:
