@@ -85,11 +85,11 @@ KNOWN_ACTION_CODES = VIDEO_ACTION_CODES | GENERAL_ACTION_CODES
 #         to VIDEO_PLAN_CODES or GENERAL_PLAN_CODES below.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Plan codes that grant VIDEO credits
+# Plan codes that grant VIDEO credits - Premium rebalance Feb 2026
 VIDEO_PLAN_CODES = {
-    "video_starter_250",
-    "video_creator_750",
-    "video_studio_1600",
+    "video_starter_300",   # £9.99 → 300 video credits
+    "video_creator_900",   # £29.99 → 900 video credits
+    "video_studio_2000",   # £59.99 → 2000 video credits
 }
 
 # Plan codes that grant GENERAL credits (one-time purchases)
