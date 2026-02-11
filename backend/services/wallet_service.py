@@ -54,11 +54,30 @@ class CreditType:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Action codes that require VIDEO credits
+# Includes variant codes for duration/resolution-based pricing
 VIDEO_ACTION_CODES = {
+    # Legacy codes (backwards compatibility)
     "VIDEO_GENERATE",
     "VIDEO_TEXT_GENERATE",
     "VIDEO_IMAGE_ANIMATE",
     "GEMINI_VIDEO",
+    # Lowercase canonical variants (preferred)
+    "video_generate",
+    "video_text_generate",
+    "video_image_animate",
+    "gemini_video",
+    # Text-to-Video variants (duration_resolution)
+    "video_text_generate_4s_720p",   # 70 credits
+    "video_text_generate_6s_720p",   # 90 credits
+    "video_text_generate_8s_720p",   # 110 credits
+    "video_text_generate_8s_1080p",  # 130 credits
+    "video_text_generate_8s_4k",     # 160 credits
+    # Image-to-Video variants (duration_resolution)
+    "video_image_animate_4s_720p",   # 70 credits
+    "video_image_animate_6s_720p",   # 90 credits
+    "video_image_animate_8s_720p",   # 110 credits
+    "video_image_animate_8s_1080p",  # 130 credits
+    "video_image_animate_8s_4k",     # 160 credits
 }
 
 # Action codes that use GENERAL credits (3D + images)
