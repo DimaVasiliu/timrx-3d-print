@@ -1162,7 +1162,8 @@ class MollieService:
 
             print(
                 f"[MOLLIE] Purchase recorded: purchase_id={purchase_id}, identity={identity_id}, "
-                f"credits={credits_granted}, balance: {current_balance} -> {new_balance}"
+                f"plan_code={plan_code}, credits={credits_granted}, credit_type={credit_type}, "
+                f"balance: {current_balance} -> {new_balance}"
             )
 
             return {
