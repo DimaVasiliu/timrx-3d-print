@@ -68,6 +68,131 @@ class MollieService:
         }
 
     # ─────────────────────────────────────────────────────────────
+    # Payment Methods for Recurring
+    # ─────────────────────────────────────────────────────────────
+
+    # Methods that support Mollie recurring (sequenceType: first/recurring)
+    # These can establish mandates for automatic future charges
+    RECURRING_METHODS = {"creditcard", "directdebit", "paypal"}
+
+    # Methods that DO NOT support recurring - must be filtered out for subscriptions
+    # These include bank transfers, iDEAL, Bancontact, etc.
+    NON_RECURRING_METHODS = {
+        "ideal", "bancontact", "banktransfer", "sofort", "eps",
+        "giropay", "kbc", "belfius", "przelewy24", "applepay",
+    }
+
+    @staticmethod
+    def get_recurring_payment_methods(
+        amount_gbp: float,
+        include_inactive: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Get payment methods that support recurring billing (subscriptions).
+
+        Only returns methods that can establish a mandate for automatic future charges:
+        - Credit/Debit Card (creditcard)
+        - SEPA Direct Debit (directdebit)
+        - PayPal (paypal)
+
+        Methods like iDEAL, Bancontact, Bank Transfer do NOT support recurring
+        and are filtered out.
+
+        Args:
+            amount_gbp: Payment amount (some methods have minimums)
+            include_inactive: Include methods not yet activated (for testing)
+
+        Returns:
+            {
+                "methods": [
+                    {"id": "creditcard", "description": "Credit card", ...},
+                    {"id": "directdebit", "description": "SEPA Direct Debit", ...},
+                    {"id": "paypal", "description": "PayPal", ...},
+                ],
+                "count": 3
+            }
+        """
+        if not MOLLIE_AVAILABLE:
+            return {"methods": [], "count": 0, "error": "Mollie not configured"}
+
+        try:
+            # Query Mollie for methods supporting first payment sequence
+            # This filters to only methods that can establish a mandate
+            params = {
+                "sequenceType": "first",
+                "amount[currency]": "GBP",
+                "amount[value]": f"{amount_gbp:.2f}",
+            }
+            if include_inactive:
+                params["includeWallets"] = "applepay"
+
+            response = requests.get(
+                f"{MollieService.MOLLIE_API_BASE}/methods",
+                headers=MollieService._get_headers(),
+                params=params,
+                timeout=15,
+            )
+
+            if response.status_code != 200:
+                print(f"[MOLLIE] Error fetching recurring methods: {response.status_code}")
+                # Fallback to hardcoded list
+                return MollieService._get_fallback_recurring_methods()
+
+            data = response.json()
+            methods = data.get("_embedded", {}).get("methods", [])
+
+            # Double-filter to only include known recurring methods
+            # (Mollie API should handle this, but we validate anyway)
+            recurring_methods = [
+                m for m in methods
+                if m.get("id") in MollieService.RECURRING_METHODS
+            ]
+
+            print(
+                f"[MOLLIE] Recurring methods for £{amount_gbp:.2f}: "
+                f"{[m['id'] for m in recurring_methods]}"
+            )
+
+            return {
+                "methods": recurring_methods,
+                "count": len(recurring_methods),
+            }
+
+        except requests.RequestException as e:
+            print(f"[MOLLIE] Error fetching recurring methods: {e}")
+            return MollieService._get_fallback_recurring_methods()
+
+    @staticmethod
+    def _get_fallback_recurring_methods() -> Dict[str, Any]:
+        """Fallback recurring methods if API fails."""
+        return {
+            "methods": [
+                {
+                    "id": "creditcard",
+                    "description": "Credit card",
+                    "image": {"size1x": "", "size2x": "", "svg": ""},
+                },
+                {
+                    "id": "directdebit",
+                    "description": "SEPA Direct Debit",
+                    "image": {"size1x": "", "size2x": "", "svg": ""},
+                },
+                {
+                    "id": "paypal",
+                    "description": "PayPal",
+                    "image": {"size1x": "", "size2x": "", "svg": ""},
+                },
+            ],
+            "count": 3,
+            "fallback": True,
+        }
+
+    @staticmethod
+    def is_recurring_method(method_id: str) -> bool:
+        """Check if a payment method supports recurring billing."""
+        return method_id in MollieService.RECURRING_METHODS
+
+    # ─────────────────────────────────────────────────────────────
     # Checkout Flow
     # ─────────────────────────────────────────────────────────────
 
@@ -295,8 +420,32 @@ class MollieService:
                 }
 
         # Refund statuses: refunded, charged_back
-        # Revoke credits (idempotent by checking existing refund ledger entry)
+        # For subscriptions: suspend subscription and stop future grants
+        # For one-time purchases: revoke credits
         if status in ("refunded", "charged_back"):
+            # Check if this is a subscription payment
+            is_subscription = subscription_id or payment_type in ("subscription_first", "subscription_recurring")
+
+            if is_subscription:
+                # Handle subscription refund/chargeback - suspend subscription
+                result = MollieService._handle_subscription_refund(payment)
+                if result:
+                    was_existing = result.get("was_existing", False)
+                    print(
+                        f"[SUB] Subscription {status}: payment_id={payment_id}, "
+                        f"sub_id={result.get('subscription_id')}, suspended={result.get('suspended')}"
+                    )
+                    return {
+                        "ok": True,
+                        "status": status,
+                        "message": f"Subscription suspended due to {status}" if not was_existing else "Already processed",
+                        "subscription_suspended": result.get("suspended", False),
+                    }
+                else:
+                    print(f"[SUB] ERROR: Failed to process subscription {status}: payment_id={payment_id}")
+                    return {"ok": False, "status": status, "error": f"Failed to process subscription {status}"}
+
+            # One-time purchase refund
             result = MollieService._handle_payment_refunded(payment)
 
             if result:
@@ -747,6 +896,131 @@ class MollieService:
             return None
 
     @staticmethod
+    def _handle_subscription_refund(payment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Handle a refund/chargeback for a SUBSCRIPTION payment.
+
+        This suspends the subscription and logs an admin entry.
+        The cron/webhook checks suspended_at before granting credits.
+
+        Args:
+            payment: Full Mollie payment object
+
+        Returns:
+            Dict with suspension info, or None on failure
+        """
+        from backend.services.subscription_service import SubscriptionService
+
+        payment_id = payment.get("id")
+        status = payment.get("status")  # 'refunded' or 'charged_back'
+        metadata = payment.get("metadata", {})
+        identity_id = metadata.get("identity_id")
+        plan_code = metadata.get("plan_code")
+        subscription_id_mollie = payment.get("subscriptionId")
+
+        if not identity_id:
+            print(f"[SUB] Subscription refund skipped - no identity_id: payment_id={payment_id}")
+            return None
+
+        suspend_reason = "charged_back" if status == "charged_back" else "refunded"
+
+        try:
+            # Find the subscription by Mollie subscription ID or identity
+            sub = None
+            if subscription_id_mollie:
+                sub = SubscriptionService.get_subscription_by_provider_id("mollie", subscription_id_mollie)
+
+            if not sub:
+                # Try to find by identity and plan
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""
+                            SELECT * FROM {Tables.SUBSCRIPTIONS}
+                            WHERE identity_id = %s
+                              AND status IN ('active', 'cancelled')
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            (identity_id,),
+                        )
+                        sub = cur.fetchone()
+
+            if not sub:
+                print(f"[SUB] Subscription refund skipped - no subscription found: identity={identity_id}")
+                return {"suspended": False, "reason": "no_subscription"}
+
+            sub_id = str(sub["id"])
+
+            # Check if already suspended
+            if sub.get("suspended_at"):
+                print(f"[SUB] Subscription already suspended: sub_id={sub_id}")
+                return {"suspended": True, "was_existing": True, "subscription_id": sub_id}
+
+            # Suspend the subscription
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.SUBSCRIPTIONS}
+                        SET status = 'suspended',
+                            suspended_at = NOW(),
+                            suspend_reason = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING id, customer_email
+                        """,
+                        (suspend_reason, sub["id"]),
+                    )
+                    updated_sub = cur.fetchone()
+
+                    # Log admin entry
+                    cur.execute(
+                        """
+                        INSERT INTO timrx_billing.admin_logs
+                            (event_type, subscription_id, identity_id, payment_id, details)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            f"subscription_{suspend_reason}",
+                            sub["id"],
+                            identity_id,
+                            payment_id,
+                            json.dumps({
+                                "plan_code": plan_code,
+                                "mollie_subscription_id": subscription_id_mollie,
+                                "status": status,
+                                "action": "subscription_suspended",
+                            }),
+                        ),
+                    )
+                conn.commit()
+
+            # Log event
+            SubscriptionService._log_event(sub_id, "suspended", {
+                "reason": suspend_reason,
+                "payment_id": payment_id,
+            })
+
+            print(
+                f"[SUB] Subscription SUSPENDED due to {suspend_reason}: "
+                f"sub_id={sub_id} payment_id={payment_id} identity={identity_id}"
+            )
+
+            # TODO: Send email notification to user about suspension
+
+            return {
+                "suspended": True,
+                "was_existing": False,
+                "subscription_id": sub_id,
+                "reason": suspend_reason,
+            }
+
+        except Exception as e:
+            print(f"[SUB] Error suspending subscription: {e}")
+            return None
+
+    @staticmethod
     def _record_mollie_purchase(
         identity_id: str,
         plan_id: str,
@@ -1167,13 +1441,17 @@ class MollieService:
         now = datetime.now(timezone.utc)
         billing_day = now.day
 
-        if cadence == "yearly":
+        # Calculate period end and prepaid tracking for yearly plans
+        is_yearly = cadence == "yearly"
+        if is_yearly:
             period_end = now + timedelta(days=365)
             credits_remaining_months = 12
+            prepaid_until = period_end  # Yearly: prepaid for full year
         else:
             # For monthly, period_end is next billing date
             period_end = SubscriptionService.calculate_next_credit_date(now, billing_day)
             credits_remaining_months = None
+            prepaid_until = None  # Monthly: no prepaid concept
 
         try:
             with get_conn() as conn:
@@ -1191,6 +1469,8 @@ class MollieService:
                                 billing_day = %s,
                                 next_credit_date = %s,
                                 credits_remaining_months = %s,
+                                first_paid_at = %s,
+                                prepaid_until = %s,
                                 updated_at = NOW()
                             WHERE id = %s
                             RETURNING *
@@ -1203,13 +1483,16 @@ class MollieService:
                                 billing_day,
                                 SubscriptionService.calculate_next_credit_date(now, billing_day),
                                 credits_remaining_months,
+                                now,  # first_paid_at
+                                prepaid_until,  # prepaid_until (only set for yearly)
                                 pending_sub["id"],
                             ),
                         )
                         sub = cur.fetchone()
                         print(
                             f"[SUB] payment_id={payment_id} action=activated_pending_subscription "
-                            f"sub_id={pending_sub['id']} mollie_sub_id={mollie_subscription_id}"
+                            f"sub_id={pending_sub['id']} mollie_sub_id={mollie_subscription_id} "
+                            f"prepaid_until={prepaid_until}"
                         )
                     else:
                         # CREATE new subscription (fallback if pending wasn't created)
@@ -1221,10 +1504,11 @@ class MollieService:
                                  mollie_first_payment_id, is_mollie_recurring,
                                  current_period_start, current_period_end,
                                  billing_day, next_credit_date,
-                                 credits_remaining_months, customer_email)
+                                 credits_remaining_months, customer_email,
+                                 first_paid_at, prepaid_until)
                             VALUES (%s, %s, 'active', 'mollie',
                                     %s, %s, %s, %s, TRUE,
-                                    %s, %s, %s, %s, %s, %s)
+                                    %s, %s, %s, %s, %s, %s, %s, %s)
                             RETURNING *
                             """,
                             (
@@ -1240,6 +1524,8 @@ class MollieService:
                                 SubscriptionService.calculate_next_credit_date(now, billing_day),
                                 credits_remaining_months,
                                 customer_email,
+                                now,  # first_paid_at
+                                prepaid_until,  # prepaid_until (only set for yearly)
                             ),
                         )
                         sub = cur.fetchone()
@@ -1756,6 +2042,41 @@ class MollieService:
         plan = SUBSCRIPTION_PLANS.get(plan_code)
         if not plan:
             raise ValueError(f"Unknown subscription plan: {plan_code}")
+
+        # ═══════════════════════════════════════════════════════════════════
+        # PART 5: PREVENT DUPLICATE PENDING SUBSCRIPTIONS
+        # Expire any existing pending_payment subscriptions for this identity
+        # This handles the case where user abandons checkout and starts again
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # Expire old pending subscriptions (allow new checkout)
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.SUBSCRIPTIONS}
+                        SET status = 'expired',
+                            expired_at = NOW(),
+                            updated_at = NOW()
+                        WHERE identity_id = %s
+                          AND status = 'pending_payment'
+                        RETURNING id
+                        """,
+                        (identity_id,),
+                    )
+                    expired = cur.fetchall()
+                conn.commit()
+
+            if expired:
+                expired_ids = [str(r["id"]) for r in expired]
+                print(f"[SUB] Expired {len(expired)} old pending subscription(s): {expired_ids}")
+                for old_id in expired_ids:
+                    SubscriptionService._log_event(old_id, "expired", {
+                        "reason": "new_checkout_started",
+                        "new_plan_code": plan_code,
+                    })
+        except Exception as e:
+            print(f"[SUB] Warning: Could not expire old pending subscriptions: {e}")
 
         # Get or create Mollie customer
         customer_result = MollieService.get_or_create_customer(identity_id, email)
