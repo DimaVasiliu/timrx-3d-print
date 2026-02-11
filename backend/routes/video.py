@@ -750,8 +750,10 @@ def _video_status_handler(job_id: str):
                 if job["status"] == "ready":
                     video_url = meta.get("video_url") or job_meta.get("video_url")
                     thumbnail_url = meta.get("thumbnail_url") or job_meta.get("thumbnail_url")
+                    # Include new_balance so frontend can update credits display
+                    new_balance = meta.get("new_balance") or job_meta.get("new_balance")
 
-                    return jsonify({
+                    response_data = {
                         "ok": True,
                         "status": "done",
                         "job_id": job_id,
@@ -761,14 +763,18 @@ def _video_status_handler(job_id: str):
                         "duration_seconds": meta.get("duration_seconds") or job_meta.get("duration_seconds"),
                         "resolution": meta.get("resolution") or job_meta.get("resolution"),
                         "provider": meta.get("provider") or job_meta.get("provider") or "google",
-                    })
+                    }
+                    # Only include new_balance if present (backwards compatible)
+                    if new_balance is not None:
+                        response_data["new_balance"] = new_balance
+                    return jsonify(response_data)
 
         except Exception as e:
             print(f"[VIDEO STATUS] Error checking job {job_id}: {e}")
 
     # Fallback to job store
     if meta.get("status") == "done":
-        return jsonify({
+        response_data = {
             "ok": True,
             "status": "done",
             "job_id": job_id,
@@ -778,7 +784,12 @@ def _video_status_handler(job_id: str):
             "duration_seconds": meta.get("duration_seconds"),
             "resolution": meta.get("resolution"),
             "provider": meta.get("provider", "google"),
-        })
+        }
+        # Include new_balance if present (for frontend credit display)
+        new_balance = meta.get("new_balance")
+        if new_balance is not None:
+            response_data["new_balance"] = new_balance
+        return jsonify(response_data)
 
     if meta.get("status") == "failed":
         error_msg = meta.get("error", "Video generation failed")
@@ -847,14 +858,19 @@ def _video_status_handler(job_id: str):
                             jm = __import__('json').loads(jm)
                         except Exception:
                             jm = {}
-                    return jsonify({
+                    response_data = {
                         "ok": True,
                         "status": "done",
                         "job_id": job_id,
                         "video_id": job_id,
                         "video_url": jm.get("video_url"),
                         "thumbnail_url": jm.get("thumbnail_url"),
-                    })
+                    }
+                    # Include new_balance if present
+                    new_balance = jm.get("new_balance")
+                    if new_balance is not None:
+                        response_data["new_balance"] = new_balance
+                    return jsonify(response_data)
                 if status == "failed":
                     return jsonify({
                         "ok": False,
