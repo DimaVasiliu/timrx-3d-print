@@ -12,10 +12,88 @@ Yearly plans bill annually but grant credits monthly.
 from __future__ import annotations
 
 import json
+import hashlib
+import calendar
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 from backend.db import USE_DB, get_conn, Tables
+
+
+def _stable_grant_ref_id(subscription_id: str, period_start: datetime, plan_code: str) -> str:
+    """
+    Generate a stable, deterministic ref_id for ledger entries.
+
+    This ensures that even if webhooks retry or cron re-processes,
+    the same grant attempt will always produce the same ref_id,
+    enabling idempotency at the ledger level.
+
+    Format: sha256(subscription_id + period_start_iso + plan_code)[:16]
+    """
+    period_str = period_start.strftime("%Y-%m-%d")
+    data = f"{subscription_id}:{period_str}:{plan_code}"
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+
+# ─────────────────────────────────────────────────────────────
+# CRON LOCKING - Prevent concurrent cron runs
+# ─────────────────────────────────────────────────────────────
+
+@contextmanager
+def cron_lock(job_name: str, timeout_minutes: int = 10):
+    """
+    Acquire a cron lock to prevent concurrent runs.
+
+    Usage:
+        with cron_lock("subscription_credits") as acquired:
+            if not acquired:
+                return {"status": "already_running"}
+            # Do work...
+
+    Yields:
+        bool: True if lock acquired, False if already held
+    """
+    if not USE_DB:
+        yield True
+        return
+
+    lock_acquired = False
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Try to acquire lock (only if not held or expired)
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.CRON_LOCKS} (job_name, locked_at, expires_at, locked_by)
+                    VALUES (%s, NOW(), NOW() + %s * INTERVAL '1 minute', %s)
+                    ON CONFLICT (job_name) DO UPDATE SET
+                        locked_at = NOW(),
+                        expires_at = NOW() + %s * INTERVAL '1 minute',
+                        locked_by = EXCLUDED.locked_by
+                    WHERE {Tables.CRON_LOCKS}.expires_at < NOW()
+                    RETURNING job_name
+                    """,
+                    (job_name, timeout_minutes, "cron", timeout_minutes),
+                )
+                result = cur.fetchone()
+                lock_acquired = result is not None
+            conn.commit()
+
+        yield lock_acquired
+
+    finally:
+        if lock_acquired:
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"DELETE FROM {Tables.CRON_LOCKS} WHERE job_name = %s",
+                            (job_name,),
+                        )
+                    conn.commit()
+            except Exception as e:
+                print(f"[CRON] Error releasing lock {job_name}: {e}")
 
 
 # ── Plan config (credits granted per month) ──────────────────
@@ -195,7 +273,11 @@ class SubscriptionService:
                         SELECT id, identity_id, plan_code, status,
                                provider, provider_subscription_id,
                                current_period_start, current_period_end,
-                               cancelled_at, created_at, updated_at
+                               cancelled_at, created_at, updated_at,
+                               billing_day, next_credit_date, customer_email,
+                               credits_remaining_months,
+                               mollie_customer_id, mollie_mandate_id,
+                               mollie_first_payment_id, is_mollie_recurring
                         FROM {Tables.SUBSCRIPTIONS}
                         WHERE identity_id = %s
                           AND status IN ('active', 'cancelled')
@@ -447,16 +529,20 @@ class SubscriptionService:
                         )
 
                     # Add credits via ledger (with credit_type based on plan)
+                    # Use stable ref_id hash for idempotency across retries
                     from backend.services.wallet_service import WalletService, get_credit_type_for_plan
                     credit_type = get_credit_type_for_plan(sub["plan_code"])
+                    stable_ref_id = _stable_grant_ref_id(subscription_id, period_start, sub["plan_code"])
+
                     WalletService.add_credits(
                         identity_id,
                         credits_amount,
                         entry_type="subscription_grant",
-                        ref_type="subscription_cycle",
-                        ref_id=cycle_id,
+                        ref_type="subscription_grant",  # Changed from subscription_cycle
+                        ref_id=stable_ref_id,  # Stable hash instead of cycle_id
                         meta={
                             "subscription_id": subscription_id,
+                            "cycle_id": cycle_id,
                             "plan_code": sub["plan_code"],
                             "period_start": period_start.isoformat(),
                             "period_end": period_end.isoformat(),
@@ -953,17 +1039,34 @@ class SubscriptionService:
 
         This should be run by a cron job every hour or so.
         It finds subscriptions where next_credit_date <= NOW() and:
-        1. Grants the monthly credits
-        2. Updates next_credit_date to next month
-        3. Sends notification email
-        4. For yearly plans, decrements credits_remaining_months
+        1. Verifies payment is current (for Mollie recurring subscriptions)
+        2. Grants the monthly credits
+        3. Updates next_credit_date to next month
+        4. Sends notification email
+        5. For yearly plans, decrements credits_remaining_months
 
-        Returns summary: {processed: N, granted: N, errors: N}
+        HARDENED:
+        - Uses cron_lock to prevent concurrent runs
+        - Verifies subscription is truly valid before granting
+        - For Mollie recurring subs, only grants if payment cycle is confirmed
+
+        Returns summary: {processed: N, granted: N, errors: N, skipped: N}
         """
         if not USE_DB:
-            return {"processed": 0, "granted": 0, "errors": 0}
+            return {"processed": 0, "granted": 0, "errors": 0, "skipped": 0}
 
-        result = {"processed": 0, "granted": 0, "errors": 0, "details": []}
+        # Acquire cron lock to prevent concurrent runs
+        with cron_lock("subscription_credits", timeout_minutes=15) as acquired:
+            if not acquired:
+                print("[SUB] process_due_credit_allocations: Lock not acquired (another run in progress)")
+                return {"processed": 0, "granted": 0, "errors": 0, "skipped": 0, "status": "locked"}
+
+            return SubscriptionService._process_due_credit_allocations_impl()
+
+    @staticmethod
+    def _process_due_credit_allocations_impl() -> Dict[str, Any]:
+        """Internal implementation of credit allocation processing."""
+        result = {"processed": 0, "granted": 0, "errors": 0, "skipped": 0, "details": []}
 
         try:
             with get_conn() as conn:
@@ -1052,11 +1155,30 @@ class SubscriptionService:
                     result["errors"] += 1
                     continue
 
+                # ────────────────────────────────────────────────────────────────
+                # MONTHLY RECURRING: Skip cron grants - webhook is the source of truth
+                # For monthly Mollie recurring subscriptions, credits are ONLY granted
+                # when Mollie sends a payment.paid webhook. Cron must not grant automatically.
+                # ────────────────────────────────────────────────────────────────
+                if sub.get("is_mollie_recurring") and plan["cadence"] == "monthly":
+                    print(
+                        f"[SUB] Skipping cron grant for monthly recurring {sub_id}: "
+                        f"waiting for Mollie payment webhook"
+                    )
+                    result["skipped"] += 1
+                    result["details"].append({
+                        "subscription_id": sub_id,
+                        "status": "skipped",
+                        "reason": "monthly_recurring_awaiting_payment",
+                    })
+                    continue
+
                 # Check if yearly plan has exhausted credits
                 if plan["cadence"] == "yearly":
                     remaining = sub.get("credits_remaining_months", 0)
                     if remaining is not None and remaining <= 0:
                         print(f"[SUB] Yearly subscription {sub_id} has exhausted monthly credits")
+                        result["skipped"] += 1
                         continue
 
                 try:
