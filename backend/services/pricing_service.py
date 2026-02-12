@@ -170,7 +170,8 @@ def _is_video_variant_code(action_key: str) -> bool:
     - video_text_generate_{duration}s_{resolution}
     - video_image_animate_{duration}s_{resolution}
 
-    Where duration is 4, 6, or 8 and resolution is 720p, 1080p, or 4k.
+    Where duration is 4, 6, or 8 and resolution is 720p or 1080p.
+    (4k exists in DB for future use but is not exposed in UI)
     """
     if not action_key.startswith("video_"):
         return False
@@ -245,17 +246,16 @@ DEFAULT_ACTION_COSTS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Video credit costs by resolution and duration (must match frontend)
+# Note: 4K removed from UI - not available to users (requires GCP allowlisting)
 VIDEO_CREDIT_COSTS = {
     "720p": {4: 70, 6: 90, 8: 110},
     "1080p": {8: 130},
-    "4k": {8: 160},
 }
 
 # Valid durations per resolution (Gemini/Veo constraints)
 VIDEO_VALID_DURATIONS = {
     "720p": [4, 6, 8],
     "1080p": [8],
-    "4k": [8],
 }
 
 
@@ -267,10 +267,10 @@ def get_video_action_code(task: str, duration_seconds: int, resolution: str) -> 
     Args:
         task: "text2video" or "image2video"
         duration_seconds: 4, 6, or 8
-        resolution: "720p", "1080p", or "4k"
+        resolution: "720p" or "1080p"
 
     Returns:
-        Action code like "video_text_generate_4s_720p" or "video_image_animate_8s_4k"
+        Action code like "video_text_generate_4s_720p" or "video_image_animate_8s_1080p"
     """
     # Normalize inputs - use lowercase canonical format
     task_part = "text_generate" if task.lower() in ("text2video", "text_to_video", "text") else "image_animate"
@@ -286,10 +286,10 @@ def get_video_credit_cost(duration_seconds: int, resolution: str) -> int:
 
     Args:
         duration_seconds: 4, 6, or 8
-        resolution: "720p", "1080p", or "4k"
+        resolution: "720p" or "1080p"
 
     Returns:
-        Credit cost (70, 90, 110, 130, or 160)
+        Credit cost (70, 90, 110, or 130)
     """
     resolution = resolution.lower()
     duration = int(duration_seconds)
