@@ -4,10 +4,11 @@ Video Provider Router with Fallback.
 Routes video generation requests to available providers in priority order.
 Falls back to next provider on configuration or quota errors.
 
-Supported providers (ordered by priority based on VIDEO_PROVIDER env):
+Supported providers for Veo (Google):
 - vertex  (Vertex AI Veo) — production default
 - google  (Gemini AI Studio Veo) — fallback
-- runway  (Runway Gen-4) — secondary fallback
+
+Runway is handled separately via dedicated endpoints.
 
 Provider selection:
 - VIDEO_PROVIDER=vertex (default in prod): Use Vertex AI first, AI Studio as fallback
@@ -149,19 +150,26 @@ _RUNWAY_PROVIDER = RunwayProvider()
 
 def _get_ordered_providers() -> List[VideoProvider]:
     """
-    Get providers ordered by priority based on VIDEO_PROVIDER setting.
+    Get Veo providers ordered by priority based on VIDEO_PROVIDER setting.
 
-    VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio -> Runway
-    VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex -> Runway
+    VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio
+    VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex
+
+    Note: Runway is handled separately via dedicated endpoints.
     """
     video_provider = getattr(config, 'VIDEO_PROVIDER', 'vertex').lower()
 
     if video_provider == "aistudio":
         # AI Studio first, Vertex as fallback
-        return [_AISTUDIO_PROVIDER, _VERTEX_PROVIDER, _RUNWAY_PROVIDER]
+        return [_AISTUDIO_PROVIDER, _VERTEX_PROVIDER]
     else:
         # Vertex first (production default), AI Studio as fallback
-        return [_VERTEX_PROVIDER, _AISTUDIO_PROVIDER, _RUNWAY_PROVIDER]
+        return [_VERTEX_PROVIDER, _AISTUDIO_PROVIDER]
+
+
+def get_runway_provider() -> RunwayProvider:
+    """Get the Runway provider instance for direct access."""
+    return _RUNWAY_PROVIDER
 
 
 
@@ -169,11 +177,13 @@ def _get_ordered_providers() -> List[VideoProvider]:
 # ── Router ────────────────────────────────────────────────────
 class VideoRouter:
     """
-    Route video generation to available providers with automatic fallback.
+    Route Veo video generation to available Google providers with automatic fallback.
 
     Tries providers in priority order based on VIDEO_PROVIDER setting:
-      - VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio -> Runway
-      - VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex -> Runway
+      - VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio
+      - VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex
+
+    Note: Runway is handled separately via dedicated endpoints, not through this router.
 
     Falls back on:
       - Configuration errors (provider not set up)
