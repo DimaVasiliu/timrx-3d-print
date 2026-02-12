@@ -2148,3 +2148,32 @@ def billing_health():
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/billing/credit-analytics", methods=["GET"])
+@require_admin
+def credit_analytics():
+    """
+    Get comprehensive credit usage analytics for admin dashboard.
+
+    Query params:
+        - days: Number of days to look back (default: 30, max: 90)
+
+    Returns:
+        - summary: Total purchased, spent, usage rate
+        - by_action_type: Credits grouped by category (image, 3d_model, video)
+        - top_users: Top 20 users by credit usage (with masked emails)
+        - over_time: Daily credit usage time series
+    """
+    try:
+        days = min(request.args.get("days", 30, type=int), 90)
+
+        data = AdminService.get_credit_analytics(days=days)
+
+        return jsonify({"ok": True, **data})
+
+    except Exception as e:
+        print(f"[ADMIN] Credit analytics error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
