@@ -47,12 +47,15 @@ def build_hash_s3_key(prefix: str, provider: str | None, content_hash: str, cont
 
     IMPORTANT: Always pass the correct provider to organize assets properly:
     - "openai" for OpenAI/GPT images
-    - "google" for Gemini Imagen images
+    - "google" for Gemini Imagen/AI Studio images and videos
+    - "vertex" for Vertex AI Veo videos
+    - "runway" for Runway video generation
     - "meshy" for Meshy 3D models
     - "user" for user-uploaded source images
     """
     # Normalize provider - default to "unknown" if not provided
-    KNOWN_PROVIDERS = {"openai", "google", "meshy", "user", "unknown"}
+    # All video/image/3D providers must be listed here
+    KNOWN_PROVIDERS = {"openai", "google", "vertex", "runway", "meshy", "user", "unknown"}
     raw_provider = (provider or "").lower().strip()
     safe_provider = sanitize_filename(raw_provider) if raw_provider else "unknown"
 
