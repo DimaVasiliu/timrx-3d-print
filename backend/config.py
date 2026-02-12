@@ -467,6 +467,10 @@ class Config:
     RUNWAY_API_BASE: str = field(default_factory=lambda: _get_env("RUNWAY_API_BASE", "https://api.dev.runwayml.com").rstrip("/"))
     RUNWAY_API_VERSION: str = field(default_factory=lambda: _get_env("RUNWAY_API_VERSION", "2024-11-06"))
 
+    # Luma Dream Machine video generation
+    LUMA_API_KEY: str = field(default_factory=lambda: _get_env("LUMA_API_KEY"))
+    LUMA_BASE_URL: str = field(default_factory=lambda: _get_env("LUMA_BASE_URL", "https://api.lumalabs.ai").rstrip("/"))
+
     # ─────────────────────────────────────────────────────────────
     # Vertex AI (Veo) Video Generation
     # ─────────────────────────────────────────────────────────────
@@ -724,6 +728,8 @@ GEMINI_API_KEY = config.GEMINI_API_KEY
 RUNWAY_API_KEY = config.RUNWAY_API_KEY
 RUNWAY_API_BASE = config.RUNWAY_API_BASE
 RUNWAY_API_VERSION = config.RUNWAY_API_VERSION
+LUMA_API_KEY = config.LUMA_API_KEY
+LUMA_BASE_URL = config.LUMA_BASE_URL
 DEFAULT_MODEL_TITLE = config.DEFAULT_MODEL_TITLE
 ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS
