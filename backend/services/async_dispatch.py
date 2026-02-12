@@ -1074,11 +1074,15 @@ def _poll_video_completion(
     poll_interval: int = 3,
 ):
     """
-    Provider-aware video polling.
+    Provider-aware video polling with exponential backoff for Vertex.
 
-    For 'google' (Gemini), delegates to the existing _poll_gemini_video_completion.
-    For 'runway' and future providers, uses the VideoProvider.check_status()
-    interface which returns a normalized {status, progress, video_url, error} dict.
+    For 'google' (Gemini AI Studio), delegates to _poll_gemini_video_completion.
+    For 'vertex', uses exponential backoff (2s initial, 10s max, ~6min timeout).
+    For 'runway' and others, uses fixed interval polling.
+
+    Status response may contain:
+    - video_url: URL to download video from
+    - video_bytes: Raw video bytes (base64 decoded) - used by Vertex
     """
     if provider_name == "google":
         # Existing Gemini-specific poll (uses Gemini API directly)
@@ -1087,7 +1091,7 @@ def _poll_video_completion(
             max_polls=max_polls, poll_interval=poll_interval,
         )
 
-    # ── Generic provider poll (Runway, future providers) ─────
+    # ── Provider lookup ─────
     provider = video_router.get_provider(provider_name)
     if not provider:
         print(f"[ASYNC] ERROR: Unknown provider {provider_name} for job {internal_job_id}")
@@ -1097,11 +1101,17 @@ def _poll_video_completion(
         ExpenseGuard.unregister_active_job(internal_job_id)
         return
 
-    # print(f"[ASYNC] Starting {provider_name} poll for upstream_id={upstream_id}")
+    # ── Vertex-specific: exponential backoff polling ─────
+    if provider_name == "vertex":
+        _poll_vertex_with_backoff(
+            internal_job_id, identity_id, reservation_id, upstream_id,
+            provider, store_meta,
+        )
+        return
 
+    # ── Generic provider poll (Runway, future providers) ─────
     consecutive_errors = 0
     max_consecutive_errors = 5
-    zero_progress_polls = 0  # Track polls with 0% progress
 
     for poll_num in range(1, max_polls + 1):
         try:
@@ -1110,24 +1120,15 @@ def _poll_video_completion(
             status_resp = provider.check_status(upstream_id)
             status = status_resp.get("status", "unknown")
 
-            # print(f"[ASYNC] Poll {poll_num}/{max_polls} for job {internal_job_id} ({provider_name}): status={status}")
-
             # Reset error counter on successful poll
             consecutive_errors = 0
 
-            # Processing — update progress
+            # Processing — update progress (log every 10 polls to reduce spam)
             if status == "processing":
                 progress = status_resp.get("progress", 0)
+                if poll_num == 1 or poll_num % 10 == 0:
+                    print(f"[ASYNC] Poll {poll_num} for job {internal_job_id} ({provider_name}): progress={progress}%")
 
-                # Track stuck operations (0% progress for > 5 polls)
-                if progress == 0:
-                    zero_progress_polls += 1
-                    if zero_progress_polls == 5:
-                        print(f"[ASYNC] WARNING: Job {internal_job_id} ({provider_name}) stuck at 0% progress after {zero_progress_polls} polls")
-                    elif zero_progress_polls > 5 and zero_progress_polls % 10 == 0:
-                        print(f"[ASYNC] WARNING: Job {internal_job_id} ({provider_name}) still at 0% after {zero_progress_polls} polls")
-                else:
-                    zero_progress_polls = 0  # Reset if progress advances
                 store = load_store()
                 store_meta["progress"] = progress
                 store_meta["status"] = "processing"
@@ -1153,21 +1154,28 @@ def _poll_video_completion(
                         print(f"[ASYNC] Error updating progress for {internal_job_id}: {e}")
 
             elif status == "done":
+                # Check for video_bytes (base64 decoded) or video_url
+                video_bytes = status_resp.get("video_bytes")
                 video_url = status_resp.get("video_url")
-                if video_url:
+
+                if video_bytes:
+                    _finalize_video_success_with_bytes(
+                        internal_job_id, identity_id, reservation_id,
+                        video_bytes, status_resp.get("content_type", "video/mp4"),
+                        store_meta, provider_name=provider_name,
+                    )
+                elif video_url:
                     _finalize_video_success(
                         internal_job_id, identity_id, reservation_id,
                         video_url, store_meta, provider_name=provider_name,
                     )
                 else:
-                    # Log missing video_url in response
-                    print(f"[ASYNC] ERROR: Job {internal_job_id} ({provider_name}) status=done but video_url missing from response: {status_resp}")
-                    raise RuntimeError(f"{provider_name}_video_failed: Task done but no video_url")
+                    print(f"[ASYNC] ERROR: Job {internal_job_id} ({provider_name}) done but no video data: {list(status_resp.keys())}")
+                    raise RuntimeError(f"{provider_name}_video_failed: Task done but no video data")
                 return
 
             elif status in ("failed", "error"):
                 error_code = status_resp.get("error", f"{provider_name}_video_failed")
-                print(f"[ASYNC] ERROR: Job {internal_job_id} ({provider_name}) failed: {error_code} - {status_resp.get('message', 'Unknown error')}")
                 error_msg = status_resp.get("message", "Video generation failed")
                 is_retryable = status == "error"
 
@@ -1207,6 +1215,298 @@ def _poll_video_completion(
     ExpenseGuard.unregister_active_job(internal_job_id)
 
 
+def _poll_vertex_with_backoff(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    upstream_id: str,
+    provider,
+    store_meta: dict,
+):
+    """
+    Vertex-specific polling with exponential backoff.
+
+    - Initial delay: 2s
+    - Max delay: 10s
+    - Total timeout: ~6 minutes (360s)
+    - No progress warnings (Vertex often shows 0% until done)
+    """
+    INITIAL_DELAY = 2
+    MAX_DELAY = 10
+    TIMEOUT_SECONDS = 360  # 6 minutes for fast model
+
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    current_delay = INITIAL_DELAY
+    elapsed = 0
+    poll_count = 0
+
+    print(f"[ASYNC] Starting Vertex poll for job {internal_job_id} (timeout={TIMEOUT_SECONDS}s)")
+
+    while elapsed < TIMEOUT_SECONDS:
+        try:
+            time.sleep(current_delay)
+            elapsed += current_delay
+            poll_count += 1
+
+            status_resp = provider.check_status(upstream_id)
+            status = status_resp.get("status", "unknown")
+
+            # Reset error counter on successful poll
+            consecutive_errors = 0
+
+            # Log progress sparingly (every 30s or on status change)
+            if poll_count == 1 or elapsed % 30 < current_delay:
+                progress = status_resp.get("progress", 0)
+                print(f"[ASYNC] Vertex poll #{poll_count} ({elapsed}s): status={status}, progress={progress}%")
+
+            if status == "processing":
+                # Update store (no warnings for 0% - Vertex doesn't report progress)
+                progress = status_resp.get("progress", 0)
+                store = load_store()
+                store_meta["progress"] = progress
+                store_meta["status"] = "processing"
+                store[internal_job_id] = store_meta
+                save_store(store)
+
+                # Exponential backoff: increase delay up to max
+                current_delay = min(current_delay * 1.5, MAX_DELAY)
+
+            elif status == "done":
+                # Check for video_bytes (base64 decoded) or video_url
+                video_bytes = status_resp.get("video_bytes")
+                video_url = status_resp.get("video_url")
+
+                print(f"[ASYNC] Vertex job {internal_job_id} completed in {elapsed}s")
+
+                if video_bytes:
+                    _finalize_video_success_with_bytes(
+                        internal_job_id, identity_id, reservation_id,
+                        video_bytes, status_resp.get("content_type", "video/mp4"),
+                        store_meta, provider_name="vertex",
+                    )
+                elif video_url:
+                    _finalize_video_success(
+                        internal_job_id, identity_id, reservation_id,
+                        video_url, store_meta, provider_name="vertex",
+                    )
+                else:
+                    print(f"[ASYNC] ERROR: Vertex job {internal_job_id} done but no video data: {list(status_resp.keys())}")
+                    raise RuntimeError("vertex_video_failed: Task done but no video data")
+                return
+
+            elif status in ("failed", "error"):
+                error_code = status_resp.get("error", "vertex_video_failed")
+                error_msg = status_resp.get("message", "Video generation failed")
+
+                print(f"[ASYNC] Vertex video failed for job {internal_job_id}: {error_code} - {error_msg}")
+
+                if reservation_id:
+                    release_job_credits(reservation_id, error_code, internal_job_id)
+                update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
+                ExpenseGuard.unregister_active_job(internal_job_id)
+                return
+
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"[ASYNC] Error polling Vertex for job {internal_job_id} (attempt {consecutive_errors}): {e}")
+
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"[ASYNC] Too many Vertex poll errors for job {internal_job_id}, failing")
+                if reservation_id:
+                    release_job_credits(reservation_id, "vertex_poll_error", internal_job_id)
+                update_job_status_failed(internal_job_id, f"vertex_poll_error: {e}")
+                ExpenseGuard.unregister_active_job(internal_job_id)
+                return
+
+            # On error, use shorter delay for retry
+            current_delay = INITIAL_DELAY
+
+    # Timeout
+    print(f"[ASYNC] Timeout: Vertex video job {internal_job_id} did not complete after {TIMEOUT_SECONDS}s")
+    if reservation_id:
+        release_job_credits(reservation_id, "vertex_timeout", internal_job_id)
+    update_job_status_failed(
+        internal_job_id,
+        f"vertex_timeout: Video generation did not complete within {TIMEOUT_SECONDS} seconds",
+    )
+    ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+def _finalize_video_success_with_bytes(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    video_bytes: bytes,
+    content_type: str,
+    store_meta: dict,
+    provider_name: str = "vertex",
+):
+    """
+    Finalize a successful video generation when we already have the video bytes.
+
+    Used by Vertex when it returns base64 encoded video directly (no URL to download).
+
+    1. Upload video bytes to S3
+    2. Extract and upload thumbnail
+    3. Update job status and store
+    4. Finalize credits (CAPTURE, not release)
+    """
+    import base64 as b64_module
+
+    print(f"[ASYNC] Finalizing {provider_name} video with {len(video_bytes)} bytes for job {internal_job_id}")
+
+    final_video_url = None
+    s3_video_url = None
+    s3_thumbnail_url = None
+
+    # Upload to S3
+    if AWS_BUCKET_MODELS:
+        try:
+            ext = ".mp4"
+            if "webm" in content_type:
+                ext = ".webm"
+
+            # S3 key: videos/{provider}/{identity}/{job_id}.mp4
+            video_b64 = f"data:{content_type};base64,{b64_module.b64encode(video_bytes).decode('utf-8')}"
+            s3_video_url = safe_upload_to_s3(
+                video_b64,
+                content_type,
+                "videos",
+                f"{provider_name}_{internal_job_id}",
+                user_id=identity_id,
+                key_base=f"videos/{provider_name}/{identity_id or 'public'}/{internal_job_id}{ext}",
+                provider=provider_name,
+            )
+
+            if s3_video_url:
+                print(f"[ASYNC] Uploaded video to S3: {s3_video_url}")
+                final_video_url = s3_video_url
+
+                # Extract and upload thumbnail
+                try:
+                    thumb_bytes = extract_video_thumbnail(video_bytes, timestamp_sec=1.0)
+                    if thumb_bytes:
+                        thumb_b64 = f"data:image/jpeg;base64,{b64_module.b64encode(thumb_bytes).decode('utf-8')}"
+                        s3_thumbnail_url = safe_upload_to_s3(
+                            thumb_b64,
+                            "image/jpeg",
+                            "thumbnails",
+                            f"{provider_name}_thumb_{internal_job_id}",
+                            user_id=identity_id,
+                            key_base=f"thumbnails/{identity_id or 'public'}/{internal_job_id}.jpg",
+                            provider=provider_name,
+                        )
+                        if s3_thumbnail_url:
+                            print(f"[ASYNC] Uploaded thumbnail to S3: {s3_thumbnail_url}")
+                    else:
+                        print(f"[ASYNC] WARNING: Thumbnail extraction returned None for {internal_job_id}")
+                        s3_thumbnail_url = s3_video_url
+                except Exception as thumb_err:
+                    print(f"[ASYNC] WARNING: Thumbnail extraction failed for {internal_job_id}: {thumb_err}")
+                    s3_thumbnail_url = s3_video_url
+            else:
+                print(f"[ASYNC] ERROR: S3 upload returned no URL for {internal_job_id}")
+
+        except Exception as e:
+            print(f"[ASYNC] ERROR: Failed to upload video to S3 for {internal_job_id}: {e}")
+
+    if not final_video_url:
+        # This is a critical error - we have bytes but couldn't upload to S3
+        print(f"[ASYNC] ERROR: No final video URL for {internal_job_id}, failing job")
+        if reservation_id:
+            release_job_credits(reservation_id, "s3_upload_failed", internal_job_id)
+        update_job_status_failed(internal_job_id, "s3_upload_failed: Could not upload video to storage")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
+
+    # Update store
+    store = load_store()
+    store_meta["status"] = "done"
+    store_meta["video_url"] = final_video_url
+    if s3_video_url:
+        store_meta["s3_video_url"] = s3_video_url
+    if s3_thumbnail_url:
+        store_meta["thumbnail_url"] = s3_thumbnail_url
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    # Finalize credits (CAPTURE - charge the user)
+    finalize_result = finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    new_balance = finalize_result.get("new_balance")
+
+    if finalize_result.get("success"):
+        print(f"[ASYNC] Credits CAPTURED for {provider_name} video job {internal_job_id} new_balance={new_balance}")
+        store_meta["new_balance"] = new_balance
+        store_meta["credits_charged"] = finalize_result.get("cost")
+    elif reservation_id:
+        print(f"[ASYNC] WARNING: Credits finalize returned False for job {internal_job_id}")
+
+    # Save to normalized tables (videos + history_items)
+    prompt = store_meta.get("prompt", "")
+    duration_seconds = store_meta.get("duration_seconds")
+    if duration_seconds:
+        try:
+            duration_seconds = int(duration_seconds)
+        except (ValueError, TypeError):
+            duration_seconds = None
+
+    save_video_to_normalized_db(
+        video_id=internal_job_id,
+        video_url=str(final_video_url) if final_video_url else "",
+        prompt=prompt,
+        duration_seconds=duration_seconds,
+        resolution=store_meta.get("resolution"),
+        aspect_ratio=store_meta.get("aspect_ratio"),
+        thumbnail_url=str(s3_thumbnail_url) if s3_thumbnail_url else None,
+        user_id=identity_id,
+        provider=provider_name,
+        s3_video_url=str(s3_video_url) if s3_video_url else None,
+    )
+
+    # Update job status
+    update_job_status_ready(
+        internal_job_id,
+        upstream_job_id=store_meta.get("upstream_id") or store_meta.get("operation_name") or "",
+    )
+
+    # Unregister active job
+    ExpenseGuard.unregister_active_job(internal_job_id)
+
+    # Update meta with video_url in jobs table
+    if USE_DB:
+        try:
+            meta_update = {
+                "video_url": final_video_url,
+                "progress": 100,
+                "provider": provider_name,
+            }
+            if s3_video_url:
+                meta_update["s3_video_url"] = s3_video_url
+            if s3_thumbnail_url:
+                meta_update["thumbnail_url"] = s3_thumbnail_url
+            if new_balance is not None:
+                meta_update["new_balance"] = new_balance
+            if store_meta.get("credits_charged") is not None:
+                meta_update["credits_charged"] = store_meta.get("credits_charged")
+
+            with get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
+                        WHERE id::text = %s
+                        """,
+                        (json.dumps(meta_update), internal_job_id),
+                    )
+                conn.commit()
+        except Exception as e:
+            print(f"[ASYNC] Error updating video_url for {internal_job_id}: {e}")
+
+    print(f"[ASYNC] {provider_name} video job {internal_job_id} completed successfully")
+
+
 def _finalize_video_success(
     internal_job_id: str,
     identity_id: str,
@@ -1226,7 +1526,7 @@ def _finalize_video_success(
     Works for any provider — uses the VideoRouter to get the right
     download method.
     """
-    # print(f"[ASYNC] Video completed for job {internal_job_id} ({provider_name}): {video_url[:100]}...")
+    print(f"[ASYNC] Finalizing {provider_name} video for job {internal_job_id}: {video_url[:80]}...")
 
     final_video_url = video_url
     s3_video_url = None
@@ -1237,7 +1537,7 @@ def _finalize_video_success(
         try:
             provider = video_router.get_provider(provider_name)
 
-            # print(f"[ASYNC] Downloading video from {provider_name} for S3 upload...")
+            print(f"[ASYNC] Downloading video from {provider_name} for S3 upload...")
             if provider:
                 video_bytes, content_type = provider.download_video(video_url)
             else:
