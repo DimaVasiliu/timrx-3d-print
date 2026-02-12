@@ -434,6 +434,37 @@ def vertex_image_to_video(
     return _execute_video_start_request(url, payload, "image-to-video")
 
 
+def _normalize_operation_name(operation_name: str) -> str:
+    """
+    Normalize operation name to the correct polling path.
+
+    Vertex returns operation names like:
+      projects/{project}/locations/{location}/publishers/google/models/{model}/operations/{op_id}
+
+    But polling should use:
+      projects/{project}/locations/{location}/operations/{op_id}
+
+    This function extracts the operation ID and builds the correct path.
+    """
+    # If it contains /publishers/google/models/, extract just the operation ID
+    # and rebuild with the correct path
+    if "/publishers/google/models/" in operation_name and "/operations/" in operation_name:
+        # Extract: projects/{project}/locations/{location} and operations/{op_id}
+        # From: projects/{project}/locations/{location}/publishers/google/models/{model}/operations/{op_id}
+        parts = operation_name.split("/operations/")
+        if len(parts) == 2:
+            op_id = parts[1]
+            # Extract project and location from the beginning
+            # projects/{project}/locations/{location}/publishers/...
+            prefix_parts = parts[0].split("/publishers/")[0]  # projects/{project}/locations/{location}
+            normalized = f"{prefix_parts}/operations/{op_id}"
+            print(f"[Vertex Veo] Normalized operation path: {operation_name[:60]}... -> {normalized}")
+            return normalized
+
+    # Already in correct format or just an operation ID
+    return operation_name
+
+
 def vertex_video_status(operation_name: str) -> Dict[str, Any]:
     """
     Check the status of a long-running video generation operation.
@@ -441,6 +472,7 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
     Args:
         operation_name: The operation name from the start response
                         Format: "projects/.../locations/.../operations/..."
+                        or: "projects/.../publishers/google/models/.../operations/..."
 
     Returns:
         Dict with:
@@ -450,23 +482,30 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
         - error: error message (if failed)
     """
     location = _get_vertex_location()
+    project = _get_project_id()
+
+    # Normalize the operation name to the correct polling path
+    normalized_op = _normalize_operation_name(operation_name)
 
     # Build status URL
-    # Operation names from Vertex are full paths like:
-    # projects/{project}/locations/{location}/publishers/google/models/{model}/operations/{op_id}
-    if operation_name.startswith("projects/"):
-        url = f"https://{location}-aiplatform.googleapis.com/v1/{operation_name}"
+    if normalized_op.startswith("projects/"):
+        url = f"https://{location}-aiplatform.googleapis.com/v1/{normalized_op}"
     else:
-        # Assume it's just the operation ID - need to build full path
-        project = _get_project_id()
-        url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/operations/{operation_name}"
+        # Assume it's just the operation ID - build full path
+        url = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/operations/{normalized_op}"
 
     try:
-        print(f"[Vertex Veo] Polling: {operation_name[:80]}...")
+        print(f"[Vertex Veo] Polling operation: {normalized_op}")
+        print(f"[Vertex Veo] Poll URL: {url}")
         r = requests.get(url, headers=_get_headers(), timeout=VERTEX_TIMEOUT)
 
         if not r.ok:
-            error_text = r.text[:300] if r.text else "No error details"
+            # Check if response is HTML (wrong endpoint/host)
+            content_type = r.headers.get("Content-Type", "")
+            if "text/html" in content_type:
+                error_text = f"[HTML Response - wrong endpoint?] {r.text[:200]}"
+            else:
+                error_text = r.text[:300] if r.text else "No error details"
             print(f"[Vertex Veo] Poll failed: {r.status_code} - {error_text}")
 
             if r.status_code == 404:
