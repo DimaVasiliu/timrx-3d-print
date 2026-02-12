@@ -468,6 +468,54 @@ class Config:
     RUNWAY_API_VERSION: str = field(default_factory=lambda: _get_env("RUNWAY_API_VERSION", "2024-11-06"))
 
     # ─────────────────────────────────────────────────────────────
+    # Vertex AI (Veo) Video Generation
+    # ─────────────────────────────────────────────────────────────
+    # Provider selection: "vertex" (production) or "aistudio" (fallback)
+    VIDEO_PROVIDER: str = field(default_factory=lambda: _get_env("VIDEO_PROVIDER", "vertex").lower())
+
+    # Google Cloud project and credentials
+    GOOGLE_CLOUD_PROJECT: str = field(default_factory=lambda: _get_env("GOOGLE_CLOUD_PROJECT"))
+    GOOGLE_CLOUD_REGION: str = field(default_factory=lambda: _get_env("GOOGLE_CLOUD_REGION", "europe-west2"))
+
+    # Service account credentials JSON (full JSON string for Render deployments)
+    GOOGLE_APPLICATION_CREDENTIALS_JSON: str = field(default_factory=lambda: _get_env("GOOGLE_APPLICATION_CREDENTIALS_JSON"))
+
+    # Vertex AI location - MUST be us-central1 for Veo quota
+    VERTEX_LOCATION: str = field(default_factory=lambda: _get_env("VERTEX_LOCATION", "us-central1"))
+
+    # Vertex AI Veo models
+    VERTEX_MODEL_FAST: str = field(default_factory=lambda: _get_env("VERTEX_MODEL_FAST", "veo-3.1-fast-generate-001"))
+    VERTEX_MODEL_HQ: str = field(default_factory=lambda: _get_env("VERTEX_MODEL_HQ", "veo-3.1-generate-001"))
+
+    # Video quality: "fast" or "hq" (determines which Veo model to use)
+    VIDEO_QUALITY: str = field(default_factory=lambda: _get_env("VIDEO_QUALITY", "fast").lower())
+
+    @property
+    def USE_VERTEX_VIDEO(self) -> bool:
+        """True if Vertex AI should be used for video generation."""
+        return self.VIDEO_PROVIDER == "vertex"
+
+    @property
+    def USE_AISTUDIO_VIDEO(self) -> bool:
+        """True if AI Studio should be used for video generation."""
+        return self.VIDEO_PROVIDER == "aistudio"
+
+    @property
+    def VERTEX_VEO_MODEL(self) -> str:
+        """Get the appropriate Veo model based on VIDEO_QUALITY setting."""
+        if self.VIDEO_QUALITY == "hq":
+            return self.VERTEX_MODEL_HQ
+        return self.VERTEX_MODEL_FAST
+
+    @property
+    def VERTEX_CONFIGURED(self) -> bool:
+        """True if Vertex AI is configured for video generation."""
+        return bool(
+            self.GOOGLE_CLOUD_PROJECT and
+            (self.GOOGLE_APPLICATION_CREDENTIALS_JSON or _get_env("GOOGLE_APPLICATION_CREDENTIALS"))
+        )
+
+    # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
     # ─────────────────────────────────────────────────────────────
     DEFAULT_MODEL_TITLE: str = "3D Model"
