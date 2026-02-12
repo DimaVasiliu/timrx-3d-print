@@ -568,35 +568,52 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
                     "message": error_msg,
                 }
 
-            # Extract video URL from response
-            video_url = _extract_video_url(result)
-            if video_url:
-                print(f"[Vertex Veo] Video ready: {video_url[:100]}...")
+            # Extract video data from response (handles both base64 and URLs)
+            video_data = _extract_video_data(result)
+
+            if video_data.get("video_bytes"):
+                # Base64 video bytes - return them for upload to S3
+                print(f"[Vertex Veo] Video ready: {len(video_data['video_bytes'])} bytes (base64)")
                 return {
                     "status": "done",
-                    "video_url": video_url,
+                    "video_bytes": video_data["video_bytes"],
+                    "content_type": video_data.get("content_type", "video/mp4"),
                 }
-            else:
-                # Check for content filtering
-                response = result.get("response", {})
-                video_response = response.get("generateVideoResponse", {})
-                filtered_reasons = video_response.get("raiMediaFilteredReasons", [])
 
-                if filtered_reasons:
-                    reasons_str = ", ".join(str(r) for r in filtered_reasons)
-                    print(f"[Vertex Veo] Content filtered: {reasons_str}")
-                    return {
-                        "status": "failed",
-                        "error": "provider_filtered_content",
-                        "message": "Content blocked by safety filters. Try removing faces/logos/copyrighted content.",
-                        "filtered_reasons": filtered_reasons,
-                    }
+            if video_data.get("video_url"):
+                # URL reference (GCS or HTTPS)
+                print(f"[Vertex Veo] Video ready: {video_data['video_url'][:100]}...")
+                return {
+                    "status": "done",
+                    "video_url": video_data["video_url"],
+                }
 
-                print(f"[Vertex Veo] No video URL in response: {json.dumps(result, default=str)[:500]}")
+            # No video found - check for content filtering
+            response = result.get("response", {})
+            video_response = response.get("generateVideoResponse", {})
+            filtered_reasons = video_response.get("raiMediaFilteredReasons", [])
+
+            # Also check at response level
+            if not filtered_reasons:
+                filtered_reasons = response.get("raiMediaFilteredReasons", [])
+
+            if filtered_reasons:
+                reasons_str = ", ".join(str(r) for r in filtered_reasons)
+                print(f"[Vertex Veo] Content filtered: {reasons_str}")
                 return {
                     "status": "failed",
-                    "error": "vertex_video_failed",
-                    "message": "No video in response",
+                    "error": "provider_filtered_content",
+                    "message": "Content blocked by safety filters. Try removing faces/logos/copyrighted content.",
+                    "filtered_reasons": filtered_reasons,
+                }
+
+            # Log full response for debugging
+            print(f"[Vertex Veo] No video data in response. Keys: {list(response.keys())}")
+            print(f"[Vertex Veo] Full response: {json.dumps(result, default=str)[:800]}")
+            return {
+                "status": "failed",
+                "error": "vertex_video_failed",
+                "message": "No video in response",
                 }
 
         # Still processing
@@ -832,32 +849,94 @@ def _execute_video_start_request(
     raise RuntimeError(f"vertex_video_failed: Request failed after {MAX_RETRIES} attempts: {last_error}")
 
 
-def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
-    """Extract video URL from completed operation response."""
+def _extract_video_data(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract video data from completed Vertex operation response.
+
+    Vertex can return video in multiple formats:
+    1. Base64 bytes: response.videos[0].bytesBase64Encoded
+    2. GCS URI: response.videos[0].gcsUri
+    3. Legacy formats with generatedSamples or predictions
+
+    Returns:
+        Dict with either:
+        - {"video_bytes": bytes, "content_type": "video/mp4"} for base64 data
+        - {"video_url": "gs://..." or "https://..."} for URL references
+        - {} if no video found
+    """
     response = result.get("response", {})
 
-    # Format 1: generateVideoResponse.generatedSamples[0].video.uri
+    # Format 1: Vertex Veo response.videos[0] (CURRENT PRIMARY FORMAT)
+    # This is what Vertex AI Veo actually returns
+    videos = response.get("videos", [])
+    if videos:
+        video_item = videos[0]
+
+        # Check for base64 encoded bytes (most common for Vertex Veo)
+        b64_data = video_item.get("bytesBase64Encoded")
+        if b64_data:
+            try:
+                video_bytes = base64.b64decode(b64_data)
+                print(f"[Vertex Veo] Extracted {len(video_bytes)} bytes from base64 response")
+                return {
+                    "video_bytes": video_bytes,
+                    "content_type": "video/mp4",
+                }
+            except Exception as e:
+                print(f"[Vertex Veo] Failed to decode base64 video: {e}")
+
+        # Check for GCS URI
+        gcs_uri = video_item.get("gcsUri")
+        if gcs_uri:
+            print(f"[Vertex Veo] Found GCS URI: {gcs_uri[:80]}...")
+            return {"video_url": gcs_uri}
+
+        # Check for direct URI
+        uri = video_item.get("uri")
+        if uri:
+            print(f"[Vertex Veo] Found URI: {uri[:80]}...")
+            return {"video_url": uri}
+
+    # Format 2: generateVideoResponse.generatedSamples (legacy/alternative)
     video_response = response.get("generateVideoResponse", {})
     generated_samples = video_response.get("generatedSamples", [])
     if generated_samples:
         video_info = generated_samples[0].get("video", {})
-        video_url = video_info.get("uri")
+        video_url = video_info.get("uri") or video_info.get("gcsUri")
         if video_url:
-            return video_url
+            return {"video_url": video_url}
 
-    # Format 2: direct generatedSamples
+        # Check for base64 in this format too
+        b64_data = video_info.get("bytesBase64Encoded")
+        if b64_data:
+            try:
+                video_bytes = base64.b64decode(b64_data)
+                return {"video_bytes": video_bytes, "content_type": "video/mp4"}
+            except Exception:
+                pass
+
+    # Format 3: direct generatedSamples at response level
     generated_samples = response.get("generatedSamples", [])
     if generated_samples:
         video_url = generated_samples[0].get("video", {}).get("uri")
         if video_url:
-            return video_url
+            return {"video_url": video_url}
 
-    # Format 3: predictions format
+    # Format 4: predictions format (older API)
     predictions = response.get("predictions", [])
     if predictions:
         video_data = predictions[0]
         video_url = video_data.get("videoUri") or video_data.get("video", {}).get("uri")
         if video_url:
-            return video_url
+            return {"video_url": video_url}
 
-    return None
+    return {}
+
+
+def _extract_video_url(result: Dict[str, Any]) -> Optional[str]:
+    """
+    Legacy function - extracts video URL only.
+    For full extraction including base64, use _extract_video_data().
+    """
+    data = _extract_video_data(result)
+    return data.get("video_url")
