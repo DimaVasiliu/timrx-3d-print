@@ -136,6 +136,62 @@ class VertexQuotaError(Exception):
     pass
 
 
+class VertexResolutionNotAllowed(Exception):
+    """Raised when requested resolution is not allowed for this Vertex project."""
+    def __init__(self, resolution: str, allowed: list, message: str = ""):
+        self.resolution = resolution
+        self.allowed = allowed
+        self.message = message or f"Resolution {resolution} is not allowed. Allowed: {allowed}"
+        super().__init__(self.message)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VERTEX CAPABILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# 4k resolution requires explicit allowlisting per GCP project.
+# Most projects only have 720p and 1080p by default.
+# To avoid wasted credits (reserve -> fail -> release), block 4k upfront.
+#
+# Set VERTEX_ALLOW_4K=true in env if your project has 4k allowlisted.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Check if 4k is enabled for this project
+VERTEX_ALLOW_4K = os.getenv("VERTEX_ALLOW_4K", "").lower() in ("true", "1", "yes")
+
+# Supported resolutions for Vertex (depends on project allowlisting)
+VERTEX_SUPPORTED_RESOLUTIONS = {"720p", "1080p"}
+if VERTEX_ALLOW_4K:
+    VERTEX_SUPPORTED_RESOLUTIONS.add("4k")
+
+
+def check_vertex_resolution(resolution: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if resolution is supported by Vertex for this project.
+
+    Args:
+        resolution: Requested resolution (e.g., "720p", "1080p", "4k")
+
+    Returns:
+        (True, None) if supported
+        (False, error_message) if not supported
+    """
+    resolution = resolution.lower()
+    if resolution == "4K":
+        resolution = "4k"
+
+    if resolution not in VERTEX_SUPPORTED_RESOLUTIONS:
+        if resolution == "4k" and not VERTEX_ALLOW_4K:
+            return False, (
+                "4k resolution requires explicit GCP project allowlisting. "
+                "Please use 720p or 1080p instead. "
+                "If your project has 4k access, set VERTEX_ALLOW_4K=true in environment."
+            )
+        return False, f"Resolution {resolution} not supported. Use: {', '.join(sorted(VERTEX_SUPPORTED_RESOLUTIONS))}"
+
+    return True, None
+
+
 def _get_service_account_info() -> Dict[str, Any]:
     """
     Get service account credentials from environment.
