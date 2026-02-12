@@ -38,14 +38,20 @@ from backend.services.gemini_video_service import (
     GeminiValidationError,
 )
 from backend.services.vertex_video_service import check_vertex_resolution
-from backend.services.video_router import video_router, get_runway_provider
+from backend.services.video_router import video_router, get_runway_provider, get_luma_provider
 from backend.services.video_prompts import (
     normalize_text_prompt,
     normalize_motion_prompt,
     get_style_presets,
     get_motion_presets,
 )
-from backend.services.pricing_service import get_video_action_code, get_video_credit_cost
+from backend.services.pricing_service import (
+    get_video_action_code,
+    get_video_credit_cost,
+    get_luma_action_code,
+    get_luma_credit_cost,
+    get_luma_quality_tier_info,
+)
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("video", __name__)
@@ -1309,4 +1315,235 @@ def runway_provider_status():
     return jsonify({
         "ok": True, "provider": "runway", "configured": configured,
         "available": configured, "error": config_err if not configured else None,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LUMA DREAM MACHINE VIDEO ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bp.route("/video/luma/generate", methods=["POST", "OPTIONS"])
+@with_session
+def luma_video_generate():
+    """
+    Generate video using Luma Dream Machine.
+
+    Request body:
+    {
+        "task": "text2video" or "image2video",
+        "prompt": "A serene forest...",
+        "image_data": "https://...",     # Required for image2video
+        "duration_sec": 6,               # 4, 6, 8
+        "aspect_ratio": "16:9",          # "16:9", "9:16", "1:1"
+        "quality_tier": "studio_hd",     # "fast_preview", "studio_hd", "pro_full_hd"
+        "style_preset": "cinematic",     # Optional style hint
+        "motion_preset": "pan",          # Optional camera motion
+        "custom_motion": "slow dolly",   # Optional custom motion text
+        "loop": false                    # Whether video should loop
+    }
+
+    Quality Tiers:
+    - fast_preview:  Ray2 Flash 720p (cheapest, fastest)
+    - studio_hd:     Ray2 720p (balanced)
+    - pro_full_hd:   Ray2 1080p (highest quality)
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    luma = get_luma_provider()
+    configured, config_err = luma.is_configured()
+    if not configured:
+        return jsonify({
+            "error": "luma_not_configured",
+            "message": f"Luma is not configured: {config_err}",
+            "details": {"hint": "Set LUMA_API_KEY environment variable"}
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+
+    task = (body.get("task") or "text2video").lower()
+    if task not in ("text2video", "image2video"):
+        return jsonify({
+            "error": "invalid_params",
+            "message": "task must be 'text2video' or 'image2video'",
+            "field": "task"
+        }), 400
+
+    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or 6
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
+    quality_tier = body.get("quality_tier") or body.get("qualityTier") or "studio_hd"
+    style_preset = body.get("style_preset") or body.get("stylePreset")
+    motion_preset = body.get("motion_preset") or body.get("motionPreset")
+    custom_motion = (body.get("custom_motion") or body.get("customMotion") or "").strip()
+    loop = body.get("loop", False)
+    seed = body.get("seed")
+
+    try:
+        duration_seconds = int(raw_duration)
+    except (ValueError, TypeError):
+        duration_seconds = 6
+
+    # Clamp duration to valid values (4, 6, 8)
+    if duration_seconds <= 4:
+        duration_seconds = 4
+    elif duration_seconds <= 6:
+        duration_seconds = 6
+    else:
+        duration_seconds = 8
+
+    # Validate quality tier
+    valid_tiers = ["fast_preview", "studio_hd", "pro_full_hd"]
+    tier_normalized = quality_tier.lower().replace(" ", "_").replace("-", "_")
+    if tier_normalized not in valid_tiers:
+        tier_normalized = "studio_hd"
+
+    # Task-specific validation
+    if task == "text2video":
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt:
+            return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
+        image_data = None
+    else:
+        image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
+        if not image_data:
+            return jsonify({"error": "invalid_params", "message": "image_data is required", "field": "image_data"}), 400
+        prompt = body.get("motion") or body.get("prompt") or ""
+
+    # Apply style and motion presets to prompt
+    enhanced_prompt = prompt
+    if style_preset:
+        enhanced_prompt = normalize_text_prompt(prompt, style_preset, duration_seconds)
+    if motion_preset or custom_motion:
+        motion_text = normalize_motion_prompt(custom_motion or "", motion_preset)
+        if motion_text and motion_text not in enhanced_prompt:
+            enhanced_prompt = f"{enhanced_prompt}. {motion_text}" if enhanced_prompt else motion_text
+
+    internal_job_id = str(uuid.uuid4())
+
+    # Get Luma-specific action code and cost
+    action_key = get_luma_action_code(task, tier_normalized, duration_seconds)
+    expected_cost = get_luma_credit_cost(tier_normalized, duration_seconds)
+
+    print(f"[LUMA] Reserving credits: action_code={action_key} cost={expected_cost} tier={tier_normalized} duration={duration_seconds}s")
+
+    reservation_id, credit_error = start_paid_job(
+        identity_id, action_key, internal_job_id,
+        {
+            "task": task,
+            "provider": "luma",
+            "prompt": enhanced_prompt[:100] if enhanced_prompt else None,
+            "duration_seconds": duration_seconds,
+            "quality_tier": tier_normalized,
+            "expected_cost": expected_cost,
+        },
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "video",
+        "created_at": now_s() * 1000,
+        "task": task,
+        "provider": "luma",
+        "prompt": enhanced_prompt,
+        "original_prompt": prompt,
+        "duration_seconds": duration_seconds,
+        "aspect_ratio": aspect_ratio,
+        "quality_tier": tier_normalized,
+        "style_preset": style_preset,
+        "motion_preset": motion_preset,
+        "custom_motion": custom_motion,
+        "loop": loop,
+        "seed": seed,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+    }
+
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id or "",
+        provider="luma",
+        action_key=action_key,
+        prompt=enhanced_prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    payload = {
+        "task": task,
+        "prompt": enhanced_prompt,
+        "image_data": image_data,
+        "aspect_ratio": aspect_ratio,
+        "duration_seconds": duration_seconds,
+        "quality_tier": tier_normalized,
+        "loop": loop,
+        "seed": seed,
+    }
+
+    from backend.services.async_dispatch import dispatch_luma_video_async  # noqa: E402
+    ExpenseGuard.register_active_job(internal_job_id)
+    get_executor().submit(dispatch_luma_video_async, internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+    log_event("video/luma/generate:dispatched", {"internal_job_id": internal_job_id, "task": task, "quality_tier": tier_normalized})
+
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "video_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "status": "queued",
+        "task": task,
+        "provider": "luma",
+        "params": {
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": duration_seconds,
+            "quality_tier": tier_normalized,
+        },
+        "expected_cost": expected_cost,
+    })
+
+
+@bp.route("/video/luma/status", methods=["GET", "OPTIONS"])
+@with_session
+def luma_provider_status():
+    """Check if Luma provider is configured and available."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    luma = get_luma_provider()
+    configured, config_err = luma.is_configured()
+
+    return jsonify({
+        "ok": True,
+        "provider": "luma",
+        "configured": configured,
+        "available": configured,
+        "error": config_err if not configured else None,
+    })
+
+
+@bp.route("/video/luma/pricing", methods=["GET", "OPTIONS"])
+def luma_pricing():
+    """Get Luma quality tiers and pricing for frontend display."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    return jsonify({
+        "ok": True,
+        "provider": "luma",
+        "quality_tiers": get_luma_quality_tier_info(),
+        "durations": [4, 6, 8],
+        "aspect_ratios": ["16:9", "9:16", "1:1"],
     })
