@@ -1,5 +1,4 @@
-"""
-Vertex AI Veo Video Generation Service.
+"""Vertex AI Veo Video Generation Service.
 
 Uses Vertex AI's Long-Running Operations (LRO) API for video generation via Veo models.
 Authentication: Service Account JSON (GOOGLE_APPLICATION_CREDENTIALS_JSON env var).
@@ -24,10 +23,8 @@ For AI Studio (Fallback):
 ===============================================================================
 MODELS SUPPORTED
 ===============================================================================
-
 - veo-3.1-fast-generate-001: Fast model, lower latency, good for testing
 - veo-3.1-generate-001: High quality model, longer generation time
-
 ===============================================================================
 API ENDPOINTS
 ===============================================================================
