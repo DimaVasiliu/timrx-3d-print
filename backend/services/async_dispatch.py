@@ -41,6 +41,7 @@ from backend.services.video_router import (
     QuotaExhaustedError,
     ProviderUnavailableError,
     video_router,
+    get_runway_provider,
 )
 from backend.services.video_queue import video_queue
 
@@ -1397,3 +1398,129 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+
+def dispatch_runway_video_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+):
+    """
+    Dispatch video generation directly to Runway (no fallback).
+
+    This is the dedicated Runway path, separate from the Veo router.
+    Used when user explicitly selects Runway as the video provider.
+
+    Payload parameters:
+    - task: "text2video" or "image2video"
+    - prompt: Text prompt for video generation
+    - image_data: Base64 image for image2video
+    - aspect_ratio: "16:9", "9:16", "1:1", etc.
+    - duration_seconds: 4, 6, 8, or 10 (Runway supports 2-10s for image2video)
+    - seed: Optional random seed
+    """
+    start_time = time.time()
+    task = payload.get("task", "text2video")
+    print(f"[ASYNC] Starting Runway video {task} dispatch for job {internal_job_id}")
+
+    runway_provider = get_runway_provider()
+
+    try:
+        # Check if Runway is configured
+        configured, config_err = runway_provider.is_configured()
+        if not configured:
+            raise RuntimeError(f"runway_not_configured: {config_err}")
+
+        # Extract parameters
+        aspect_ratio = payload.get("aspect_ratio", "16:9")
+        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 6)
+
+        # Ensure duration_seconds is an integer
+        try:
+            if isinstance(duration_seconds, str):
+                duration_seconds = int(duration_seconds.replace("s", "").replace("sec", "").strip())
+            else:
+                duration_seconds = int(duration_seconds)
+        except (ValueError, TypeError):
+            duration_seconds = 6
+
+        seed = payload.get("seed")
+
+        route_params = dict(
+            aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            seed=seed,
+        )
+
+        # Call Runway directly
+        if task == "image2video":
+            prompt = payload.get("motion") or payload.get("prompt", "")
+            resp = runway_provider.start_image_to_video(
+                image_data=payload.get("image_data", ""),
+                prompt=prompt,
+                **route_params,
+            )
+        else:  # text2video
+            prompt = payload.get("prompt", "")
+            resp = runway_provider.start_text_to_video(
+                prompt=prompt,
+                **route_params,
+            )
+
+        store_meta["provider"] = "runway"
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Runway returns task_id
+        upstream_id = resp.get("task_id")
+
+        if upstream_id:
+            print(f"[ASYNC] Runway returned task_id={upstream_id} for job {internal_job_id} in {duration_ms}ms")
+
+            update_job_with_upstream_id(internal_job_id, upstream_id)
+
+            store = load_store()
+            store_meta["upstream_id"] = upstream_id
+            store_meta["task_id"] = upstream_id
+            store_meta["status"] = "processing"
+            store[internal_job_id] = store_meta
+            save_store(store)
+
+            # Poll for completion using the generic provider poller
+            _poll_video_completion(
+                internal_job_id,
+                identity_id,
+                reservation_id,
+                upstream_id,
+                "runway",
+                store_meta,
+            )
+        else:
+            raise RuntimeError("runway_failed: No task_id in response")
+
+    except QuotaExhaustedError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] Runway quota exhausted for job {internal_job_id} after {duration_ms}ms")
+        if reservation_id:
+            release_job_credits(reservation_id, "runway_quota_exhausted", internal_job_id)
+        update_job_status_failed(internal_job_id, f"runway_quota_exhausted: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+    except RuntimeError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        error_str = str(e)
+        print(f"[ASYNC] ERROR: Runway video {task} failed for job {internal_job_id} after {duration_ms}ms: {error_str}")
+        if reservation_id:
+            release_job_credits(reservation_id, "runway_failed", internal_job_id)
+        update_job_status_failed(internal_job_id, error_str)
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Unexpected Runway error for job {internal_job_id} after {duration_ms}ms: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "runway_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"runway_failed: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
