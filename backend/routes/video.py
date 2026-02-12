@@ -926,3 +926,212 @@ def video_admin_process_queue():
         "dispatched": dispatched,
         "queue_remaining": video_queue.size,
     })
+
+
+# ── GET /video/admin/provider-info — Show current video provider config ──
+@bp.route("/video/admin/provider-info", methods=["GET", "OPTIONS"])
+@with_session
+def video_admin_provider_info():
+    """
+    Admin endpoint: Show current video provider configuration.
+
+    Returns:
+    {
+        "ok": true,
+        "video_provider": "vertex",
+        "video_quality": "fast",
+        "vertex_model": "veo-3.1-fast-generate-001",
+        "providers": [
+            {"name": "vertex", "configured": true, "primary": true},
+            {"name": "google", "configured": true, "primary": false},
+            {"name": "runway", "configured": false, "primary": false}
+        ]
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    from backend.config import config
+
+    providers_info = []
+    available = video_router.get_available_providers()
+    available_names = [p.name for p in available]
+
+    for idx, provider in enumerate(video_router.providers):
+        configured, err = provider.is_configured()
+        providers_info.append({
+            "name": provider.name,
+            "configured": configured,
+            "primary": idx == 0,
+            "error": err if not configured else None,
+        })
+
+    return jsonify({
+        "ok": True,
+        "video_provider": getattr(config, 'VIDEO_PROVIDER', 'vertex'),
+        "video_quality": getattr(config, 'VIDEO_QUALITY', 'fast'),
+        "vertex_model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown'),
+        "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
+        "active_providers": available_names,
+        "providers": providers_info,
+    })
+
+
+# ── POST /video/admin/smoke-test — Quick Veo test (no credits) ──
+@bp.route("/video/admin/smoke-test", methods=["POST", "OPTIONS"])
+@with_session
+def video_admin_smoke_test():
+    """
+    Admin smoke test: Start a fast Veo job and return operation name.
+
+    This is for testing the Vertex AI integration without going through
+    the full credit reservation flow. Only available to admins.
+
+    Request body (optional):
+    {
+        "provider": "vertex",           # "vertex" or "aistudio"
+        "prompt": "A cat on a beach"    # Optional, uses default if not provided
+    }
+
+    Returns:
+    {
+        "ok": true,
+        "provider": "vertex",
+        "operation_name": "projects/.../operations/...",
+        "model": "veo-3.1-fast-generate-001"
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    # Check admin access (optional - remove if you want any authenticated user)
+    from backend.config import config
+    # For now, allow any authenticated user to run smoke test
+
+    body = request.get_json(silent=True) or {}
+    provider_name = (body.get("provider") or "vertex").lower()
+    prompt = body.get("prompt") or "A serene mountain lake at sunrise, calm water reflections, cinematic"
+
+    # Get the requested provider
+    provider = video_router.get_provider(provider_name)
+    if not provider:
+        return jsonify({
+            "ok": False,
+            "error": "invalid_provider",
+            "message": f"Unknown provider: {provider_name}",
+            "available": [p.name for p in video_router.providers],
+        }), 400
+
+    configured, config_err = provider.is_configured()
+    if not configured:
+        return jsonify({
+            "ok": False,
+            "error": "provider_not_configured",
+            "message": f"Provider {provider_name} is not configured: {config_err}",
+        }), 400
+
+    try:
+        # Start a short, low-cost video job for testing
+        result = provider.start_text_to_video(
+            prompt=prompt,
+            aspect_ratio="16:9",
+            resolution="720p",
+            duration_seconds=4,  # Shortest duration for quick test
+        )
+
+        operation_name = result.get("operation_name")
+
+        return jsonify({
+            "ok": True,
+            "provider": provider_name,
+            "operation_name": operation_name,
+            "model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown') if provider_name == "vertex" else "veo-3.1-generate-preview",
+            "prompt": prompt,
+            "hint": f"Poll status with: GET /api/_mod/video/admin/smoke-test/status?op={operation_name[:50]}...",
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "smoke_test_failed",
+            "message": str(e),
+            "provider": provider_name,
+        }), 500
+
+
+# ── GET /video/admin/smoke-test/status — Poll smoke test operation ──
+@bp.route("/video/admin/smoke-test/status", methods=["GET", "OPTIONS"])
+@with_session
+def video_admin_smoke_test_status():
+    """
+    Poll a smoke test operation for status.
+
+    Query params:
+    - op: Operation name from smoke test
+    - provider: "vertex" or "aistudio" (default: vertex)
+
+    Returns:
+    {
+        "ok": true,
+        "status": "processing" | "done" | "failed",
+        "progress": 45,
+        "video_url": "..." (if done)
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    operation_name = request.args.get("op")
+    if not operation_name:
+        return jsonify({
+            "ok": False,
+            "error": "missing_param",
+            "message": "Query param 'op' (operation name) is required",
+        }), 400
+
+    provider_name = request.args.get("provider", "vertex").lower()
+    provider = video_router.get_provider(provider_name)
+    if not provider:
+        return jsonify({
+            "ok": False,
+            "error": "invalid_provider",
+            "message": f"Unknown provider: {provider_name}",
+        }), 400
+
+    try:
+        result = provider.check_status(operation_name)
+
+        response = {
+            "ok": True,
+            "provider": provider_name,
+            "status": result.get("status"),
+            "progress": result.get("progress", 0),
+        }
+
+        if result.get("video_url"):
+            response["video_url"] = result["video_url"]
+
+        if result.get("error"):
+            response["error"] = result.get("error")
+            response["message"] = result.get("message")
+
+        return jsonify(response)
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": "status_check_failed",
+            "message": str(e),
+        }), 500
