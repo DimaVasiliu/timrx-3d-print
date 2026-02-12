@@ -42,6 +42,7 @@ from backend.services.video_router import (
     ProviderUnavailableError,
     video_router,
     get_runway_provider,
+    get_luma_provider,
 )
 from backend.services.video_queue import video_queue
 
@@ -1823,4 +1824,136 @@ def dispatch_runway_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "runway_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"runway_failed: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+def dispatch_luma_video_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+):
+    """
+    Dispatch video generation directly to Luma Dream Machine.
+
+    This is the dedicated Luma path for video generation.
+    Used when user explicitly selects Luma as the video provider.
+
+    Payload parameters:
+    - task: "text2video" or "image2video"
+    - prompt: Text prompt for video generation
+    - image_data: HTTPS URL or data URI for image2video
+    - aspect_ratio: "16:9", "9:16", "1:1"
+    - duration_seconds: 4, 6, or 8 (mapped to Luma's 5 or 10)
+    - quality_tier: "fast_preview", "studio_hd", "pro_full_hd"
+    - loop: Whether video should loop
+    - seed: Optional random seed
+    """
+    start_time = time.time()
+    task = payload.get("task", "text2video")
+    quality_tier = payload.get("quality_tier", "studio_hd")
+    print(f"[ASYNC] Starting Luma video {task} dispatch for job {internal_job_id} (tier={quality_tier})")
+
+    luma_provider = get_luma_provider()
+
+    try:
+        # Check if Luma is configured
+        configured, config_err = luma_provider.is_configured()
+        if not configured:
+            raise RuntimeError(f"luma_not_configured: {config_err}")
+
+        # Extract parameters
+        aspect_ratio = payload.get("aspect_ratio", "16:9")
+        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 6)
+
+        # Ensure duration_seconds is an integer
+        try:
+            if isinstance(duration_seconds, str):
+                duration_seconds = int(duration_seconds.replace("s", "").replace("sec", "").strip())
+            else:
+                duration_seconds = int(duration_seconds)
+        except (ValueError, TypeError):
+            duration_seconds = 6
+
+        loop = payload.get("loop", False)
+        seed = payload.get("seed")
+
+        route_params = dict(
+            aspect_ratio=aspect_ratio,
+            duration_seconds=duration_seconds,
+            quality_tier=quality_tier,
+            loop=loop,
+            seed=seed,
+        )
+
+        # Call Luma directly
+        if task == "image2video":
+            prompt = payload.get("motion") or payload.get("prompt", "")
+            resp = luma_provider.start_image_to_video(
+                image_data=payload.get("image_data", ""),
+                prompt=prompt,
+                **route_params,
+            )
+        else:  # text2video
+            prompt = payload.get("prompt", "")
+            resp = luma_provider.start_text_to_video(
+                prompt=prompt,
+                **route_params,
+            )
+
+        store_meta["provider"] = "luma"
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Luma returns generation_id (also aliased as task_id for consistency)
+        upstream_id = resp.get("generation_id") or resp.get("task_id")
+
+        if upstream_id:
+            print(f"[ASYNC] Luma returned generation_id={upstream_id} for job {internal_job_id} in {duration_ms}ms")
+
+            update_job_with_upstream_id(internal_job_id, upstream_id)
+
+            store = load_store()
+            store_meta["upstream_id"] = upstream_id
+            store_meta["generation_id"] = upstream_id
+            store_meta["status"] = "processing"
+            store[internal_job_id] = store_meta
+            save_store(store)
+
+            # Poll for completion using the generic provider poller
+            _poll_video_completion(
+                internal_job_id,
+                identity_id,
+                reservation_id,
+                upstream_id,
+                "luma",
+                store_meta,
+            )
+        else:
+            raise RuntimeError("luma_failed: No generation_id in response")
+
+    except QuotaExhaustedError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] Luma quota exhausted for job {internal_job_id} after {duration_ms}ms")
+        if reservation_id:
+            release_job_credits(reservation_id, "luma_quota_exhausted", internal_job_id)
+        update_job_status_failed(internal_job_id, f"luma_quota_exhausted: {e}")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+    except RuntimeError as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        error_str = str(e)
+        print(f"[ASYNC] ERROR: Luma video {task} failed for job {internal_job_id} after {duration_ms}ms: {error_str}")
+        if reservation_id:
+            release_job_credits(reservation_id, "luma_failed", internal_job_id)
+        update_job_status_failed(internal_job_id, error_str)
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[ASYNC] ERROR: Unexpected Luma error for job {internal_job_id} after {duration_ms}ms: {e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "luma_error", internal_job_id)
+        update_job_status_failed(internal_job_id, f"luma_failed: {e}")
         ExpenseGuard.unregister_active_job(internal_job_id)
