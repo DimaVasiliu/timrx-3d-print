@@ -1,5 +1,4 @@
-"""
-Vertex AI Veo Video Generation Service.
+"""Vertex AI Veo Video Generation Service.
 
 Uses Vertex AI's Long-Running Operations (LRO) API for video generation via Veo models.
 Authentication: Service Account JSON (GOOGLE_APPLICATION_CREDENTIALS_JSON env var).
@@ -24,10 +23,8 @@ For AI Studio (Fallback):
 ===============================================================================
 MODELS SUPPORTED
 ===============================================================================
-
 - veo-3.1-fast-generate-001: Fast model, lower latency, good for testing
 - veo-3.1-generate-001: High quality model, longer generation time
-
 ===============================================================================
 API ENDPOINTS
 ===============================================================================
@@ -35,8 +32,9 @@ API ENDPOINTS
 Start job:
   POST https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LOCATION}/publishers/google/models/{MODEL}:predictLongRunning
 
-Poll status:
-  GET https://{LOCATION}-aiplatform.googleapis.com/v1/{operation_name}
+Poll status (fetchPredictOperation):
+  POST https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{PROJECT}/locations/{LOCATION}/publishers/google/models/{MODEL}:fetchPredictOperation
+  Body: {"operationName": "<full operation name from predictLongRunning>"}
 
 ===============================================================================
 CRITICAL NOTES
@@ -434,27 +432,43 @@ def vertex_image_to_video(
     return _execute_video_start_request(url, payload, "image-to-video")
 
 
-def _sanitize_operation_name(operation_name: str) -> str:
+def _parse_operation_name(operation_name: str) -> Dict[str, str]:
     """
-    Sanitize operation name - only strip leading slashes, never rewrite the path.
+    Parse operation name to extract project, location, and model.
 
-    Vertex returns operation names like:
+    Expected format:
       projects/{project}/locations/{location}/publishers/google/models/{model}/operations/{op_id}
 
-    We use this EXACTLY as returned. This helper only removes accidental leading slashes.
+    Returns dict with keys: project, location, model, operation_id
+    Raises ValueError if format is invalid.
     """
-    # Only strip leading slashes - do NOT rewrite or modify the path structure
-    return operation_name.lstrip("/")
+    import re
+
+    clean_name = operation_name.lstrip("/")
+
+    pattern = r"^projects/([^/]+)/locations/([^/]+)/publishers/google/models/([^/]+)/operations/([^/]+)$"
+    match = re.match(pattern, clean_name)
+
+    if not match:
+        raise ValueError(f"Invalid operation name format: {clean_name[:100]}")
+
+    return {
+        "project": match.group(1),
+        "location": match.group(2),
+        "model": match.group(3),
+        "operation_id": match.group(4),
+    }
 
 
 def vertex_video_status(operation_name: str) -> Dict[str, Any]:
     """
     Check the status of a long-running video generation operation.
 
+    Uses the fetchPredictOperation method (POST) per Google docs.
+
     Args:
-        operation_name: The operation name EXACTLY as returned by Vertex.
-                        Format: "projects/.../locations/.../publishers/google/models/.../operations/..."
-                        We poll using this path exactly - no normalization.
+        operation_name: The operation name EXACTLY as returned by predictLongRunning.
+                        Format: "projects/{project}/locations/{location}/publishers/google/models/{model}/operations/{op_id}"
 
     Returns:
         Dict with:
@@ -463,30 +477,30 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
         - video_url: URI to video (if done)
         - error: error message (if failed)
     """
-    location = _get_vertex_location()
-
-    # Sanitize: only strip leading slashes, never rewrite the path
-    clean_op_name = _sanitize_operation_name(operation_name)
-
-    # Build the poll URL using the operation name EXACTLY as Vertex returned it
-    # Vertex returns full paths like:
-    #   projects/{project}/locations/{location}/publishers/google/models/{model}/operations/{op_id}
-    # We use: GET https://{location}-aiplatform.googleapis.com/v1/{operation_name}
-
-    if clean_op_name.startswith("projects/"):
-        # Full path from Vertex - use as-is (most common case)
-        url = f"https://{location}-aiplatform.googleapis.com/v1/{clean_op_name}"
-    else:
-        # Unexpected format - log warning but try anyway
-        print(f"[Vertex Veo] WARNING: operation_name does not start with 'projects/': {clean_op_name[:100]}")
-        url = f"https://{location}-aiplatform.googleapis.com/v1/{clean_op_name}"
-
     try:
-        print(f"[Vertex Veo] Polling operation: {clean_op_name}")
-        print(f"[Vertex Veo] GET URL: {url}")
+        # Parse operation name to get project, location, model
+        parsed = _parse_operation_name(operation_name)
+        project = parsed["project"]
+        location = parsed["location"]
+        model = parsed["model"]
+
+        # Build fetchPredictOperation URL
+        # POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:fetchPredictOperation
+        url = (
+            f"https://{location}-aiplatform.googleapis.com/v1/"
+            f"projects/{project}/locations/{location}/"
+            f"publishers/google/models/{model}:fetchPredictOperation"
+        )
+
+        # Request body contains the full operation name
+        payload = {"operationName": operation_name.lstrip("/")}
+
+        print("[Vertex Veo] Polling operation via fetchPredictOperation")
+        print(f"[Vertex Veo] POST URL: {url}")
+        print(f"[Vertex Veo] operationName: {operation_name[:80]}...")
 
         headers = _get_headers()
-        r = requests.get(url, headers=headers, timeout=VERTEX_TIMEOUT)
+        r = requests.post(url, headers=headers, json=payload, timeout=VERTEX_TIMEOUT)
 
         # Log response details for debugging
         content_type = r.headers.get("Content-Type", "unknown")
@@ -538,6 +552,7 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
             }
 
         result = r.json()
+        print(f"[Vertex Veo] Response keys: {list(result.keys())}")
 
         # Check if operation is done
         if result.get("done"):
@@ -577,7 +592,7 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
                         "filtered_reasons": filtered_reasons,
                     }
 
-                print(f"[Vertex Veo] No video URL in response: {result}")
+                print(f"[Vertex Veo] No video URL in response: {json.dumps(result, default=str)[:500]}")
                 return {
                     "status": "failed",
                     "error": "vertex_video_failed",
@@ -594,6 +609,14 @@ def vertex_video_status(operation_name: str) -> Dict[str, Any]:
             "progress": progress,
         }
 
+    except ValueError as e:
+        # Invalid operation name format
+        print(f"[Vertex Veo] Invalid operation name: {e}")
+        return {
+            "status": "failed",
+            "error": "vertex_video_failed",
+            "message": str(e),
+        }
     except VertexAuthError as e:
         return {
             "status": "failed",
