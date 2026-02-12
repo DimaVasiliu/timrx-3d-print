@@ -3,12 +3,16 @@ Video Generation Routes Blueprint.
 ----------------------------------
 Registered under /api/_mod and /api for compatibility.
 
-Endpoints:
+Veo Endpoints (Google Vertex/AI Studio with fallback):
 - POST /video/generate   - Unified start (text2video or image2video) — legacy
 - POST /video/text        - Text → short cinematic clip
 - POST /video/animate     - Image → animated video clip
 - GET  /video/status/<job_id>          - Poll job status (canonical)
 - GET  /video/generate/status/<job_id> - Poll job status (legacy alias)
+
+Runway Endpoints (Dedicated provider - separate from Veo):
+- POST /video/runway/generate  - Runway video generation
+- GET  /video/runway/status    - Check Runway provider availability
 
 Veo 3.1 Constraints:
 - aspectRatio: ONLY "16:9" or "9:16" (NO "1:1" for video)
@@ -33,7 +37,7 @@ from backend.services.gemini_video_service import (
     validate_video_params,
     GeminiValidationError,
 )
-from backend.services.video_router import video_router
+from backend.services.video_router import video_router, get_runway_provider
 from backend.services.video_prompts import (
     normalize_text_prompt,
     normalize_motion_prompt,
@@ -1135,3 +1139,139 @@ def video_admin_smoke_test_status():
             "error": "status_check_failed",
             "message": str(e),
         }), 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUNWAY VIDEO ENDPOINTS (Dedicated provider - separate from Veo router)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bp.route("/video/runway/generate", methods=["POST", "OPTIONS"])
+@with_session
+def runway_video_generate():
+    """
+    Generate video using Runway directly (no Veo fallback).
+
+    Request body:
+    {
+        "task": "text2video" or "image2video",
+        "prompt": "A serene forest...",
+        "image_data": "base64...",     # Required for image2video
+        "duration_sec": 6,              # 4, 6, 8 (text2video) or 2-10 (image2video)
+        "aspect_ratio": "16:9",         # "16:9", "9:16", "1:1", etc.
+        "seed": 12345                   # Optional
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    runway = get_runway_provider()
+    configured, config_err = runway.is_configured()
+    if not configured:
+        return jsonify({
+            "error": "runway_not_configured",
+            "message": f"Runway is not configured: {config_err}",
+            "details": {"hint": "Set RUNWAY_API_KEY environment variable"}
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+
+    task = (body.get("task") or "text2video").lower()
+    if task not in ("text2video", "image2video"):
+        return jsonify({
+            "error": "invalid_params",
+            "message": "task must be 'text2video' or 'image2video'",
+            "field": "task"
+        }), 400
+
+    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or 6
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
+    seed = body.get("seed")
+
+    try:
+        duration_seconds = int(raw_duration)
+    except (ValueError, TypeError):
+        duration_seconds = 6
+
+    # Clamp duration based on task
+    if task == "text2video":
+        duration_seconds = 4 if duration_seconds <= 4 else (6 if duration_seconds <= 6 else 8)
+    else:
+        duration_seconds = max(2, min(10, duration_seconds))
+
+    # Task-specific validation
+    if task == "text2video":
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt:
+            return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
+        image_data = None
+    else:
+        image_data = body.get("image_data") or body.get("image") or ""
+        if not image_data:
+            return jsonify({"error": "invalid_params", "message": "image_data is required", "field": "image_data"}), 400
+        prompt = body.get("motion") or body.get("prompt") or ""
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = get_video_action_code(task, duration_seconds, "720p")
+    expected_cost = get_video_credit_cost(duration_seconds, "720p")
+
+    reservation_id, credit_error = start_paid_job(
+        identity_id, action_key, internal_job_id,
+        {"task": task, "provider": "runway", "prompt": prompt[:100] if prompt else None,
+         "duration_seconds": duration_seconds, "expected_cost": expected_cost},
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "video", "created_at": now_s() * 1000, "task": task, "provider": "runway",
+        "prompt": prompt, "duration_seconds": duration_seconds, "aspect_ratio": aspect_ratio,
+        "resolution": "720p", "seed": seed, "user_id": identity_id, "identity_id": identity_id,
+        "reservation_id": reservation_id, "internal_job_id": internal_job_id, "status": "queued",
+    }
+
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id, identity_id=identity_id, provider="runway",
+        action_key=action_key, prompt=prompt, meta=store_meta,
+        reservation_id=reservation_id, status="queued",
+    )
+
+    payload = {
+        "task": task, "prompt": prompt, "image_data": image_data, "aspect_ratio": aspect_ratio,
+        "duration_seconds": duration_seconds, "motion": body.get("motion") or "", "seed": seed,
+    }
+
+    from backend.services.async_dispatch import dispatch_runway_video_async
+    ExpenseGuard.register_active_job(internal_job_id)
+    get_executor().submit(dispatch_runway_video_async, internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+    log_event("video/runway/generate:dispatched", {"internal_job_id": internal_job_id, "task": task})
+
+    return jsonify({
+        "ok": True, "job_id": internal_job_id, "video_id": internal_job_id,
+        "reservation_id": reservation_id, "status": "queued", "task": task, "provider": "runway",
+        "params": {"aspect_ratio": aspect_ratio, "duration_seconds": duration_seconds},
+    })
+
+
+@bp.route("/video/runway/status", methods=["GET", "OPTIONS"])
+@with_session
+def runway_provider_status():
+    """Check if Runway provider is configured and available."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    runway = get_runway_provider()
+    configured, config_err = runway.is_configured()
+
+    return jsonify({
+        "ok": True, "provider": "runway", "configured": configured,
+        "available": configured, "error": config_err if not configured else None,
+    })
