@@ -4,19 +4,24 @@ Video Provider Router with Fallback.
 Routes video generation requests to available providers in priority order.
 Falls back to next provider on configuration or quota errors.
 
-Supported providers (ordered by priority):
-- google  (Gemini Veo 3.1) — primary
-- runway  (Runway Gen-4 / Veo via Runway) — fallback
+Supported providers (ordered by priority based on VIDEO_PROVIDER env):
+- vertex  (Vertex AI Veo) — production default
+- google  (Gemini AI Studio Veo) — fallback
+- runway  (Runway Gen-4) — secondary fallback
+
+Provider selection:
+- VIDEO_PROVIDER=vertex (default in prod): Use Vertex AI first, AI Studio as fallback
+- VIDEO_PROVIDER=aistudio: Use AI Studio first, Vertex as fallback
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.config import config
 from backend.services.gemini_video_service import (
     GeminiAuthError,
     GeminiConfigError,
-    GeminiValidationError,
     check_gemini_configured,
     download_video_bytes,
     extract_video_thumbnail,
@@ -30,6 +35,12 @@ from backend.services.runway_service import (
     RunwayQuotaError,
 )
 from backend.services.video_providers.runway_provider import RunwayProvider
+from backend.services.video_providers.vertex_provider import VertexVeoProvider
+from backend.services.vertex_video_service import (
+    VertexAuthError,
+    VertexConfigError,
+    VertexQuotaError,
+)
 
 
 # ── Errors ────────────────────────────────────────────────────
@@ -129,11 +140,30 @@ def _is_quota_error(msg: str) -> bool:
     return any(tok in lower for tok in ("quota", "billing", "resource_exhausted", "rate_limit", "429"))
 
 
-# ── Provider registry (ordered by priority) ──────────────────
-_PROVIDERS: List[VideoProvider] = [
-    GeminiVeoProvider(),
-    RunwayProvider(),
-]
+# ── Provider registry ─────────────────────────────────────────
+# Provider instances (singletons)
+_VERTEX_PROVIDER = VertexVeoProvider()
+_AISTUDIO_PROVIDER = GeminiVeoProvider()
+_RUNWAY_PROVIDER = RunwayProvider()
+
+
+def _get_ordered_providers() -> List[VideoProvider]:
+    """
+    Get providers ordered by priority based on VIDEO_PROVIDER setting.
+
+    VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio -> Runway
+    VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex -> Runway
+    """
+    video_provider = getattr(config, 'VIDEO_PROVIDER', 'vertex').lower()
+
+    if video_provider == "aistudio":
+        # AI Studio first, Vertex as fallback
+        return [_AISTUDIO_PROVIDER, _VERTEX_PROVIDER, _RUNWAY_PROVIDER]
+    else:
+        # Vertex first (production default), AI Studio as fallback
+        return [_VERTEX_PROVIDER, _AISTUDIO_PROVIDER, _RUNWAY_PROVIDER]
+
+
 
 
 # ── Router ────────────────────────────────────────────────────
@@ -141,7 +171,11 @@ class VideoRouter:
     """
     Route video generation to available providers with automatic fallback.
 
-    Tries providers in priority order.  Falls back on:
+    Tries providers in priority order based on VIDEO_PROVIDER setting:
+      - VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio -> Runway
+      - VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex -> Runway
+
+    Falls back on:
       - Configuration errors (provider not set up)
       - Quota exhaustion (daily limits)
       - Authentication failures
@@ -151,7 +185,8 @@ class VideoRouter:
     """
 
     def __init__(self, providers: List[VideoProvider] | None = None):
-        self.providers = providers or _PROVIDERS
+        # Use dynamic provider ordering if not explicitly provided
+        self.providers = providers if providers is not None else _get_ordered_providers()
 
     # ── queries ───────────────────────────────────────────────
     def get_available_providers(self) -> List[VideoProvider]:
@@ -210,10 +245,10 @@ class VideoRouter:
             except QuotaExhaustedError as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
-            except (GeminiAuthError, GeminiConfigError, RunwayAuthError, RunwayConfigError) as e:
+            except (GeminiAuthError, GeminiConfigError, VertexAuthError, VertexConfigError, RunwayAuthError, RunwayConfigError) as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} auth/config error: {e}, trying next…")
-            except RunwayQuotaError as e:
+            except (RunwayQuotaError, VertexQuotaError) as e:
                 last_error = QuotaExhaustedError(provider.name, str(e))
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
             # Let GeminiValidationError and other RuntimeErrors propagate
