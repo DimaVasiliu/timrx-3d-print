@@ -106,6 +106,140 @@ class AdminService:
             "total_revenue_gbp": float(revenue["total"]) if revenue else 0.0,
         }
 
+    @staticmethod
+    def get_credit_analytics(days: int = 30) -> Dict[str, Any]:
+        """
+        Get comprehensive credit usage analytics.
+
+        Args:
+            days: Number of days to look back (max 90)
+
+        Returns:
+            summary: Total purchased, spent, usage rate
+            by_action_type: Credits grouped by category (image, 3d_model, video)
+            top_users: Top 20 users by credit usage
+            over_time: Daily credit usage time series
+        """
+        days = min(max(1, days), 90)
+
+        # Summary: total purchased vs spent (all time)
+        summary_row = query_one(
+            f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN amount_credits > 0 THEN amount_credits ELSE 0 END), 0) as purchased,
+                COALESCE(SUM(CASE WHEN entry_type = 'reservation_finalize' THEN ABS(amount_credits) ELSE 0 END), 0) as spent
+            FROM {Tables.LEDGER_ENTRIES}
+            """
+        )
+        total_purchased = int(summary_row["purchased"]) if summary_row else 0
+        total_spent = int(summary_row["spent"]) if summary_row else 0
+        usage_rate = round((total_spent / total_purchased * 100), 1) if total_purchased > 0 else 0.0
+
+        # Credits by action type (from completed jobs in period)
+        by_type_rows = query_all(
+            f"""
+            SELECT
+                CASE
+                    WHEN action_code LIKE 'OPENAI%%' OR action_code LIKE 'image%%' THEN 'image'
+                    WHEN action_code LIKE 'MESHY%%' THEN '3d_model'
+                    WHEN action_code LIKE 'VIDEO%%' OR action_code LIKE 'video%%' OR action_code = 'GEMINI_VIDEO' THEN 'video'
+                    ELSE 'other'
+                END as category,
+                COALESCE(SUM(cost_credits), 0) as total_credits,
+                COUNT(*) as job_count
+            FROM {Tables.JOBS}
+            WHERE status = 'completed' AND created_at >= NOW() - INTERVAL '%s days'
+            GROUP BY category
+            ORDER BY total_credits DESC
+            """,
+            (days,)
+        )
+
+        # Calculate percentages for action types
+        total_period_credits = sum(int(r["total_credits"]) for r in by_type_rows)
+        by_action_type = []
+        for row in by_type_rows:
+            credits = int(row["total_credits"])
+            pct = round((credits / total_period_credits * 100), 1) if total_period_credits > 0 else 0.0
+            by_action_type.append({
+                "category": row["category"],
+                "total_credits": credits,
+                "job_count": row["job_count"],
+                "percentage": pct
+            })
+
+        # Top 20 users by credit usage
+        top_users_rows = query_all(
+            f"""
+            SELECT
+                j.identity_id,
+                i.email,
+                COALESCE(SUM(j.cost_credits), 0) as total_spent,
+                COUNT(*) as job_count,
+                MAX(j.created_at) as last_active
+            FROM {Tables.JOBS} j
+            LEFT JOIN {Tables.IDENTITIES} i ON i.id = j.identity_id
+            WHERE j.status = 'completed' AND j.created_at >= NOW() - INTERVAL '%s days'
+            GROUP BY j.identity_id, i.email
+            ORDER BY total_spent DESC
+            LIMIT 20
+            """,
+            (days,)
+        )
+
+        top_users = []
+        for row in top_users_rows:
+            # Mask email for privacy (show first 2 chars + *** + domain)
+            email = row["email"]
+            if email and "@" in email:
+                local, domain = email.split("@", 1)
+                masked = local[:2] + "***@" + domain if len(local) > 2 else local + "***@" + domain
+            else:
+                masked = email
+            top_users.append({
+                "identity_id": str(row["identity_id"]),
+                "email": masked,
+                "total_spent": int(row["total_spent"]),
+                "job_count": row["job_count"],
+                "last_active": row["last_active"].isoformat() if row["last_active"] else None
+            })
+
+        # Credits over time (daily)
+        over_time_rows = query_all(
+            f"""
+            SELECT
+                DATE(created_at) as date,
+                COALESCE(SUM(cost_credits), 0) as credits_spent,
+                COUNT(*) as job_count
+            FROM {Tables.JOBS}
+            WHERE status = 'completed' AND created_at >= NOW() - INTERVAL '%s days'
+            GROUP BY DATE(created_at)
+            ORDER BY date ASC
+            """,
+            (days,)
+        )
+
+        over_time = [
+            {
+                "date": row["date"].isoformat() if row["date"] else None,
+                "credits_spent": int(row["credits_spent"]),
+                "job_count": row["job_count"]
+            }
+            for row in over_time_rows
+        ]
+
+        return {
+            "summary": {
+                "total_purchased": total_purchased,
+                "total_spent": total_spent,
+                "usage_rate": usage_rate,
+                "period_days": days
+            },
+            "by_action_type": by_action_type,
+            "top_users": top_users,
+            "over_time": over_time
+        }
+
     # ─────────────────────────────────────────────────────────────
     # Identity Management
     # ─────────────────────────────────────────────────────────────
