@@ -37,6 +37,7 @@ from backend.services.gemini_video_service import (
     validate_video_params,
     GeminiValidationError,
 )
+from backend.services.vertex_video_service import check_vertex_resolution
 from backend.services.video_router import video_router, get_runway_provider
 from backend.services.video_prompts import (
     normalize_text_prompt,
@@ -207,6 +208,22 @@ def generate_video():
     action_key = get_video_action_code(task, duration_seconds, resolution)
     expected_cost = get_video_credit_cost(duration_seconds, resolution)
 
+    # PRE-FLIGHT: Check Vertex resolution capability BEFORE reserving credits
+    # This prevents reserve -> fail -> release cycle for 4k on non-allowlisted projects
+    primary_provider = available_providers[0].name if available_providers else None
+    if primary_provider == "vertex":
+        resolution_ok, resolution_err = check_vertex_resolution(resolution)
+        if not resolution_ok:
+            print(f"[VIDEO] Vertex resolution check failed: {resolution_err}")
+            return jsonify({
+                "ok": False,
+                "error": "vertex_resolution_not_allowed",
+                "message": resolution_err,
+                "field": "resolution",
+                "value": resolution,
+                "allowed": ["720p", "1080p"],
+            }), 400
+
     print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
     # Reserve credits
@@ -362,6 +379,24 @@ def _dispatch_video_job(
     # Use variant action code based on duration/resolution
     action_key = get_video_action_code(task, duration_seconds, resolution)
     expected_cost = get_video_credit_cost(duration_seconds, resolution)
+
+    # PRE-FLIGHT: Check Vertex resolution capability BEFORE reserving credits
+    # This prevents reserve -> fail -> release cycle for 4k on non-allowlisted projects
+    available_providers = video_router.get_available_providers()
+    primary_provider = available_providers[0].name if available_providers else None
+
+    if primary_provider == "vertex":
+        resolution_ok, resolution_err = check_vertex_resolution(resolution)
+        if not resolution_ok:
+            print(f"[VIDEO] Vertex resolution check failed: {resolution_err}")
+            return jsonify({
+                "ok": False,
+                "error": "vertex_resolution_not_allowed",
+                "message": resolution_err,
+                "field": "resolution",
+                "value": resolution,
+                "allowed": ["720p", "1080p"],
+            }), 400
 
     print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
