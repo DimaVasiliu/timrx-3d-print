@@ -238,6 +238,33 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_generate", "cost_credits": 70, "provider": "video"},
     {"action_code": "video_text_generate", "cost_credits": 70, "provider": "video"},
     {"action_code": "video_image_animate", "cost_credits": 70, "provider": "video"},
+    # ─────────────────────────────────────────────────────────────────────────────
+    # LUMA VIDEO GENERATION COSTS
+    # Based on Luma's published credit system with TimrX markup:
+    # Formula: user_cost = ceil(luma_cost * 2.5) + 5
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Fast Preview (ray-flash-2 @ 720p) - 11 credits/sec base
+    {"action_code": "luma_fast_preview_4s", "cost_credits": 115, "provider": "luma"},
+    {"action_code": "luma_fast_preview_6s", "cost_credits": 170, "provider": "luma"},
+    {"action_code": "luma_fast_preview_8s", "cost_credits": 225, "provider": "luma"},
+    # Studio HD (ray-2 @ 720p) - 32 credits/sec base
+    {"action_code": "luma_studio_hd_4s", "cost_credits": 325, "provider": "luma"},
+    {"action_code": "luma_studio_hd_6s", "cost_credits": 485, "provider": "luma"},
+    {"action_code": "luma_studio_hd_8s", "cost_credits": 645, "provider": "luma"},
+    # Pro Full HD (ray-2 @ 1080p) - 34 credits/sec base
+    {"action_code": "luma_pro_full_hd_4s", "cost_credits": 345, "provider": "luma"},
+    {"action_code": "luma_pro_full_hd_6s", "cost_credits": 515, "provider": "luma"},
+    {"action_code": "luma_pro_full_hd_8s", "cost_credits": 685, "provider": "luma"},
+    # Luma image-to-video variants (same pricing as text-to-video)
+    {"action_code": "luma_image_fast_preview_4s", "cost_credits": 115, "provider": "luma"},
+    {"action_code": "luma_image_fast_preview_6s", "cost_credits": 170, "provider": "luma"},
+    {"action_code": "luma_image_fast_preview_8s", "cost_credits": 225, "provider": "luma"},
+    {"action_code": "luma_image_studio_hd_4s", "cost_credits": 325, "provider": "luma"},
+    {"action_code": "luma_image_studio_hd_6s", "cost_credits": 485, "provider": "luma"},
+    {"action_code": "luma_image_studio_hd_8s", "cost_credits": 645, "provider": "luma"},
+    {"action_code": "luma_image_pro_full_hd_4s", "cost_credits": 345, "provider": "luma"},
+    {"action_code": "luma_image_pro_full_hd_6s", "cost_credits": 515, "provider": "luma"},
+    {"action_code": "luma_image_pro_full_hd_8s", "cost_credits": 685, "provider": "luma"},
 ]
 
 
@@ -297,6 +324,121 @@ def get_video_credit_cost(duration_seconds: int, resolution: str) -> int:
     # Get cost from mapping, fallback to 70 if not found
     resolution_costs = VIDEO_CREDIT_COSTS.get(resolution, {})
     return resolution_costs.get(duration, 70)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LUMA VIDEO PRICING
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Luma quality tiers
+LUMA_QUALITY_TIERS = ["fast_preview", "studio_hd", "pro_full_hd"]
+
+# Luma credit costs: (quality_tier, duration) -> cost
+LUMA_CREDIT_COSTS = {
+    ("fast_preview", 4): 115,
+    ("fast_preview", 6): 170,
+    ("fast_preview", 8): 225,
+    ("studio_hd", 4): 325,
+    ("studio_hd", 6): 485,
+    ("studio_hd", 8): 645,
+    ("pro_full_hd", 4): 345,
+    ("pro_full_hd", 6): 515,
+    ("pro_full_hd", 8): 685,
+}
+
+
+def get_luma_action_code(task: str, quality_tier: str, duration_seconds: int) -> str:
+    """
+    Build the Luma action code for a specific variant.
+
+    Args:
+        task: "text2video" or "image2video"
+        quality_tier: "fast_preview", "studio_hd", "pro_full_hd"
+        duration_seconds: 4, 6, or 8
+
+    Returns:
+        Action code like "luma_fast_preview_4s" or "luma_image_studio_hd_6s"
+    """
+    # Normalize tier
+    tier = quality_tier.lower().replace(" ", "_").replace("-", "_") if quality_tier else "studio_hd"
+    if tier not in LUMA_QUALITY_TIERS:
+        tier = "studio_hd"
+
+    # Normalize duration
+    duration = int(duration_seconds)
+    if duration <= 4:
+        duration = 4
+    elif duration <= 6:
+        duration = 6
+    else:
+        duration = 8
+
+    # Build action code
+    if task.lower() in ("image2video", "image_to_video", "image", "animate"):
+        return f"luma_image_{tier}_{duration}s"
+    return f"luma_{tier}_{duration}s"
+
+
+def get_luma_credit_cost(quality_tier: str, duration_seconds: int) -> int:
+    """
+    Get the TimrX credit cost for a Luma video generation.
+
+    Args:
+        quality_tier: "fast_preview", "studio_hd", "pro_full_hd"
+        duration_seconds: 4, 6, or 8
+
+    Returns:
+        TimrX credits to charge (115-685 depending on tier and duration)
+    """
+    # Normalize tier
+    tier = quality_tier.lower().replace(" ", "_").replace("-", "_") if quality_tier else "studio_hd"
+    if tier not in LUMA_QUALITY_TIERS:
+        tier = "studio_hd"
+
+    # Normalize duration
+    duration = int(duration_seconds)
+    if duration <= 4:
+        duration = 4
+    elif duration <= 6:
+        duration = 6
+    else:
+        duration = 8
+
+    return LUMA_CREDIT_COSTS.get((tier, duration), 325)  # Default to studio_hd 4s
+
+
+def get_luma_quality_tier_info() -> list:
+    """
+    Get information about Luma quality tiers for frontend display.
+
+    Returns list of tier info dicts with name, display_name, description.
+    """
+    return [
+        {
+            "id": "fast_preview",
+            "name": "Fast Preview",
+            "description": "Quick drafts (Ray2 Flash 720p)",
+            "model": "ray-flash-2",
+            "resolution": "720p",
+            "costs": {4: 115, 6: 170, 8: 225},
+        },
+        {
+            "id": "studio_hd",
+            "name": "Studio HD",
+            "description": "Balanced quality (Ray2 720p)",
+            "model": "ray-2",
+            "resolution": "720p",
+            "costs": {4: 325, 6: 485, 8: 645},
+        },
+        {
+            "id": "pro_full_hd",
+            "name": "Pro Full HD",
+            "description": "Maximum quality (Ray2 1080p)",
+            "model": "ray-2",
+            "resolution": "1080p",
+            "costs": {4: 345, 6: 515, 8: 685},
+        },
+    ]
 
 DEFAULT_PLANS = [
     {
