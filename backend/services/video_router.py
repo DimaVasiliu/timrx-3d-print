@@ -35,8 +35,14 @@ from backend.services.runway_service import (
     RunwayConfigError,
     RunwayQuotaError,
 )
+from backend.services.luma_service import (
+    LumaAuthError,
+    LumaConfigError,
+    LumaQuotaError,
+)
 from backend.services.video_providers.runway_provider import RunwayProvider
 from backend.services.video_providers.vertex_provider import VertexVeoProvider
+from backend.services.video_providers.luma_provider import LumaProvider
 from backend.services.vertex_video_service import (
     VertexAuthError,
     VertexConfigError,
@@ -146,6 +152,7 @@ def _is_quota_error(msg: str) -> bool:
 _VERTEX_PROVIDER = VertexVeoProvider()
 _AISTUDIO_PROVIDER = GeminiVeoProvider()
 _RUNWAY_PROVIDER = RunwayProvider()
+_LUMA_PROVIDER = LumaProvider()
 
 
 def _get_ordered_providers() -> List[VideoProvider]:
@@ -172,6 +179,37 @@ def get_runway_provider() -> RunwayProvider:
     return _RUNWAY_PROVIDER
 
 
+def get_luma_provider() -> LumaProvider:
+    """Get the Luma provider instance for direct access."""
+    return _LUMA_PROVIDER
+
+
+def resolve_video_provider(provider_name: str):
+    """
+    Resolve a provider by name. Safe for import from any module.
+
+    This function exists to avoid circular imports — async_dispatch and
+    other modules can import this single resolver instead of individual
+    provider getter functions.
+
+    Args:
+        provider_name: "runway", "luma", "google", "vertex"
+
+    Returns:
+        The provider instance, or None if not found.
+    """
+    name = (provider_name or "").lower()
+    if name == "runway":
+        return _RUNWAY_PROVIDER
+    elif name == "luma":
+        return _LUMA_PROVIDER
+    elif name == "google":
+        return _AISTUDIO_PROVIDER
+    elif name == "vertex":
+        return _VERTEX_PROVIDER
+    else:
+        # Try the router's provider lookup as fallback
+        return video_router.get_provider(name)
 
 
 # ── Router ────────────────────────────────────────────────────
@@ -255,10 +293,10 @@ class VideoRouter:
             except QuotaExhaustedError as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
-            except (GeminiAuthError, GeminiConfigError, VertexAuthError, VertexConfigError, RunwayAuthError, RunwayConfigError) as e:
+            except (GeminiAuthError, GeminiConfigError, VertexAuthError, VertexConfigError, RunwayAuthError, RunwayConfigError, LumaAuthError, LumaConfigError) as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} auth/config error: {e}, trying next…")
-            except (RunwayQuotaError, VertexQuotaError) as e:
+            except (RunwayQuotaError, VertexQuotaError, LumaQuotaError) as e:
                 last_error = QuotaExhaustedError(provider.name, str(e))
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
             # Let GeminiValidationError and other RuntimeErrors propagate
