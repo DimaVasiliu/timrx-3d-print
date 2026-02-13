@@ -148,11 +148,27 @@ def _is_quota_error(msg: str) -> bool:
 
 
 # ── Provider registry ─────────────────────────────────────────
-# Provider instances (singletons)
-_VERTEX_PROVIDER = VertexVeoProvider()
-_AISTUDIO_PROVIDER = GeminiVeoProvider()
-_RUNWAY_PROVIDER = RunwayProvider()
-_LUMA_PROVIDER = LumaProvider()
+# Provider instances (singletons) - lazily initialized to avoid circular imports
+_VERTEX_PROVIDER: Optional[VertexVeoProvider] = None
+_AISTUDIO_PROVIDER: Optional[GeminiVeoProvider] = None
+_RUNWAY_PROVIDER: Optional[RunwayProvider] = None
+_LUMA_PROVIDER: Optional[LumaProvider] = None
+
+
+def _get_vertex_provider() -> VertexVeoProvider:
+    """Lazy-load Vertex provider."""
+    global _VERTEX_PROVIDER
+    if _VERTEX_PROVIDER is None:
+        _VERTEX_PROVIDER = VertexVeoProvider()
+    return _VERTEX_PROVIDER
+
+
+def _get_aistudio_provider() -> GeminiVeoProvider:
+    """Lazy-load AI Studio provider."""
+    global _AISTUDIO_PROVIDER
+    if _AISTUDIO_PROVIDER is None:
+        _AISTUDIO_PROVIDER = GeminiVeoProvider()
+    return _AISTUDIO_PROVIDER
 
 
 def _get_ordered_providers() -> List[VideoProvider]:
@@ -168,19 +184,25 @@ def _get_ordered_providers() -> List[VideoProvider]:
 
     if video_provider == "aistudio":
         # AI Studio first, Vertex as fallback
-        return [_AISTUDIO_PROVIDER, _VERTEX_PROVIDER]
+        return [_get_aistudio_provider(), _get_vertex_provider()]
     else:
         # Vertex first (production default), AI Studio as fallback
-        return [_VERTEX_PROVIDER, _AISTUDIO_PROVIDER]
+        return [_get_vertex_provider(), _get_aistudio_provider()]
 
 
 def get_runway_provider() -> RunwayProvider:
-    """Get the Runway provider instance for direct access."""
+    """Get the Runway provider instance for direct access (lazy-loaded)."""
+    global _RUNWAY_PROVIDER
+    if _RUNWAY_PROVIDER is None:
+        _RUNWAY_PROVIDER = RunwayProvider()
     return _RUNWAY_PROVIDER
 
 
 def get_luma_provider() -> LumaProvider:
-    """Get the Luma provider instance for direct access."""
+    """Get the Luma provider instance for direct access (lazy-loaded)."""
+    global _LUMA_PROVIDER
+    if _LUMA_PROVIDER is None:
+        _LUMA_PROVIDER = LumaProvider()
     return _LUMA_PROVIDER
 
 
@@ -200,13 +222,13 @@ def resolve_video_provider(provider_name: str):
     """
     name = (provider_name or "").lower()
     if name == "runway":
-        return _RUNWAY_PROVIDER
+        return get_runway_provider()
     elif name == "luma":
-        return _LUMA_PROVIDER
+        return get_luma_provider()
     elif name == "google":
-        return _AISTUDIO_PROVIDER
+        return _get_aistudio_provider()
     elif name == "vertex":
-        return _VERTEX_PROVIDER
+        return _get_vertex_provider()
     else:
         # Try the router's provider lookup as fallback
         return video_router.get_provider(name)
