@@ -169,14 +169,21 @@ def _is_video_variant_code(action_key: str) -> bool:
     Video variant codes follow the pattern:
     - video_text_generate_{duration}s_{resolution}
     - video_image_animate_{duration}s_{resolution}
+    - luma_{quality_tier}_{duration}s
+    - luma_image_{quality_tier}_{duration}s
+    - runway_{model}_{duration}s_{resolution}
 
     Where duration is 4, 6, or 8 and resolution is 720p or 1080p.
     (4k exists in DB for future use but is not exposed in UI)
     """
+    # Provider-specific patterns (dynamic recognition for scalability)
+    if action_key.startswith("luma_") or action_key.startswith("runway_"):
+        return True
+
     if not action_key.startswith("video_"):
         return False
 
-    # Valid prefixes
+    # Valid prefixes for legacy Veo video codes
     valid_prefixes = ("video_text_generate_", "video_image_animate_")
     if not any(action_key.startswith(p) for p in valid_prefixes):
         return False
