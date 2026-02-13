@@ -49,6 +49,9 @@ class CreditType:
 #         When adding a new action in pricing_service.py, you MUST also add it
 #         to VIDEO_ACTION_CODES or GENERAL_ACTION_CODES below.
 #
+#         EXCEPTION: Actions starting with "luma_" or "runway_" are dynamically
+#         validated (pattern-based) to avoid hardcoding every duration/tier combo.
+#
 #         This is intentional - fail-closed prevents video actions from
 #         accidentally consuming cheaper general credits.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +163,16 @@ def get_credit_type_for_action(action_code: str) -> str:
         return CreditType.GENERAL  # Video actions now use unified pool
     if action_code in GENERAL_ACTION_CODES:
         return CreditType.GENERAL
+
+    # Dynamic provider action codes (pattern-based validation for scalability)
+    # This avoids hardcoding every duration/quality tier combination
+    if action_code.startswith("luma_"):
+        print(f"[WALLET] Recognized dynamic Luma action: {action_code}")
+        return CreditType.GENERAL  # Luma video actions use unified pool
+    if action_code.startswith("runway_"):
+        print(f"[WALLET] Recognized dynamic Runway action: {action_code}")
+        return CreditType.GENERAL  # Runway video actions use unified pool
+
     raise ValueError(
         f"Unknown action code: {action_code}. "
         f"Add to VIDEO_ACTION_CODES or GENERAL_ACTION_CODES in wallet_service.py"
