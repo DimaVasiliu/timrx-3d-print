@@ -37,14 +37,8 @@ from backend.services.gemini_image_service import (
     GeminiConfigError as GeminiImageConfigError,
     GeminiValidationError as GeminiImageValidationError,
 )
-from backend.services.video_router import (
-    QuotaExhaustedError,
-    ProviderUnavailableError,
-    video_router,
-    get_runway_provider,
-    get_luma_provider,
-)
-from backend.services.video_queue import video_queue
+# Video router imports moved to lazy-load inside video functions to avoid
+# image pipeline depending on video dependencies at import time
 
 # Shared executor for background tasks
 _background_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="job_worker")
@@ -626,6 +620,8 @@ def _redispatch_to_runway(
     Reuses the same job_id and credit reservation (no double-charge).
     The original payload is reconstructed from store_meta.
     """
+    from backend.services.video_router import video_router
+
     runway = video_router.get_provider("runway")
     if not runway:
         print(f"[ASYNC] Runway provider not found for fallback of {internal_job_id}")
@@ -757,6 +753,13 @@ def dispatch_gemini_video_async(
     - negative_prompt: Optional things to avoid
     - seed: Optional random seed
     """
+    from backend.services.video_router import (
+        video_router,
+        QuotaExhaustedError,
+        ProviderUnavailableError,
+    )
+    from backend.services.video_queue import video_queue
+
     start_time = time.time()
     task = payload.get("task", "text2video")
     # print(f"[ASYNC] Starting video {task} dispatch for job {internal_job_id}")
@@ -927,6 +930,8 @@ def _poll_gemini_video_completion(
     This runs in the background thread and updates job status.
     Veo typically completes in 1-2 minutes for standard videos.
     """
+    from backend.services.video_router import video_router
+
     # print(f"[ASYNC] Starting poll for Veo operation {operation_name}")
 
     consecutive_errors = 0
@@ -1085,6 +1090,8 @@ def _poll_video_completion(
     - video_url: URL to download video from
     - video_bytes: Raw video bytes (base64 decoded) - used by Vertex
     """
+    from backend.services.video_router import video_router
+
     if provider_name == "google":
         # Existing Gemini-specific poll (uses Gemini API directly)
         return _poll_gemini_video_completion(
@@ -1527,6 +1534,8 @@ def _finalize_video_success(
     Works for any provider — uses the VideoRouter to get the right
     download method.
     """
+    from backend.services.video_router import video_router
+
     print(f"[ASYNC] Finalizing {provider_name} video for job {internal_job_id}: {video_url[:80]}...")
 
     final_video_url = video_url
@@ -1722,11 +1731,13 @@ def dispatch_runway_video_async(
     - duration_seconds: 4, 6, 8, or 10 (Runway supports 2-10s for image2video)
     - seed: Optional random seed
     """
+    from backend.services.video_router import resolve_video_provider, QuotaExhaustedError
+
     start_time = time.time()
     task = payload.get("task", "text2video")
     print(f"[ASYNC] Starting Runway video {task} dispatch for job {internal_job_id}")
 
-    runway_provider = get_runway_provider()
+    runway_provider = resolve_video_provider("runway")
 
     try:
         # Check if Runway is configured
@@ -1850,12 +1861,14 @@ def dispatch_luma_video_async(
     - loop: Whether video should loop
     - seed: Optional random seed
     """
+    from backend.services.video_router import resolve_video_provider, QuotaExhaustedError
+
     start_time = time.time()
     task = payload.get("task", "text2video")
     quality_tier = payload.get("quality_tier", "studio_hd")
     print(f"[ASYNC] Starting Luma video {task} dispatch for job {internal_job_id} (tier={quality_tier})")
 
-    luma_provider = get_luma_provider()
+    luma_provider = resolve_video_provider("luma")
 
     try:
         # Check if Luma is configured
