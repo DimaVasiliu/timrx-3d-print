@@ -38,7 +38,7 @@ from backend.services.gemini_video_service import (
     GeminiValidationError,
 )
 from backend.services.vertex_video_service import check_vertex_resolution
-from backend.services.video_router import video_router, get_runway_provider, get_luma_provider
+from backend.services.video_router import video_router, resolve_video_provider
 from backend.services.video_prompts import (
     normalize_text_prompt,
     normalize_motion_prompt,
@@ -1205,7 +1205,7 @@ def runway_video_generate():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    runway = get_runway_provider()
+    runway = resolve_video_provider("runway")
     configured, config_err = runway.is_configured()
     if not configured:
         return jsonify({
@@ -1309,7 +1309,7 @@ def runway_provider_status():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    runway = get_runway_provider()
+    runway = resolve_video_provider("runway")
     configured, config_err = runway.is_configured()
 
     return jsonify({
@@ -1350,7 +1350,7 @@ def luma_video_generate():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    luma = get_luma_provider()
+    luma = resolve_video_provider("luma")
     configured, config_err = luma.is_configured()
     if not configured:
         return jsonify({
@@ -1522,7 +1522,7 @@ def luma_provider_status():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    luma = get_luma_provider()
+    luma = resolve_video_provider("luma")
     configured, config_err = luma.is_configured()
 
     return jsonify({
