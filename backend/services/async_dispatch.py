@@ -1090,7 +1090,7 @@ def _poll_video_completion(
     - video_url: URL to download video from
     - video_bytes: Raw video bytes (base64 decoded) - used by Vertex
     """
-    from backend.services.video_router import video_router
+    from backend.services.video_router import resolve_video_provider
 
     if provider_name == "google":
         # Existing Gemini-specific poll (uses Gemini API directly)
@@ -1100,7 +1100,9 @@ def _poll_video_completion(
         )
 
     # ── Provider lookup ─────
-    provider = video_router.get_provider(provider_name)
+    # Use resolve_video_provider for all providers (Veo, Runway, Luma, etc)
+    # This works for both VideoRouter providers and standalone providers
+    provider = resolve_video_provider(provider_name)
     if not provider:
         print(f"[ASYNC] ERROR: Unknown provider {provider_name} for job {internal_job_id}")
         if reservation_id:
