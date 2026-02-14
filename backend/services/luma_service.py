@@ -246,6 +246,7 @@ def luma_create_generation(
     loop: bool = False,
     keyframes: Optional[Dict[str, Any]] = None,
     resolution: str = "720p",
+    concept: str = "auto",
 ) -> Dict[str, Any]:
     """
     Create a new Luma video generation.
@@ -254,10 +255,11 @@ def luma_create_generation(
         prompt: Text prompt for video generation
         model: "ray-2", "ray-flash-2" (fast), etc.
         aspect_ratio: "16:9", "9:16", "1:1", etc.
-        duration_seconds: 5 or 10 (Luma native), we'll convert from 4/6/8
+        duration_seconds: 5 or 10 (Luma native)
         loop: Whether video should loop
         keyframes: Optional keyframes for image-to-video
         resolution: "720p" or "1080p"
+        concept: Luma Concept ID or "auto" for default
 
     Returns:
         Generation response with 'id' for polling
@@ -273,6 +275,10 @@ def luma_create_generation(
     if resolution == "1080p" and model == "ray-2":
         payload["resolution"] = "1080p"
     # ray-flash-2 only supports 720p
+
+    # Add concept if not auto (Luma Concepts API)
+    if concept and concept != "auto":
+        payload["concept"] = concept
 
     # Add keyframes for image-to-video
     if keyframes:
@@ -310,6 +316,25 @@ def luma_cancel_generation(generation_id: str) -> Dict[str, Any]:
         raise _parse_error(r)
     except (Timeout, RequestsConnectionError) as e:
         raise LumaError(0, f"Connection error: {e}", retryable=True) from e
+
+
+def luma_get_concepts() -> Dict[str, Any]:
+    """
+    Fetch the list of available Luma Concepts for styling video generations.
+
+    Returns:
+        List of concept objects with:
+        - id: concept ID to use in generation requests
+        - name: display name
+        - description: concept description
+        - thumbnail_url: preview image
+    """
+    try:
+        resp = luma_get("/dream-machine/v1/concepts")
+        return resp
+    except LumaError:
+        # If concepts endpoint doesn't exist or fails, return empty list
+        return {"concepts": []}
 
 
 # ── Status normalization ─────────────────────────────────────
