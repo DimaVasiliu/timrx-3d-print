@@ -1858,8 +1858,9 @@ def dispatch_luma_video_async(
     - prompt: Text prompt for video generation
     - image_data: HTTPS URL or data URI for image2video
     - aspect_ratio: "16:9", "9:16", "1:1"
-    - duration_seconds: 4, 6, or 8 (mapped to Luma's 5 or 10)
-    - quality_tier: "fast_preview", "studio_hd", "pro_full_hd"
+    - duration_seconds: 5 or 10 (Luma's supported durations)
+    - resolution: "540p", "720p", "1080p"
+    - concept: Luma Concept ID or "auto" for default style
     - loop: Whether video should loop
     - seed: Optional random seed
     """
@@ -1867,8 +1868,9 @@ def dispatch_luma_video_async(
 
     start_time = time.time()
     task = payload.get("task", "text2video")
-    quality_tier = payload.get("quality_tier", "studio_hd")
-    print(f"[ASYNC] Starting Luma video {task} dispatch for job {internal_job_id} (tier={quality_tier})")
+    resolution = payload.get("resolution", "720p")
+    concept = payload.get("concept", "auto")
+    print(f"[ASYNC] Starting Luma video {task} dispatch for job {internal_job_id} (resolution={resolution}, concept={concept})")
 
     luma_provider = resolve_video_provider("luma")
 
@@ -1880,7 +1882,7 @@ def dispatch_luma_video_async(
 
         # Extract parameters
         aspect_ratio = payload.get("aspect_ratio", "16:9")
-        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 6)
+        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 5)
 
         # Ensure duration_seconds is an integer
         try:
@@ -1889,7 +1891,7 @@ def dispatch_luma_video_async(
             else:
                 duration_seconds = int(duration_seconds)
         except (ValueError, TypeError):
-            duration_seconds = 6
+            duration_seconds = 5
 
         loop = payload.get("loop", False)
         seed = payload.get("seed")
@@ -1897,7 +1899,8 @@ def dispatch_luma_video_async(
         route_params = dict(
             aspect_ratio=aspect_ratio,
             duration_seconds=duration_seconds,
-            quality_tier=quality_tier,
+            resolution=resolution,
+            concept=concept,
             loop=loop,
             seed=seed,
         )
