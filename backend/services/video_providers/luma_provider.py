@@ -153,18 +153,19 @@ class LumaProvider:
         Params:
             prompt: Text description
             aspect_ratio: "16:9", "9:16", "1:1", etc.
-            duration_seconds: 4, 6, 8 (mapped to Luma's 5 or 10)
-            quality_tier: "fast_preview", "studio_hd", "pro_full_hd"
-            resolution: Fallback if quality_tier not specified
+            duration_seconds: 5 or 10 (Luma's supported durations)
+            resolution: "540p", "720p", or "1080p"
+            concept: Luma Concept ID or "auto" for default style
             loop: Whether video should loop
 
         Returns:
             {"generation_id": "<uuid>"}  — used as upstream identifier for polling.
         """
         ratio = _map_ratio(params.get("aspect_ratio", "16:9"))
-        duration = _map_duration(params.get("duration_seconds", 6))
+        duration = _map_duration(params.get("duration_seconds", 5))
         quality_tier = params.get("quality_tier", "")
         resolution = params.get("resolution", "720p")
+        concept = params.get("concept", "auto")
         loop = params.get("loop", False)
 
         model, final_resolution = _get_model_settings(quality_tier, resolution)
@@ -177,6 +178,7 @@ class LumaProvider:
                 duration_seconds=duration,
                 loop=loop,
                 resolution=final_resolution,
+                concept=concept,
             )
         except LumaQuotaError:
             from backend.services.video_router import QuotaExhaustedError
@@ -203,9 +205,10 @@ class LumaProvider:
             {"generation_id": "<uuid>"}
         """
         ratio = _map_ratio(params.get("aspect_ratio", "16:9"))
-        duration = _map_duration(params.get("duration_seconds", 6))
+        duration = _map_duration(params.get("duration_seconds", 5))
         quality_tier = params.get("quality_tier", "")
         resolution = params.get("resolution", "720p")
+        concept = params.get("concept", "auto")
         loop = params.get("loop", False)
 
         model, final_resolution = _get_model_settings(quality_tier, resolution)
@@ -228,6 +231,7 @@ class LumaProvider:
                 loop=loop,
                 keyframes=keyframes,
                 resolution=final_resolution,
+                concept=concept,
             )
         except LumaQuotaError:
             from backend.services.video_router import QuotaExhaustedError
