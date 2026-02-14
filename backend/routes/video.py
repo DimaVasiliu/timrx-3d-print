@@ -50,7 +50,7 @@ from backend.services.pricing_service import (
     get_video_credit_cost,
     get_luma_action_code,
     get_luma_credit_cost,
-    get_luma_quality_tier_info,
+    get_luma_resolution_info,
 )
 from backend.utils.helpers import now_s, log_event
 
@@ -1333,19 +1333,22 @@ def luma_video_generate():
         "task": "text2video" or "image2video",
         "prompt": "A serene forest...",
         "image_data": "https://...",     # Required for image2video
-        "duration_sec": 6,               # 4, 6, 8
+        "duration_sec": 5,               # 5 or 10 (Luma only supports these)
         "aspect_ratio": "16:9",          # "16:9", "9:16", "1:1"
-        "quality_tier": "studio_hd",     # "fast_preview", "studio_hd", "pro_full_hd"
-        "style_preset": "cinematic",     # Optional style hint
-        "motion_preset": "pan",          # Optional camera motion
-        "custom_motion": "slow dolly",   # Optional custom motion text
-        "loop": false                    # Whether video should loop
+        "resolution": "720p",            # "540p", "720p", "1080p"
+        "concept": "auto",               # Optional Luma concept/style ID
+        "loop": false,                   # Whether video should loop
+        "seed": null                     # Optional random seed
     }
 
-    Quality Tiers:
-    - fast_preview:  Ray2 Flash 720p (cheapest, fastest)
-    - studio_hd:     Ray2 720p (balanced)
-    - pro_full_hd:   Ray2 1080p (highest quality)
+    Resolutions:
+    - 540p:  Standard quality (fast, cheap)
+    - 720p:  HD quality (balanced)
+    - 1080p: Full HD quality (slow, expensive)
+
+    Durations:
+    - 5s:  Quick generation (5 seconds)
+    - 10s: Extended generation (10 seconds)
     """
     if request.method == "OPTIONS":
         return ("", 204)
@@ -1373,33 +1376,29 @@ def luma_video_generate():
             "field": "task"
         }), 400
 
-    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or 6
+    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or 5
     aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
-    quality_tier = body.get("quality_tier") or body.get("qualityTier") or "studio_hd"
-    style_preset = body.get("style_preset") or body.get("stylePreset")
-    motion_preset = body.get("motion_preset") or body.get("motionPreset")
-    custom_motion = (body.get("custom_motion") or body.get("customMotion") or "").strip()
+    resolution = body.get("resolution") or "720p"
+    concept = body.get("concept") or body.get("style") or "auto"
     loop = body.get("loop", False)
     seed = body.get("seed")
 
     try:
         duration_seconds = int(raw_duration)
     except (ValueError, TypeError):
-        duration_seconds = 6
+        duration_seconds = 5
 
-    # Clamp duration to valid values (4, 6, 8)
-    if duration_seconds <= 4:
-        duration_seconds = 4
-    elif duration_seconds <= 6:
-        duration_seconds = 6
+    # Validate duration (Luma only supports 5s and 10s)
+    if duration_seconds <= 5:
+        duration_seconds = 5
     else:
-        duration_seconds = 8
+        duration_seconds = 10
 
-    # Validate quality tier
-    valid_tiers = ["fast_preview", "studio_hd", "pro_full_hd"]
-    tier_normalized = quality_tier.lower().replace(" ", "_").replace("-", "_")
-    if tier_normalized not in valid_tiers:
-        tier_normalized = "studio_hd"
+    # Validate resolution
+    valid_resolutions = ["540p", "720p", "1080p"]
+    res_normalized = resolution.lower()
+    if res_normalized not in valid_resolutions:
+        res_normalized = "720p"
 
     # Task-specific validation
     if task == "text2video":
@@ -1413,22 +1412,16 @@ def luma_video_generate():
             return jsonify({"error": "invalid_params", "message": "image_data is required", "field": "image_data"}), 400
         prompt = body.get("motion") or body.get("prompt") or ""
 
-    # Apply style and motion presets to prompt
+    # Use prompt as-is (concept/style will be handled by Luma Concepts API)
     enhanced_prompt = prompt
-    if style_preset:
-        enhanced_prompt = normalize_text_prompt(prompt, style_preset, duration_seconds)
-    if motion_preset or custom_motion:
-        motion_text = normalize_motion_prompt(custom_motion or "", motion_preset)
-        if motion_text and motion_text not in enhanced_prompt:
-            enhanced_prompt = f"{enhanced_prompt}. {motion_text}" if enhanced_prompt else motion_text
 
     internal_job_id = str(uuid.uuid4())
 
     # Get Luma-specific action code and cost
-    action_key = get_luma_action_code(task, tier_normalized, duration_seconds)
-    expected_cost = get_luma_credit_cost(tier_normalized, duration_seconds)
+    action_key = get_luma_action_code(task, res_normalized, duration_seconds)
+    expected_cost = get_luma_credit_cost(res_normalized, duration_seconds)
 
-    print(f"[LUMA] Reserving credits: action_code={action_key} cost={expected_cost} tier={tier_normalized} duration={duration_seconds}s")
+    print(f"[LUMA] Reserving credits: action_code={action_key} cost={expected_cost} resolution={res_normalized} duration={duration_seconds}s")
 
     reservation_id, credit_error = start_paid_job(
         identity_id, action_key, internal_job_id,
@@ -1437,7 +1430,8 @@ def luma_video_generate():
             "provider": "luma",
             "prompt": enhanced_prompt[:100] if enhanced_prompt else None,
             "duration_seconds": duration_seconds,
-            "quality_tier": tier_normalized,
+            "resolution": res_normalized,
+            "concept": concept,
             "expected_cost": expected_cost,
         },
     )
@@ -1453,10 +1447,8 @@ def luma_video_generate():
         "original_prompt": prompt,
         "duration_seconds": duration_seconds,
         "aspect_ratio": aspect_ratio,
-        "quality_tier": tier_normalized,
-        "style_preset": style_preset,
-        "motion_preset": motion_preset,
-        "custom_motion": custom_motion,
+        "resolution": res_normalized,
+        "concept": concept,
         "loop": loop,
         "seed": seed,
         "user_id": identity_id,
@@ -1487,7 +1479,8 @@ def luma_video_generate():
         "image_data": image_data,
         "aspect_ratio": aspect_ratio,
         "duration_seconds": duration_seconds,
-        "quality_tier": tier_normalized,
+        "resolution": res_normalized,
+        "concept": concept,
         "loop": loop,
         "seed": seed,
     }
@@ -1496,7 +1489,7 @@ def luma_video_generate():
     ExpenseGuard.register_active_job(internal_job_id)
     get_executor().submit(dispatch_luma_video_async, internal_job_id, identity_id, reservation_id, payload, store_meta)
 
-    log_event("video/luma/generate:dispatched", {"internal_job_id": internal_job_id, "task": task, "quality_tier": tier_normalized})
+    log_event("video/luma/generate:dispatched", {"internal_job_id": internal_job_id, "task": task, "resolution": res_normalized})
 
     return jsonify({
         "ok": True,
@@ -1509,7 +1502,8 @@ def luma_video_generate():
         "params": {
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration_seconds,
-            "quality_tier": tier_normalized,
+            "resolution": res_normalized,
+            "concept": concept,
         },
         "expected_cost": expected_cost,
     })
@@ -1536,14 +1530,35 @@ def luma_provider_status():
 
 @bp.route("/video/luma/pricing", methods=["GET", "OPTIONS"])
 def luma_pricing():
-    """Get Luma quality tiers and pricing for frontend display."""
+    """Get Luma resolutions and pricing for frontend display."""
     if request.method == "OPTIONS":
         return ("", 204)
 
     return jsonify({
         "ok": True,
         "provider": "luma",
-        "quality_tiers": get_luma_quality_tier_info(),
-        "durations": [4, 6, 8],
+        "resolutions": get_luma_resolution_info(),
+        "durations": [5, 10],
         "aspect_ratios": ["16:9", "9:16", "1:1"],
     })
+
+
+@bp.route("/video/luma/concepts", methods=["GET", "OPTIONS"])
+def luma_concepts():
+    """Get Luma Concepts for dynamic styling."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    try:
+        from backend.services.luma_service import luma_get_concepts
+        concepts_data = luma_get_concepts()
+        return jsonify({
+            "ok": True,
+            "concepts": concepts_data.get("concepts", []),
+        })
+    except Exception as e:
+        print(f"[LUMA] Failed to fetch concepts: {e}")
+        return jsonify({
+            "ok": True,
+            "concepts": [],
+        })
