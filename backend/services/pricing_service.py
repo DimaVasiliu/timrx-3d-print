@@ -169,17 +169,10 @@ def _is_video_variant_code(action_key: str) -> bool:
     Video variant codes follow the pattern:
     - video_text_generate_{duration}s_{resolution}
     - video_image_animate_{duration}s_{resolution}
-    - luma_{quality_tier}_{duration}s
-    - luma_image_{quality_tier}_{duration}s
-    - runway_{model}_{duration}s_{resolution}
 
     Where duration is 4, 6, or 8 and resolution is 720p or 1080p.
     (4k exists in DB for future use but is not exposed in UI)
     """
-    # Provider-specific patterns (dynamic recognition for scalability)
-    if action_key.startswith("luma_") or action_key.startswith("runway_"):
-        return True
-
     if not action_key.startswith("video_"):
         return False
 
@@ -245,28 +238,6 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_generate", "cost_credits": 70, "provider": "video"},
     {"action_code": "video_text_generate", "cost_credits": 70, "provider": "video"},
     {"action_code": "video_image_animate", "cost_credits": 70, "provider": "video"},
-    # ─────────────────────────────────────────────────────────────────────────────
-    # LUMA VIDEO GENERATION COSTS
-    # Luma Dream Machine uses 5s and 10s durations (NOT 4/6/8)
-    # Pricing is resolution-based: 540p, 720p, 1080p
-    # Formula: TimrX markup applied to Luma's per-second pricing
-    # ─────────────────────────────────────────────────────────────────────────────
-    # 540p - Standard quality (ray-flash or ray-2 @ 540p)
-    {"action_code": "luma_540p_5s", "cost_credits": 65, "provider": "luma"},
-    {"action_code": "luma_540p_10s", "cost_credits": 130, "provider": "luma"},
-    # 720p - HD quality (ray-2 @ 720p)
-    {"action_code": "luma_720p_5s", "cost_credits": 115, "provider": "luma"},
-    {"action_code": "luma_720p_10s", "cost_credits": 225, "provider": "luma"},
-    # 1080p - Full HD quality (ray-2 @ 1080p)
-    {"action_code": "luma_1080p_5s", "cost_credits": 255, "provider": "luma"},
-    {"action_code": "luma_1080p_10s", "cost_credits": 505, "provider": "luma"},
-    # Luma image-to-video variants (same pricing as text-to-video)
-    {"action_code": "luma_image_540p_5s", "cost_credits": 65, "provider": "luma"},
-    {"action_code": "luma_image_540p_10s", "cost_credits": 130, "provider": "luma"},
-    {"action_code": "luma_image_720p_5s", "cost_credits": 115, "provider": "luma"},
-    {"action_code": "luma_image_720p_10s", "cost_credits": 225, "provider": "luma"},
-    {"action_code": "luma_image_1080p_5s", "cost_credits": 255, "provider": "luma"},
-    {"action_code": "luma_image_1080p_10s", "cost_credits": 505, "provider": "luma"},
 ]
 
 
@@ -327,118 +298,6 @@ def get_video_credit_cost(duration_seconds: int, resolution: str) -> int:
     resolution_costs = VIDEO_CREDIT_COSTS.get(resolution, {})
     return resolution_costs.get(duration, 70)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LUMA VIDEO PRICING
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Luma valid resolutions (per Luma Dream Machine docs)
-LUMA_RESOLUTIONS = ["540p", "720p", "1080p"]
-
-# Luma valid durations (Luma uses 5s and 10s, NOT 4/6/8)
-LUMA_DURATIONS = [5, 10]
-
-# Luma credit costs: (resolution, duration) -> cost
-LUMA_CREDIT_COSTS = {
-    ("540p", 5): 65,
-    ("540p", 10): 130,
-    ("720p", 5): 115,
-    ("720p", 10): 225,
-    ("1080p", 5): 255,
-    ("1080p", 10): 505,
-}
-
-
-def get_luma_action_code(task: str, resolution: str, duration_seconds: int) -> str:
-    """
-    Build the Luma action code for a specific variant.
-
-    Args:
-        task: "text2video" or "image2video"
-        resolution: "540p", "720p", or "1080p"
-        duration_seconds: 5 or 10 (Luma only supports these)
-
-    Returns:
-        Action code like "luma_720p_5s" or "luma_image_1080p_10s"
-    """
-    # Normalize resolution
-    res = resolution.lower() if resolution else "720p"
-    if res not in LUMA_RESOLUTIONS:
-        res = "720p"  # Default to 720p
-
-    # Normalize duration (Luma only supports 5s and 10s)
-    duration = int(duration_seconds)
-    if duration <= 5:
-        duration = 5
-    else:
-        duration = 10
-
-    # Build action code
-    if task.lower() in ("image2video", "image_to_video", "image", "animate"):
-        return f"luma_image_{res}_{duration}s"
-    return f"luma_{res}_{duration}s"
-
-
-def get_luma_credit_cost(resolution: str, duration_seconds: int) -> int:
-    """
-    Get the TimrX credit cost for a Luma video generation.
-
-    Args:
-        resolution: "540p", "720p", or "1080p"
-        duration_seconds: 5 or 10
-
-    Returns:
-        TimrX credits to charge (65-505 depending on resolution and duration)
-    """
-    # Normalize resolution
-    res = resolution.lower() if resolution else "720p"
-    if res not in LUMA_RESOLUTIONS:
-        res = "720p"
-
-    # Normalize duration
-    duration = int(duration_seconds)
-    if duration <= 5:
-        duration = 5
-    else:
-        duration = 10
-
-    return LUMA_CREDIT_COSTS.get((res, duration), 115)  # Default to 720p 5s
-
-
-def get_luma_resolution_info() -> list:
-    """
-    Get information about Luma resolution options for frontend display.
-
-    Returns list of resolution info dicts with resolution, description, costs.
-    """
-    return [
-        {
-            "resolution": "540p",
-            "name": "Standard (540p)",
-            "description": "Fast rendering, good for drafts",
-            "costs": {5: 65, 10: 130},
-        },
-        {
-            "resolution": "720p",
-            "name": "HD (720p)",
-            "description": "Balanced quality and speed",
-            "costs": {5: 115, 10: 225},
-        },
-        {
-            "resolution": "1080p",
-            "name": "Full HD (1080p)",
-            "description": "Highest quality (slower)",
-            "costs": {5: 255, 10: 505},
-        },
-    ]
-
-
-def get_luma_quality_tier_info() -> list:
-    """
-    DEPRECATED: Use get_luma_resolution_info() instead.
-    Kept for backward compatibility with old routes.
-    """
-    return get_luma_resolution_info()
 
 DEFAULT_PLANS = [
     {
