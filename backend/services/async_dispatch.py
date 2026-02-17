@@ -608,99 +608,6 @@ def _update_job_meta(job_id: str, meta_patch: dict):
         print(f"[JOB] ERROR updating meta for {job_id}: {e}")
 
 
-def _redispatch_to_runway(
-    internal_job_id: str,
-    identity_id: str,
-    reservation_id: str | None,
-    store_meta: dict,
-):
-    """
-    Re-dispatch a filtered Gemini job to Runway.
-
-    Reuses the same job_id and credit reservation (no double-charge).
-    The original payload is reconstructed from store_meta.
-    """
-    from backend.services.video_router import video_router
-
-    runway = video_router.get_provider("runway")
-    if not runway:
-        print(f"[ASYNC] Runway provider not found for fallback of {internal_job_id}")
-        if reservation_id:
-            release_job_credits(reservation_id, "provider_filtered_third_party", internal_job_id)
-        update_job_status_failed(
-            internal_job_id,
-            "provider_filtered_third_party: Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
-        )
-        return
-
-    task = store_meta.get("task", "text2video")
-    route_params = dict(
-        aspect_ratio=store_meta.get("aspect_ratio", "16:9"),
-        resolution=store_meta.get("resolution", "720p"),
-        duration_seconds=store_meta.get("duration_seconds", 6),
-        negative_prompt=store_meta.get("negative_prompt", ""),
-        seed=store_meta.get("seed"),
-    )
-
-    try:
-        if task == "image2video":
-            resp = runway.start_image_to_video(
-                image_data=store_meta.get("image_data", ""),
-                prompt=store_meta.get("motion") or store_meta.get("prompt", ""),
-                **route_params,
-            )
-        else:
-            resp = runway.start_text_to_video(
-                prompt=store_meta.get("prompt", ""),
-                **route_params,
-            )
-
-        upstream_id = resp.get("task_id") or resp.get("operation_name")
-        if not upstream_id:
-            raise RuntimeError("Runway returned no task_id")
-
-        # print(f"[ASYNC] Runway fallback started for {internal_job_id}: upstream_id={upstream_id}")
-
-        update_job_with_upstream_id(internal_job_id, upstream_id)
-
-        store = load_store()
-        store_meta["upstream_id"] = upstream_id
-        store_meta["operation_name"] = upstream_id
-        store_meta["status"] = "processing"
-        store_meta["provider"] = "runway"
-        store[internal_job_id] = store_meta
-        save_store(store)
-
-        _poll_video_completion(
-            internal_job_id,
-            identity_id,
-            reservation_id,
-            upstream_id,
-            "runway",
-            store_meta,
-        )
-
-    except Exception as e:
-        print(f"[ASYNC] Runway fallback failed for {internal_job_id}: {e}")
-        # Store user-friendly error in meta
-        _update_job_meta(internal_job_id, {
-            "error_code": "provider_filtered_third_party",
-            "user_message": "Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
-        })
-        store = load_store()
-        store_meta["status"] = "failed"
-        store_meta["error"] = "Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters."
-        store_meta["error_code"] = "provider_filtered_third_party"
-        store[internal_job_id] = store_meta
-        save_store(store)
-        if reservation_id:
-            release_job_credits(reservation_id, "provider_filtered_third_party", internal_job_id)
-        update_job_status_failed(
-            internal_job_id,
-            "provider_filtered_third_party: Blocked by provider safety rules (third-party content). Try removing logos/faces/copyrighted characters.",
-        )
-
-
 # --- Monolith-compatible adapter names (Phase 4) ---
 
 
@@ -930,8 +837,6 @@ def _poll_gemini_video_completion(
     This runs in the background thread and updates job status.
     Veo typically completes in 1-2 minutes for standard videos.
     """
-    from backend.services.video_router import video_router
-
     # print(f"[ASYNC] Starting poll for Veo operation {operation_name}")
 
     consecutive_errors = 0
@@ -1005,29 +910,6 @@ def _poll_gemini_video_completion(
                 error_msg = status_resp.get("message", "Video generation failed")
                 print(f"[ASYNC] Veo video failed for job {internal_job_id}: {error_code} - {error_msg}")
 
-                # ── Provider content filtering — attempt Runway fallback ──
-                if error_code == "provider_filtered_third_party" and not store_meta.get("fallback_attempted"):
-                    runway_provider = video_router.get_provider("runway")
-                    runway_ok = runway_provider and runway_provider.is_configured()[0] if runway_provider else False
-
-                    if runway_ok:
-                        print(f"[ASYNC] Gemini filtered for job {internal_job_id}, attempting Runway fallback…")
-                        store_meta["fallback_attempted"] = True
-                        store_meta["original_provider"] = "google"
-                        store_meta["filter_reason"] = error_code
-
-                        _update_job_meta(internal_job_id, {
-                            "fallback_attempted": True,
-                            "original_provider": "google",
-                            "filter_reason": error_code,
-                            "provider": "runway",
-                        })
-
-                        _redispatch_to_runway(
-                            internal_job_id, identity_id, reservation_id, store_meta,
-                        )
-                        return
-
                 # Store user-friendly error details in meta + store
                 if error_code == "provider_filtered_third_party":
                     _update_job_meta(internal_job_id, {
@@ -1084,7 +966,6 @@ def _poll_video_completion(
 
     For 'google' (Gemini AI Studio), delegates to _poll_gemini_video_completion.
     For 'vertex', uses exponential backoff (2s initial, 10s max, ~6min timeout).
-    For 'runway' and others, uses fixed interval polling.
 
     Status response may contain:
     - video_url: URL to download video from
@@ -1100,8 +981,7 @@ def _poll_video_completion(
         )
 
     # ── Provider lookup ─────
-    # Use resolve_video_provider for all providers (Veo, Runway, Luma, etc)
-    # This works for both VideoRouter providers and standalone providers
+    # Use resolve_video_provider for all Veo providers (Vertex, Gemini AI Studio)
     provider = resolve_video_provider(provider_name)
     if not provider:
         print(f"[ASYNC] ERROR: Unknown provider {provider_name} for job {internal_job_id}")
@@ -1119,7 +999,7 @@ def _poll_video_completion(
         )
         return
 
-    # ── Generic provider poll (Runway, future providers) ─────
+    # ── Generic provider poll (future providers) ─────
     consecutive_errors = 0
     max_consecutive_errors = 5
 
@@ -1710,268 +1590,3 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
-
-
-def dispatch_runway_video_async(
-    internal_job_id: str,
-    identity_id: str,
-    reservation_id: Optional[str],
-    payload: dict,
-    store_meta: dict,
-):
-    """
-    Dispatch video generation directly to Runway (no fallback).
-
-    This is the dedicated Runway path, separate from the Veo router.
-    Used when user explicitly selects Runway as the video provider.
-
-    Payload parameters:
-    - task: "text2video" or "image2video"
-    - prompt: Text prompt for video generation
-    - image_data: Base64 image for image2video
-    - aspect_ratio: "16:9", "9:16", "1:1", etc.
-    - duration_seconds: 4, 6, 8, or 10 (Runway supports 2-10s for image2video)
-    - seed: Optional random seed
-    """
-    from backend.services.video_router import resolve_video_provider, QuotaExhaustedError
-
-    start_time = time.time()
-    task = payload.get("task", "text2video")
-    print(f"[ASYNC] Starting Runway video {task} dispatch for job {internal_job_id}")
-
-    runway_provider = resolve_video_provider("runway")
-
-    try:
-        # Check if Runway is configured
-        configured, config_err = runway_provider.is_configured()
-        if not configured:
-            raise RuntimeError(f"runway_not_configured: {config_err}")
-
-        # Extract parameters
-        aspect_ratio = payload.get("aspect_ratio", "16:9")
-        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 6)
-
-        # Ensure duration_seconds is an integer
-        try:
-            if isinstance(duration_seconds, str):
-                duration_seconds = int(duration_seconds.replace("s", "").replace("sec", "").strip())
-            else:
-                duration_seconds = int(duration_seconds)
-        except (ValueError, TypeError):
-            duration_seconds = 6
-
-        seed = payload.get("seed")
-
-        route_params = dict(
-            aspect_ratio=aspect_ratio,
-            duration_seconds=duration_seconds,
-            seed=seed,
-        )
-
-        # Call Runway directly
-        if task == "image2video":
-            prompt = payload.get("motion") or payload.get("prompt", "")
-            resp = runway_provider.start_image_to_video(
-                image_data=payload.get("image_data", ""),
-                prompt=prompt,
-                **route_params,
-            )
-        else:  # text2video
-            prompt = payload.get("prompt", "")
-            resp = runway_provider.start_text_to_video(
-                prompt=prompt,
-                **route_params,
-            )
-
-        store_meta["provider"] = "runway"
-
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        # Runway returns task_id
-        upstream_id = resp.get("task_id")
-
-        if upstream_id:
-            print(f"[ASYNC] Runway returned task_id={upstream_id} for job {internal_job_id} in {duration_ms}ms")
-
-            update_job_with_upstream_id(internal_job_id, upstream_id)
-
-            store = load_store()
-            store_meta["upstream_id"] = upstream_id
-            store_meta["task_id"] = upstream_id
-            store_meta["status"] = "processing"
-            store[internal_job_id] = store_meta
-            save_store(store)
-
-            # Poll for completion using the generic provider poller
-            _poll_video_completion(
-                internal_job_id,
-                identity_id,
-                reservation_id,
-                upstream_id,
-                "runway",
-                store_meta,
-            )
-        else:
-            raise RuntimeError("runway_failed: No task_id in response")
-
-    except QuotaExhaustedError as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Runway quota exhausted for job {internal_job_id} after {duration_ms}ms")
-        if reservation_id:
-            release_job_credits(reservation_id, "runway_quota_exhausted", internal_job_id)
-        update_job_status_failed(internal_job_id, f"runway_quota_exhausted: {e}")
-        ExpenseGuard.unregister_active_job(internal_job_id)
-
-    except RuntimeError as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        error_str = str(e)
-        print(f"[ASYNC] ERROR: Runway video {task} failed for job {internal_job_id} after {duration_ms}ms: {error_str}")
-        if reservation_id:
-            release_job_credits(reservation_id, "runway_failed", internal_job_id)
-        update_job_status_failed(internal_job_id, error_str)
-        ExpenseGuard.unregister_active_job(internal_job_id)
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Unexpected Runway error for job {internal_job_id} after {duration_ms}ms: {e}")
-        if reservation_id:
-            release_job_credits(reservation_id, "runway_error", internal_job_id)
-        update_job_status_failed(internal_job_id, f"runway_failed: {e}")
-        ExpenseGuard.unregister_active_job(internal_job_id)
-
-
-def dispatch_luma_video_async(
-    internal_job_id: str,
-    identity_id: str,
-    reservation_id: Optional[str],
-    payload: dict,
-    store_meta: dict,
-):
-    """
-    Dispatch video generation directly to Luma Dream Machine.
-
-    This is the dedicated Luma path for video generation.
-    Used when user explicitly selects Luma as the video provider.
-
-    Payload parameters:
-    - task: "text2video" or "image2video"
-    - prompt: Text prompt for video generation
-    - image_data: HTTPS URL or data URI for image2video
-    - aspect_ratio: "16:9", "9:16", "1:1"
-    - duration_seconds: 5 or 10 (Luma's supported durations)
-    - resolution: "540p", "720p", "1080p"
-    - concept: Luma Concept ID or "auto" for default style
-    - loop: Whether video should loop
-    - seed: Optional random seed
-    """
-    from backend.services.video_router import resolve_video_provider, QuotaExhaustedError
-
-    start_time = time.time()
-    task = payload.get("task", "text2video")
-    resolution = payload.get("resolution", "720p")
-    concept = payload.get("concept", "auto")
-    print(f"[ASYNC] Starting Luma video {task} dispatch for job {internal_job_id} (resolution={resolution}, concept={concept})")
-
-    luma_provider = resolve_video_provider("luma")
-
-    try:
-        # Check if Luma is configured
-        configured, config_err = luma_provider.is_configured()
-        if not configured:
-            raise RuntimeError(f"luma_not_configured: {config_err}")
-
-        # Extract parameters
-        aspect_ratio = payload.get("aspect_ratio", "16:9")
-        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 5)
-
-        # Ensure duration_seconds is an integer
-        try:
-            if isinstance(duration_seconds, str):
-                duration_seconds = int(duration_seconds.replace("s", "").replace("sec", "").strip())
-            else:
-                duration_seconds = int(duration_seconds)
-        except (ValueError, TypeError):
-            duration_seconds = 5
-
-        loop = payload.get("loop", False)
-        seed = payload.get("seed")
-
-        route_params = dict(
-            aspect_ratio=aspect_ratio,
-            duration_seconds=duration_seconds,
-            resolution=resolution,
-            concept=concept,
-            loop=loop,
-            seed=seed,
-        )
-
-        # Call Luma directly
-        if task == "image2video":
-            prompt = payload.get("motion") or payload.get("prompt", "")
-            resp = luma_provider.start_image_to_video(
-                image_data=payload.get("image_data", ""),
-                prompt=prompt,
-                **route_params,
-            )
-        else:  # text2video
-            prompt = payload.get("prompt", "")
-            resp = luma_provider.start_text_to_video(
-                prompt=prompt,
-                **route_params,
-            )
-
-        store_meta["provider"] = "luma"
-
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        # Luma returns generation_id (also aliased as task_id for consistency)
-        upstream_id = resp.get("generation_id") or resp.get("task_id")
-
-        if upstream_id:
-            print(f"[ASYNC] Luma returned generation_id={upstream_id} for job {internal_job_id} in {duration_ms}ms")
-
-            update_job_with_upstream_id(internal_job_id, upstream_id)
-
-            store = load_store()
-            store_meta["upstream_id"] = upstream_id
-            store_meta["generation_id"] = upstream_id
-            store_meta["status"] = "processing"
-            store[internal_job_id] = store_meta
-            save_store(store)
-
-            # Poll for completion using the generic provider poller
-            _poll_video_completion(
-                internal_job_id,
-                identity_id,
-                reservation_id,
-                upstream_id,
-                "luma",
-                store_meta,
-            )
-        else:
-            raise RuntimeError("luma_failed: No generation_id in response")
-
-    except QuotaExhaustedError as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Luma quota exhausted for job {internal_job_id} after {duration_ms}ms")
-        if reservation_id:
-            release_job_credits(reservation_id, "luma_quota_exhausted", internal_job_id)
-        update_job_status_failed(internal_job_id, f"luma_quota_exhausted: {e}")
-        ExpenseGuard.unregister_active_job(internal_job_id)
-
-    except RuntimeError as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        error_str = str(e)
-        print(f"[ASYNC] ERROR: Luma video {task} failed for job {internal_job_id} after {duration_ms}ms: {error_str}")
-        if reservation_id:
-            release_job_credits(reservation_id, "luma_failed", internal_job_id)
-        update_job_status_failed(internal_job_id, error_str)
-        ExpenseGuard.unregister_active_job(internal_job_id)
-
-    except Exception as e:
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Unexpected Luma error for job {internal_job_id} after {duration_ms}ms: {e}")
-        if reservation_id:
-            release_job_credits(reservation_id, "luma_error", internal_job_id)
-        update_job_status_failed(internal_job_id, f"luma_failed: {e}")
-        ExpenseGuard.unregister_active_job(internal_job_id)
