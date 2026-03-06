@@ -300,116 +300,201 @@ class InvoicingService:
     # ── PDF generation ─────────────────────────────────────
 
     @staticmethod
+    def _place_logo(pdf, x, y, w=28):
+        """Place the TimrX logo on the PDF. Returns True if placed."""
+        logo = _load_logo()
+        if not logo:
+            return False
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.write(logo)
+            tmp.close()
+            pdf.image(tmp.name, x=x, y=y, w=w)
+            os.unlink(tmp.name)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _draw_from_block(pdf, x, y):
+        """Draw the 'From' address block (TimrX business details)."""
+        BLACK = (30, 30, 30)
+        GRAY = (120, 120, 120)
+        pdf.set_text_color(*BLACK)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_xy(x, y)
+        pdf.cell(80, 5, "TimrX")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*GRAY)
+        for i, line in enumerate([
+            "9 Thomas Court",
+            "New Mossford Way",
+            "London, IG6 1FJ",
+            "United Kingdom",
+            "support@timrx.live",
+        ]):
+            pdf.set_xy(x, y + 6 + i * 5)
+            pdf.cell(80, 5, line)
+        return y + 6 + 5 * 5  # return y after last line
+
+    @staticmethod
+    def _draw_footer(pdf, lm, rm):
+        """Draw the professional footer line."""
+        GRAY = (120, 120, 120)
+        LGRAY = (200, 200, 200)
+        pdf.set_y(-25)
+        pdf.set_draw_color(*LGRAY)
+        pdf.line(lm, pdf.get_y(), rm, pdf.get_y())
+        pdf.ln(3)
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(*GRAY)
+        pdf.cell(
+            rm - lm, 4,
+            "TimrX  |  9 Thomas Court, New Mossford Way, London IG6 1FJ  |  timrx.live  |  support@timrx.live",
+            align="C",
+        )
+
+    @staticmethod
     def generate_invoice_pdf(
         invoice: Dict[str, Any],
         items: List[Dict[str, Any]],
     ) -> bytes:
-        """Generate a professional invoice PDF.  Returns raw bytes."""
+        """Generate a professional invoice PDF. Returns raw bytes."""
         from fpdf import FPDF
 
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=25)
         pdf.add_page()
 
-        # -- Logo
-        logo = _load_logo()
-        if logo:
-            try:
-                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                tmp.write(logo)
-                tmp.close()
-                pdf.image(tmp.name, x=10, y=10, w=30)
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+        LM = 15
+        RM = 195
+        CW = RM - LM
+        BLACK = (30, 30, 30)
+        GRAY = (120, 120, 120)
+        LGRAY = (200, 200, 200)
 
-        # -- Header
-        pdf.set_font("Helvetica", "B", 22)
-        pdf.set_xy(120, 10)
-        pdf.cell(80, 10, "INVOICE", align="R")
+        # -- Logo (top-left)
+        InvoicingService._place_logo(pdf, LM, 15)
 
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_xy(120, 22)
-        invoice_num = sanitize_pdf_text(str(invoice['invoice_number']))
-        pdf.cell(80, 5, f"No: {invoice_num}", align="R")
+        # -- Title (top-right)
+        pdf.set_text_color(*BLACK)
+        pdf.set_font("Helvetica", "B", 28)
+        pdf.set_xy(RM - 80, 15)
+        pdf.cell(80, 12, "Invoice", align="R")
 
+        # -- Invoice details (right column below title)
+        invoice_num = sanitize_pdf_text(str(invoice["invoice_number"]))
         issued = invoice.get("issued_at")
         if issued:
             date_str = issued.strftime("%d %B %Y") if hasattr(issued, "strftime") else str(issued)[:10]
         else:
             date_str = datetime.now(timezone.utc).strftime("%d %B %Y")
-        pdf.set_xy(120, 28)
-        pdf.cell(80, 5, f"Date: {sanitize_pdf_text(date_str)}", align="R")
 
-        # -- From
-        pdf.set_xy(10, 45)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(80, 6, "From")
+        y = 32
         pdf.set_font("Helvetica", "", 9)
-        pdf.set_xy(10, 52)
-        pdf.cell(80, 5, "TimrX - 3D Print Hub")
-        pdf.set_xy(10, 57)
-        pdf.cell(80, 5, "support@timrx.live")
+        for label, val in [
+            ("Invoice number", invoice_num),
+            ("Date of issue", sanitize_pdf_text(date_str)),
+            ("Date due", sanitize_pdf_text(date_str)),
+        ]:
+            pdf.set_text_color(*GRAY)
+            pdf.set_xy(115, y)
+            pdf.cell(40, 5, label)
+            pdf.set_text_color(*BLACK)
+            pdf.cell(40, 5, val, align="R")
+            y += 6
 
-        # -- Bill To
-        pdf.set_xy(120, 45)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(80, 6, "Bill To", align="R")
+        # -- From (left)
+        y_from = 55
+        y_after_addr = InvoicingService._draw_from_block(pdf, LM, y_from)
+
+        # -- Bill To (right)
+        pdf.set_text_color(*BLACK)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_xy(115, y_from)
+        pdf.cell(80, 5, "Bill to", align="R")
         pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*GRAY)
         email = sanitize_pdf_text(invoice.get("customer_email") or "-")
-        pdf.set_xy(120, 52)
+        pdf.set_xy(115, y_from + 6)
         pdf.cell(80, 5, email, align="R")
 
+        # -- Amount due banner
+        amount = float(invoice["total"])
+        y_banner = y_after_addr + 8
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(*BLACK)
+        pdf.set_xy(LM, y_banner)
+        pdf.cell(CW, 10, sanitize_pdf_text(f"\u00a3{amount:.2f} due {date_str}"), align="C")
+
         # -- Line items table
-        y_start = 72
-        pdf.set_xy(10, y_start)
+        y_tbl = y_banner + 16
+        pdf.set_draw_color(*LGRAY)
+        pdf.line(LM, y_tbl, RM, y_tbl)
 
-        # Table header
-        pdf.set_fill_color(40, 40, 40)
-        pdf.set_text_color(255, 255, 255)
+        y_tbl += 2
+        pdf.set_xy(LM, y_tbl)
         pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(90, 8, "  Description", fill=True)
-        pdf.cell(25, 8, "Qty", align="C", fill=True)
-        pdf.cell(35, 8, "Unit Price", align="R", fill=True)
-        pdf.cell(35, 8, "Total  ", align="R", fill=True)
-        pdf.ln()
+        pdf.set_text_color(*GRAY)
+        pdf.cell(90, 7, "Description")
+        pdf.cell(20, 7, "Qty", align="C")
+        pdf.cell(35, 7, "Unit price", align="R")
+        pdf.cell(35, 7, "Amount", align="R")
 
-        # Table rows
-        pdf.set_text_color(0, 0, 0)
+        y_tbl += 9
+        pdf.line(LM, y_tbl, RM, y_tbl)
+
+        pdf.set_text_color(*BLACK)
         pdf.set_font("Helvetica", "", 9)
         for item in items:
-            desc = sanitize_pdf_text(str(item.get('description', '')))
-            pdf.cell(90, 8, f"  {desc}")
-            pdf.cell(25, 8, str(item.get("quantity", 1)), align="C")
+            pdf.set_xy(LM, y_tbl + 2)
+            desc = sanitize_pdf_text(str(item.get("description", "")))
+            pdf.cell(90, 8, desc)
+            pdf.cell(20, 8, str(item.get("quantity", 1)), align="C")
             pdf.cell(35, 8, f"\u00a3{float(item['unit_price']):.2f}", align="R")
-            pdf.cell(35, 8, f"\u00a3{float(item['total']):.2f}  ", align="R")
-            pdf.ln()
+            pdf.cell(35, 8, f"\u00a3{float(item['total']):.2f}", align="R")
+            y_tbl += 10
 
-        # -- Totals
-        y_totals = pdf.get_y() + 6
-        pdf.set_xy(120, y_totals)
+        pdf.line(LM, y_tbl, RM, y_tbl)
+
+        # -- Totals (right-aligned)
+        yt = y_tbl + 6
         pdf.set_font("Helvetica", "", 9)
-        pdf.cell(45, 7, "Subtotal:", align="R")
-        pdf.cell(35, 7, f"\u00a3{float(invoice['subtotal']):.2f}  ", align="R")
-        pdf.ln()
+        pdf.set_text_color(*GRAY)
+        pdf.set_xy(RM - 80, yt)
+        pdf.cell(45, 7, "Subtotal")
+        pdf.set_text_color(*BLACK)
+        pdf.cell(35, 7, f"\u00a3{float(invoice['subtotal']):.2f}", align="R")
 
         tax = float(invoice.get("tax_amount", 0))
         if tax > 0:
-            pdf.set_x(120)
-            pdf.cell(45, 7, "Tax:", align="R")
-            pdf.cell(35, 7, f"\u00a3{tax:.2f}  ", align="R")
-            pdf.ln()
+            yt += 7
+            pdf.set_text_color(*GRAY)
+            pdf.set_xy(RM - 80, yt)
+            pdf.cell(45, 7, "Tax")
+            pdf.set_text_color(*BLACK)
+            pdf.cell(35, 7, f"\u00a3{tax:.2f}", align="R")
 
-        pdf.set_x(120)
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.cell(45, 9, "Total:", align="R")
-        pdf.cell(35, 9, f"\u00a3{float(invoice['total']):.2f}  ", align="R")
+        yt += 7
+        pdf.set_text_color(*GRAY)
+        pdf.set_xy(RM - 80, yt)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(45, 7, "Total")
+        pdf.set_text_color(*BLACK)
+        pdf.cell(35, 7, f"\u00a3{amount:.2f}", align="R")
+
+        yt += 10
+        pdf.line(RM - 80, yt, RM, yt)
+
+        yt += 4
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(*BLACK)
+        pdf.set_xy(RM - 80, yt)
+        pdf.cell(45, 8, "Amount due")
+        pdf.cell(35, 8, f"\u00a3{amount:.2f}", align="R")
 
         # -- Footer
-        pdf.set_y(-30)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(130, 130, 130)
-        pdf.cell(0, 5, "TimrX - 3D Print Hub  |  timrx.live  |  support@timrx.live", align="C")
+        InvoicingService._draw_footer(pdf, LM, RM)
 
         return pdf.output()
 
@@ -417,82 +502,187 @@ class InvoicingService:
     def generate_receipt_pdf(
         receipt: Dict[str, Any],
         invoice: Dict[str, Any],
+        items: Optional[List[Dict[str, Any]]] = None,
     ) -> bytes:
-        """Generate a payment receipt PDF.  Returns raw bytes."""
+        """Generate a professional payment receipt PDF. Returns raw bytes."""
         from fpdf import FPDF
 
         pdf = FPDF()
         pdf.set_auto_page_break(auto=True, margin=25)
         pdf.add_page()
 
-        # -- Logo
-        logo = _load_logo()
-        if logo:
-            try:
-                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                tmp.write(logo)
-                tmp.close()
-                pdf.image(tmp.name, x=10, y=10, w=30)
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+        LM = 15
+        RM = 195
+        CW = RM - LM
+        BLACK = (30, 30, 30)
+        GRAY = (120, 120, 120)
+        LGRAY = (200, 200, 200)
+        GREEN = (0, 150, 75)
 
-        # -- Header
-        pdf.set_font("Helvetica", "B", 22)
-        pdf.set_xy(120, 10)
-        pdf.cell(80, 10, "RECEIPT", align="R")
+        # -- Logo (top-left)
+        InvoicingService._place_logo(pdf, LM, 15)
 
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_xy(120, 22)
-        receipt_num = sanitize_pdf_text(str(receipt['receipt_number']))
-        pdf.cell(80, 5, f"No: {receipt_num}", align="R")
+        # -- Title (top-right)
+        pdf.set_text_color(*BLACK)
+        pdf.set_font("Helvetica", "B", 28)
+        pdf.set_xy(RM - 80, 15)
+        pdf.cell(80, 12, "Receipt", align="R")
 
+        # -- Receipt details (right column below title)
+        receipt_num = sanitize_pdf_text(str(receipt["receipt_number"]))
+        inv_num = sanitize_pdf_text(str(invoice.get("invoice_number", "-")))
         paid_at = receipt.get("paid_at")
         if paid_at:
             date_str = paid_at.strftime("%d %B %Y") if hasattr(paid_at, "strftime") else str(paid_at)[:10]
         else:
             date_str = datetime.now(timezone.utc).strftime("%d %B %Y")
-        pdf.set_xy(120, 28)
-        pdf.cell(80, 5, f"Date: {sanitize_pdf_text(date_str)}", align="R")
 
-        # -- PAID stamp
-        pdf.set_font("Helvetica", "B", 28)
-        pdf.set_text_color(0, 160, 80)
-        pdf.set_xy(10, 42)
-        pdf.cell(50, 14, "PAID", border=1)
-        pdf.set_text_color(0, 0, 0)
+        y = 32
+        pdf.set_font("Helvetica", "", 9)
+        for label, val in [
+            ("Receipt number", receipt_num),
+            ("Invoice number", inv_num),
+            ("Date of issue", sanitize_pdf_text(date_str)),
+        ]:
+            pdf.set_text_color(*GRAY)
+            pdf.set_xy(115, y)
+            pdf.cell(40, 5, label)
+            pdf.set_text_color(*BLACK)
+            pdf.cell(40, 5, val, align="R")
+            y += 6
 
-        # -- Details
-        pdf.set_xy(10, 65)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(80, 6, "Payment Details")
-        pdf.ln()
+        # -- From (left)
+        y_from = 55
+        y_after_addr = InvoicingService._draw_from_block(pdf, LM, y_from)
+
+        # -- Bill To (right)
+        pdf.set_text_color(*BLACK)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_xy(115, y_from)
+        pdf.cell(80, 5, "Bill to", align="R")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(*GRAY)
+        email = sanitize_pdf_text(invoice.get("customer_email") or "-")
+        pdf.set_xy(115, y_from + 6)
+        pdf.cell(80, 5, email, align="R")
+
+        # -- Amount paid banner (green)
+        amount = float(receipt["amount_paid"])
+        y_banner = y_after_addr + 8
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(*GREEN)
+        pdf.set_xy(LM, y_banner)
+        pdf.cell(CW, 10, sanitize_pdf_text(f"\u00a3{amount:.2f} paid on {date_str}"), align="C")
+
+        # -- Line items table (if items provided)
+        y_tbl = y_banner + 16
+        if items:
+            pdf.set_draw_color(*LGRAY)
+            pdf.line(LM, y_tbl, RM, y_tbl)
+
+            y_tbl += 2
+            pdf.set_xy(LM, y_tbl)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.set_text_color(*GRAY)
+            pdf.cell(90, 7, "Description")
+            pdf.cell(20, 7, "Qty", align="C")
+            pdf.cell(35, 7, "Unit price", align="R")
+            pdf.cell(35, 7, "Amount", align="R")
+
+            y_tbl += 9
+            pdf.line(LM, y_tbl, RM, y_tbl)
+
+            pdf.set_text_color(*BLACK)
+            pdf.set_font("Helvetica", "", 9)
+            for item in items:
+                pdf.set_xy(LM, y_tbl + 2)
+                desc = sanitize_pdf_text(str(item.get("description", "")))
+                pdf.cell(90, 8, desc)
+                pdf.cell(20, 8, str(item.get("quantity", 1)), align="C")
+                pdf.cell(35, 8, f"\u00a3{float(item['unit_price']):.2f}", align="R")
+                pdf.cell(35, 8, f"\u00a3{float(item['total']):.2f}", align="R")
+                y_tbl += 10
+
+            pdf.line(LM, y_tbl, RM, y_tbl)
+
+        # -- Totals (right-aligned)
+        yt = y_tbl + 6
+        total = float(invoice.get("total", amount))
+        subtotal = float(invoice.get("subtotal", total))
 
         pdf.set_font("Helvetica", "", 9)
-        details = [
-            ("Receipt No:", receipt["receipt_number"]),
-            ("Invoice No:", invoice.get("invoice_number") or "-"),
-            ("Customer:", invoice.get("customer_email") or "-"),
-            ("Payment Method:", (receipt.get("payment_method") or "mollie").title()),
-            ("Currency:", receipt.get("currency", "GBP")),
-            ("Date:", date_str),
-        ]
-        for label, value in details:
-            pdf.cell(45, 7, label)
-            pdf.cell(100, 7, sanitize_pdf_text(str(value)))
-            pdf.ln()
+        pdf.set_text_color(*GRAY)
+        pdf.set_xy(RM - 80, yt)
+        pdf.cell(45, 7, "Subtotal")
+        pdf.set_text_color(*BLACK)
+        pdf.cell(35, 7, f"\u00a3{subtotal:.2f}", align="R")
 
-        # -- Amount
-        pdf.ln(6)
-        pdf.set_font("Helvetica", "B", 14)
-        pdf.cell(45, 10, "Amount Paid:")
-        pdf.cell(100, 10, f"\u00a3{float(receipt['amount_paid']):.2f}")
+        tax = float(invoice.get("tax_amount", 0))
+        if tax > 0:
+            yt += 7
+            pdf.set_text_color(*GRAY)
+            pdf.set_xy(RM - 80, yt)
+            pdf.cell(45, 7, "Tax")
+            pdf.set_text_color(*BLACK)
+            pdf.cell(35, 7, f"\u00a3{tax:.2f}", align="R")
+
+        yt += 7
+        pdf.set_text_color(*GRAY)
+        pdf.set_xy(RM - 80, yt)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(45, 7, "Total")
+        pdf.set_text_color(*BLACK)
+        pdf.cell(35, 7, f"\u00a3{total:.2f}", align="R")
+
+        yt += 10
+        pdf.set_draw_color(*LGRAY)
+        pdf.line(RM - 80, yt, RM, yt)
+
+        yt += 4
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(*GREEN)
+        pdf.set_xy(RM - 80, yt)
+        pdf.cell(45, 8, "Amount paid")
+        pdf.cell(35, 8, f"\u00a3{amount:.2f}", align="R")
+
+        # -- Payment history
+        yt += 16
+        pdf.set_text_color(*BLACK)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_xy(LM, yt)
+        pdf.cell(CW, 7, "Payment history")
+
+        yt += 10
+        pdf.set_draw_color(*LGRAY)
+        pdf.line(LM, yt, RM, yt)
+
+        yt += 2
+        pdf.set_xy(LM, yt)
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(*GRAY)
+        pdf.cell(40, 7, "Payment")
+        pdf.cell(45, 7, "Date")
+        pdf.cell(40, 7, "Amount", align="R")
+        pdf.cell(55, 7, "Receipt number", align="R")
+
+        yt += 9
+        pdf.line(LM, yt, RM, yt)
+
+        yt += 2
+        pdf.set_xy(LM, yt)
+        pdf.set_font("Helvetica", "", 8)
+        pdf.set_text_color(*BLACK)
+        method = sanitize_pdf_text((receipt.get("payment_method") or "Mollie").title())
+        pdf.cell(40, 7, method)
+        pdf.cell(45, 7, sanitize_pdf_text(date_str))
+        pdf.cell(40, 7, f"\u00a3{amount:.2f}", align="R")
+        pdf.cell(55, 7, receipt_num, align="R")
+
+        yt += 9
+        pdf.line(LM, yt, RM, yt)
 
         # -- Footer
-        pdf.set_y(-30)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(130, 130, 130)
-        pdf.cell(0, 5, "TimrX - 3D Print Hub  |  timrx.live  |  support@timrx.live", align="C")
+        InvoicingService._draw_footer(pdf, LM, RM)
 
         return pdf.output()
 
@@ -603,7 +793,7 @@ class InvoicingService:
             # 2. Generate PDFs (with error handling - don't fail the whole pipeline)
             try:
                 invoice_pdf = InvoicingService.generate_invoice_pdf(invoice, items)
-                receipt_pdf = InvoicingService.generate_receipt_pdf(receipt, invoice) if receipt else None
+                receipt_pdf = InvoicingService.generate_receipt_pdf(receipt, invoice, items) if receipt else None
                 print(f"[INVOICE] PDFs generated: invoice={len(invoice_pdf) if invoice_pdf else 0} bytes, receipt={len(receipt_pdf) if receipt_pdf else 0} bytes")
             except Exception as pdf_err:
                 pdf_error = str(pdf_err)
