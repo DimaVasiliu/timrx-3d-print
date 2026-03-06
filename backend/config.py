@@ -463,6 +463,9 @@ class Config:
     # GEMINI_API_KEY with fallback to GOOGLE_API_KEY for backward compatibility
     GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY"))
 
+    # Discord webhook for community share notifications
+    DISCORD_WEBHOOK_URL: str = field(default_factory=lambda: _get_env("DISCORD_WEBHOOK_URL"))
+
     # ─────────────────────────────────────────────────────────────
     # Vertex AI (Veo) Video Generation
     # ─────────────────────────────────────────────────────────────
@@ -721,6 +724,7 @@ DEFAULT_MODEL_TITLE = config.DEFAULT_MODEL_TITLE
 ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS
 ALLOWED_ORIGINS = config._ALLOWED_ORIGINS_RAW  # Raw string for existing code
+DISCORD_WEBHOOK_URL = config.DISCORD_WEBHOOK_URL
 
 
 def log_config():
