@@ -6,13 +6,19 @@ Registered under /api/_mod to avoid conflicts during migration.
 
 from __future__ import annotations
 
+import logging
+import requests as http_requests
+
 from flask import Blueprint, jsonify, request
 
+from backend.config import config
 from backend.db import USE_DB, get_conn
 from backend.middleware import with_session
 from backend.services.identity_service import require_identity
 
 bp = Blueprint("community", __name__)
+
+logger = logging.getLogger(__name__)
 
 
 @bp.route("/community/feed", methods=["GET", "OPTIONS"])
@@ -250,3 +256,57 @@ def community_delete_mod(post_id: str):
             return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
 
     return _inner(post_id)
+
+
+@bp.route("/community/discord-share", methods=["POST", "OPTIONS"])
+def community_discord_share():
+    """Post a creation share embed to the Discord webhook."""
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        _, auth_error = require_identity()
+        if auth_error:
+            return auth_error
+
+        webhook_url = config.DISCORD_WEBHOOK_URL
+        if not webhook_url:
+            return jsonify({"ok": False, "error": {"code": "WEBHOOK_NOT_CONFIGURED"}}), 503
+
+        data = request.get_json() or {}
+        asset_type = data.get("type", "creation")
+        prompt = data.get("prompt", "")
+        thumbnail_url = data.get("thumbnail_url", "")
+
+        labels = {"model": "3D Model", "image": "AI Image", "video": "AI Video"}
+        label = labels.get(asset_type, "Creation")
+
+        embed = {
+            "title": f"New {label} on TimrX",
+            "color": 5793266,  # #5865F2 Discord blurple
+            "url": "https://timrx.live/3dprint",
+            "footer": {"text": "TimrX 3D Print Hub"},
+        }
+
+        if prompt:
+            embed["description"] = prompt[:200]
+        if thumbnail_url:
+            embed["thumbnail"] = {"url": thumbnail_url}
+
+        payload = {
+            "content": None,
+            "embeds": [embed],
+        }
+
+        try:
+            resp = http_requests.post(webhook_url, json=payload, timeout=5)
+            if resp.status_code in (200, 204):
+                return jsonify({"ok": True})
+            logger.warning(f"[Discord] Webhook returned {resp.status_code}: {resp.text[:200]}")
+            return jsonify({"ok": False, "error": {"code": "WEBHOOK_FAILED"}}), 502
+        except Exception as e:
+            logger.error(f"[Discord] Webhook error: {e}")
+            return jsonify({"ok": False, "error": {"code": "WEBHOOK_ERROR"}}), 502
+
+    return _inner()
