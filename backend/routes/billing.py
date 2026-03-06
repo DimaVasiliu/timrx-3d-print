@@ -1659,7 +1659,7 @@ def debug_test_invoice_pdf():
 
     try:
         from backend.services.invoicing_service import InvoicingService
-        receipt_pdf = InvoicingService.generate_receipt_pdf(mock_receipt, mock_invoice)
+        receipt_pdf = InvoicingService.generate_receipt_pdf(mock_receipt, mock_invoice, mock_items)
         result["receipt_pdf_bytes"] = len(receipt_pdf) if receipt_pdf else 0
     except Exception as e:
         errors.append(f"Receipt PDF error: {e}")
