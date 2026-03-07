@@ -1019,7 +1019,7 @@ class JobService:
                 meta = job.get("meta") or {}
                 thumbnail = meta.get("thumbnail_url") or meta.get("image_url") or ""
                 title = get_title_for_action(action_code)
-                send_to_discord(title, prompt, thumbnail or None)
+                send_to_discord(title, prompt, thumbnail or None, job.get("identity_id"))
             except Exception:
                 pass  # Discord notification is best-effort
 
