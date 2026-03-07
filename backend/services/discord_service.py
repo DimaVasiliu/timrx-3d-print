@@ -24,15 +24,26 @@ _ACTION_TITLES = {
 }
 
 
-def _get_user_email(identity_id: str) -> str:
-    """Look up user email from identity_id. Returns empty string if not found."""
+def _email_to_label(email: str) -> str:
+    """Convert email to a privacy-safe display label (name part only, no domain)."""
+    if not email or "@" not in email:
+        return ""
+    local = email.split("@")[0]
+    # Clean up common separators to produce a readable name
+    name = local.replace(".", " ").replace("_", " ").replace("-", " ")
+    # Capitalize each word for readability
+    return " ".join(w.capitalize() for w in name.split() if w)
+
+
+def _get_user_label(identity_id: str) -> str:
+    """Look up user display label from identity_id. Returns empty string if not found."""
     if not identity_id:
         return ""
     try:
         from backend.services.identity_service import IdentityService
         identity = IdentityService.get_identity(identity_id)
         if identity and identity.get("email"):
-            return identity["email"]
+            return _email_to_label(identity["email"])
     except Exception:
         pass
     return ""
@@ -51,9 +62,9 @@ def send_to_discord(title: str, prompt: str = "", image_url: str = None, identit
     if not DISCORD_WEBHOOK_URL:
         return
 
-    # Build footer with user email if available
-    user_email = _get_user_email(identity_id) if identity_id else ""
-    footer_text = f"TimrX 3D Print Hub | {user_email}" if user_email else "TimrX 3D Print Hub"
+    # Build footer with user label if available
+    user_label = _get_user_label(identity_id) if identity_id else ""
+    footer_text = f"TimrX 3D Print Hub | {user_label}" if user_label else "TimrX 3D Print Hub"
 
     embed = {
         "title": title,
