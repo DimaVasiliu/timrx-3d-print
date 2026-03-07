@@ -284,18 +284,20 @@ def community_discord_share():
 
         embed = {
             "title": f"New {label} on TimrX",
-            "color": 5793266,  # #5865F2 Discord blurple
+            "description": f"Prompt:\n{prompt[:200]}" if prompt else None,
+            "color": 5814783,
             "url": "https://timrx.live/3dprint",
             "footer": {"text": "TimrX 3D Print Hub"},
         }
 
-        if prompt:
-            embed["description"] = prompt[:200]
         if thumbnail_url:
-            embed["thumbnail"] = {"url": thumbnail_url}
+            embed["image"] = {"url": thumbnail_url}
+
+        # Remove None values from embed
+        embed = {k: v for k, v in embed.items() if v is not None}
 
         payload = {
-            "content": None,
+            "username": "TimrX Generator",
             "embeds": [embed],
         }
 
