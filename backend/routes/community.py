@@ -281,12 +281,15 @@ def community_discord_share():
         prompt = data.get("prompt", "")
         thumbnail_url = data.get("thumbnail_url", "")
 
-        # Get user email for the embed footer
+        # Get user display label for the embed footer (privacy-safe, no full email)
         user_label = ""
         try:
             identity = IdentityService.get_identity(identity_id)
             if identity and identity.get("email"):
-                user_label = identity["email"]
+                email = identity["email"]
+                local = email.split("@")[0] if "@" in email else email
+                name = local.replace(".", " ").replace("_", " ").replace("-", " ")
+                user_label = " ".join(w.capitalize() for w in name.split() if w)
         except Exception:
             pass
 
