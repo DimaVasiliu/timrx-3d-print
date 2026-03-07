@@ -343,7 +343,7 @@ def dispatch_openai_image_async(
         )
 
         # Post to Discord
-        send_to_discord("🖼️ New AI Image Generated", prompt, urls[0])
+        send_to_discord("🖼️ New AI Image Generated", prompt, urls[0], identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
@@ -444,7 +444,7 @@ def dispatch_gemini_image_async(
         )
 
         # Post to Discord
-        send_to_discord("🖼️ New AI Image Generated", prompt, image_url or image_urls[0])
+        send_to_discord("🖼️ New AI Image Generated", prompt, image_url or image_urls[0], identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
@@ -1369,7 +1369,7 @@ def _finalize_video_success_with_bytes(
 
     # Post to Discord
     prompt = store_meta.get("prompt", "")
-    send_to_discord("🎬 New AI Video Generated", prompt, str(s3_thumbnail_url) if s3_thumbnail_url else None)
+    send_to_discord("🎬 New AI Video Generated", prompt, str(s3_thumbnail_url) if s3_thumbnail_url else None, identity_id)
 
     # Unregister active job
     ExpenseGuard.unregister_active_job(internal_job_id)
