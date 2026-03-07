@@ -594,9 +594,9 @@ def video_animate():
     image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
     image_id = body.get("image_id")
 
-    # If image_id provided, fetch the URL from our images table
+    # If image_id provided, fetch the URL from our images table (scoped to current user)
     if not image_data and image_id:
-        image_data = _resolve_image_id(image_id)
+        image_data = _resolve_image_id(image_id, identity_id)
 
     if not image_data:
         return jsonify({"error": "invalid_params", "message": "image_data, image_url, or image_id is required", "field": "image_data"}), 400
@@ -631,9 +631,9 @@ def video_animate():
 
 
 # ── Helper: resolve image_id → image_url from DB ─────────────
-def _resolve_image_id(image_id: str) -> str | None:
-    """Look up an image URL from our images table by image_id."""
-    if not USE_DB or not image_id:
+def _resolve_image_id(image_id: str, identity_id: str | None) -> str | None:
+    """Look up an image URL from our images table by image_id, scoped to the requesting user."""
+    if not USE_DB or not image_id or not identity_id:
         return None
     try:
         with get_conn() as conn:
@@ -641,10 +641,10 @@ def _resolve_image_id(image_id: str) -> str | None:
                 cur.execute(
                     f"""
                     SELECT image_url FROM {Tables.IMAGES}
-                    WHERE id::text = %s AND deleted_at IS NULL
+                    WHERE id::text = %s AND identity_id = %s AND deleted_at IS NULL
                     LIMIT 1
                     """,
-                    (image_id,),
+                    (image_id, identity_id),
                 )
                 row = cur.fetchone()
         if row and row.get("image_url"):
