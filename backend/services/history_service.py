@@ -460,28 +460,22 @@ def save_image_to_normalized_db(
         print("[DB] USE_DB is False, skipping save_image_to_normalized_db")
         return False
 
+    if not user_id:
+        print(f"[DB] SKIPPED save_image: no identity_id for image_id={image_id} (would create orphaned row)")
+        return None
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 existing_history_id = None
-                if user_id:
-                    cur.execute(
-                        f"""
-                        SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
-                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
-                        LIMIT 1
-                        """,
-                        (image_id, image_id, user_id),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
-                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id IS NULL
-                        LIMIT 1
-                        """,
-                        (image_id, image_id),
-                    )
+                cur.execute(
+                    f"""
+                    SELECT id, image_id FROM {Tables.HISTORY_ITEMS}
+                    WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
+                    LIMIT 1
+                    """,
+                    (image_id, image_id, user_id),
+                )
                 existing = cur.fetchone()
                 if existing:
                     # existing is a dict due to connection's default row_factory=dict_row
@@ -943,29 +937,23 @@ def save_video_to_normalized_db(
         print("[DB] USE_DB is False, skipping save_video_to_normalized_db")
         return None
 
+    if not user_id:
+        print(f"[DB] SKIPPED save_video: no identity_id for video_id={video_id} (would create orphaned row)")
+        return None
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # Check for existing history item
                 existing_history_id = None
-                if user_id:
-                    cur.execute(
-                        f"""
-                        SELECT id, video_id FROM {Tables.HISTORY_ITEMS}
-                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
-                        LIMIT 1
-                        """,
-                        (video_id, video_id, user_id),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        SELECT id, video_id FROM {Tables.HISTORY_ITEMS}
-                        WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id IS NULL
-                        LIMIT 1
-                        """,
-                        (video_id, video_id),
-                    )
+                cur.execute(
+                    f"""
+                    SELECT id, video_id FROM {Tables.HISTORY_ITEMS}
+                    WHERE (payload->>'original_id' = %s OR id::text = %s) AND identity_id = %s
+                    LIMIT 1
+                    """,
+                    (video_id, video_id, user_id),
+                )
                 existing = cur.fetchone()
                 if existing:
                     existing_history_id = str(existing["id"])
@@ -1200,6 +1188,10 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
     if not user_id:
         user_id = job_meta.get("identity_id") or job_meta.get("user_id")
+
+    if not user_id:
+        print(f"[DB] SKIPPED save_finished_job: no identity_id for job_id={job_id} (would create orphaned row)")
+        return None
 
     if not USE_DB:
         print("[DB] USE_DB is False, skipping save_finished_job_to_normalized_db")
