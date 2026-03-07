@@ -990,11 +990,11 @@ def history_item_update_mod(item_id: str):
                             )
 
                             if model_id:
-                                cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s", (model_id,))
+                                cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s AND identity_id = %s", (model_id, identity_id))
                             if image_id:
-                                cur.execute(f"DELETE FROM {Tables.IMAGES} WHERE id = %s", (image_id,))
+                                cur.execute(f"DELETE FROM {Tables.IMAGES} WHERE id = %s AND identity_id = %s", (image_id, identity_id))
                             if video_id:
-                                cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s", (video_id,))
+                                cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s AND identity_id = %s", (video_id, identity_id))
                         conn.commit()
                         db_ok = True
 
