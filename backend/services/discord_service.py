@@ -24,7 +24,21 @@ _ACTION_TITLES = {
 }
 
 
-def send_to_discord(title: str, prompt: str = "", image_url: str = None):
+def _get_user_email(identity_id: str) -> str:
+    """Look up user email from identity_id. Returns empty string if not found."""
+    if not identity_id:
+        return ""
+    try:
+        from backend.services.identity_service import IdentityService
+        identity = IdentityService.get_identity(identity_id)
+        if identity and identity.get("email"):
+            return identity["email"]
+    except Exception:
+        pass
+    return ""
+
+
+def send_to_discord(title: str, prompt: str = "", image_url: str = None, identity_id: str = None):
     """
     Post a generation notification embed to the configured Discord webhook.
 
@@ -32,14 +46,19 @@ def send_to_discord(title: str, prompt: str = "", image_url: str = None):
         title: Embed title (e.g. "🧊 New AI 3D Model Generated")
         prompt: The user's generation prompt
         image_url: Optional thumbnail/preview URL
+        identity_id: Optional user identity ID (to include email in footer)
     """
     if not DISCORD_WEBHOOK_URL:
         return
 
+    # Build footer with user email if available
+    user_email = _get_user_email(identity_id) if identity_id else ""
+    footer_text = f"TimrX 3D Print Hub | {user_email}" if user_email else "TimrX 3D Print Hub"
+
     embed = {
         "title": title,
         "color": 5814783,
-        "footer": {"text": "TimrX 3D Print Hub"},
+        "footer": {"text": footer_text},
     }
 
     if prompt:
