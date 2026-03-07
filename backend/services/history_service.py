@@ -1312,7 +1312,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             if user_id:
                 cur.execute(
                     f"""
-                    SELECT status, glb_url, image_url, item_type
+                    SELECT status, glb_url, image_url, thumbnail_url, item_type
                     FROM {Tables.HISTORY_ITEMS}
                     WHERE (id::text = %s OR payload->>'original_job_id' = %s)
                       AND (identity_id = %s OR identity_id IS NULL)
@@ -1324,7 +1324,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             else:
                 cur.execute(
                     f"""
-                    SELECT status, glb_url, image_url, item_type
+                    SELECT status, glb_url, image_url, thumbnail_url, item_type
                     FROM {Tables.HISTORY_ITEMS}
                     WHERE (id::text = %s OR payload->>'original_job_id' = %s)
                       AND identity_id IS NULL
@@ -1338,9 +1338,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 asset_type = existing_history.get("item_type") or ("image" if job_type in ("image", "openai_image") else "model")
                 asset_url = existing_history.get("image_url") if asset_type == "image" else existing_history.get("glb_url")
                 if existing_history.get("status") == "finished" and is_s3_url(asset_url):
-                    # print(f"[DB] save_finished_job skipped: already finished with S3 (job_id={job_id}, stage={final_stage})")
                     cur.close()
-                    return {"success": True, "db_ok": True, "skipped": True}
+                    return {
+                        "success": True, "db_ok": True, "skipped": True,
+                        "glb_url": existing_history.get("glb_url"),
+                        "thumbnail_url": existing_history.get("thumbnail_url"),
+                    }
 
             try:
                 cur.execute(
