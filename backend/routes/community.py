@@ -266,7 +266,9 @@ def community_discord_share():
         if request.method == "OPTIONS":
             return ("", 204)
 
-        _, auth_error = require_identity()
+        from backend.services.identity_service import IdentityService
+
+        identity_id, auth_error = require_identity()
         if auth_error:
             return auth_error
 
@@ -279,15 +281,26 @@ def community_discord_share():
         prompt = data.get("prompt", "")
         thumbnail_url = data.get("thumbnail_url", "")
 
+        # Get user email for the embed footer
+        user_label = ""
+        try:
+            identity = IdentityService.get_identity(identity_id)
+            if identity and identity.get("email"):
+                user_label = identity["email"]
+        except Exception:
+            pass
+
         labels = {"model": "3D Model", "image": "AI Image", "video": "AI Video"}
         label = labels.get(asset_type, "Creation")
+
+        footer_text = f"TimrX 3D Print Hub | {user_label}" if user_label else "TimrX 3D Print Hub"
 
         embed = {
             "title": f"New {label} on TimrX",
             "description": f"Prompt:\n{prompt[:200]}" if prompt else None,
             "color": 5814783,
             "url": "https://timrx.live/3dprint",
-            "footer": {"text": "TimrX 3D Print Hub"},
+            "footer": {"text": footer_text},
         }
 
         if thumbnail_url:
