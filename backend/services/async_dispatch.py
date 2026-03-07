@@ -19,6 +19,7 @@ from backend.db import USE_DB, get_conn, Tables
 from backend.services.credits_helper import finalize_job_credits, release_job_credits
 from backend.services.expense_guard import ExpenseGuard
 from backend.services.history_service import save_image_to_normalized_db, save_video_to_normalized_db
+from backend.services.discord_service import send_to_discord
 from backend.services.job_service import load_store, save_active_job_to_db, save_store
 from backend.services.meshy_service import mesh_post
 from backend.services.openai_service import openai_image_generate
@@ -341,6 +342,9 @@ def dispatch_openai_image_async(
             image_url=urls[0],
         )
 
+        # Post to Discord
+        send_to_discord("🖼️ New AI Image Generated", prompt, urls[0])
+
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
 
@@ -438,6 +442,9 @@ def dispatch_gemini_image_async(
             image_id=internal_job_id,
             image_url=image_url or image_urls[0],
         )
+
+        # Post to Discord
+        send_to_discord("🖼️ New AI Image Generated", prompt, image_url or image_urls[0])
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
@@ -1359,6 +1366,10 @@ def _finalize_video_success_with_bytes(
         internal_job_id,
         upstream_job_id=store_meta.get("upstream_id") or store_meta.get("operation_name") or "",
     )
+
+    # Post to Discord
+    prompt = store_meta.get("prompt", "")
+    send_to_discord("🎬 New AI Video Generated", prompt, str(s3_thumbnail_url) if s3_thumbnail_url else None)
 
     # Unregister active job
     ExpenseGuard.unregister_active_job(internal_job_id)
