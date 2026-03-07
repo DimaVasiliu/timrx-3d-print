@@ -1010,6 +1010,19 @@ class JobService:
 
         # print(f"[JOB] Completed job={job_id}, success={success}, reservation={reservation_id}")
 
+        # Post to Discord on success (3D model completions via Meshy callback)
+        if success:
+            try:
+                from backend.services.discord_service import send_to_discord, get_title_for_action
+                action_code = job.get("action_code", "")
+                prompt = job.get("prompt", "")
+                meta = job.get("meta") or {}
+                thumbnail = meta.get("thumbnail_url") or meta.get("image_url") or ""
+                title = get_title_for_action(action_code)
+                send_to_discord(title, prompt, thumbnail or None)
+            except Exception:
+                pass  # Discord notification is best-effort
+
         return {
             "job": JobService.get_job(job_id),
             "was_already_completed": False,
