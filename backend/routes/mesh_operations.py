@@ -735,3 +735,153 @@ def mesh_rigging_status_mod(job_id: str):
             print(f"[mesh/rigging][mod] DB lookup for finalized model failed: {e}")
 
     return jsonify(out)
+
+
+# ── Meshy Animation (Step 2 of Animate) ──────────────────────────────────────
+
+@bp.route("/mesh/animations", methods=["POST", "OPTIONS"])
+@with_session
+def mesh_animations_mod():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    log_event("mesh/animations:incoming[mod]", body)
+
+    rig_task_id = (body.get("rig_task_id") or "").strip()
+    if not rig_task_id:
+        return jsonify({"ok": False, "error": "rig_task_id required"}), 400
+
+    action_id = body.get("action_id")
+    if action_id is None:
+        return jsonify({"ok": False, "error": "action_id required"}), 400
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = ACTION_KEYS["animation"]
+
+    payload = {
+        "rig_task_id": rig_task_id,
+        "action_id": int(action_id),
+    }
+
+    post_process = body.get("post_process")
+    if post_process:
+        payload["post_process"] = post_process
+
+    store = load_store()
+    source_meta = get_job_metadata(rig_task_id, store) or {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    explicit_title = body.get("title") or source_meta.get("title")
+    title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
+
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": "animation",
+        "source_task_id": rig_task_id,
+        "action_id": int(action_id),
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=job_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    try:
+        resp = mesh_post("/openapi/v1/animations", payload)
+        log_event("mesh/animations:meshy-resp[mod]", resp)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
+    except Exception as e:
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+        return jsonify({"ok": False, "error": str(e)}), 502
+
+    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
+
+    store[meshy_task_id] = {
+        "stage": "animation",
+        "source_task_id": rig_task_id,
+        "created_at": now_s() * 1000,
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "action_id": int(action_id),
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+    }
+    save_store(store)
+
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": meshy_task_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "source": "modular",
+    })
+
+
+@bp.route("/mesh/animations/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def mesh_animations_status_mod(job_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    log_event("mesh/animations/status:incoming[mod]", {"job_id": job_id})
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id = g.identity_id
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    try:
+        ms = mesh_get(f"/openapi/v1/animations/{job_id}")
+        log_event("mesh/animations/status:meshy-resp[mod]", ms)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 404
+    out = normalize_meshy_task(ms, stage="animation")
+    log_status_summary("mesh/animations[mod]", job_id, out)
+
+    if out["status"] == "done":
+        store = load_store()
+        meta = get_job_metadata(job_id, store)
+        if identity_id and not meta.get("identity_id"):
+            meta["identity_id"] = identity_id
+            meta["user_id"] = identity_id
+
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
+        s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="animation", user_id=user_id)
+
+        if s3_result and s3_result.get("success"):
+            if s3_result.get("glb_url"):
+                out["glb_url"] = s3_result["glb_url"]
+            if s3_result.get("thumbnail_url"):
+                out["thumbnail_url"] = s3_result["thumbnail_url"]
+
+    return jsonify(out)
