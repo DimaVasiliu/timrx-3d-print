@@ -150,6 +150,8 @@ def extract_model_urls(ms: dict):
                     c.get("mesh_download_url"),
                     c.get("gltf_url"),
                     c.get("gltf_download_url"),
+                    c.get("animation_glb_url"),  # Meshy animation result
+                    c.get("animation_fbx_url"),  # Meshy animation fallback
                     c.get("glb"),  # animation output may use bare "glb" key
                     c.get("fbx"),  # fallback for animation output
                     pick_url(c.get("model_urls") or {}),
