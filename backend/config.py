@@ -537,6 +537,8 @@ class Config:
             "video_generate": "video_generate",
             "video_text_generate": "video_text_generate",
             "video_image_animate": "video_image_animate",
+            "rigging": "rigging",
+            "animation": "animation",
         }
     )
 
