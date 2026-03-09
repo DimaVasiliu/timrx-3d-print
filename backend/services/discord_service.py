@@ -16,7 +16,6 @@ _ACTION_TITLES = {
     "MESHY_REFINE": "🧊 New AI 3D Model Refined",
     "MESHY_REMESH": "🔷 3D Model Remeshed",
     "MESHY_TEXTURE": "🎨 AI Texture Generated",
-    "MESHY_RIG": "🦴 3D Model Auto-Rigged",
     "IMAGE_STUDIO": "🖼️ New AI Image Generated",
     "OPENAI_IMAGE": "🖼️ New AI Image Generated",
     "GEMINI_IMAGE": "🖼️ New AI Image Generated",
