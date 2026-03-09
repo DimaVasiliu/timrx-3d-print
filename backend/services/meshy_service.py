@@ -150,6 +150,8 @@ def extract_model_urls(ms: dict):
                     c.get("mesh_download_url"),
                     c.get("gltf_url"),
                     c.get("gltf_download_url"),
+                    c.get("glb"),  # animation output may use bare "glb" key
+                    c.get("fbx"),  # fallback for animation output
                     pick_url(c.get("model_urls") or {}),
                     pick_url(c.get("output_model_urls") or {}),
                     c.get("rigged_character_glb_url"),
@@ -158,8 +160,13 @@ def extract_model_urls(ms: dict):
             ]
         )
 
-    if not glb_candidates and isinstance(ms, dict) and isinstance(ms.get("result"), str) and ms["result"].startswith("http"):
-        glb_candidates.append(ms["result"])
+    # Fallback: check top-level string fields that may contain direct URLs
+    # (e.g. animation API returns output as a string URL, not a dict)
+    if isinstance(ms, dict):
+        for fallback_key in ("result", "output", "animated_model_url", "output_url"):
+            val = ms.get(fallback_key)
+            if isinstance(val, str) and val.startswith("http"):
+                glb_candidates.append(val)
 
     glb_url = (
         textured_glb_url
