@@ -567,7 +567,8 @@ class PricingService:
             "refine": 10,
             "remesh": 10,
             "retexture": 15,
-            "rigging": 25,
+            "rigging": 5,
+            "animation": 3,
             "video_generate": 70,
             "video_text_generate": 70,
             "video_image_animate": 70
