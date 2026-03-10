@@ -116,13 +116,16 @@ def create_app() -> Flask:
         except Exception as e:
             print(f"[APP] Warning: Stale job recovery failed: {e}")
 
-        # Start the durable job worker (DB-driven, restart-safe)
+        # Start the durable job worker (DB-driven, restart-safe).
+        # Each Gunicorn process spawns a worker thread, but only one
+        # acquires the PostgreSQL advisory lock (leader election).
+        # Non-leaders exit immediately. Stall detector runs on all
+        # processes since it's idempotent and lightweight.
         try:
             from backend.services.job_worker import start_worker, start_stall_detector
 
             start_worker()
             start_stall_detector(interval=60)
-            print(f"[APP] Durable job worker started")
         except Exception as e:
             print(f"[APP] Warning: Failed to start job worker: {e}")
 
