@@ -1088,6 +1088,14 @@ def _poll_video_completion(
         )
         return
 
+    # ── Seedance-aware poll with pending/processing split timeouts ─────
+    if provider_name == "seedance":
+        _poll_seedance_with_state_awareness(
+            internal_job_id, identity_id, reservation_id, upstream_id,
+            provider, store_meta,
+        )
+        return
+
     # ── Generic provider poll (future providers) ─────
     consecutive_errors = 0
     max_consecutive_errors = 1
@@ -1103,10 +1111,10 @@ def _poll_video_completion(
             consecutive_errors = 0
 
             # Processing — update progress (log every 10 polls to reduce spam)
-            if status == "processing":
+            if status in ("processing", "pending"):
                 progress = status_resp.get("progress", 0)
                 if poll_num == 1 or poll_num % 10 == 0:
-                    print(f"[ASYNC] Poll {poll_num} for job {internal_job_id} ({provider_name}): progress={progress}%")
+                    print(f"[ASYNC] Poll {poll_num} for job {internal_job_id} ({provider_name}): status={status} progress={progress}%")
 
                 store = load_store()
                 store_meta["progress"] = progress
@@ -1192,6 +1200,197 @@ def _poll_video_completion(
         f"{provider_name}_timeout: Video generation did not complete within {timeout_seconds} seconds",
     )
     ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+# ── Seedance timeout constants (seconds) by task tier ────────────────────────
+# Each tier has: (pending_soft, pending_hard, processing_soft, processing_hard)
+_SEEDANCE_TIMEOUTS = {
+    "seedance-2-fast-preview": (5 * 60, 15 * 60, 8 * 60, 15 * 60),
+    "seedance-2-preview":      (10 * 60, 25 * 60, 12 * 60, 25 * 60),
+}
+_SEEDANCE_DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 8 * 60, 15 * 60)
+
+# Poll intervals
+_SEEDANCE_POLL_NORMAL = 4       # seconds between polls while within soft timeout
+_SEEDANCE_POLL_SLOW = 15        # seconds between polls after soft timeout hit
+
+
+def _poll_seedance_with_state_awareness(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    upstream_id: str,
+    provider,
+    store_meta: dict,
+):
+    """
+    Seedance-specific polling that distinguishes pending (never started) from
+    processing (actively rendering).
+
+    - Pending jobs get a longer leash — provider queue may be busy.
+    - Only marks failed on explicit provider failure or hard timeout.
+    - Reduces poll frequency after soft timeout.
+    - Updates DB/store with provider_pending status so frontend shows "Queued".
+    """
+    task_type = store_meta.get("task_type", "seedance-2-fast-preview")
+    pend_soft, pend_hard, proc_soft, proc_hard = _SEEDANCE_TIMEOUTS.get(
+        task_type, _SEEDANCE_DEFAULT_TIMEOUTS,
+    )
+
+    pending_elapsed = 0.0
+    processing_elapsed = 0.0
+    last_phase = "pending"       # "pending" or "processing"
+    consecutive_errors = 0
+    poll_num = 0
+
+    while True:
+        # ── Determine poll interval ──
+        if last_phase == "pending":
+            phase_elapsed = pending_elapsed
+            past_soft = phase_elapsed >= pend_soft
+        else:
+            phase_elapsed = processing_elapsed
+            past_soft = phase_elapsed >= proc_soft
+
+        sleep_sec = _SEEDANCE_POLL_SLOW if past_soft else _SEEDANCE_POLL_NORMAL
+
+        time.sleep(sleep_sec)
+        poll_num += 1
+
+        # ── Hard timeout check ──
+        if last_phase == "pending" and pending_elapsed >= pend_hard:
+            _seedance_fail(
+                internal_job_id, reservation_id,
+                "seedance_pending_timeout",
+                f"Provider never started this job after {int(pending_elapsed)}s",
+            )
+            return
+        if last_phase == "processing" and processing_elapsed >= proc_hard:
+            _seedance_fail(
+                internal_job_id, reservation_id,
+                "seedance_processing_timeout",
+                f"Provider did not finish rendering after {int(processing_elapsed)}s",
+            )
+            return
+
+        # ── Poll provider ──
+        try:
+            status_resp = provider.check_status(upstream_id)
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"[SEEDANCE] Poll error #{consecutive_errors} for {internal_job_id}: {e}")
+            if consecutive_errors >= 3:
+                _seedance_fail(internal_job_id, reservation_id, "seedance_poll_error", str(e))
+                return
+            pending_elapsed += sleep_sec
+            processing_elapsed += sleep_sec
+            continue
+
+        consecutive_errors = 0
+        status = status_resp.get("status", "pending")
+        provider_status = status_resp.get("provider_status", status)
+        started_at = status_resp.get("started_at")
+        ended_at = status_resp.get("ended_at")
+        progress = status_resp.get("progress", 0)
+
+        # ── Logging ──
+        timeout_stage = "past_soft" if past_soft else "normal"
+        if poll_num <= 3 or poll_num % 10 == 0 or status != last_phase:
+            print(
+                f"[SEEDANCE] Poll {poll_num} job={internal_job_id} "
+                f"provider_status={provider_status} internal={status} "
+                f"started_at={started_at} ended_at={ended_at} "
+                f"pending={int(pending_elapsed)}s processing={int(processing_elapsed)}s "
+                f"timeout_stage={timeout_stage}"
+            )
+
+        # ── Route by status ──
+        if status == "done":
+            video_url = status_resp.get("video_url")
+            if video_url:
+                _finalize_video_success(
+                    internal_job_id, identity_id, reservation_id,
+                    video_url, store_meta, provider_name="seedance",
+                )
+            else:
+                _seedance_fail(
+                    internal_job_id, reservation_id,
+                    "seedance_no_video_url", "Completed but no video URL",
+                )
+            return
+
+        if status == "failed":
+            error_code = status_resp.get("error", "seedance_generation_failed")
+            error_msg = status_resp.get("message", "Seedance generation failed")
+            _seedance_fail(internal_job_id, reservation_id, error_code, error_msg)
+            return
+
+        # ── Pending (provider never started) ──
+        if status == "pending":
+            pending_elapsed += sleep_sec
+            last_phase = "pending"
+            db_status = "provider_pending"
+            _update_job_progress(internal_job_id, store_meta, db_status, progress, {
+                "provider_status": provider_status,
+                "pending_seconds": int(pending_elapsed),
+            })
+
+        # ── Processing (actively rendering) ──
+        elif status == "processing":
+            processing_elapsed += sleep_sec
+            # If we just transitioned from pending → processing, reset pending timer
+            if last_phase == "pending":
+                print(f"[SEEDANCE] Job {internal_job_id} transitioned pending→processing after {int(pending_elapsed)}s pending")
+            last_phase = "processing"
+            _update_job_progress(internal_job_id, store_meta, "processing", progress, {
+                "provider_status": provider_status,
+                "started_at": started_at,
+            })
+
+        else:
+            # Unknown status — treat as pending
+            pending_elapsed += sleep_sec
+
+
+def _seedance_fail(internal_job_id, reservation_id, error_code, error_msg):
+    """Helper: mark a Seedance job as failed, release credits, unregister."""
+    print(f"[SEEDANCE] FAIL job={internal_job_id} code={error_code} msg={error_msg}")
+    if reservation_id:
+        release_job_credits(reservation_id, error_code, internal_job_id)
+    update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
+    ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+def _update_job_progress(internal_job_id, store_meta, db_status, progress, extra_meta=None):
+    """Helper: update job store and DB with current progress/status."""
+    store = load_store()
+    store_meta["progress"] = progress
+    store_meta["status"] = db_status
+    if extra_meta:
+        store_meta.update(extra_meta)
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    if USE_DB:
+        try:
+            meta_json = {"progress": progress, "status_detail": db_status}
+            if extra_meta:
+                meta_json.update(extra_meta)
+            with get_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = %s,
+                            meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id::text = %s
+                        """,
+                        (db_status, json.dumps(meta_json), internal_job_id),
+                    )
+                conn.commit()
+        except Exception as e:
+            print(f"[SEEDANCE] DB update error for {internal_job_id}: {e}")
 
 
 def _poll_vertex_with_backoff(
