@@ -1288,6 +1288,8 @@ def _update_store(
             "stage": "video",
             "internal_job_id": job_id,
             "progress": progress,
+            "dispatched_at": meta.get("dispatched_at"),
+            "processing_started_at": meta.get("processing_started_at"),
         })
         store[job_id] = store_entry
         save_store(store)
