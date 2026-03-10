@@ -78,6 +78,20 @@ VIDEO_ACTION_CODES = {
     "video_image_animate_8s_720p",   # 110 credits
     "video_image_animate_8s_1080p",  # 130 credits
     "video_image_animate_8s_4k",     # 160 credits
+    # Seedance 2.0 — Text-to-Video (Fast: 14 cps, Preview: 24 cps)
+    "seedance_fast_text_generate_5s",       # 70 credits
+    "seedance_fast_text_generate_10s",      # 140 credits
+    "seedance_fast_text_generate_15s",      # 210 credits
+    "seedance_preview_text_generate_5s",    # 120 credits
+    "seedance_preview_text_generate_10s",   # 240 credits
+    "seedance_preview_text_generate_15s",   # 360 credits
+    # Seedance 2.0 — Image-to-Video (same CPS tiers)
+    "seedance_fast_image_animate_5s",       # 70 credits
+    "seedance_fast_image_animate_10s",      # 140 credits
+    "seedance_fast_image_animate_15s",      # 210 credits
+    "seedance_preview_image_animate_5s",    # 120 credits
+    "seedance_preview_image_animate_10s",   # 240 credits
+    "seedance_preview_image_animate_15s",   # 360 credits
 }
 
 # Action codes that use GENERAL credits (3D + images)
@@ -159,6 +173,12 @@ def get_credit_type_for_action(action_code: str) -> str:
     if action_code in VIDEO_ACTION_CODES:
         return CreditType.GENERAL  # Video actions now use unified pool
     if action_code in GENERAL_ACTION_CODES:
+        return CreditType.GENERAL
+
+    # Dynamic recognition: Seedance variant codes follow a known pattern
+    # This prevents hard-coded set from going stale if new tiers/durations are added
+    from backend.services.pricing_service import _is_seedance_variant_code
+    if _is_seedance_variant_code(action_code):
         return CreditType.GENERAL
 
     raise ValueError(
