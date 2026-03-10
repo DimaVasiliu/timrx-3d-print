@@ -757,8 +757,8 @@ def dispatch_gemini_video_async(
         duration_ms = int((time.time() - start_time) * 1000)
 
         # Providers return different upstream identifiers:
-        #   Gemini → {"operation_name": "..."}
-        #   Runway → {"task_id": "..."}
+        #   Veo/Gemini  → {"operation_name": "..."}
+        #   Seedance    → {"task_id": "..."}
         upstream_id = resp.get("operation_name") or resp.get("task_id")
 
         if upstream_id:
