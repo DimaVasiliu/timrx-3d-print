@@ -300,6 +300,7 @@ def generate_video():
         meta=store_meta,
         reservation_id=reservation_id,
         status="queued",
+        stage="video",
     )
 
     # Build payload for async dispatch
@@ -510,6 +511,7 @@ def _dispatch_video_job(
         reservation_id=reservation_id,
         status="queued",
         priority=str(job_priority),
+        stage="video",
     )
     if not job_created:
         print(f"[VIDEO] CRITICAL: Job row creation failed for {internal_job_id}, aborting dispatch. action_key={action_key}")
