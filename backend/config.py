@@ -515,6 +515,11 @@ class Config:
         )
 
     # ─────────────────────────────────────────────────────────────
+    # Seedance (PiAPI) Video Generation
+    # ─────────────────────────────────────────────────────────────
+    PIAPI_API_KEY: str = field(default_factory=lambda: _get_env("PIAPI_API_KEY"))
+
+    # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
     # ─────────────────────────────────────────────────────────────
     DEFAULT_MODEL_TITLE: str = "3D Model"
