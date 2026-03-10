@@ -1204,11 +1204,18 @@ def _poll_video_completion(
 
 # ── Seedance timeout constants (seconds) by task tier ────────────────────────
 # Each tier has: (pending_soft, pending_hard, processing_soft, processing_hard)
+#
+# PiAPI observed timings (2026-03-10):
+#   fast:    7-8 min total (queue + render)
+#   preview: can sit Pending 20-100+ min, total up to 1h40m
+#
+# Strategy: preview gets a generous pending window, but if it stalls we
+# fallback to fast tier (see _seedance_pending_fallback).
 _SEEDANCE_TIMEOUTS = {
-    "seedance-2-fast-preview": (5 * 60, 15 * 60, 8 * 60, 15 * 60),
-    "seedance-2-preview":      (10 * 60, 25 * 60, 12 * 60, 25 * 60),
+    "seedance-2-fast-preview": (5 * 60, 15 * 60, 10 * 60, 20 * 60),
+    "seedance-2-preview":      (15 * 60, 30 * 60, 15 * 60, 30 * 60),
 }
-_SEEDANCE_DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 8 * 60, 15 * 60)
+_SEEDANCE_DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
 
 # Poll intervals
 _SEEDANCE_POLL_NORMAL = 4       # seconds between polls while within soft timeout
