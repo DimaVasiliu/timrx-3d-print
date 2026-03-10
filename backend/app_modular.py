@@ -105,7 +105,67 @@ def create_app() -> Flask:
         except Exception as e:
             print(f"[APP] Warning: Failed to seed pricing data: {e}")
 
+        # ── Recover stale video jobs from previous process ─────────
+        # After a deploy/restart, in-flight polling threads are lost.
+        # Mark orphaned processing/provider_pending jobs as provider_stalled
+        # so credits are released and frontend shows a clear failure.
+        try:
+            _recover_stale_video_jobs()
+        except Exception as e:
+            print(f"[APP] Warning: Stale job recovery failed: {e}")
+
     return app
+
+
+def _recover_stale_video_jobs():
+    """Mark video jobs stuck in processing/provider_pending as provider_stalled.
+
+    Called once at startup. Only affects jobs older than 30 minutes to avoid
+    touching jobs that might have just been dispatched by another worker.
+    """
+    import json as _json
+    from backend.db import get_conn, Tables
+    from backend.services.credits_helper import release_job_credits
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {Tables.JOBS}
+                SET status = 'provider_stalled',
+                    error_message = 'provider_stalled: Server restarted while job was in progress',
+                    meta = COALESCE(meta, '{{}}'::jsonb) || '{{"error_code": "server_restart", "failure_reason": "Server restarted during generation — credits refunded"}}'::jsonb,
+                    updated_at = NOW()
+                WHERE status IN ('processing', 'provider_pending')
+                  AND meta->>'stage' = 'video'
+                  AND updated_at < NOW() - INTERVAL '30 minutes'
+                RETURNING id, meta
+                """,
+            )
+            stale_rows = cur.fetchall()
+        conn.commit()
+
+    if not stale_rows:
+        return
+
+    stale_ids = [r["id"] for r in stale_rows]
+    print(f"[APP] Recovered {len(stale_ids)} stale video jobs: {stale_ids[:5]}{'...' if len(stale_ids) > 5 else ''}")
+
+    for row in stale_rows:
+        _release_stale_reservation(row, release_job_credits, _json)
+
+
+def _release_stale_reservation(row, release_fn, json_mod):
+    """Release credits for a single stale job row."""
+    try:
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            meta = json_mod.loads(meta)
+        rid = meta.get("reservation_id")
+        if rid:
+            release_fn(rid, "server_restart", str(row["id"]))
+    except Exception as e:
+        print(f"[APP] Warning: Failed to release credits for stale job {row['id']}: {e}")
 
 
 app = create_app()
