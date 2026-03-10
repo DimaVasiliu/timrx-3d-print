@@ -465,7 +465,7 @@ class WalletDriftService:
                 COUNT(*) as total_repairs,
                 COALESCE(SUM(ABS(drift_amount)), 0) as total_drift_corrected
             FROM {_BILLING_SCHEMA}.wallet_repairs
-            WHERE created_at >= NOW() - INTERVAL '%s days'
+            WHERE created_at >= NOW() - %s * INTERVAL '1 day'
             """,
             (days,),
         )
@@ -478,7 +478,7 @@ class WalletDriftService:
                 COUNT(*) as count,
                 COALESCE(SUM(ABS(drift_amount)), 0) as drift_total
             FROM {_BILLING_SCHEMA}.wallet_repairs
-            WHERE created_at >= NOW() - INTERVAL '%s days'
+            WHERE created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY reason
             ORDER BY count DESC
             """,
@@ -493,7 +493,7 @@ class WalletDriftService:
                 COUNT(*) as count,
                 COALESCE(SUM(ABS(drift_amount)), 0) as drift_total
             FROM {_BILLING_SCHEMA}.wallet_repairs
-            WHERE created_at >= NOW() - INTERVAL '%s days'
+            WHERE created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY trigger_source
             ORDER BY count DESC
             """,
