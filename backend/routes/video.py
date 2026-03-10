@@ -25,7 +25,7 @@ from flask import Blueprint, jsonify, request
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import with_session
 from backend.services.async_dispatch import get_executor
-from backend.services.credits_helper import start_paid_job
+from backend.services.credits_helper import start_paid_job, release_job_credits
 from backend.services.expense_guard import ExpenseGuard
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
@@ -396,6 +396,15 @@ def _dispatch_video_job(
     action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
     expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
 
+    # FAIL-CLOSED: Reject unknown action codes before any billing or provider calls
+    if expected_cost <= 0:
+        print(f"[VIDEO] REJECTED: action_key={action_key} resolved to 0 credits — refusing to dispatch")
+        return jsonify({
+            "ok": False,
+            "error": "unknown_action_code",
+            "message": f"Unknown video action code: {action_key}. Cannot determine cost.",
+        }), 400
+
     # PRE-FLIGHT: Check Vertex resolution capability BEFORE reserving credits
     # (only for Veo providers, not Seedance)
     if provider != "seedance":
@@ -461,7 +470,9 @@ def _dispatch_video_job(
     store[internal_job_id] = store_meta
     save_store(store)
 
-    create_internal_job_row(
+    # FAIL-CLOSED: Job row MUST exist before dispatching upstream provider task.
+    # If the insert fails (e.g. FK constraint on action_code), abort and release credits.
+    job_created = create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
         provider=provider,
@@ -471,6 +482,22 @@ def _dispatch_video_job(
         reservation_id=reservation_id,
         status="queued",
     )
+    if not job_created:
+        print(f"[VIDEO] CRITICAL: Job row creation failed for {internal_job_id}, aborting dispatch. action_key={action_key}")
+        # Release reserved credits
+        if reservation_id:
+            try:
+                release_job_credits(reservation_id, job_id=internal_job_id, reason="job_row_creation_failed")
+            except Exception as rel_err:
+                print(f"[VIDEO] ERROR releasing reservation {reservation_id}: {rel_err}")
+        # Clean up in-memory store
+        store.pop(internal_job_id, None)
+        save_store(store)
+        return jsonify({
+            "ok": False,
+            "error": "internal_job_creation_failed",
+            "message": "Failed to create internal job record. Credits have been released. Please try again.",
+        }), 500
 
     payload = {
         "task": task,
