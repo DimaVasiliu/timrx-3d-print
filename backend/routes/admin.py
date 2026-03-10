@@ -1394,7 +1394,7 @@ def debug_magic_code():
             f"""
             INSERT INTO {Tables.MAGIC_CODES}
             (email, code_hash, expires_at, attempts, consumed, created_at)
-            VALUES (%s, %s, NOW() + INTERVAL '%s minutes', 0, FALSE, NOW())
+            VALUES (%s, %s, NOW() + %s * INTERVAL '1 minute', 0, FALSE, NOW())
             """,
             (email, code_hash, config.MAGIC_CODE_EXPIRY_MINUTES),
         )
