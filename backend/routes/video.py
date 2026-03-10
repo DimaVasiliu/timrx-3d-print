@@ -804,6 +804,109 @@ def video_status(job_id: str):
     return _video_status_handler(job_id)
 
 
+# ── Live PiAPI re-check helpers for orphaned Seedance jobs ───
+_STALE_THRESHOLD_SECONDS = 10 * 60  # 10 minutes without DB update → stale
+
+
+def _is_stale_seedance_job(job_row, job_meta) -> bool:
+    """Return True if this looks like a Seedance job whose polling thread died."""
+    provider = job_meta.get("provider", "")
+    if provider != "seedance":
+        return False
+    upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
+    if not upstream_id:
+        return False
+    updated_at = job_row.get("updated_at")
+    if not updated_at:
+        return True
+    from datetime import datetime, timezone
+    if hasattr(updated_at, 'tzinfo') and updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    return age > _STALE_THRESHOLD_SECONDS
+
+
+def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | None):
+    """
+    One-shot live check against PiAPI for an orphaned Seedance job.
+
+    If PiAPI says done → finalize (upload to S3, update DB, update history).
+    If PiAPI says failed → mark failed.
+    If still processing → return None (let normal status response handle it).
+    """
+    upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
+    if not upstream_id:
+        return None
+
+    try:
+        from backend.services.seedance_service import check_seedance_status
+        status_resp = check_seedance_status(upstream_id)
+    except Exception as e:
+        print(f"[VIDEO STATUS] Live PiAPI check failed for {job_id}: {e}")
+        return None
+
+    status = status_resp.get("status")
+
+    if status == "done":
+        video_url = status_resp.get("video_url")
+        if not video_url:
+            return None
+
+        print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI! Finalizing now.")
+
+        # Finalize in background to not block the status response
+        try:
+            from backend.services.async_dispatch import (
+                _finalize_video_success,
+                load_store,
+            )
+            store = load_store()
+            store_meta = store.get(job_id) or job_meta
+            reservation_id = store_meta.get("reservation_id") or job_meta.get("reservation_id")
+
+            _finalize_video_success(
+                job_id, identity_id or "", reservation_id,
+                video_url, store_meta, provider_name="seedance",
+            )
+        except Exception as e:
+            print(f"[VIDEO STATUS] Live finalize failed for {job_id}: {e}")
+
+        return jsonify({
+            "ok": True,
+            "status": "done",
+            "job_id": job_id,
+            "video_url": video_url,
+            "message": "Video ready",
+        })
+
+    if status == "failed":
+        return _live_check_mark_failed(job_id, job_meta, status_resp)
+
+    # Still pending/processing on PiAPI — return None to use normal response
+    return None
+
+
+def _live_check_mark_failed(job_id, job_meta, status_resp):
+    """Handle a live PiAPI check that returned failed."""
+    error_code = status_resp.get("error", "seedance_generation_failed")
+    error_msg = status_resp.get("message", "Seedance generation failed")
+    print(f"[VIDEO STATUS] Live check: job {job_id} failed on PiAPI: {error_code}")
+    try:
+        from backend.services.async_dispatch import update_job_status_failed, ExpenseGuard
+        reservation_id = job_meta.get("reservation_id")
+        if reservation_id:
+            from backend.services.credits_helper import release_job_credits
+            release_job_credits(reservation_id, error_code, job_id)
+        update_job_status_failed(job_id, f"{error_code}: {error_msg}")
+        ExpenseGuard.unregister_active_job(job_id)
+    except Exception as e:
+        print(f"[VIDEO STATUS] Live fail-update error for {job_id}: {e}")
+    return jsonify({
+        "ok": False, "status": "failed", "job_id": job_id,
+        "error": error_code, "message": error_msg,
+    })
+
+
 # ── Shared status handler ────────────────────────────────────
 def _video_status_handler(job_id: str):
     """
@@ -833,7 +936,7 @@ def _video_status_handler(job_id: str):
                 with conn.cursor() as cur:
                     cur.execute(
                         f"""
-                        SELECT id, status, error_message, meta
+                        SELECT id, status, error_message, meta, updated_at
                         FROM {Tables.JOBS}
                         WHERE id::text = %s AND identity_id = %s
                         LIMIT 1
@@ -876,6 +979,14 @@ def _video_status_handler(job_id: str):
                         "quota_queued": True,
                     })
 
+                # ── Live PiAPI re-check for orphaned Seedance jobs ──
+                # If the backend polling thread died (deploy/crash) and the job
+                # has been stuck for >10 min, check PiAPI directly and finalize.
+                if job["status"] in ("provider_pending", "processing") and _is_stale_seedance_job(job, job_meta):
+                    live_result = _try_live_seedance_check(job_id, job_meta, identity_id)
+                    if live_result:
+                        return live_result
+
                 if job["status"] == "provider_pending":
                     pending_secs = job_meta.get("pending_seconds", 0)
                     msg = "Queued with provider" if pending_secs < 120 else "Provider queue busy — your video is still queued"
@@ -894,11 +1005,18 @@ def _video_status_handler(job_id: str):
                     provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
                     from backend.services.video_limits import get_estimated_render_time
                     rtime = get_estimated_render_time(provider_hint)
+                    # Format time estimate as minutes if > 90s
+                    lo, hi = rtime['estimated_min_seconds'], rtime['estimated_max_seconds']
+                    if lo >= 90:
+                        time_hint = f"{lo // 60}–{hi // 60} min"
+                    else:
+                        time_hint = f"{lo}–{hi}s"
+
                     return jsonify({
                         "ok": True,
                         "status": "processing",
                         "job_id": job_id,
-                        "message": f"Rendering (estimated {rtime['estimated_min_seconds']}–{rtime['estimated_max_seconds']}s)",
+                        "message": f"Rendering (estimated {time_hint})",
                         "progress": progress,
                         "estimated_duration_seconds": rtime["estimated_duration_seconds"],
                     })
