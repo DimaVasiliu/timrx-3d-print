@@ -1,4 +1,3 @@
-
 """
 /api/admin routes - Admin-only endpoints.
 
@@ -19,6 +18,7 @@ Endpoints:
 - GET  /api/admin/jobs               - List jobs
 - GET  /api/admin/health             - Admin health check
 - GET  /api/admin/debug/user         - Internal debug: user summary (masked email, wallet, history)
+- POST /api/admin/jobs/rescue        - Rescue late-completed Seedance jobs
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -2195,6 +2195,51 @@ def credit_analytics():
 
     except Exception as e:
         print(f"[ADMIN] Credit analytics error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB RESCUE — Recover late-completed Seedance jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/jobs/rescue", methods=["POST"])
+@require_admin
+def rescue_jobs():
+    """
+    Rescue locally-failed Seedance jobs that completed upstream at PiAPI.
+
+    Query params / JSON body:
+        hours: Look-back window in hours (default: 72, max: 720)
+        dry_run: If true, report candidates without modifying (default: false)
+        max_jobs: Max jobs to process (default: 50, max: 200)
+
+    Credit safety:
+        - If reservation still held: finalize (charge credits)
+        - If reservation was released (refunded): user keeps video free
+        - If reservation was finalized: already charged, skip
+
+    Returns rescue summary with per-job details.
+    """
+    try:
+        from backend.services.job_rescue import rescue_late_completed_jobs
+
+        data = request.get_json(silent=True) or {}
+        hours = min(int(data.get("hours", request.args.get("hours", 72))), 720)
+        dry_run = bool(data.get("dry_run", request.args.get("dry_run", "false").lower() == "true"))
+        max_jobs = min(int(data.get("max_jobs", request.args.get("max_jobs", 50))), 200)
+
+        result = rescue_late_completed_jobs(
+            hours=hours,
+            dry_run=dry_run,
+            max_jobs=max_jobs,
+        )
+
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Job rescue error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
