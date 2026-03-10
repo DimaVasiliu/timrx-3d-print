@@ -105,10 +105,9 @@ def create_app() -> Flask:
         except Exception as e:
             print(f"[APP] Warning: Failed to seed pricing data: {e}")
 
-        # ── Recover stale video jobs from previous process ─────────
-        # After a deploy/restart, in-flight polling threads are lost.
-        # Check PiAPI upstream status before deciding: finalize done jobs,
-        # resume still-running ones, and only fail jobs that truly failed.
+        # ── Recover stale jobs and start durable worker ───────────
+        # After a deploy/restart, mark orphaned jobs as stalled so the
+        # durable worker loop picks them up. Then start the worker.
         try:
             from backend.services.job_recovery import recover_stale_jobs
 
@@ -116,6 +115,16 @@ def create_app() -> Flask:
             print(f"[APP] Job recovery: {result}")
         except Exception as e:
             print(f"[APP] Warning: Stale job recovery failed: {e}")
+
+        # Start the durable job worker (DB-driven, restart-safe)
+        try:
+            from backend.services.job_worker import start_worker, start_stall_detector
+
+            start_worker()
+            start_stall_detector(interval=60)
+            print(f"[APP] Durable job worker started")
+        except Exception as e:
+            print(f"[APP] Warning: Failed to start job worker: {e}")
 
     return app
 
