@@ -45,6 +45,7 @@ from backend.services.pricing_service import (
     get_video_action_code,
     get_video_credit_cost,
 )
+from backend.services.video_limits import validate_video_rate_limits
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("video", __name__)
@@ -202,6 +203,15 @@ def generate_video():
     guard_error = ExpenseGuard.check_video_request(duration_seconds=duration_seconds)
     if guard_error:
         return guard_error
+
+    # RATE LIMITS: concurrency, hourly cap, cooldown, spend guardrails
+    rate_error = validate_video_rate_limits(
+        identity_id or "",
+        provider=provider,
+        duration_seconds=duration_seconds,
+    )
+    if rate_error:
+        return rate_error
 
     # Idempotency check: return cached response if duplicate
     idempotency_key = ExpenseGuard.compute_idempotency_key(
@@ -368,6 +378,10 @@ def _dispatch_video_job(
 
     Returns a Flask response tuple.
     """
+    # Part 4: Dynamic provider routing — auto-select cheaper provider under load
+    from backend.services.video_limits import select_video_provider
+    provider = select_video_provider(provider)
+
     # Seedance skips Veo-specific validation (different duration/resolution constraints)
     if provider != "seedance":
         # Validate video parameters STRICTLY - reject invalid combinations
@@ -424,6 +438,16 @@ def _dispatch_video_job(
                     "allowed": ["720p", "1080p"],
                 }), 400
 
+    # RATE LIMITS: concurrency, hourly cap, cooldown, spend guardrails
+    rate_error = validate_video_rate_limits(
+        identity_id,
+        provider=provider,
+        duration_seconds=duration_seconds,
+        seedance_tier=seedance_tier,
+    )
+    if rate_error:
+        return rate_error
+
     print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
     reservation_id, credit_error = start_paid_job(
@@ -470,6 +494,10 @@ def _dispatch_video_job(
     store[internal_job_id] = store_meta
     save_store(store)
 
+    # Part 8: Priority queue — derive priority from user tier
+    from backend.services.video_limits import get_job_priority
+    job_priority = get_job_priority(identity_id)
+
     # FAIL-CLOSED: Job row MUST exist before dispatching upstream provider task.
     # If the insert fails (e.g. FK constraint on action_code), abort and release credits.
     job_created = create_internal_job_row(
@@ -481,6 +509,7 @@ def _dispatch_video_job(
         meta=store_meta,
         reservation_id=reservation_id,
         status="queued",
+        priority=str(job_priority),
     )
     if not job_created:
         print(f"[VIDEO] CRITICAL: Job row creation failed for {internal_job_id}, aborting dispatch. action_key={action_key}")
@@ -526,6 +555,8 @@ def _dispatch_video_job(
     log_event(f"video/{task}:dispatched", {"internal_job_id": internal_job_id})
 
     # D1: Return fast — skip balance query (frontend caches wallet separately)
+    from backend.services.video_limits import get_estimated_render_time
+    rtime = get_estimated_render_time(provider)
     return jsonify({
         "ok": True,
         "job_id": internal_job_id,
@@ -538,6 +569,7 @@ def _dispatch_video_job(
             "resolution": resolution,
             "duration_seconds": duration_seconds,
         },
+        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
     })
 
 
@@ -819,12 +851,19 @@ def _video_status_handler(job_id: str):
                         job_meta = {}
 
                 if job["status"] == "queued":
+                    from backend.services.video_limits import get_queue_position, get_estimated_render_time
+                    qpos = get_queue_position(job_id)
+                    provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
+                    rtime = get_estimated_render_time(provider_hint)
                     return jsonify({
                         "ok": True,
                         "status": "queued",
                         "job_id": job_id,
-                        "message": "Video generation queued...",
+                        "message": f"Queue position #{qpos['queue_position']}",
                         "progress": 0,
+                        "queue_position": qpos["queue_position"],
+                        "estimated_start_seconds": qpos["estimated_start_seconds"],
+                        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
                     })
 
                 if job["status"] == "quota_queued":
@@ -839,12 +878,16 @@ def _video_status_handler(job_id: str):
 
                 if job["status"] == "processing":
                     progress = meta.get("progress") or job_meta.get("progress") or 0
+                    provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
+                    from backend.services.video_limits import get_estimated_render_time
+                    rtime = get_estimated_render_time(provider_hint)
                     return jsonify({
                         "ok": True,
                         "status": "processing",
                         "job_id": job_id,
-                        "message": "Generating video...",
+                        "message": f"Rendering (estimated {rtime['estimated_min_seconds']}–{rtime['estimated_max_seconds']}s)",
                         "progress": progress,
+                        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
                     })
 
                 if job["status"] == "failed":
@@ -942,12 +985,16 @@ def _video_status_handler(job_id: str):
         })
 
     if meta.get("status") in ("queued", "processing"):
+        provider_hint = meta.get("provider", "veo")
+        from backend.services.video_limits import get_estimated_render_time
+        rtime = get_estimated_render_time(provider_hint)
         return jsonify({
             "ok": True,
             "status": meta.get("status"),
             "job_id": job_id,
             "progress": meta.get("progress", 0),
             "message": "Generating video...",
+            "estimated_duration_seconds": rtime["estimated_duration_seconds"],
         })
 
     # Store has an entry but with an unexpected status — treat as in-flight
