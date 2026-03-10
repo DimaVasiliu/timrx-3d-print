@@ -114,7 +114,7 @@ class MagicCodeService:
                 f"""
                 INSERT INTO {Tables.MAGIC_CODES}
                 (email, code_hash, expires_at, attempts, consumed, ip_hash, created_at)
-                VALUES (%s, %s, NOW() + INTERVAL '%s minutes', 0, FALSE, %s, NOW())
+                VALUES (%s, %s, NOW() + %s * INTERVAL '1 minute', 0, FALSE, %s, NOW())
                 RETURNING id
                 """,
                 (email, code_hash, expiry_minutes, ip_hash),
