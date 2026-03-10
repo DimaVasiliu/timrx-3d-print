@@ -449,15 +449,18 @@ def validate_video_rate_limits(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Average generation time per provider (seconds)
+# Observed PiAPI timings (2026-03-10):
+#   fast:    7-8 min total (queue + render)
+#   preview: 20-100+ min (highly variable queue)
 AVERAGE_GENERATION_TIME = {
-    "veo": 80,       # 45–120s
-    "seedance": 40,  # 20–60s
+    "veo": 80,         # 45–120s
+    "seedance": 480,   # ~8 min (fast tier typical)
 }
 
 # Estimated render time ranges shown to user
 RENDER_TIME_RANGE = {
     "veo": (45, 120),
-    "seedance": (20, 60),
+    "seedance": (300, 600),  # 5-10 min (fast tier)
 }
 
 
