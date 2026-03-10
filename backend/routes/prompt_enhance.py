@@ -45,6 +45,9 @@ def prompt_enhance():
         "error": "message"
     }
     """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     body = request.get_json(silent=True) or {}
 
     raw_prompt = (body.get("prompt") or "").strip()
