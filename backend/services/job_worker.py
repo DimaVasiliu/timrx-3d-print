@@ -348,6 +348,11 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                     return None
 
                 attempt = (row.get("attempt_count") or 0)
+                print(
+                    f"[JOB][DEBUG] _claim_next_job FOUND job={row['id']} "
+                    f"status={row['status']} next_poll_at={row.get('next_poll_at')} "
+                    f"claimed_by={row.get('claimed_by')} attempt={attempt}"
+                )
 
                 cur.execute(
                     f"""
@@ -378,6 +383,14 @@ def _release_claim(job_id: str):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Read next_poll_at BEFORE releasing, so we can log it
+                cur.execute(
+                    f"SELECT next_poll_at FROM {Tables.JOBS} WHERE id::text = %s",
+                    (job_id,),
+                )
+                npa_row = cur.fetchone()
+                npa_val = npa_row[0] if npa_row else "NOT_FOUND"
+
                 cur.execute(
                     f"""
                     UPDATE {Tables.JOBS}
@@ -390,6 +403,10 @@ def _release_claim(job_id: str):
                     (job_id, WORKER_ID),
                 )
             conn.commit()
+        print(
+            f"[JOB][DEBUG] _release_claim job={job_id} next_poll_at={npa_val} "
+            f"(job should NOT be re-claimed until next_poll_at)"
+        )
     except Exception as e:
         print(f"[JOB] Release claim error for {job_id}: {e}")
 
@@ -817,6 +834,10 @@ def _poll_provider_once(
     if status == "pending":
         past_soft = pending_elapsed >= pend_soft
         poll_interval = 15 if past_soft else POLL_SLEEP_PENDING
+        print(
+            f"[JOB][DEBUG] status=pending job={job_id} poll_interval={poll_interval}s "
+            f"past_soft={past_soft} pending_elapsed={int(pending_elapsed)}s"
+        )
 
         _update_job_state(job_id, "provider_pending", provider_status, progress, poll_interval, {
             "pending_seconds": int(pending_elapsed),
@@ -833,6 +854,10 @@ def _poll_provider_once(
 
         past_soft = processing_elapsed >= proc_soft if processing_started_at else False
         poll_interval = 15 if past_soft else POLL_SLEEP_PROCESSING
+        print(
+            f"[JOB][DEBUG] status=processing job={job_id} poll_interval={poll_interval}s "
+            f"past_soft={past_soft} processing_elapsed={int(processing_elapsed)}s"
+        )
 
         if status_resp.get("started_at"):
             meta_patch["started_at"] = status_resp["started_at"]
@@ -1189,6 +1214,12 @@ def _update_job_state(
     if not USE_DB:
         return
 
+    print(
+        f"[JOB][DEBUG] _update_job_state ENTER job={job_id} status={status} "
+        f"provider_status={provider_status} progress={progress} "
+        f"next_poll_interval={next_poll_interval}s extra_meta={extra_meta}"
+    )
+
     try:
         meta_patch = {"progress": progress, "provider_status": provider_status}
         if extra_meta:
@@ -1207,13 +1238,28 @@ def _update_job_state(
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                         updated_at = NOW()
                     WHERE id::text = %s
+                    RETURNING next_poll_at, heartbeat_at
                     """,
                     (status, provider_status, progress, next_poll_interval,
                      json.dumps(meta_patch, default=str), job_id),
                 )
+                row = cur.fetchone()
+                if row:
+                    print(
+                        f"[JOB][DEBUG] _update_job_state OK job={job_id} "
+                        f"next_poll_at={row[0]} heartbeat_at={row[1]} rowcount={cur.rowcount}"
+                    )
+                else:
+                    print(
+                        f"[JOB][DEBUG] _update_job_state NO ROW MATCHED job={job_id} "
+                        f"(WHERE id::text = '{job_id}' matched 0 rows!)"
+                    )
             conn.commit()
+            print(f"[JOB][DEBUG] _update_job_state COMMITTED job={job_id}")
     except Exception as e:
         print(f"[JOB] state update error job={job_id}: {e}")
+        import traceback as _tb
+        _tb.print_exc()
 
 
 # ── Store Compat (in-memory store for frontend polling) ─────
