@@ -587,7 +587,7 @@ class JobService:
             FROM {Tables.JOBS}
             WHERE status IN ('pending', 'processing')
               AND upstream_job_id IS NOT NULL
-              AND updated_at < NOW() - INTERVAL '%s minutes'
+              AND updated_at < NOW() - %s * INTERVAL '1 minute'
             ORDER BY updated_at ASC
             LIMIT %s
             """,
