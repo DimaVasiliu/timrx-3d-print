@@ -445,20 +445,26 @@ def history_mod():
                                     model_id = item.get("model_id")
                                     image_id = item.get("image_id")
                                     lookup_reason = None
-                                    if not model_id and not image_id:
-                                        model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                            cur, item_type, item_id, glb_url, image_url, identity_id, provider
-                                        )
-                                    if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
-                                        if lookup_reason:
-                                            skip_reason = lookup_reason
-                                        elif model_id and image_id:
-                                            skip_reason = "xor_violation"
-                                        else:
-                                            skip_reason = "missing_asset_reference"
-                                        print(f"[History][mod] Skipping item {item_id} - reason: {skip_reason}")
-                                        skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
-                                        continue
+
+                                    # Video items use video_id, not model_id/image_id — skip XOR check
+                                    if item_type == "video":
+                                        model_id = None
+                                        image_id = None
+                                    else:
+                                        if not model_id and not image_id:
+                                            model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
+                                                cur, item_type, item_id, glb_url, image_url, identity_id, provider
+                                            )
+                                        if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
+                                            if lookup_reason:
+                                                skip_reason = lookup_reason
+                                            elif model_id and image_id:
+                                                skip_reason = "xor_violation"
+                                            else:
+                                                skip_reason = "missing_asset_reference"
+                                            print(f"[History][mod] Skipping item {item_id} - reason: {skip_reason}")
+                                            skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
+                                            continue
 
                                     cur.execute(
                                         f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
@@ -674,11 +680,16 @@ def history_item_add_mod():
                                 model_id = item.get("model_id")
                                 image_id = item.get("image_id")
                                 lookup_reason = None
-                                if not model_id and not image_id:
+
+                                # Video items use video_id, not model_id/image_id — skip XOR check
+                                if item_type == "video":
+                                    model_id = None
+                                    image_id = None
+                                elif not model_id and not image_id:
                                     model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
                                         cur, item_type, item_id, glb_url, image_url, identity_id, provider
                                     )
-                                if not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
+                                if item_type != "video" and not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
                                     if lookup_reason:
                                         skip_reason = lookup_reason
                                     elif model_id and image_id:
