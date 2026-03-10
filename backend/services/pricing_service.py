@@ -252,6 +252,15 @@ VIDEO_CREDIT_COSTS = {
     "1080p": {8: 130},
 }
 
+# Seedance credit costs: tier * duration
+# seedance-2-fast-preview: 14 credits/sec
+# seedance-2-preview:      24 credits/sec
+SEEDANCE_CREDITS_PER_SEC = {
+    "fast": 14,
+    "preview": 24,
+}
+SEEDANCE_VALID_DURATIONS = [5, 10, 15]
+
 # Valid durations per resolution (Gemini/Veo constraints)
 VIDEO_VALID_DURATIONS = {
     "720p": [4, 6, 8],
@@ -259,42 +268,62 @@ VIDEO_VALID_DURATIONS = {
 }
 
 
-def get_video_action_code(task: str, duration_seconds: int, resolution: str) -> str:
+def get_video_action_code(
+    task: str,
+    duration_seconds: int,
+    resolution: str,
+    provider: str = "veo",
+    seedance_tier: str = "fast",
+) -> str:
     """
     Build the video action code for a specific variant.
-    Uses lowercase snake_case as canonical format.
 
     Args:
         task: "text2video" or "image2video"
-        duration_seconds: 4, 6, or 8
+        duration_seconds: Duration in seconds
         resolution: "720p" or "1080p"
+        provider: "veo" or "seedance"
+        seedance_tier: "fast" or "preview" (only for seedance)
 
     Returns:
-        Action code like "video_text_generate_4s_720p" or "video_image_animate_8s_1080p"
+        Action code like "video_text_generate_4s_720p" or "seedance_fast_text_generate_5s"
     """
-    # Normalize inputs - use lowercase canonical format
     task_part = "text_generate" if task.lower() in ("text2video", "text_to_video", "text") else "image_animate"
-    duration_part = f"{duration_seconds}s"
-    resolution_part = resolution.lower()  # Ensure 720p, 1080p, 4k
 
+    if provider == "seedance":
+        tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
+        return f"seedance_{tier}_{task_part}_{duration_seconds}s"
+
+    duration_part = f"{duration_seconds}s"
+    resolution_part = resolution.lower()
     return f"video_{task_part}_{duration_part}_{resolution_part}"
 
 
-def get_video_credit_cost(duration_seconds: int, resolution: str) -> int:
+def get_video_credit_cost(
+    duration_seconds: int,
+    resolution: str,
+    provider: str = "veo",
+    seedance_tier: str = "fast",
+) -> int:
     """
     Get the credit cost for a video variant.
 
     Args:
-        duration_seconds: 4, 6, or 8
+        duration_seconds: Duration in seconds
         resolution: "720p" or "1080p"
+        provider: "veo" or "seedance"
+        seedance_tier: "fast" or "preview" (only for seedance)
 
     Returns:
-        Credit cost (70, 90, 110, or 130)
+        Credit cost
     """
+    if provider == "seedance":
+        tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
+        cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 14)
+        return cps * int(duration_seconds)
+
     resolution = resolution.lower()
     duration = int(duration_seconds)
-
-    # Get cost from mapping, fallback to 70 if not found
     resolution_costs = VIDEO_CREDIT_COSTS.get(resolution, {})
     return resolution_costs.get(duration, 70)
 
