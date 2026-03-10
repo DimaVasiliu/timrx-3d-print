@@ -43,6 +43,14 @@ _SYSTEM_PROMPTS = {
         "Do not inject unsupported technical claims or overstuff the scene. "
         "Return ONLY the final enhanced prompt text. No explanations, no labels, no quotes."
     ),
+    "texture": (
+        "You are a prompt enhancement engine for AI 3D texture generation. "
+        "Rewrite the user's prompt into a stronger prompt for 3D model texturing. "
+        "Add material detail: surface properties, weathering, color variation, reflectivity. "
+        "If a specific material is mentioned, elaborate on its physical characteristics. "
+        "Keep it concise and descriptive. Avoid abstract or poetic language. "
+        "Return ONLY the final enhanced prompt text. No explanations, no labels, no quotes."
+    ),
 }
 
 
