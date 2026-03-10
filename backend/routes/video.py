@@ -903,17 +903,20 @@ def _video_status_handler(job_id: str):
                         "estimated_duration_seconds": rtime["estimated_duration_seconds"],
                     })
 
-                if job["status"] == "failed":
+                if job["status"] in ("failed", "provider_stalled"):
                     error_msg = job.get("error_message", "Video generation failed")
-                    error_code = "video_failed"
-                    # Parse error code from "code: message" format
-                    if error_msg and ":" in error_msg:
+                    error_code = job_meta.get("error_code") or "video_failed"
+
+                    # Fallback: parse error code from "code: message" format
+                    if error_code == "video_failed" and error_msg and ":" in error_msg:
                         parts = error_msg.split(":", 1)
                         candidate = parts[0].strip()
-                        # Accept any machine-readable code (snake_case, no spaces)
                         if candidate and " " not in candidate:
                             error_code = candidate
                             error_msg = parts[1].strip()
+
+                    # Use structured failure_reason from meta if available
+                    failure_reason = job_meta.get("failure_reason") or error_msg
 
                     # Surface user-friendly message for filtered errors
                     user_message = job_meta.get("user_message") if error_code == "provider_filtered_third_party" else None
@@ -923,10 +926,12 @@ def _video_status_handler(job_id: str):
                         "status": "failed",
                         "job_id": job_id,
                         "error": error_code,
-                        "message": user_message or error_msg,
+                        "message": user_message or failure_reason,
                     }
                     if user_message:
                         resp["user_message"] = user_message
+                    if job["status"] == "provider_stalled":
+                        resp["provider_stalled"] = True
                     return jsonify(resp)
 
                 if job["status"] == "ready":
@@ -973,7 +978,7 @@ def _video_status_handler(job_id: str):
             response_data["new_balance"] = new_balance
         return jsonify(response_data)
 
-    if meta.get("status") == "failed":
+    if meta.get("status") in ("failed", "provider_stalled"):
         error_msg = meta.get("error", "Video generation failed")
         error_code = meta.get("error_code", "gemini_video_failed")
         resp = {
@@ -985,6 +990,8 @@ def _video_status_handler(job_id: str):
         }
         if error_code == "provider_filtered_third_party":
             resp["user_message"] = error_msg
+        if meta.get("status") == "provider_stalled":
+            resp["provider_stalled"] = True
         return jsonify(resp)
 
     if meta.get("status") == "quota_queued":
