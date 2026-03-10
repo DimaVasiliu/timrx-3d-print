@@ -594,6 +594,44 @@ def update_job_status_ready(
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
 
+def _mark_job_for_worker(job_id: str, upstream_id: str, provider_name: str, store_meta: dict):
+    """
+    Transition a dispatched video job so the durable worker picks it up.
+
+    Sets status='dispatched', stores upstream_id, and schedules next_poll_at
+    so the worker claims and polls it. This replaces in-thread polling.
+    """
+    if not USE_DB:
+        return
+    try:
+        meta_patch = {
+            "upstream_id": upstream_id,
+            "provider": provider_name,
+            "dispatched_via": "async_dispatch",
+        }
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'dispatched',
+                        upstream_job_id = %s,
+                        last_provider_status = 'pending',
+                        next_poll_at = NOW() + INTERVAL '5 seconds',
+                        heartbeat_at = NULL,
+                        claimed_by = NULL,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                    """,
+                    (upstream_id, json.dumps(meta_patch), job_id),
+                )
+            conn.commit()
+        print(f"[ASYNC] Job {job_id} queued for durable worker (upstream={upstream_id}, provider={provider_name})")
+    except Exception as e:
+        print(f"[ASYNC] ERROR marking job {job_id} for worker: {e}")
+
+
 def _update_job_meta(job_id: str, meta_patch: dict):
     """Merge a dict into the jobs.meta JSONB column."""
     if not USE_DB or not meta_patch:
@@ -812,14 +850,11 @@ def dispatch_gemini_video_async(
         upstream_id = resp.get("operation_name") or resp.get("task_id")
 
         if upstream_id:
-            # Long-running operation - need to poll for status
-            # print(f"[ASYNC] Video returned upstream_id={upstream_id} for job {internal_job_id} via {provider_used} in {duration_ms}ms")
-            # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={upstream_id} provider={provider_used} status=processing")
-
-            # Update job with upstream identifier
+            # Long-running operation — hand off to durable worker for polling.
+            # Update job with upstream ID and set status so the DB worker claims it.
             update_job_with_upstream_id(internal_job_id, upstream_id)
 
-            # Store upstream id for polling
+            # Store upstream id for frontend status polling
             store = load_store()
             store_meta["operation_name"] = upstream_id  # kept for backward compat
             store_meta["upstream_id"] = upstream_id
@@ -827,15 +862,8 @@ def dispatch_gemini_video_async(
             store[internal_job_id] = store_meta
             save_store(store)
 
-            # Poll for completion using provider-aware loop
-            _poll_video_completion(
-                internal_job_id,
-                identity_id,
-                reservation_id,
-                upstream_id,
-                provider_used,
-                store_meta,
-            )
+            # Transition to dispatched — the durable worker picks this up
+            _mark_job_for_worker(internal_job_id, upstream_id, provider_used, store_meta)
         else:
             # Immediate result (unexpected for video)
             video_url = resp.get("video_url")
