@@ -673,11 +673,37 @@ def dispatch_gemini_video_async(
         ProviderUnavailableError,
     )
     from backend.services.video_queue import video_queue
+    from backend.services.video_limits import (
+        acquire_video_worker,
+        release_video_worker,
+        record_video_request,
+    )
+
+    # Global worker limit: wait for a slot (Part 3)
+    if not acquire_video_worker():
+        print(f"[ASYNC] Worker limit reached for job {internal_job_id}, queuing")
+        # Retry after a short delay — up to 5 attempts, 10s apart
+        for _wait_attempt in range(5):
+            time.sleep(10)
+            if acquire_video_worker():
+                break
+        else:
+            # Still no slot — release credits and fail gracefully
+            release_job_credits(reservation_id, "worker_limit_exceeded", internal_job_id)
+            ExpenseGuard.unregister_active_job(internal_job_id)
+            store = load_store()
+            store_meta["status"] = "failed"
+            store_meta["error"] = "Server busy — please try again shortly."
+            store[internal_job_id] = store_meta
+            save_store(store)
+            _update_job_status(internal_job_id, "failed", error_message="worker_limit_exceeded: No worker slot available")
+            return
 
     start_time = time.time()
     task = payload.get("task", "text2video")
-    # print(f"[ASYNC] Starting video {task} dispatch for job {internal_job_id}")
-    # print(f"[JOB] provider_started job_id={internal_job_id} action={task} reservation_id={reservation_id}")
+
+    # Record for abuse detection (Part 7)
+    record_video_request(identity_id, payload.get("prompt", ""))
 
     try:
         # Extract parameters (use new names, fallback to old for compatibility)
@@ -737,19 +763,43 @@ def dispatch_gemini_video_async(
             provider_used = "seedance"
         else:
             # Veo routing with provider fallback
-            if task == "image2video":
-                prompt = payload.get("motion") or payload.get("prompt", "")
-                resp, provider_used = video_router.route_image_to_video(
-                    image_data=payload.get("image_data", ""),
-                    prompt=prompt,
-                    **route_params,
-                )
-            else:  # text2video
-                prompt = payload.get("prompt", "")
-                resp, provider_used = video_router.route_text_to_video(
-                    prompt=prompt,
-                    **route_params,
-                )
+            try:
+                if task == "image2video":
+                    prompt = payload.get("motion") or payload.get("prompt", "")
+                    resp, provider_used = video_router.route_image_to_video(
+                        image_data=payload.get("image_data", ""),
+                        prompt=prompt,
+                        **route_params,
+                    )
+                else:  # text2video
+                    prompt = payload.get("prompt", "")
+                    resp, provider_used = video_router.route_text_to_video(
+                        prompt=prompt,
+                        **route_params,
+                    )
+            except (ProviderUnavailableError, RuntimeError) as veo_err:
+                # Part 5: Provider failover — try Seedance once if Veo fails
+                print(f"[ASYNC] Veo failed for job {internal_job_id}: {veo_err}, attempting Seedance failover")
+                from backend.services.video_router import resolve_video_provider as _resolve
+                _failover = _resolve("seedance")
+                if _failover:
+                    _configured, _ = _failover.is_configured()
+                    if _configured:
+                        route_params["task_type"] = "seedance-2-fast-preview"
+                        prompt = payload.get("prompt", "")
+                        if task == "image2video":
+                            prompt = payload.get("motion") or prompt
+                            resp = _failover.start_image_to_video(
+                                image_data=payload.get("image_data", ""), prompt=prompt, **route_params,
+                            )
+                        else:
+                            resp = _failover.start_text_to_video(prompt=prompt, **route_params)
+                        provider_used = "seedance"
+                        print(f"[ASYNC] Seedance failover succeeded for job {internal_job_id}")
+                    else:
+                        raise veo_err
+                else:
+                    raise veo_err
 
         # Track which provider actually handled the request
         store_meta["provider"] = provider_used
@@ -857,6 +907,9 @@ def dispatch_gemini_video_async(
         update_job_status_failed(internal_job_id, f"video_failed: {e}")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
+    finally:
+        release_video_worker()
+
 
 def _poll_gemini_video_completion(
     internal_job_id: str,
@@ -876,7 +929,7 @@ def _poll_gemini_video_completion(
     # print(f"[ASYNC] Starting poll for Veo operation {operation_name}")
 
     consecutive_errors = 0
-    max_consecutive_errors = 5
+    max_consecutive_errors = 1
     zero_progress_polls = 0  # Track polls with 0% progress
 
     for poll_num in range(1, max_polls + 1):
@@ -1037,7 +1090,7 @@ def _poll_video_completion(
 
     # ── Generic provider poll (future providers) ─────
     consecutive_errors = 0
-    max_consecutive_errors = 5
+    max_consecutive_errors = 1
 
     for poll_num in range(1, max_polls + 1):
         try:
@@ -1162,7 +1215,7 @@ def _poll_vertex_with_backoff(
     TIMEOUT_SECONDS = 360  # 6 minutes for fast model
 
     consecutive_errors = 0
-    max_consecutive_errors = 5
+    max_consecutive_errors = 1
     current_delay = INITIAL_DELAY
     elapsed = 0
     poll_count = 0
