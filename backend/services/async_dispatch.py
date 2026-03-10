@@ -1242,6 +1242,7 @@ def _poll_seedance_with_state_awareness(
     last_phase = "pending"       # "pending" or "processing"
     consecutive_errors = 0
     poll_num = 0
+    did_fallback = False          # True if we already retried with fast tier
 
     while True:
         # ── Determine poll interval ──
@@ -1259,6 +1260,27 @@ def _poll_seedance_with_state_awareness(
 
         # ── Hard timeout check ──
         if last_phase == "pending" and pending_elapsed >= pend_hard:
+            # FALLBACK: If this was a preview job, retry once with fast tier
+            if task_type == "seedance-2-preview" and not did_fallback:
+                fallback_result = _seedance_pending_fallback(
+                    internal_job_id, identity_id, reservation_id,
+                    provider, store_meta,
+                )
+                if fallback_result:
+                    # Fallback created a new upstream task — reset poll state
+                    upstream_id = fallback_result["upstream_id"]
+                    task_type = "seedance-2-fast-preview"
+                    pend_soft, pend_hard, proc_soft, proc_hard = _SEEDANCE_TIMEOUTS.get(
+                        task_type, _SEEDANCE_DEFAULT_TIMEOUTS,
+                    )
+                    pending_elapsed = 0.0
+                    processing_elapsed = 0.0
+                    last_phase = "pending"
+                    poll_num = 0
+                    did_fallback = True
+                    print(f"[SEEDANCE] Fallback to fast tier for job {internal_job_id}, new upstream={upstream_id}")
+                    continue
+
             _seedance_fail(
                 internal_job_id, reservation_id,
                 "seedance_pending_timeout",
@@ -1353,12 +1375,148 @@ def _poll_seedance_with_state_awareness(
 
 
 def _seedance_fail(internal_job_id, reservation_id, error_code, error_msg):
-    """Helper: mark a Seedance job as failed, release credits, unregister."""
-    print(f"[SEEDANCE] FAIL job={internal_job_id} code={error_code} msg={error_msg}")
+    """Helper: mark a Seedance job as failed, release credits, unregister.
+
+    Uses 'provider_stalled' DB status for timeout errors where provider never
+    started (pending_timeout) — distinct from explicit provider failure.
+    """
+    # Determine DB status: provider_stalled for queue timeouts, failed for everything else
+    is_stalled = error_code in (
+        "seedance_pending_timeout",
+        "seedance_processing_timeout",
+        "seedance_poll_error",
+    )
+    db_status = "provider_stalled" if is_stalled else "failed"
+
+    print(f"[SEEDANCE] FAIL job={internal_job_id} code={error_code} db_status={db_status} msg={error_msg}")
+
+    # Store structured error metadata in DB jsonb (for frontend to surface)
+    _update_job_meta(internal_job_id, {
+        "error_code": error_code,
+        "error_message": error_msg,
+        "failure_reason": _FAILURE_REASON_MAP.get(error_code, error_msg),
+    })
+
+    # Also update in-memory store with error details
+    store = load_store()
+    sm = store.get(internal_job_id)
+    if sm:
+        sm["status"] = db_status
+        sm["error_code"] = error_code
+        sm["error"] = _FAILURE_REASON_MAP.get(error_code, error_msg)
+        store[internal_job_id] = sm
+        save_store(store)
+
     if reservation_id:
         release_job_credits(reservation_id, error_code, internal_job_id)
-    update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
+
+    # Use provider_stalled or failed in DB
+    if is_stalled:
+        _update_job_db_status(internal_job_id, "provider_stalled", f"{error_code}: {error_msg}")
+    else:
+        update_job_status_failed(internal_job_id, f"{error_code}: {error_msg}")
     ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+# Human-readable failure reasons keyed by error_code
+_FAILURE_REASON_MAP = {
+    "seedance_pending_timeout": "Provider queue timed out — Seedance did not start this job in time",
+    "seedance_processing_timeout": "Render timed out — Seedance started but did not finish in time",
+    "seedance_poll_error": "Lost connection to provider during generation",
+    "seedance_generation_failed": "Seedance rejected this generation",
+    "seedance_no_video_url": "Generation completed but no video was returned",
+    "seedance_auth_error": "Provider authentication failed",
+}
+
+
+def _update_job_db_status(job_id: str, status: str, error_message: str = None):
+    """Update job status in DB to an arbitrary status string (e.g. provider_stalled)."""
+    if not USE_DB:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = %s, error_message = %s, updated_at = NOW()
+                    WHERE id::text = %s
+                    """,
+                    (status, (error_message[:500] if error_message else None), job_id),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[JOB] ERROR updating job {job_id} to status={status}: {e}")
+
+
+def _seedance_pending_fallback(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    provider,
+    store_meta: dict,
+) -> Optional[dict]:
+    """
+    Attempt to retry a Seedance preview job with the fast tier.
+
+    Called when a preview job times out in pending. Creates a new upstream task
+    with seedance-2-fast-preview. The same internal_job_id, reservation, and
+    credits are reused — no double charge.
+
+    Returns {"upstream_id": "..."} on success, None on failure.
+    """
+    try:
+        print(f"[SEEDANCE] Attempting fallback preview→fast for job {internal_job_id}")
+
+        prompt = store_meta.get("prompt", "")
+        duration = store_meta.get("duration_seconds", 5)
+        aspect = store_meta.get("aspect_ratio", "16:9")
+        image_urls = None
+        if store_meta.get("task") == "image2video":
+            img = store_meta.get("image_data") or ""
+            if img:
+                image_urls = [img]
+
+        from backend.services.seedance_service import create_seedance_task
+        resp = create_seedance_task(
+            prompt=prompt,
+            duration=duration,
+            aspect_ratio=aspect,
+            image_urls=image_urls,
+            task_type="seedance-2-fast-preview",
+        )
+
+        new_upstream = resp.get("task_id")
+        if not new_upstream:
+            print(f"[SEEDANCE] Fallback failed: no task_id returned")
+            return None
+
+        # Update store and DB with new upstream id + fallback metadata
+        store_meta["upstream_id"] = new_upstream
+        store_meta["operation_name"] = new_upstream
+        store_meta["task_type"] = "seedance-2-fast-preview"
+        store_meta["seedance_variant"] = "seedance-2-fast-preview"
+        store_meta["seedance_tier"] = "fast"
+        store_meta["fallback_from"] = "seedance-2-preview"
+        store_meta["status"] = "processing"
+
+        store = load_store()
+        store[internal_job_id] = store_meta
+        save_store(store)
+
+        _update_job_meta(internal_job_id, {
+            "upstream_id": new_upstream,
+            "task_type": "seedance-2-fast-preview",
+            "fallback_from": "seedance-2-preview",
+            "fallback_reason": "pending_timeout",
+        })
+        update_job_with_upstream_id(internal_job_id, new_upstream)
+
+        return {"upstream_id": new_upstream}
+
+    except Exception as e:
+        print(f"[SEEDANCE] Fallback failed for job {internal_job_id}: {e}")
+        return None
 
 
 def _update_job_progress(internal_job_id, store_meta, db_status, progress, extra_meta=None):
