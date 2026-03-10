@@ -1897,6 +1897,7 @@ def create_internal_job_row(
     reservation_id: Optional[str] = None,
     status: str = "queued",
     priority: str = "normal",
+    stage: Optional[str] = None,
 ) -> bool:
     """
     Create or update a timrx_billing.jobs row for an internal job id.
@@ -1953,15 +1954,16 @@ def create_internal_job_row(
                 cur.execute(
                     f"""
                     INSERT INTO {Tables.JOBS}
-                        (id, identity_id, provider, action_code, status, cost_credits, reservation_id, prompt, meta, priority)
+                        (id, identity_id, provider, action_code, status, cost_credits, reservation_id, prompt, meta, priority, stage)
                     VALUES
-                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
                     SET provider = EXCLUDED.provider,
                         reservation_id = COALESCE(EXCLUDED.reservation_id, {Tables.JOBS}.reservation_id),
                         prompt = COALESCE(EXCLUDED.prompt, {Tables.JOBS}.prompt),
                         meta = COALESCE({Tables.JOBS}.meta, '{{}}'::jsonb) || COALESCE(EXCLUDED.meta, '{{}}'::jsonb),
                         priority = EXCLUDED.priority,
+                        stage = COALESCE(EXCLUDED.stage, {Tables.JOBS}.stage),
                         updated_at = NOW()
                     """,
                     (
@@ -1975,6 +1977,7 @@ def create_internal_job_row(
                         prompt,
                         meta_json,
                         priority,
+                        stage,
                     ),
                 )
             conn.commit()
