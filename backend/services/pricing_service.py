@@ -151,10 +151,9 @@ def normalize_action_key(action_key: str) -> str:
     if normalized in ALIAS_TO_CANONICAL:
         return ALIAS_TO_CANONICAL[normalized]
 
-    # Video variant codes are canonical by design (e.g., video_text_generate_4s_720p)
-    # Pattern: video_{task}_{duration}s_{resolution}
-    # These map directly to DB action_costs table entries
-    if _is_video_variant_code(normalized):
+    # Video variant codes are canonical by design
+    # Veo: video_text_generate_4s_720p  |  Seedance: seedance_fast_text_generate_5s
+    if _is_video_variant_code(normalized) or _is_seedance_variant_code(normalized):
         return normalized
 
     # Unknown - log warning and return as-is
@@ -164,30 +163,42 @@ def normalize_action_key(action_key: str) -> str:
 
 def _is_video_variant_code(action_key: str) -> bool:
     """
-    Check if an action key is a video variant code.
+    Check if an action key is a Veo video variant code.
 
-    Video variant codes follow the pattern:
-    - video_text_generate_{duration}s_{resolution}
-    - video_image_animate_{duration}s_{resolution}
-
-    Where duration is 4, 6, or 8 and resolution is 720p or 1080p.
-    (4k exists in DB for future use but is not exposed in UI)
+    Pattern: video_{text_generate|image_animate}_{duration}s_{resolution}
     """
     if not action_key.startswith("video_"):
         return False
 
-    # Valid prefixes for legacy Veo video codes
     valid_prefixes = ("video_text_generate_", "video_image_animate_")
-    if not any(action_key.startswith(p) for p in valid_prefixes):
-        return False
-
-    # Extract suffix after prefix (e.g., "8s_1080p" from "video_image_animate_8s_1080p")
     for prefix in valid_prefixes:
         if action_key.startswith(prefix):
             suffix = action_key[len(prefix):]
-            # Valid suffixes: 4s_720p, 6s_720p, 8s_720p, 8s_1080p, 8s_4k
             valid_suffixes = {"4s_720p", "6s_720p", "8s_720p", "8s_1080p", "8s_4k"}
             return suffix in valid_suffixes
+
+    return False
+
+
+def _is_seedance_variant_code(action_key: str) -> bool:
+    """
+    Check if an action key is a Seedance variant code.
+
+    Pattern: seedance_{fast|preview}_{text_generate|image_animate}_{duration}s
+    """
+    if not action_key.startswith("seedance_"):
+        return False
+
+    valid_prefixes = (
+        "seedance_fast_text_generate_",
+        "seedance_fast_image_animate_",
+        "seedance_preview_text_generate_",
+        "seedance_preview_image_animate_",
+    )
+    for prefix in valid_prefixes:
+        if action_key.startswith(prefix):
+            suffix = action_key[len(prefix):]
+            return suffix in {"5s", "10s", "15s"}
 
     return False
 
@@ -776,8 +787,8 @@ class PricingService:
         canonical = normalize_action_key(job_type)
 
         # Video variant codes ARE the DB action codes (lowercase canonical format)
-        # e.g., video_text_generate_4s_720p, video_image_animate_8s_1080p
-        if _is_video_variant_code(canonical):
+        # e.g., video_text_generate_4s_720p, seedance_fast_text_generate_5s
+        if _is_video_variant_code(canonical) or _is_seedance_variant_code(canonical):
             return canonical
 
         # For other actions, look up the DB code mapping
