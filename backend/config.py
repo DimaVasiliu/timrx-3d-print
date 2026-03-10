@@ -575,6 +575,22 @@ class Config:
     )
 
     # ─────────────────────────────────────────────────────────────
+    # Video Rate Limits & Budget Guardrails
+    # ─────────────────────────────────────────────────────────────
+    VIDEO_ENFORCE_LIMITS: bool = field(
+        default_factory=lambda: _get_env_bool("VIDEO_ENFORCE_LIMITS", True)
+    )
+    VIDEO_DAILY_PROVIDER_BUDGET_GBP: int = field(
+        default_factory=lambda: _get_env_int("VIDEO_DAILY_PROVIDER_BUDGET_GBP", 500)
+    )
+    MAX_VIDEO_WORKERS: int = field(
+        default_factory=lambda: _get_env_int("MAX_VIDEO_WORKERS", 8)
+    )
+    VIDEO_COST_SAFETY_MULTIPLIER: float = field(
+        default_factory=lambda: float(os.getenv("VIDEO_COST_SAFETY_MULTIPLIER", "1.25"))
+    )
+
+    # ─────────────────────────────────────────────────────────────
     # Logging & Debug
     # ─────────────────────────────────────────────────────────────
     def log_summary(self) -> None:
