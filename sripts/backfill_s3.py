@@ -120,11 +120,8 @@ def infer_provider_video(row: dict, payload: dict) -> str:
     if payload.get("provider"):
         return str(payload["provider"])
     url = row.get("video_url") or ""
-    if "runway" in url or "runwayml" in url:
-        return "runway"
-    if "cloudfront" in url:
-        # Runway uses CloudFront for ephemeral output URLs
-        return "runway"
+    if "piapi" in url:
+        return "seedance"
     return "google"
 
 
