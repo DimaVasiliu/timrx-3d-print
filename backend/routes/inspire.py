@@ -482,6 +482,9 @@ def inspire_feed() -> Response:
         shuffle = request.args.get("shuffle", "true").lower() == "true"
         seed = request.args.get("seed")
         filter_type = request.args.get("type", "all").lower()
+        mix_mode = request.args.get("mix", "balanced").lower()
+        if mix_mode not in ("balanced", "sequential"):
+            mix_mode = "balanced"
 
         with get_conn() as conn:
             cursor = conn.cursor(row_factory=dict_row)
@@ -489,38 +492,69 @@ def inspire_feed() -> Response:
             # Get prompt of the day
             potd = _get_prompt_of_the_day(cursor)
 
-            # Fetch ALL items from DB (no limit), then shuffle and slice
+            total_available = 0
+            already_shuffled = False
+
+            # Fetch ALL items from DB (no limit), then mix and slice
             if filter_type == "all":
-                # Fetch ALL items from each table
                 models = _fetch_models(cursor, limit=None, debug=True)
                 images = _fetch_images(cursor, limit=None, debug=True)
                 videos = _fetch_videos(cursor, limit=None, debug=True)
+                total_available = len(models) + len(images) + len(videos)
 
-                # Combine all items
-                items = models + images + videos
+                print(
+                    f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} "
+                    f"videos:{len(videos)} total:{total_available} mix:{mix_mode}"
+                )
 
-                # Debug logging: counts per type
-                print(f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} videos:{len(videos)} total:{len(items)}")
+                if mix_mode == "balanced":
+                    # Shuffle each source first so balancing does not always pick the same recent rows.
+                    if shuffle:
+                        if seed:
+                            models = _seeded_shuffle(models, seed + "_models")
+                            images = _seeded_shuffle(images, seed + "_images")
+                            videos = _seeded_shuffle(videos, seed + "_videos")
+                        else:
+                            random.shuffle(models)
+                            random.shuffle(images)
+                            random.shuffle(videos)
+
+                    items = _balanced_mix(
+                        models=models,
+                        images=images,
+                        videos=videos,
+                        target=limit,
+                        shuffle=shuffle,
+                        seed=seed,
+                    )
+                    already_shuffled = True
+                else:
+                    # Sequential mode keeps historical behavior for compatibility.
+                    items = models + images + videos
 
             elif filter_type in ("model", "models"):
                 items = _fetch_models(cursor, limit=None, debug=True)
+                total_available = len(items)
                 print(f"[INSPIRE] Models-only feed: {len(items)} items")
 
             elif filter_type in ("image", "images"):
                 items = _fetch_images(cursor, limit=None, debug=True)
+                total_available = len(items)
                 print(f"[INSPIRE] Images-only feed: {len(items)} items")
 
             elif filter_type in ("video", "videos"):
                 items = _fetch_videos(cursor, limit=None, debug=True)
+                total_available = len(items)
                 print(f"[INSPIRE] Videos-only feed: {len(items)} items")
 
             else:
                 items = []
+                total_available = 0
 
             cursor.close()
 
-        # Shuffle ALL items together
-        if shuffle:
+        # Shuffle ALL items together (balanced mode already shuffled/mixed above)
+        if shuffle and not already_shuffled:
             if seed:
                 items = _seeded_shuffle(items, seed)
             else:
@@ -532,11 +566,13 @@ def inspire_feed() -> Response:
         for idx, item in enumerate(items):
             if len(cards) >= limit:
                 break
-            # Skip duplicates
+            # Skip duplicates; include type to avoid cross-table id collisions.
             item_id = item.get("id", "")
-            if item_id in seen_ids:
+            item_type = item.get("type", "unknown")
+            unique_key = f"{item_type}:{item_id}"
+            if unique_key in seen_ids:
                 continue
-            seen_ids.add(item_id)
+            seen_ids.add(unique_key)
 
             card = _transform_to_card(item, idx, limit)
             if card:
@@ -547,7 +583,7 @@ def inspire_feed() -> Response:
             "prompt_of_the_day": potd,
             "cards": cards,
             "total": len(cards),
-            "total_available": len(items),
+            "total_available": total_available,
             "source": "inspire"
         })
         response.headers["Content-Type"] = "application/json"
