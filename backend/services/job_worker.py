@@ -19,14 +19,21 @@ Single-worker guarantee:
   Only one process across all Gunicorn workers acquires the lock. Others
   log a standby message and exit their worker thread immediately.
 
+Provider routing:
+  Only video jobs with supported providers are claimed. Meshy 3D model
+  jobs use a separate legacy dispatch path and are never touched here.
+  Each provider has its own timeout config and error codes.
+
 Lifecycle states:
   created -> queued -> dispatched -> provider_pending -> provider_processing
-    -> provider_succeeded -> finalizing -> succeeded
-    -> provider_failed -> failed
+    -> finalizing -> ready (succeeded)
+    -> failed
     -> stalled (reclaimable)
     -> refunded
+    -> abandoned_legacy (too old for recovery)
 
-Terminal states: succeeded, failed, refunded
+Terminal states: succeeded, failed, refunded, ready, ready_unbilled,
+                 abandoned_legacy, recovery_blocked
 """
 
 from __future__ import annotations
@@ -61,18 +68,41 @@ POLL_SLEEP_PENDING = 15          # seconds between provider polls (pending)
 POLL_SLEEP_PROCESSING = 10       # seconds between provider polls (processing)
 WORKER_LOOP_SLEEP = 2            # seconds between claim attempts when idle
 MAX_ATTEMPTS = 5                 # max retry attempts before permanent failure
+MAX_RECOVERY_AGE_HOURS = 48      # don't claim jobs older than this
 
 # Stepped backoff for provider errors (indexed by consecutive_errors count)
 BACKOFF_STEPS = [30, 60, 120, 300]  # seconds
 
-# Seedance timeouts (pend_soft, pend_hard, proc_soft, proc_hard)
-_SEEDANCE_TIMEOUTS = {
-    "seedance-2-fast-preview": (5 * 60, 15 * 60, 10 * 60, 20 * 60),
-    "seedance-2-preview":      (15 * 60, 30 * 60, 15 * 60, 30 * 60),
-}
-_SEEDANCE_DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
+# ── Provider Configuration ───────────────────────────────────
+# Only these provider/stage combinations are handled by the durable worker.
+# Everything else (meshy 3D, image gen, etc.) uses legacy dispatch paths.
+_SUPPORTED_PROVIDERS = {"seedance", "vertex", "google", "veo"}
+_SUPPORTED_STAGES = {"video"}
 
+# Per-provider timeout config: (pend_soft, pend_hard, proc_soft, proc_hard)
+# Keys can be "provider" or "provider:task_type" for finer granularity
+_PROVIDER_TIMEOUTS = {
+    # Seedance task types
+    "seedance:seedance-2-fast-preview": (5 * 60, 15 * 60, 10 * 60, 20 * 60),
+    "seedance:seedance-2-preview":      (15 * 60, 30 * 60, 15 * 60, 30 * 60),
+    "seedance":                         (5 * 60, 15 * 60, 10 * 60, 20 * 60),
+    # Vertex / Google Veo — faster models, tighter timeouts
+    "vertex":                           (2 * 60, 6 * 60, 4 * 60, 10 * 60),
+    "google":                           (2 * 60, 6 * 60, 4 * 60, 10 * 60),
+    "veo":                              (2 * 60, 6 * 60, 4 * 60, 10 * 60),
+}
+_DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
+
+# Provider-neutral failure reason map. Code format: "{provider}_{reason}"
+# falls back to generic messages when provider-specific not found.
 _FAILURE_REASON_MAP = {
+    "pending_timeout": "Provider queue timed out — job was not started in time",
+    "processing_timeout": "Render timed out — provider started but did not finish in time",
+    "poll_error": "Lost connection to provider during generation",
+    "generation_failed": "Provider rejected this generation",
+    "no_result_url": "Generation completed but no result was returned",
+    "auth_error": "Provider authentication failed",
+    # Seedance-specific (backward compat)
     "seedance_pending_timeout": "Provider queue timed out -- Seedance did not start this job in time",
     "seedance_processing_timeout": "Render timed out -- Seedance started but did not finish in time",
     "seedance_poll_error": "Lost connection to provider during generation",
@@ -82,18 +112,26 @@ _FAILURE_REASON_MAP = {
 }
 
 # Terminal states -- worker must never touch these
-TERMINAL_STATES = {"succeeded", "failed", "refunded", "ready", "ready_unbilled"}
+TERMINAL_STATES = {
+    "succeeded", "failed", "refunded", "ready", "ready_unbilled",
+    "abandoned_legacy", "recovery_blocked",
+}
 
 # Error codes that warrant credit release (terminal, confirmed failures).
 # Timeouts and poll errors do NOT release credits — the provider may still
 # complete the job, and the rescue service can recover it later.
 _TERMINAL_ERROR_CODES = {
-    "seedance_generation_failed",   # Provider confirmed failure
-    "seedance_no_video_url",        # Provider said done but no URL
-    "seedance_auth_error",          # Auth failure — won't recover
+    "generation_failed",            # Provider confirmed failure (generic)
+    "no_result_url",                # Provider said done but no URL (generic)
+    "auth_error",                   # Auth failure (generic)
+    "seedance_generation_failed",   # Provider confirmed failure (legacy)
+    "seedance_no_video_url",        # Provider said done but no URL (legacy)
+    "seedance_auth_error",          # Auth failure (legacy)
     "max_attempts_exceeded",        # Exhausted all retries
     "dispatch_failed",              # Could not dispatch to provider
-    "no_upstream_id",               # Missing upstream ID — cannot poll
+    "no_upstream_id",               # Missing upstream ID
+    "missing_fields",               # Required fields missing
+    "unsupported_recovery_provider",  # Provider not supported for recovery
 }
 
 
@@ -128,7 +166,6 @@ def stop_worker():
     if _worker_thread:
         _worker_thread.join(timeout=10)
 
-    # Release the advisory lock
     if _leader_conn:
         try:
             _leader_conn.close()
@@ -154,13 +191,12 @@ def _acquire_leader_lock() -> bool:
     global _leader_conn
 
     if not USE_DB:
-        return True  # No DB = no contention, just run
+        return True
 
     try:
         if _create_connection:
             _leader_conn = _create_connection()
         else:
-            # Fallback: open a raw connection
             import psycopg
             from psycopg.rows import dict_row
             db_url = os.getenv("DATABASE_URL", "")
@@ -190,7 +226,7 @@ def _acquire_leader_lock() -> bool:
             except Exception:
                 pass
             _leader_conn = None
-        return True  # Fail-open: if we can't check, assume single instance
+        return True  # Fail-open
 
 
 def _release_leader_lock():
@@ -204,7 +240,7 @@ def _release_leader_lock():
         _leader_conn = None
 
 
-# ── Core Worker Loop ───────────────���────────────────────────
+# ── Core Worker Loop ────────────────────────────────────────
 
 def _worker_loop():
     """
@@ -213,7 +249,6 @@ def _worker_loop():
     Never crashes — all errors are caught per-job. The loop itself only
     exits when _worker_stop is set or leader lock is not acquired.
     """
-    # Step 1: Acquire leader lock — only one worker per deployment
     if not _acquire_leader_lock():
         print(f"[JOB] {WORKER_ID} exiting — not the leader")
         return
@@ -232,10 +267,11 @@ def _worker_loop():
                 job_id = str(job["id"])
                 provider = job.get("provider") or "unknown"
                 upstream = job.get("upstream_job_id") or "none"
+                stage = job.get("stage") or "unknown"
                 attempt = job.get("attempt_count", 0)
                 print(
                     f"[JOB] claimed job={job_id} status={job['status']} "
-                    f"provider={provider} upstream={upstream} attempt={attempt}"
+                    f"provider={provider} stage={stage} upstream={upstream} attempt={attempt}"
                 )
 
                 try:
@@ -263,10 +299,19 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
     """
     Claim the next available job using SELECT ... FOR UPDATE SKIP LOCKED.
 
-    Returns the job row dict, or None if no work available.
+    Only claims jobs that:
+      - Are in a claimable status
+      - Have a supported provider (seedance, vertex, google, veo)
+      - Are video-stage jobs
+      - Were created within MAX_RECOVERY_AGE_HOURS
+      - Are not currently claimed (or have expired heartbeat)
+      - Have reached their next_poll_at time
     """
     if not USE_DB:
         return None
+
+    # Build provider IN clause
+    provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
 
     try:
         with get_conn() as conn:
@@ -281,7 +326,13 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                            result_url, thumbnail_url,
                            created_at, updated_at
                     FROM {Tables.JOBS}
-                    WHERE status IN ('queued', 'dispatched', 'provider_pending', 'provider_processing', 'stalled')
+                    WHERE (
+                        status IN ('dispatched', 'provider_pending', 'provider_processing', 'stalled')
+                        OR (status = 'queued' AND created_at < NOW() - INTERVAL '30 seconds')
+                    )
+                      AND provider IN ({provider_list})
+                      AND stage = 'video'
+                      AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
                       AND (claimed_by IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
                       AND (next_poll_at IS NULL OR next_poll_at <= NOW())
                     ORDER BY
@@ -296,7 +347,6 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                 if not row:
                     return None
 
-                job_id = str(row["id"])
                 attempt = (row.get("attempt_count") or 0)
 
                 cur.execute(
@@ -368,24 +418,58 @@ def _update_heartbeat(job_id: str):
 
 def _process_job(job: Dict[str, Any]):
     """
-    Route job to appropriate handler based on current status.
+    Route job to appropriate handler based on provider and status.
 
-    Validates required fields before dispatching or polling.
+    1. Check provider is supported
+    2. Validate required fields
+    3. Route to dispatch or poll
     """
     status = job["status"]
     job_id = str(job["id"])
     meta = _parse_meta(job.get("meta"))
     provider_name = job.get("provider") or meta.get("provider", "")
+    stage = job.get("stage") or meta.get("stage", "")
     upstream_id = job.get("upstream_job_id") or meta.get("upstream_id", "")
+
+    # Guard: only supported provider/stage combos
+    if provider_name not in _SUPPORTED_PROVIDERS:
+        print(
+            f"[JOB] BLOCKED job={job_id} provider={provider_name} stage={stage} "
+            f"reason=unsupported_provider handler=none credits=preserved"
+        )
+        _quarantine_job(job_id, meta, "unsupported_recovery_provider",
+                        f"Provider '{provider_name}' not supported by durable worker")
+        return
+
+    if stage not in _SUPPORTED_STAGES:
+        print(
+            f"[JOB] BLOCKED job={job_id} provider={provider_name} stage={stage} "
+            f"reason=unsupported_stage handler=none credits=preserved"
+        )
+        _quarantine_job(job_id, meta, "unsupported_recovery_stage",
+                        f"Stage '{stage}' not supported by durable worker")
+        return
+
+    # Resolve timeout family for this provider
+    task_type = meta.get("task_type") or meta.get("seedance_variant") or ""
+    timeout_key = f"{provider_name}:{task_type}" if task_type else provider_name
+    timeouts = _PROVIDER_TIMEOUTS.get(timeout_key, _PROVIDER_TIMEOUTS.get(provider_name, _DEFAULT_TIMEOUTS))
+
+    print(
+        f"[JOB] routing job={job_id} provider={provider_name} stage={stage} "
+        f"status={status} upstream={'yes' if upstream_id else 'no'} "
+        f"timeout_family={timeout_key} handler=durable_video_worker"
+    )
 
     if status in ("queued", "stalled"):
         if upstream_id:
-            # Already dispatched but stalled — validate before resuming poll
+            # Already dispatched but stalled — validate + resume poll
             if not _validate_poll_fields(job, meta):
                 return
-            _poll_provider_once(job, meta)
+            # Ensure fresh timeout anchor for reclaimed stalled jobs
+            meta = _ensure_timeout_anchor(job_id, meta)
+            _poll_provider_once(job, meta, provider_name, timeouts)
         else:
-            # Needs dispatch — validate dispatch fields
             if not _validate_dispatch_fields(job, meta):
                 return
             _dispatch_to_provider(job, meta)
@@ -393,17 +477,62 @@ def _process_job(job: Dict[str, Any]):
     elif status in ("dispatched", "provider_pending", "provider_processing"):
         if not _validate_poll_fields(job, meta):
             return
-        _poll_provider_once(job, meta)
+        _poll_provider_once(job, meta, provider_name, timeouts)
 
     else:
         print(f"[JOB] skip job={job_id} reason=unexpected_status status={status}")
 
 
+def _ensure_timeout_anchor(job_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure the job has a valid dispatched_at timestamp for timeout tracking.
+
+    For stalled jobs being reclaimed, the original dispatched_at might be
+    very old (or missing). In that case, set a fresh anchor so the job
+    gets a fair chance to be polled before timing out.
+
+    Returns updated meta dict.
+    """
+    now = time.time()
+    dispatched_at = meta.get("dispatched_at")
+
+    if not dispatched_at:
+        # No dispatch timestamp at all — set fresh anchor
+        meta["dispatched_at"] = now
+        meta["recovery_anchor_set"] = True
+        _transition_job(job_id, None, meta_patch={
+            "dispatched_at": now,
+            "recovery_anchor_set": True,
+        })
+        print(f"[JOB] set fresh timeout anchor job={job_id} reason=no_dispatched_at")
+        return meta
+
+    # Check if the dispatch timestamp is absurdly old (> MAX_RECOVERY_AGE_HOURS)
+    age_hours = (now - dispatched_at) / 3600
+    if age_hours > MAX_RECOVERY_AGE_HOURS:
+        # Reset the timeout anchor so the job gets polled before timing out
+        meta["dispatched_at"] = now
+        meta["original_dispatched_at"] = dispatched_at
+        meta["recovery_anchor_set"] = True
+        _transition_job(job_id, None, meta_patch={
+            "dispatched_at": now,
+            "original_dispatched_at": dispatched_at,
+            "recovery_anchor_set": True,
+        })
+        print(
+            f"[JOB] reset timeout anchor job={job_id} "
+            f"reason=stale_dispatch age={int(age_hours)}h original_at={dispatched_at}"
+        )
+        return meta
+
+    return meta
+
+
 def _validate_dispatch_fields(job: Dict[str, Any], meta: Dict[str, Any]) -> bool:
     """Validate required fields before dispatching. Returns True if valid."""
     job_id = str(job["id"])
-    stage = job.get("stage") or meta.get("stage", "")
     provider_name = job.get("provider") or meta.get("provider", "")
+    stage = job.get("stage") or meta.get("stage", "")
     identity_id = str(job.get("identity_id") or meta.get("identity_id", ""))
 
     missing = []
@@ -417,7 +546,7 @@ def _validate_dispatch_fields(job: Dict[str, Any], meta: Dict[str, Any]) -> bool
     if missing:
         msg = f"Missing required dispatch fields: {', '.join(missing)}"
         print(f"[JOB] skip job={job_id} reason=missing_fields fields={','.join(missing)}")
-        _fail_job(job_id, meta, msg, "missing_fields")
+        _fail_job(job_id, meta, msg, "missing_fields", provider_name)
         return False
 
     return True
@@ -438,7 +567,7 @@ def _validate_poll_fields(job: Dict[str, Any], meta: Dict[str, Any]) -> bool:
     if missing:
         msg = f"Missing required poll fields: {', '.join(missing)}"
         print(f"[JOB] skip job={job_id} reason=missing_fields fields={','.join(missing)}")
-        _fail_job(job_id, meta, msg, "missing_fields")
+        _fail_job(job_id, meta, msg, "missing_fields", provider_name)
         return False
 
     return True
@@ -455,10 +584,9 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
     stage = job.get("stage") or meta.get("stage", "")
     provider_name = job.get("provider") or meta.get("provider", "seedance")
     identity_id = str(job.get("identity_id") or meta.get("identity_id", ""))
-    reservation_id = str(job.get("reservation_id") or meta.get("reservation_id", "")) or None
 
     if stage != "video":
-        print(f"[JOB] skip job={job_id} reason=non_video_stage stage={stage}")
+        print(f"[JOB] skip job={job_id} reason=non_video_stage stage={stage} provider={provider_name}")
         return
 
     print(f"[JOB] dispatching job={job_id} provider={provider_name} stage={stage}")
@@ -523,33 +651,36 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
 
         print(f"[JOB] dispatched job={job_id} upstream={upstream_id} provider={provider_name}")
 
-        # Update in-memory store for frontend status polling
         _update_store(job_id, meta, upstream_id, "processing")
 
     except Exception as e:
         print(f"[JOB] dispatch FAILED job={job_id} provider={provider_name}: {e}")
-        _fail_job(job_id, meta, f"dispatch_failed: {e}", "dispatch_failed")
+        _fail_job(job_id, meta, f"dispatch_failed: {e}", "dispatch_failed", provider_name)
 
 
-def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
+def _poll_provider_once(
+    job: Dict[str, Any],
+    meta: Dict[str, Any],
+    provider_name: str,
+    timeouts: tuple,
+):
     """
     Single-poll-per-claim: do ONE provider status check, then either
     finalize, fail, or schedule next_poll_at and return.
 
-    This replaces the old inner while-loop that could burn through
-    multiple polls in a single claim cycle.
+    Provider-aware: uses the correct timeout config and error codes
+    for the given provider.
     """
     job_id = str(job["id"])
     upstream_id = job.get("upstream_job_id") or meta.get("upstream_id")
-    provider_name = job.get("provider") or meta.get("provider", "seedance")
     identity_id = str(job.get("identity_id") or meta.get("identity_id", ""))
     reservation_id = str(job.get("reservation_id") or meta.get("reservation_id", "")) or None
-    task_type = meta.get("task_type") or meta.get("seedance_variant") or "seedance-2-fast-preview"
+    task_type = meta.get("task_type") or meta.get("seedance_variant") or ""
     consecutive_errors = meta.get("consecutive_errors", 0)
 
     if not upstream_id:
         print(f"[JOB] FAIL job={job_id} reason=no_upstream_id provider={provider_name}")
-        _fail_job(job_id, meta, "No upstream job ID", "no_upstream_id")
+        _fail_job(job_id, meta, "No upstream job ID", "no_upstream_id", provider_name)
         return
 
     # Compute elapsed times from timestamps
@@ -559,31 +690,39 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
     pending_elapsed = now - dispatched_at if dispatched_at else 0
     processing_elapsed = (now - processing_started_at) if processing_started_at else 0
 
-    # Timeout thresholds
-    pend_soft, pend_hard, proc_soft, proc_hard = _SEEDANCE_TIMEOUTS.get(
-        task_type, _SEEDANCE_DEFAULT_TIMEOUTS,
+    # Unpack provider-specific timeout thresholds
+    pend_soft, pend_hard, proc_soft, proc_hard = timeouts
+
+    # Log elapsed sources for debugging
+    elapsed_source = "meta.dispatched_at" if meta.get("dispatched_at") else "job.created_at"
+    print(
+        f"[JOB] poll prep job={job_id} provider={provider_name} upstream={upstream_id} "
+        f"elapsed_source={elapsed_source} pending={int(pending_elapsed)}s "
+        f"processing={int(processing_elapsed)}s timeout_hard_p={pend_hard}s timeout_hard_r={proc_hard}s"
     )
 
     # Hard timeout checks BEFORE polling
     last_status = job.get("last_provider_status") or meta.get("provider_status", "pending")
 
     if last_status in ("pending", "queued", "staged") and pending_elapsed >= pend_hard:
-        # Attempt fallback for preview tier
-        if task_type == "seedance-2-preview":
+        # Seedance-specific: attempt preview -> fast fallback
+        if provider_name == "seedance" and task_type == "seedance-2-preview":
             from backend.services.video_router import resolve_video_provider
-            provider = resolve_video_provider(provider_name)
-            fallback = _attempt_seedance_fallback(job_id, meta, provider)
+            provider_obj = resolve_video_provider(provider_name)
+            fallback = _attempt_seedance_fallback(job_id, meta, provider_obj)
             if fallback:
-                print(f"[JOB] fallback job={job_id} new_upstream={fallback} reason=pending_timeout")
+                print(f"[JOB] fallback job={job_id} new_upstream={fallback} reason=pending_timeout provider=seedance")
                 return
 
-        print(f"[JOB] FAIL job={job_id} reason=pending_timeout elapsed={int(pending_elapsed)}s hard={pend_hard}s")
-        _fail_job(job_id, meta, f"Provider never started after {int(pending_elapsed)}s", "seedance_pending_timeout")
+        error_code = f"{provider_name}_pending_timeout"
+        print(f"[JOB] FAIL job={job_id} reason=pending_timeout elapsed={int(pending_elapsed)}s hard={pend_hard}s provider={provider_name}")
+        _fail_job(job_id, meta, f"Provider never started after {int(pending_elapsed)}s", error_code, provider_name)
         return
 
     if processing_started_at and processing_elapsed >= proc_hard:
-        print(f"[JOB] FAIL job={job_id} reason=processing_timeout elapsed={int(processing_elapsed)}s hard={proc_hard}s")
-        _fail_job(job_id, meta, f"Provider did not finish after {int(processing_elapsed)}s", "seedance_processing_timeout")
+        error_code = f"{provider_name}_processing_timeout"
+        print(f"[JOB] FAIL job={job_id} reason=processing_timeout elapsed={int(processing_elapsed)}s hard={proc_hard}s provider={provider_name}")
+        _fail_job(job_id, meta, f"Provider did not finish after {int(processing_elapsed)}s", error_code, provider_name)
         return
 
     # Update heartbeat
@@ -591,16 +730,15 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
 
     # Do ONE provider status check
     from backend.services.video_router import resolve_video_provider
-    provider = resolve_video_provider(provider_name)
+    provider_obj = resolve_video_provider(provider_name)
 
     try:
-        if provider:
-            status_resp = provider.check_status(upstream_id)
+        if provider_obj:
+            status_resp = provider_obj.check_status(upstream_id)
         else:
             from backend.services.seedance_service import check_seedance_status
             status_resp = check_seedance_status(upstream_id)
     except Exception as e:
-        # Network/provider error — schedule retry with backoff
         consecutive_errors += 1
         backoff = _get_backoff(consecutive_errors)
 
@@ -610,8 +748,9 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
         )
 
         if consecutive_errors >= MAX_ATTEMPTS:
-            print(f"[JOB] FAIL job={job_id} reason=max_poll_errors consecutive_errors={consecutive_errors}")
-            _fail_job(job_id, meta, f"Poll error after {consecutive_errors} attempts: {e}", "seedance_poll_error")
+            error_code = f"{provider_name}_poll_error"
+            print(f"[JOB] FAIL job={job_id} reason=max_poll_errors consecutive_errors={consecutive_errors} provider={provider_name}")
+            _fail_job(job_id, meta, f"Poll error after {consecutive_errors} attempts: {e}", error_code, provider_name)
         else:
             _transition_job(job_id, job["status"], {
                 "next_poll_at": f"NOW() + INTERVAL '{backoff} seconds'",
@@ -619,11 +758,11 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
                 "consecutive_errors": consecutive_errors,
                 "last_poll_error": str(e)[:200],
             })
-            print(f"[JOB] retry scheduled job={job_id} next_poll_at=+{backoff}s")
+            print(f"[JOB] retry scheduled job={job_id} next_poll_at=+{backoff}s provider={provider_name}")
 
         return
 
-    # Successful poll — reset consecutive errors
+    # Successful poll — parse response
     status = status_resp.get("status", "pending")
     provider_status = status_resp.get("provider_status", status)
     progress = status_resp.get("progress", 0)
@@ -640,18 +779,18 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
         if video_url:
             _finalize_success(job_id, identity_id, reservation_id, video_url, meta, provider_name)
         else:
-            _fail_job(job_id, meta, "Completed but no video URL", "seedance_no_video_url")
+            error_code = f"{provider_name}_no_result_url"
+            _fail_job(job_id, meta, "Completed but no video URL", error_code, provider_name)
         return
 
     if status == "failed":
-        error_code = status_resp.get("error", "seedance_generation_failed")
+        error_code = status_resp.get("error", f"{provider_name}_generation_failed")
         error_msg = status_resp.get("message", "Provider generation failed")
-        print(f"[JOB] FAIL job={job_id} reason=upstream_failed error={error_code}: {error_msg}")
-        _fail_job(job_id, meta, f"{error_code}: {error_msg}", error_code)
+        print(f"[JOB] FAIL job={job_id} reason=upstream_failed error={error_code}: {error_msg} provider={provider_name}")
+        _fail_job(job_id, meta, f"{error_code}: {error_msg}", error_code, provider_name)
         return
 
     if status == "error":
-        # Provider returned error status (not an exception) — same as network error
         consecutive_errors += 1
         backoff = _get_backoff(consecutive_errors)
 
@@ -661,7 +800,8 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
         )
 
         if consecutive_errors >= MAX_ATTEMPTS:
-            _fail_job(job_id, meta, "Repeated provider errors", "seedance_poll_error")
+            error_code = f"{provider_name}_poll_error"
+            _fail_job(job_id, meta, "Repeated provider errors", error_code, provider_name)
         else:
             _transition_job(job_id, job["status"], {
                 "next_poll_at": f"NOW() + INTERVAL '{backoff} seconds'",
@@ -669,7 +809,7 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
                 "consecutive_errors": consecutive_errors,
                 "last_poll_error": "provider_error_status",
             })
-            print(f"[JOB] retry scheduled job={job_id} next_poll_at=+{backoff}s")
+            print(f"[JOB] retry scheduled job={job_id} next_poll_at=+{backoff}s provider={provider_name}")
 
         return
 
@@ -689,7 +829,7 @@ def _poll_provider_once(job: Dict[str, Any], meta: Dict[str, Any]):
         meta_patch = {"consecutive_errors": 0}
         if not processing_started_at:
             meta_patch["processing_started_at"] = now
-            print(f"[JOB] job={job_id} transitioned pending->processing after {int(pending_elapsed)}s")
+            print(f"[JOB] job={job_id} transitioned pending->processing after {int(pending_elapsed)}s provider={provider_name}")
 
         past_soft = processing_elapsed >= proc_soft if processing_started_at else False
         poll_interval = 15 if past_soft else POLL_SLEEP_PROCESSING
@@ -790,7 +930,13 @@ def _finalize_success(
 
 # ── Failure Handling ────────────────────────────────────────
 
-def _fail_job(job_id: str, meta: Dict[str, Any], error_msg: str, error_code: str):
+def _fail_job(
+    job_id: str,
+    meta: Dict[str, Any],
+    error_msg: str,
+    error_code: str,
+    provider_name: str = "unknown",
+):
     """
     Mark job as failed. Only releases credits for terminal error codes.
 
@@ -798,24 +944,33 @@ def _fail_job(job_id: str, meta: Dict[str, Any], error_msg: str, error_code: str
     so the rescue service can recover the job later if the provider
     eventually completes.
     """
-    print(f"[JOB] FAIL job={job_id} code={error_code} msg={error_msg}")
+    print(f"[JOB] FAIL job={job_id} code={error_code} provider={provider_name} msg={error_msg}")
 
-    # Only release credits for confirmed terminal failures
+    # Determine if this error code is terminal (warrants credit release).
+    # Check both the exact code and the generic suffix (e.g. "seedance_generation_failed" -> "generation_failed")
     reservation_id = meta.get("reservation_id")
-    if reservation_id and error_code in _TERMINAL_ERROR_CODES:
+    suffix = error_code.split("_", 1)[-1] if "_" in error_code else error_code
+    is_terminal = error_code in _TERMINAL_ERROR_CODES or suffix in _TERMINAL_ERROR_CODES
+
+    if reservation_id and is_terminal:
         from backend.services.credits_helper import release_job_credits
         try:
             release_job_credits(reservation_id, error_code, job_id)
-            print(f"[JOB] credits released job={job_id} reason={error_code}")
+            print(f"[JOB] credits RELEASED job={job_id} reason={error_code} provider={provider_name}")
         except Exception as e:
             print(f"[JOB] WARNING: credit release failed job={job_id}: {e}")
     elif reservation_id:
         print(
             f"[JOB] credits HELD job={job_id} reason=non_terminal_error "
-            f"code={error_code} (rescue may recover)"
+            f"code={error_code} provider={provider_name} (rescue may recover)"
         )
+    else:
+        print(f"[JOB] credits N/A job={job_id} no_reservation provider={provider_name}")
 
-    user_message = _FAILURE_REASON_MAP.get(error_code, error_msg)
+    # Resolve user-facing message: try provider-specific, then generic suffix
+    user_message = _FAILURE_REASON_MAP.get(error_code)
+    if not user_message:
+        user_message = _FAILURE_REASON_MAP.get(suffix, error_msg)
 
     _transition_job(job_id, "failed", {
         "last_error_code": error_code,
@@ -825,6 +980,7 @@ def _fail_job(job_id: str, meta: Dict[str, Any], error_msg: str, error_code: str
         "error_code": error_code,
         "error_message": error_msg,
         "failure_reason": user_message,
+        "failure_provider": provider_name,
     })
 
     # Update in-memory store for frontend
@@ -843,15 +999,44 @@ def _fail_job(job_id: str, meta: Dict[str, Any], error_msg: str, error_code: str
     ExpenseGuard.unregister_active_job(job_id)
 
 
+def _quarantine_job(job_id: str, meta: Dict[str, Any], error_code: str, reason: str):
+    """
+    Quarantine a job that cannot be safely recovered by the durable worker.
+
+    - Does NOT release or finalize credits (preserves reservation state)
+    - Marks job as recovery_blocked so it's excluded from future claims
+    - Requires manual review or admin intervention
+    """
+    provider = meta.get("provider", "unknown")
+    reservation_id = meta.get("reservation_id")
+
+    print(
+        f"[JOB] QUARANTINE job={job_id} code={error_code} provider={provider} "
+        f"reservation={'held_safe' if reservation_id else 'none'} reason={reason}"
+    )
+
+    _transition_job(job_id, "recovery_blocked", {
+        "last_error_code": error_code,
+        "last_error_message": reason[:500],
+    }, meta_patch={
+        "quarantine_reason": reason,
+        "quarantine_code": error_code,
+        "quarantine_by": WORKER_ID,
+        "quarantine_at": time.time(),
+        "credits_action": "preserved",
+    })
+
+
 def _handle_job_error(job: Dict[str, Any], error_msg: str):
     """Handle unexpected errors during job processing."""
     job_id = str(job["id"])
     meta = _parse_meta(job.get("meta"))
+    provider_name = job.get("provider") or "unknown"
     attempt = job.get("attempt_count", 0)
 
     if attempt >= MAX_ATTEMPTS:
-        print(f"[JOB] FAIL job={job_id} reason=max_attempts attempts={attempt}/{MAX_ATTEMPTS}")
-        _fail_job(job_id, meta, f"Exceeded max attempts: {error_msg}", "max_attempts_exceeded")
+        print(f"[JOB] FAIL job={job_id} reason=max_attempts attempts={attempt}/{MAX_ATTEMPTS} provider={provider_name}")
+        _fail_job(job_id, meta, f"Exceeded max attempts: {error_msg}", "max_attempts_exceeded", provider_name)
     else:
         backoff = _get_backoff(attempt)
         _transition_job(job_id, "stalled", {
@@ -859,7 +1044,7 @@ def _handle_job_error(job: Dict[str, Any], error_msg: str):
             "last_error_message": error_msg[:500],
             "next_poll_at": f"NOW() + INTERVAL '{backoff} seconds'",
         })
-        print(f"[JOB] stalled job={job_id} attempt={attempt}/{MAX_ATTEMPTS} retry_in={backoff}s")
+        print(f"[JOB] stalled job={job_id} attempt={attempt}/{MAX_ATTEMPTS} retry_in={backoff}s provider={provider_name}")
 
 
 # ── Seedance Fallback ───────────────────────────────────────
@@ -935,12 +1120,15 @@ def _attempt_seedance_fallback(job_id: str, meta: Dict[str, Any], provider) -> O
 
 def _transition_job(
     job_id: str,
-    new_status: str,
+    new_status: Optional[str],
     field_updates: Optional[Dict[str, Any]] = None,
     meta_patch: Optional[Dict[str, Any]] = None,
 ):
     """
     Atomically transition a job to a new status with optional field updates.
+
+    If new_status is None, only applies field_updates/meta_patch without
+    changing the status (useful for setting meta without state transition).
 
     field_updates: dict of column_name -> value. Raw SQL expressions like
                    'NOW()' or 'NOW() + INTERVAL ...' are detected and inlined.
@@ -950,8 +1138,12 @@ def _transition_job(
         return
 
     try:
-        set_clauses = ["status = %s", "updated_at = NOW()"]
-        params: list = [new_status]
+        set_clauses = ["updated_at = NOW()"]
+        params: list = []
+
+        if new_status is not None:
+            set_clauses.insert(0, "status = %s")
+            params.append(new_status)
 
         if field_updates:
             for col, val in field_updates.items():
@@ -981,7 +1173,8 @@ def _transition_job(
             conn.commit()
 
     except Exception as e:
-        print(f"[JOB] transition error job={job_id} -> {new_status}: {e}")
+        status_str = new_status or "(meta-only)"
+        print(f"[JOB] transition error job={job_id} -> {status_str}: {e}")
 
 
 def _update_job_state(
@@ -1009,7 +1202,7 @@ def _update_job_state(
                     SET status = %s,
                         last_provider_status = %s,
                         progress = %s,
-                        next_poll_at = NOW() + INTERVAL '%s seconds',
+                        next_poll_at = NOW() + %s * INTERVAL '1 second',
                         heartbeat_at = NOW(),
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                         updated_at = NOW()
@@ -1062,9 +1255,12 @@ def detect_stalled_jobs():
     """
     Find jobs with expired heartbeats and mark them as stalled.
     Called periodically (e.g., every 60s).
+    Only operates on supported provider/stage jobs.
     """
     if not USE_DB:
         return 0
+
+    provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
 
     try:
         with get_conn() as conn:
@@ -1077,16 +1273,18 @@ def detect_stalled_jobs():
                         claimed_at = NULL,
                         updated_at = NOW()
                     WHERE status IN ('dispatched', 'provider_pending', 'provider_processing')
+                      AND provider IN ({provider_list})
+                      AND stage = 'video'
                       AND claimed_by IS NOT NULL
                       AND heartbeat_at < NOW() - INTERVAL '{STALL_TIMEOUT} seconds'
-                    RETURNING id
+                    RETURNING id, provider
                     """,
                 )
                 stalled = cur.fetchall()
             conn.commit()
 
         if stalled:
-            ids = [str(r["id"]) for r in stalled]
+            ids = [f"{r['id']}({r.get('provider', '?')})" for r in stalled]
             print(f"[JOB] stall_detected count={len(stalled)} jobs={ids}")
 
         return len(stalled) if stalled else 0
@@ -1100,15 +1298,23 @@ def detect_stalled_jobs():
 
 def recover_stale_jobs():
     """
-    Startup recovery: find all non-terminal jobs with expired claims
+    Startup recovery: find non-terminal video jobs with supported providers
     and mark them as stalled so the worker loop picks them up.
+
+    Jobs outside the supported scope (meshy 3D, old legacy, unknown providers)
+    are left untouched — they use separate dispatch paths.
+
+    Very old jobs (> MAX_RECOVERY_AGE_HOURS) are marked abandoned_legacy.
     """
     if not USE_DB:
-        return {"recovered": 0}
+        return {"recovered": 0, "abandoned": 0}
+
+    provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
 
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # Recover recent supported jobs
                 cur.execute(
                     f"""
                     UPDATE {Tables.JOBS}
@@ -1120,26 +1326,56 @@ def recover_stale_jobs():
                         'queued', 'dispatched', 'pending', 'processing',
                         'provider_pending', 'provider_processing', 'recovering'
                     )
-                    AND status NOT IN ({', '.join(f"'{s}'" for s in TERMINAL_STATES)})
-                    RETURNING id, status
+                    AND provider IN ({provider_list})
+                    AND stage = 'video'
+                    AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
+                    RETURNING id, status, provider
                     """,
                 )
-                recovered = cur.fetchall()
+                recovered = cur.fetchall() or []
+
+                # Abandon very old non-terminal jobs that are past recovery age
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'abandoned_legacy',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"abandoned_reason": "too_old_for_recovery", "abandoned_by": "startup_recovery"}}'::jsonb,
+                        updated_at = NOW()
+                    WHERE status IN (
+                        'queued', 'dispatched', 'pending', 'processing',
+                        'provider_pending', 'provider_processing', 'recovering', 'stalled'
+                    )
+                    AND created_at <= NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
+                    AND status NOT IN ({', '.join(f"'{s}'" for s in TERMINAL_STATES)})
+                    RETURNING id, status, provider
+                    """,
+                )
+                abandoned = cur.fetchall() or []
+
             conn.commit()
 
-        count = len(recovered) if recovered else 0
-        if count > 0:
-            print(f"[JOB] startup recovery: marked {count} orphaned jobs as stalled")
-            for r in recovered:
-                print(f"[JOB] reclaimed job={r['id']} was_status={r['status']}")
-        else:
-            print(f"[JOB] startup recovery: no orphaned jobs found")
+        rec_count = len(recovered)
+        abn_count = len(abandoned)
 
-        return {"recovered": count}
+        if rec_count > 0:
+            print(f"[JOB] startup recovery: marked {rec_count} jobs as stalled")
+            for r in recovered:
+                print(f"[JOB]   reclaimed job={r['id']} was_status={r['status']} provider={r.get('provider', '?')}")
+        else:
+            print("[JOB] startup recovery: no recoverable jobs found")
+
+        if abn_count > 0:
+            print(f"[JOB] startup recovery: abandoned {abn_count} legacy jobs (>{MAX_RECOVERY_AGE_HOURS}h old)")
+            for r in abandoned:
+                print(f"[JOB]   abandoned job={r['id']} was_status={r['status']} provider={r.get('provider', '?')}")
+
+        return {"recovered": rec_count, "abandoned": abn_count}
 
     except Exception as e:
         print(f"[JOB] startup recovery error: {e}")
-        return {"recovered": 0, "error": str(e)}
+        return {"recovered": 0, "abandoned": 0, "error": str(e)}
 
 
 # ── Stall Detection + Rescue Thread ─────────────────────────
