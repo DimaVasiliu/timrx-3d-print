@@ -240,6 +240,20 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_image_animate_8s_720p", "cost_credits": 110, "provider": "video"},
     {"action_code": "video_image_animate_8s_1080p", "cost_credits": 130, "provider": "video"},
     {"action_code": "video_image_animate_8s_4k", "cost_credits": 160, "provider": "video"},
+    # ── Seedance 2.0 — Text-to-Video (Fast: 14 cps, Preview: 24 cps) ──
+    {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 70, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 140, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_15s", "cost_credits": 210, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_5s", "cost_credits": 120, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_10s", "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_15s", "cost_credits": 360, "provider": "seedance"},
+    # ── Seedance 2.0 — Image-to-Video (same CPS tiers) ──
+    {"action_code": "seedance_fast_image_animate_5s", "cost_credits": 70, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_10s", "cost_credits": 140, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_15s", "cost_credits": 210, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 120, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 360, "provider": "seedance"},
     # Legacy fallback codes (for backwards compatibility)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
@@ -704,6 +718,21 @@ class PricingService:
         if canonical_from_db and canonical_from_db in costs:
             return costs[canonical_from_db]
 
+        # Seedance variant fallback: compute from CPS if not yet in DB cache
+        # Pattern: seedance_{fast|preview}_{text_generate|image_animate}_{duration}s
+        if _is_seedance_variant_code(canonical):
+            tier = "preview" if canonical.startswith("seedance_preview_") else "fast"
+            # Extract duration from trailing "Ns"
+            suffix = canonical.rsplit("_", 1)[-1]  # e.g. "15s"
+            try:
+                duration = int(suffix.rstrip("s"))
+            except ValueError:
+                duration = 5
+            cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 14)
+            computed = cps * duration
+            print(f"[PRICING] Seedance fallback cost: {canonical} -> {computed} credits (CPS {cps} x {duration}s)")
+            return computed
+
         print(f"[PRICING] Warning: Unknown action key '{action_key}', returning 0 cost")
         return 0
 
@@ -730,6 +759,10 @@ class PricingService:
         db_code = CANONICAL_TO_DB.get(canonical)
         if db_code:
             return db_code
+
+        # Video/Seedance variant codes ARE their own DB action codes
+        if _is_video_variant_code(canonical) or _is_seedance_variant_code(canonical):
+            return canonical
 
         # Already a DB code?
         if action_key in PricingService.DB_TO_CANONICAL:
