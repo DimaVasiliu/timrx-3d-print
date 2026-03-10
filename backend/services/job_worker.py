@@ -402,7 +402,7 @@ def _release_claim(job_id: str):
                     (job_id,),
                 )
                 npa_row = cur.fetchone()
-                npa_val = npa_row[0] if npa_row else "NOT_FOUND"
+                npa_val = npa_row["next_poll_at"] if npa_row else "NOT_FOUND"
 
                 cur.execute(
                     f"""
@@ -1260,7 +1260,7 @@ def _update_job_state(
                 if row:
                     print(
                         f"[JOB][DEBUG] _update_job_state OK job={job_id} "
-                        f"next_poll_at={row[0]} heartbeat_at={row[1]} rowcount={cur.rowcount}"
+                        f"next_poll_at={row['next_poll_at']} heartbeat_at={row['heartbeat_at']} rowcount={cur.rowcount}"
                     )
                 else:
                     print(
