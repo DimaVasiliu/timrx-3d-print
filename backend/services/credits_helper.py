@@ -172,6 +172,9 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
                 reserved=reserved,
             )
 
+        # Debug: confirm action code accepted by wallet + pricing
+        print(f"[CREDITS] action={canonical_action} wallet_accepted=true db_cost={cost} available={available}")
+
         # Use canonical key for reservation
         result = ReservationService.reserve_credits(
             identity_id=identity_id,
