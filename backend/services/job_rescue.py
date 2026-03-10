@@ -149,7 +149,7 @@ def _find_candidates(hours: int, limit: int) -> List[Dict[str, Any]]:
                     WHERE j.provider = 'seedance'
                       AND j.status IN ('failed', 'provider_stalled')
                       AND j.upstream_job_id IS NOT NULL
-                      AND j.created_at > NOW() - INTERVAL '%s hours'
+                      AND j.created_at > NOW() - %s * INTERVAL '1 hour'
                       AND j.result_url IS NULL
                     ORDER BY j.created_at DESC
                     LIMIT %s
