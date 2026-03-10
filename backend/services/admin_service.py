@@ -148,7 +148,7 @@ class AdminService:
                 COALESCE(SUM(cost_credits), 0) as total_credits,
                 COUNT(*) as job_count
             FROM {Tables.JOBS}
-            WHERE status = 'completed' AND created_at >= NOW() - INTERVAL '%s days'
+            WHERE status = 'completed' AND created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY category
             ORDER BY total_credits DESC
             """,
@@ -179,7 +179,7 @@ class AdminService:
                 MAX(j.created_at) as last_active
             FROM {Tables.JOBS} j
             LEFT JOIN {Tables.IDENTITIES} i ON i.id = j.identity_id
-            WHERE j.status = 'completed' AND j.created_at >= NOW() - INTERVAL '%s days'
+            WHERE j.status = 'completed' AND j.created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY j.identity_id, i.email
             ORDER BY total_spent DESC
             LIMIT 20
@@ -212,7 +212,7 @@ class AdminService:
                 COALESCE(SUM(cost_credits), 0) as credits_spent,
                 COUNT(*) as job_count
             FROM {Tables.JOBS}
-            WHERE status = 'completed' AND created_at >= NOW() - INTERVAL '%s days'
+            WHERE status = 'completed' AND created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY DATE(created_at)
             ORDER BY date ASC
             """,
