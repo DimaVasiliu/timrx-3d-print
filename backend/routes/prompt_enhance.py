@@ -16,7 +16,7 @@ from backend.services.prompt_enhance_service import (
 
 bp = Blueprint("prompt_enhance", __name__)
 
-VALID_MODES = {"model", "image", "video"}
+VALID_MODES = {"model", "image", "video", "texture"}
 
 
 @bp.route("/prompt-enhance", methods=["POST", "OPTIONS"])
