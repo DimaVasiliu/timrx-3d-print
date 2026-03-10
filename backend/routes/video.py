@@ -810,6 +810,40 @@ def video_status(job_id: str):
 _STALE_THRESHOLD_SECONDS = 10 * 60  # 10 minutes without DB update → stale
 
 
+def _estimate_video_progress(job_row, job_meta, estimated_duration: int) -> int:
+    """Estimate video generation progress from elapsed time (asymptotic to 95%)."""
+    import math
+    from datetime import datetime, timezone
+
+    # Use processing_started_at > dispatched_at > created_at
+    started = job_meta.get("processing_started_at") or job_meta.get("dispatched_at")
+    if not started:
+        created = job_row.get("created_at")
+        if created and hasattr(created, 'timestamp'):
+            started = created.timestamp()
+
+    if not started:
+        return 0
+
+    now = datetime.now(timezone.utc).timestamp()
+    if isinstance(started, (int, float)):
+        elapsed = now - started
+    else:
+        try:
+            elapsed = now - started.timestamp()
+        except Exception:
+            return 0
+
+    if elapsed <= 0 or estimated_duration <= 0:
+        return 0
+
+    # Asymptotic curve: approaches 95% as elapsed -> estimated_duration
+    # progress = 95 * (1 - e^(-2 * elapsed / estimated_duration))
+    ratio = elapsed / estimated_duration
+    progress = int(95 * (1 - math.exp(-2 * ratio)))
+    return max(1, min(progress, 95))
+
+
 def _is_stale_seedance_job(job_row, job_meta) -> bool:
     """Return True if this looks like a Seedance job whose polling thread died."""
     provider = job_meta.get("provider", "")
@@ -1002,11 +1036,17 @@ def _video_status_handler(job_id: str):
                         "provider_status": job_meta.get("provider_status", "pending"),
                     })
 
-                if job["status"] == "processing":
-                    progress = meta.get("progress") or job_meta.get("progress") or 0
+                if job["status"] in ("processing", "provider_processing"):
+                    real_progress = meta.get("progress") or job_meta.get("progress") or 0
                     provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
                     from backend.services.video_limits import get_estimated_render_time
                     rtime = get_estimated_render_time(provider_hint)
+
+                    # Estimate progress from elapsed time if provider gives 0
+                    progress = real_progress
+                    if progress == 0:
+                        progress = _estimate_video_progress(job, job_meta, rtime["estimated_duration_seconds"])
+
                     # Format time estimate as minutes if > 90s
                     lo, hi = rtime['estimated_min_seconds'], rtime['estimated_max_seconds']
                     if lo >= 90:
@@ -1141,11 +1181,23 @@ def _video_status_handler(job_id: str):
         provider_hint = meta.get("provider", "veo")
         from backend.services.video_limits import get_estimated_render_time
         rtime = get_estimated_render_time(provider_hint)
+        real_progress = meta.get("progress", 0)
+        # Estimate progress from elapsed time for store-based fallback
+        progress = real_progress
+        if progress == 0 and meta.get("status") == "processing":
+            import math, time as _time
+            from datetime import datetime, timezone
+            started = meta.get("processing_started_at") or meta.get("dispatched_at") or meta.get("started_at")
+            if started and isinstance(started, (int, float)):
+                elapsed = _time.time() - started
+                est = rtime["estimated_duration_seconds"]
+                if elapsed > 0 and est > 0:
+                    progress = max(1, min(int(95 * (1 - math.exp(-2 * elapsed / est))), 95))
         return jsonify({
             "ok": True,
             "status": meta.get("status"),
             "job_id": job_id,
-            "progress": meta.get("progress", 0),
+            "progress": progress,
             "message": "Generating video...",
             "estimated_duration_seconds": rtime["estimated_duration_seconds"],
         })
