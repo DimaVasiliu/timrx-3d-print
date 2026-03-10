@@ -136,30 +136,37 @@ def create_seedance_task(
 
 
 # ── Check status ─────────────────────────────────────────────
-# PiAPI status mapping to internal statuses
+# PiAPI status → internal status.
+# "Pending"/"Staged" are now distinguished from "Processing".
 _STATUS_MAP = {
     "Completed": "done",
     "completed": "done",
     "Processing": "processing",
     "processing": "processing",
-    "Pending": "processing",
-    "pending": "processing",
-    "Staged": "processing",
-    "staged": "processing",
+    "Pending": "pending",
+    "pending": "pending",
+    "Staged": "pending",
+    "staged": "pending",
     "Failed": "failed",
     "failed": "failed",
 }
+
+# Zero-value timestamp from PiAPI means "not started yet"
+_ZERO_TIMESTAMPS = {"0001-01-01T00:00:00Z", "", None}
 
 
 def check_seedance_status(task_id: str) -> Dict[str, Any]:
     """
     Check the status of a Seedance task via PiAPI.
 
-    Args:
-        task_id: The PiAPI task ID.
-
-    Returns:
-        {"status": "done|processing|failed", "video_url": "...", "progress": 0-100}
+    Returns a rich dict:
+        status:          done | processing | pending | failed | error
+        provider_status: raw PiAPI status string
+        started_at:      ISO timestamp or None
+        ended_at:        ISO timestamp or None
+        progress:        0-100
+        video_url:       (only when done)
+        error/message:   (only when failed)
     """
     headers = _get_headers()
 
@@ -182,16 +189,28 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
     task_data = data.get("data", data)
 
     piapi_status = task_data.get("status", "unknown")
-    internal_status = _STATUS_MAP.get(piapi_status, "processing")
+    internal_status = _STATUS_MAP.get(piapi_status, "pending")
+
+    # Extract timing metadata
+    started_at = task_data.get("started_at") or task_data.get("start_time")
+    ended_at = task_data.get("ended_at") or task_data.get("end_time")
+    actually_started = started_at not in _ZERO_TIMESTAMPS
+
+    # If provider says Processing but started_at is zero, treat as pending
+    if internal_status == "processing" and not actually_started:
+        internal_status = "pending"
 
     result: Dict[str, Any] = {
         "status": internal_status,
+        "provider_status": piapi_status,
+        "started_at": started_at if actually_started else None,
+        "ended_at": ended_at if ended_at not in _ZERO_TIMESTAMPS else None,
         "progress": task_data.get("progress", 0),
     }
 
     if internal_status == "done":
         # Extract video URL from output
-        output = task_data.get("output", {})
+        output = task_data.get("output") or {}
         video_url = (
             output.get("video")
             or output.get("video_url")
@@ -199,7 +218,6 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
         )
 
         if not video_url:
-            # Some PiAPI responses put URLs in different locations
             video_url = task_data.get("video_url") or task_data.get("video")
 
         if video_url:
