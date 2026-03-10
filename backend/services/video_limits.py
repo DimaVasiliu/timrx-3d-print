@@ -270,6 +270,7 @@ def get_daily_user_video_provider_spend(identity_id: str) -> float:
             WHERE identity_id = %s
               AND created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
               AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND status NOT IN ('failed', 'refunded', 'abandoned_legacy', 'recovery_blocked')
             """,
             (identity_id,),
         )
@@ -305,6 +306,7 @@ def get_daily_global_video_provider_spend() -> float:
             FROM {Tables.JOBS}
             WHERE created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
               AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND status NOT IN ('failed', 'refunded', 'abandoned_legacy', 'recovery_blocked')
             """,
         )
         total = 0.0
