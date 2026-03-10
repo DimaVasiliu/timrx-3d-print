@@ -876,6 +876,19 @@ def _video_status_handler(job_id: str):
                         "quota_queued": True,
                     })
 
+                if job["status"] == "provider_pending":
+                    pending_secs = job_meta.get("pending_seconds", 0)
+                    msg = "Queued with provider" if pending_secs < 120 else "Provider queue busy — your video is still queued"
+                    return jsonify({
+                        "ok": True,
+                        "status": "provider_pending",
+                        "job_id": job_id,
+                        "message": msg,
+                        "progress": 0,
+                        "pending_seconds": pending_secs,
+                        "provider_status": job_meta.get("provider_status", "pending"),
+                    })
+
                 if job["status"] == "processing":
                     progress = meta.get("progress") or job_meta.get("progress") or 0
                     provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
@@ -982,6 +995,19 @@ def _video_status_handler(job_id: str):
             "progress": 0,
             "message": "Waiting for provider quota to reset — your video is queued and will be processed automatically.",
             "quota_queued": True,
+        })
+
+    if meta.get("status") == "provider_pending":
+        pending_secs = meta.get("pending_seconds", 0)
+        msg = "Queued with provider" if pending_secs < 120 else "Provider queue busy — your video is still queued"
+        return jsonify({
+            "ok": True,
+            "status": "provider_pending",
+            "job_id": job_id,
+            "message": msg,
+            "progress": 0,
+            "pending_seconds": pending_secs,
+            "provider_status": meta.get("provider_status", "pending"),
         })
 
     if meta.get("status") in ("queued", "processing"):
