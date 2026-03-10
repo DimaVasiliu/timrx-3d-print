@@ -52,6 +52,7 @@ def register_blueprints(app):
     from backend.routes.community import bp as community_bp
     from backend.routes.contact import bp as contact_bp
     from backend.routes.video import bp as video_bp
+    from backend.routes.prompt_enhance import bp as prompt_enhance_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -91,6 +92,7 @@ def register_blueprints(app):
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
     app.register_blueprint(video_bp, url_prefix="/api/_mod")
+    app.register_blueprint(prompt_enhance_bp, url_prefix="/api/_mod")
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api/_mod")
         print("[ROUTES] Registered inspire_bp at /api/_mod")
@@ -112,6 +114,7 @@ def register_blueprints(app):
     app.register_blueprint(image_gen_bp, url_prefix="/api", name="image_gen_compat")
     app.register_blueprint(community_bp, url_prefix="/api", name="community_compat")
     app.register_blueprint(video_bp, url_prefix="/api", name="video_compat")
+    app.register_blueprint(prompt_enhance_bp, url_prefix="/api", name="prompt_enhance_compat")
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
 
