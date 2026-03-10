@@ -37,6 +37,9 @@ def _derive_provider_from_action_code(action_code: str) -> str:
         return "openai"
     elif action_code.startswith("VIDEO_") or action_code == "GEMINI_VIDEO":
         return "video"
+    # Video variant codes are lowercase (e.g., video_text_generate_4s_720p)
+    elif action_code.startswith("video_") or action_code == "gemini_video":
+        return "video"
     else:
         return "unknown"
 
@@ -294,13 +297,17 @@ class ReservationService:
                 f"""
                 INSERT INTO {Tables.CREDIT_RESERVATIONS}
                 (identity_id, action_code, cost_credits, status, credit_type, created_at, expires_at, ref_job_id, meta)
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW() + INTERVAL '%s minutes', %s, %s)
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW() + %s * INTERVAL '1 minute', %s, %s)
                 RETURNING *
                 """,
                 (identity_id, action_code, cost_credits, ReservationStatus.HELD, credit_type, expiry_minutes, job_id, meta_json),
             )
             reservation = fetch_one(cur)
             assert reservation is not None, "Reservation insert failed"
+
+            # Debug: Log reservation creation
+            print(f"[RESERVATION] CREATED: id={reservation['id']}, action={action_code}, cost={cost_credits}, "
+                  f"credit_type={credit_type}, identity={identity_id[:8]}..., job={job_id[:8]}...")
 
             # 6. Update job with reservation_id for bidirectional link
             cur.execute(
