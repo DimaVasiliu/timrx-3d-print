@@ -707,20 +707,49 @@ def dispatch_gemini_video_async(
             seed=seed,
         )
 
-        # Route through VideoRouter (handles provider fallback)
-        if task == "image2video":
-            prompt = payload.get("motion") or payload.get("prompt", "")
-            resp, provider_used = video_router.route_image_to_video(
-                image_data=payload.get("image_data", ""),
-                prompt=prompt,
-                **route_params,
-            )
-        else:  # text2video
+        # Route to the requested provider
+        requested_provider = store_meta.get("provider", "veo").lower()
+
+        if requested_provider == "seedance":
+            # Direct Seedance routing (no Veo fallback)
+            from backend.services.video_router import resolve_video_provider
+            seedance = resolve_video_provider("seedance")
+            if not seedance:
+                raise ProviderUnavailableError("Seedance provider not available")
+            configured, err = seedance.is_configured()
+            if not configured:
+                raise ProviderUnavailableError(f"Seedance not configured: {err}")
+
+            # Pass task_type (seedance_variant) so provider sends correct model tier
+            seedance_variant = payload.get("seedance_variant") or store_meta.get("seedance_variant") or "seedance-2-fast-preview"
+            route_params["task_type"] = seedance_variant
+
             prompt = payload.get("prompt", "")
-            resp, provider_used = video_router.route_text_to_video(
-                prompt=prompt,
-                **route_params,
-            )
+            if task == "image2video":
+                prompt = payload.get("motion") or prompt
+                resp = seedance.start_image_to_video(
+                    image_data=payload.get("image_data", ""),
+                    prompt=prompt,
+                    **route_params,
+                )
+            else:
+                resp = seedance.start_text_to_video(prompt=prompt, **route_params)
+            provider_used = "seedance"
+        else:
+            # Veo routing with provider fallback
+            if task == "image2video":
+                prompt = payload.get("motion") or payload.get("prompt", "")
+                resp, provider_used = video_router.route_image_to_video(
+                    image_data=payload.get("image_data", ""),
+                    prompt=prompt,
+                    **route_params,
+                )
+            else:  # text2video
+                prompt = payload.get("prompt", "")
+                resp, provider_used = video_router.route_text_to_video(
+                    prompt=prompt,
+                    **route_params,
+                )
 
         # Track which provider actually handled the request
         store_meta["provider"] = provider_used
@@ -1454,7 +1483,7 @@ def _finalize_video_success(
 
             # S3 key uses provider prefix for organization:
             #   videos/google/<identity>/<job_id>.mp4
-            #   videos/runway/<identity>/<job_id>.mp4
+            #   videos/seedance/<identity>/<job_id>.mp4
             s3_video_url = safe_upload_to_s3(
                 f"data:{content_type};base64,{__import__('base64').b64encode(video_bytes).decode('utf-8')}",
                 content_type,
