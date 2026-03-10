@@ -1,3 +1,4 @@
+
 """
 /api/admin routes - Admin-only endpoints.
 
@@ -62,6 +63,26 @@ def get_stats():
     except DatabaseError as e:
         print(f"[ADMIN] Stats error: {e}")
         return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/metrics/video", methods=["GET"])
+@require_admin
+def video_metrics():
+    """
+    Get video generation operational metrics.
+
+    Returns:
+        active_jobs, queue_length, videos_generated_today,
+        provider_spend_today, average_generation_time,
+        active_workers, max_workers
+    """
+    try:
+        from backend.services.video_limits import get_video_metrics
+        metrics = get_video_metrics()
+        return jsonify({"ok": True, **metrics})
+    except Exception as e:
+        print(f"[ADMIN] Video metrics error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @bp.route("/identities", methods=["GET"])
