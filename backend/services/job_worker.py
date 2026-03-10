@@ -178,55 +178,68 @@ def stop_worker():
 
 # ── Leader Election (Advisory Lock) ─────────────────────────
 
-def _acquire_leader_lock() -> bool:
-    """
-    Try to acquire a PostgreSQL advisory lock for single-worker guarantee.
-
-    Uses a dedicated connection that stays open for the worker's lifetime.
-    The lock is automatically released when the connection closes (on stop
-    or process death).
-
-    Returns True if this process is the leader, False otherwise.
-    """
+def _try_lock_once() -> bool:
+    """Single attempt to acquire the advisory lock. Returns True if acquired."""
     global _leader_conn
 
+    if _leader_conn:
+        try:
+            _leader_conn.close()
+        except Exception:
+            pass
+        _leader_conn = None
+
+    if _create_connection:
+        _leader_conn = _create_connection()
+    else:
+        import psycopg
+        from psycopg.rows import dict_row
+        db_url = os.getenv("DATABASE_URL", "")
+        _leader_conn = psycopg.connect(db_url, row_factory=dict_row)
+
+    with _leader_conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (LEADER_LOCK_ID,))
+        row = cur.fetchone()
+    _leader_conn.commit()
+
+    acquired = row and row.get("acquired", False)
+    if not acquired:
+        _leader_conn.close()
+        _leader_conn = None
+    return acquired
+
+
+def _acquire_leader_lock() -> bool:
+    """
+    Acquire a PostgreSQL advisory lock for single-worker guarantee.
+
+    Retries with backoff to handle deploy overlap windows where the old
+    instance still holds the lock briefly (~90s total).
+    """
     if not USE_DB:
         return True
 
-    try:
-        if _create_connection:
-            _leader_conn = _create_connection()
-        else:
-            import psycopg
-            from psycopg.rows import dict_row
-            db_url = os.getenv("DATABASE_URL", "")
-            _leader_conn = psycopg.connect(db_url, row_factory=dict_row)
+    retry_delays = [5, 5, 10, 10, 15, 15, 15, 15]
+    max_attempts = 1 + len(retry_delays)
 
-        with _leader_conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s) AS acquired", (LEADER_LOCK_ID,))
-            row = cur.fetchone()
-        _leader_conn.commit()
+    for attempt in range(max_attempts):
+        try:
+            if _try_lock_once():
+                print(f"[JOB] Leader lock acquired by {WORKER_ID} (attempt={attempt + 1})")
+                return True
+        except Exception as e:
+            print(f"[JOB] Leader lock error (attempt {attempt + 1}): {e} — proceeding without lock")
+            return True  # Fail-open on error
 
-        acquired = row and row.get("acquired", False)
+        if attempt < len(retry_delays):
+            delay = retry_delays[attempt]
+            print(f"[JOB] Leader lock NOT acquired (attempt {attempt + 1}/{max_attempts}). Retrying in {delay}s.")
+            if _worker_stop.is_set():
+                return False
+            _worker_stop.wait(timeout=delay)
 
-        if acquired:
-            print(f"[JOB] Leader lock acquired by {WORKER_ID} (lock_id={LEADER_LOCK_ID})")
-        else:
-            print(f"[JOB] Leader lock NOT acquired — another worker is active. {WORKER_ID} standing by.")
-            _leader_conn.close()
-            _leader_conn = None
-
-        return acquired
-
-    except Exception as e:
-        print(f"[JOB] Leader lock error: {e} — proceeding without lock (single-instance assumed)")
-        if _leader_conn:
-            try:
-                _leader_conn.close()
-            except Exception:
-                pass
-            _leader_conn = None
-        return True  # Fail-open
+    print(f"[JOB] Leader lock NOT acquired after {max_attempts} attempts. {WORKER_ID} giving up.")
+    return False
 
 
 def _release_leader_lock():
