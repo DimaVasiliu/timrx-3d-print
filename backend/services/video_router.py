@@ -155,6 +155,18 @@ def _get_aistudio_provider() -> GeminiVeoProvider:
     return _AISTUDIO_PROVIDER
 
 
+_SEEDANCE_PROVIDER = None
+
+
+def _get_seedance_provider():
+    """Lazy-load Seedance provider."""
+    global _SEEDANCE_PROVIDER
+    if _SEEDANCE_PROVIDER is None:
+        from backend.services.video_providers.seedance_provider import SeedanceProvider
+        _SEEDANCE_PROVIDER = SeedanceProvider()
+    return _SEEDANCE_PROVIDER
+
+
 def _get_ordered_providers() -> List[VideoProvider]:
     """
     Get Veo providers ordered by priority based on VIDEO_PROVIDER setting.
@@ -181,7 +193,7 @@ def resolve_video_provider(provider_name: str):
     provider getter functions.
 
     Args:
-        provider_name: "google", "vertex"
+        provider_name: "google", "vertex", "seedance"
 
     Returns:
         The provider instance, or None if not found.
@@ -191,6 +203,8 @@ def resolve_video_provider(provider_name: str):
         return _get_aistudio_provider()
     elif name == "vertex":
         return _get_vertex_provider()
+    elif name == "seedance":
+        return _get_seedance_provider()
     else:
         # Try the router's provider lookup as fallback
         return video_router.get_provider(name)
