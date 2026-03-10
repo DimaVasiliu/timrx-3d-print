@@ -620,6 +620,7 @@ def _mark_job_for_worker(job_id: str, upstream_id: str, provider_name: str, stor
                         next_poll_at = NOW() + INTERVAL '5 seconds',
                         heartbeat_at = NULL,
                         claimed_by = NULL,
+                        stage = COALESCE(stage, 'video'),
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                         updated_at = NOW()
                     WHERE id::text = %s
