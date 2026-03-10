@@ -56,6 +56,19 @@ DURATION_MAP = {
     "4": 4, "5": 4, "6": 6, "7": 6, "8": 8, "10": 8,
 }
 
+# Seedance duration map (PiAPI accepts 5, 10, 15 seconds)
+SEEDANCE_DURATION_MAP = {
+    5: 5, 10: 10, 15: 15,
+    "5": 5, "10": 10, "15": 15,
+}
+SEEDANCE_ASPECTS = {"16:9", "9:16", "1:1"}
+
+# Map seedance_variant values to (task_type, tier) pairs
+SEEDANCE_VARIANT_MAP = {
+    "seedance-2-fast-preview": ("seedance-2-fast-preview", "fast"),
+    "seedance-2-preview": ("seedance-2-preview", "preview"),
+}
+
 
 @bp.route("/video/generate", methods=["POST", "OPTIONS"])
 @with_session
@@ -346,56 +359,61 @@ def _dispatch_video_job(
     seed: int | None,
     style_preset: str | None = None,
     motion_preset: str | None = None,
+    provider: str = "veo",
+    seedance_variant: str | None = None,
+    seedance_tier: str = "fast",
 ):
     """
     Shared helper: validate, reserve credits, create job row, dispatch async, return response.
 
     Returns a Flask response tuple.
     """
-    # Validate video parameters STRICTLY - reject invalid combinations
-    # Valid combinations:
-    # - 720p: 4s, 6s, 8s
-    # - 1080p: 8s only
-    # - 4k: 8s only
-    try:
-        aspect_ratio, resolution, duration_seconds = validate_video_params(
-            aspect_ratio, resolution, duration_seconds
-        )
-    except GeminiValidationError as e:
-        # Return 400 with clear error message for invalid combinations
-        print(f"[VIDEO] Validation failed: {e.message}")
-        return jsonify({
-            "ok": False,
-            "error": "invalid_params",
-            "message": e.message,
-            "field": e.field,
-            "value": e.value,
-            "allowed": e.allowed,
-        }), 400
+    # Seedance skips Veo-specific validation (different duration/resolution constraints)
+    if provider != "seedance":
+        # Validate video parameters STRICTLY - reject invalid combinations
+        # Valid combinations:
+        # - 720p: 4s, 6s, 8s
+        # - 1080p: 8s only
+        # - 4k: 8s only
+        try:
+            aspect_ratio, resolution, duration_seconds = validate_video_params(
+                aspect_ratio, resolution, duration_seconds
+            )
+        except GeminiValidationError as e:
+            print(f"[VIDEO] Validation failed: {e.message}")
+            return jsonify({
+                "ok": False,
+                "error": "invalid_params",
+                "message": e.message,
+                "field": e.field,
+                "value": e.value,
+                "allowed": e.allowed,
+            }), 400
 
     internal_job_id = str(uuid.uuid4())
 
     # Use variant action code based on duration/resolution
-    action_key = get_video_action_code(task, duration_seconds, resolution)
-    expected_cost = get_video_credit_cost(duration_seconds, resolution)
+    action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
+    expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
 
     # PRE-FLIGHT: Check Vertex resolution capability BEFORE reserving credits
-    # This prevents reserve -> fail -> release cycle for 4k on non-allowlisted projects
-    available_providers = video_router.get_available_providers()
-    primary_provider = available_providers[0].name if available_providers else None
+    # (only for Veo providers, not Seedance)
+    if provider != "seedance":
+        available_providers = video_router.get_available_providers()
+        primary_provider = available_providers[0].name if available_providers else None
 
-    if primary_provider == "vertex":
-        resolution_ok, resolution_err = check_vertex_resolution(resolution)
-        if not resolution_ok:
-            print(f"[VIDEO] Vertex resolution check failed: {resolution_err}")
-            return jsonify({
-                "ok": False,
-                "error": "vertex_resolution_not_allowed",
-                "message": resolution_err,
-                "field": "resolution",
-                "value": resolution,
-                "allowed": ["720p", "1080p"],
-            }), 400
+        if primary_provider == "vertex":
+            resolution_ok, resolution_err = check_vertex_resolution(resolution)
+            if not resolution_ok:
+                print(f"[VIDEO] Vertex resolution check failed: {resolution_err}")
+                return jsonify({
+                    "ok": False,
+                    "error": "vertex_resolution_not_allowed",
+                    "message": resolution_err,
+                    "field": "resolution",
+                    "value": resolution,
+                    "allowed": ["720p", "1080p"],
+                }), 400
 
     print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
@@ -420,6 +438,7 @@ def _dispatch_video_job(
         "stage": "video",
         "created_at": now_s() * 1000,
         "task": task,
+        "provider": provider,
         "prompt": prompt,
         "duration_seconds": duration_seconds,
         "aspect_ratio": aspect_ratio,
@@ -429,6 +448,8 @@ def _dispatch_video_job(
         "seed": seed,
         "style_preset": style_preset,
         "motion_preset": motion_preset,
+        "seedance_variant": seedance_variant,
+        "seedance_tier": seedance_tier if provider == "seedance" else None,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -443,7 +464,7 @@ def _dispatch_video_job(
     create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
-        provider="video",  # Generic — actual provider determined by router during dispatch
+        provider=provider,
         action_key=action_key,
         prompt=prompt,
         meta=store_meta,
@@ -461,6 +482,7 @@ def _dispatch_video_job(
         "motion": motion,
         "negative_prompt": negative_prompt,
         "seed": seed,
+        "seedance_variant": seedance_variant,
     }
 
     from backend.services.async_dispatch import dispatch_gemini_video_async
@@ -529,18 +551,35 @@ def video_text():
     if not raw_prompt:
         return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
 
-    raw_duration = body.get("seconds") or body.get("duration_sec") or 6
-    duration_seconds = DURATION_MAP.get(raw_duration, 6)
+    provider = (body.get("provider") or "veo").lower()
+    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider == "seedance" else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
     resolution = body.get("resolution") or "720p"
-    if resolution == "4K":
-        resolution = "4k"
     negative_prompt = (body.get("negative_prompt") or "").strip()
     seed = body.get("seed")
     style_preset = body.get("style_preset")
 
-    # C1: Normalize prompt with cinematic style instructions
-    prompt = normalize_text_prompt(raw_prompt, style_preset, duration_seconds)
+    seedance_variant = None
+    seedance_tier = "fast"
+
+    if provider == "seedance":
+        duration_seconds = SEEDANCE_DURATION_MAP.get(raw_duration, 5)
+        if aspect_ratio not in SEEDANCE_ASPECTS:
+            aspect_ratio = "16:9"
+        resolution = "720p"  # Seedance has no quality tiers
+        prompt = raw_prompt  # No style normalization for Seedance
+        # Read seedance_variant from body (seedance-2-fast-preview or seedance-2-preview)
+        seedance_variant = body.get("seedance_variant", "seedance-2-fast-preview")
+        task_type, seedance_tier = SEEDANCE_VARIANT_MAP.get(
+            seedance_variant, ("seedance-2-fast-preview", "fast")
+        )
+        seedance_variant = task_type  # Normalize to valid task_type
+    else:
+        duration_seconds = DURATION_MAP.get(raw_duration, 6)
+        if resolution == "4K":
+            resolution = "4k"
+        # C1: Normalize prompt with cinematic style instructions
+        prompt = normalize_text_prompt(raw_prompt, style_preset, duration_seconds)
 
     return _dispatch_video_job(
         identity_id=identity_id,
@@ -554,6 +593,9 @@ def video_text():
         negative_prompt=negative_prompt,
         seed=seed,
         style_preset=style_preset,
+        provider=provider,
+        seedance_variant=seedance_variant,
+        seedance_tier=seedance_tier,
     )
 
 
@@ -601,19 +643,35 @@ def video_animate():
     if not image_data:
         return jsonify({"error": "invalid_params", "message": "image_data, image_url, or image_id is required", "field": "image_data"}), 400
 
+    provider = (body.get("provider") or "veo").lower()
     raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
-    raw_duration = body.get("seconds") or body.get("duration_sec") or 6
-    duration_seconds = DURATION_MAP.get(raw_duration, 6)
+    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider == "seedance" else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
     resolution = body.get("resolution") or "720p"
-    if resolution == "4K":
-        resolution = "4k"
     negative_prompt = (body.get("negative_prompt") or "").strip()
     seed = body.get("seed")
     motion_preset = body.get("motion_preset")
 
-    # C2: Normalize motion prompt with preset
-    prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
+    seedance_variant = None
+    seedance_tier = "fast"
+
+    if provider == "seedance":
+        duration_seconds = SEEDANCE_DURATION_MAP.get(raw_duration, 5)
+        if aspect_ratio not in SEEDANCE_ASPECTS:
+            aspect_ratio = "16:9"
+        resolution = "720p"
+        prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
+        seedance_variant = body.get("seedance_variant", "seedance-2-fast-preview")
+        task_type, seedance_tier = SEEDANCE_VARIANT_MAP.get(
+            seedance_variant, ("seedance-2-fast-preview", "fast")
+        )
+        seedance_variant = task_type
+    else:
+        duration_seconds = DURATION_MAP.get(raw_duration, 6)
+        if resolution == "4K":
+            resolution = "4k"
+        # C2: Normalize motion prompt with preset
+        prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
 
     return _dispatch_video_job(
         identity_id=identity_id,
@@ -627,6 +685,9 @@ def video_animate():
         negative_prompt=negative_prompt,
         seed=seed,
         motion_preset=motion_preset,
+        provider=provider,
+        seedance_variant=seedance_variant,
+        seedance_tier=seedance_tier,
     )
 
 
