@@ -17,9 +17,13 @@ SOURCE OF TRUTH (critical for audit/debugging)
 
 ═══════════════════════════════════════════════════════════════════════════════
 
-Credit types:
-- general: Credits for 3D generation and images (cheaper)
-- video: Credits for video generation (more expensive, separate balance)
+UNIFIED CREDITS MODEL (Feb 2026):
+  All actions (3D, images, AND video) now use GENERAL credits from a single
+  pool. The CreditType.VIDEO constant and balance_video_credits DB column
+  still exist for backward compatibility / ledger history, but all new
+  reservations and charges use CreditType.GENERAL.
+
+  Video plan codes (video_starter_300, etc.) now grant GENERAL credits.
 
 Ledger entry types:
 - purchase_credit: Credits from buying a plan
@@ -36,9 +40,9 @@ from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, 
 
 
 class CreditType:
-    """Valid credit types for separate accounting."""
-    GENERAL = "general"  # 3D generation + images
-    VIDEO = "video"      # Video generation only
+    """Credit type constants. All actions now use GENERAL (unified pool)."""
+    GENERAL = "general"  # Unified pool: 3D, images, AND video
+    VIDEO = "video"      # Legacy — retained for DB/ledger backward compat only
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,8 +57,8 @@ class CreditType:
 #         accidentally consuming cheaper general credits.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Action codes that require VIDEO credits
-# Includes variant codes for duration/resolution-based pricing
+# Action codes for video generation (now use GENERAL credits, but kept as
+# a separate set for fail-closed validation and action classification).
 VIDEO_ACTION_CODES = {
     # Legacy codes (backwards compatibility)
     "VIDEO_GENERATE",
@@ -118,11 +122,11 @@ KNOWN_ACTION_CODES = VIDEO_ACTION_CODES | GENERAL_ACTION_CODES
 #         to VIDEO_PLAN_CODES or GENERAL_PLAN_CODES below.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Plan codes that grant VIDEO credits - Premium rebalance Feb 2026
+# Video plan codes (now grant GENERAL credits under unified model, Feb 2026)
 VIDEO_PLAN_CODES = {
-    "video_starter_300",   # £9.99 → 300 video credits
-    "video_creator_900",   # £29.99 → 900 video credits
-    "video_studio_2000",   # £59.99 → 2000 video credits
+    "video_starter_300",   # £9.99 → 300 credits (general pool)
+    "video_creator_900",   # £29.99 → 900 credits (general pool)
+    "video_studio_2000",   # £59.99 → 2000 credits (general pool)
 }
 
 # Plan codes that grant GENERAL credits (one-time purchases)
