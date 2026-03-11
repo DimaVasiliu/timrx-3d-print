@@ -1,34 +1,20 @@
 """
 Video Provider Router with Fallback.
 
-Routes video generation requests to available providers in priority order.
-Falls back to next provider on configuration or quota errors.
+Routes video generation requests to available providers.
 
-Supported providers for Veo (Google):
-- vertex  (Vertex AI Veo) — production default
-- google  (Gemini AI Studio Veo) — fallback
+Active providers:
+- vertex   (Vertex AI Veo) — production default
+- seedance (PiAPI Seedance 2.0)
 
 Provider selection:
-- VIDEO_PROVIDER=vertex (default in prod): Use Vertex AI first, AI Studio as fallback
-- VIDEO_PROVIDER=aistudio: Use AI Studio first, Vertex as fallback
+- VIDEO_PROVIDER=vertex (default): Use Vertex AI
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.config import config
-from backend.services.gemini_video_service import (
-    GeminiAuthError,
-    GeminiConfigError,
-    check_gemini_configured,
-    download_video_bytes,
-    extract_video_thumbnail,
-    gemini_image_to_video,
-    gemini_text_to_video,
-    gemini_video_status,
-)
-from backend.services.video_providers.vertex_provider import VertexVeoProvider
 from backend.services.vertex_video_service import (
     VertexAuthError,
     VertexConfigError,
@@ -76,56 +62,6 @@ class VideoProvider:
         raise NotImplementedError
 
 
-# ── Google Veo 3.1 ────────────────────────────────────────────
-class GeminiVeoProvider(VideoProvider):
-    """Google Gemini Veo 3.1 video generation provider."""
-
-    name = "google"
-
-    def is_configured(self) -> Tuple[bool, Optional[str]]:
-        return check_gemini_configured()
-
-    def start_text_to_video(self, prompt: str, **params) -> Dict[str, Any]:
-        try:
-            return gemini_text_to_video(
-                prompt=prompt,
-                aspect_ratio=params.get("aspect_ratio", "16:9"),
-                resolution=params.get("resolution", "720p"),
-                duration_seconds=params.get("duration_seconds", 6),
-                negative_prompt=params.get("negative_prompt"),
-                seed=params.get("seed"),
-            )
-        except RuntimeError as e:
-            if _is_quota_error(str(e)):
-                raise QuotaExhaustedError(self.name, str(e))
-            raise
-
-    def start_image_to_video(self, image_data: str, prompt: str, **params) -> Dict[str, Any]:
-        try:
-            return gemini_image_to_video(
-                image_data=image_data,
-                motion_prompt=prompt,
-                aspect_ratio=params.get("aspect_ratio", "16:9"),
-                resolution=params.get("resolution", "720p"),
-                duration_seconds=params.get("duration_seconds", 6),
-                negative_prompt=params.get("negative_prompt"),
-                seed=params.get("seed"),
-            )
-        except RuntimeError as e:
-            if _is_quota_error(str(e)):
-                raise QuotaExhaustedError(self.name, str(e))
-            raise
-
-    def check_status(self, operation_name: str) -> Dict[str, Any]:
-        return gemini_video_status(operation_name)
-
-    def download_video(self, video_url: str) -> Tuple[bytes, str]:
-        return download_video_bytes(video_url)
-
-    def extract_thumbnail(self, video_bytes: bytes, timestamp_sec: float = 1.0) -> Optional[bytes]:
-        return extract_video_thumbnail(video_bytes, timestamp_sec)
-
-
 # ── Helpers ───────────────────────────────────────────────────
 def _is_quota_error(msg: str) -> bool:
     """Detect quota / billing errors from error messages."""
@@ -134,9 +70,10 @@ def _is_quota_error(msg: str) -> bool:
 
 
 # ── Provider registry ─────────────────────────────────────────
-# Provider instances (singletons) - lazily initialized to avoid circular imports
+from backend.services.video_providers.vertex_provider import VertexVeoProvider
+
 _VERTEX_PROVIDER: Optional[VertexVeoProvider] = None
-_AISTUDIO_PROVIDER: Optional[GeminiVeoProvider] = None
+_SEEDANCE_PROVIDER = None
 
 
 def _get_vertex_provider() -> VertexVeoProvider:
@@ -145,17 +82,6 @@ def _get_vertex_provider() -> VertexVeoProvider:
     if _VERTEX_PROVIDER is None:
         _VERTEX_PROVIDER = VertexVeoProvider()
     return _VERTEX_PROVIDER
-
-
-def _get_aistudio_provider() -> GeminiVeoProvider:
-    """Lazy-load AI Studio provider."""
-    global _AISTUDIO_PROVIDER
-    if _AISTUDIO_PROVIDER is None:
-        _AISTUDIO_PROVIDER = GeminiVeoProvider()
-    return _AISTUDIO_PROVIDER
-
-
-_SEEDANCE_PROVIDER = None
 
 
 def _get_seedance_provider():
@@ -169,67 +95,46 @@ def _get_seedance_provider():
 
 def _get_ordered_providers() -> List[VideoProvider]:
     """
-    Get Veo providers ordered by priority based on VIDEO_PROVIDER setting.
+    Get video providers ordered by priority.
 
-    VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio
-    VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex
+    Returns Vertex as the primary provider.
     """
-    video_provider = getattr(config, 'VIDEO_PROVIDER', 'vertex').lower()
-
-    if video_provider == "aistudio":
-        # AI Studio first, Vertex as fallback
-        return [_get_aistudio_provider(), _get_vertex_provider()]
-    else:
-        # Vertex first (production default), AI Studio as fallback
-        return [_get_vertex_provider(), _get_aistudio_provider()]
+    return [_get_vertex_provider()]
 
 
 def resolve_video_provider(provider_name: str):
     """
     Resolve a provider by name. Safe for import from any module.
 
-    This function exists to avoid circular imports — async_dispatch and
-    other modules can import this single resolver instead of individual
-    provider getter functions.
-
     Args:
-        provider_name: "google", "vertex", "seedance"
+        provider_name: "vertex", "seedance"
 
     Returns:
         The provider instance, or None if not found.
     """
     name = (provider_name or "").lower()
-    if name == "google":
-        return _get_aistudio_provider()
-    elif name == "vertex":
+    if name == "vertex":
         return _get_vertex_provider()
     elif name == "seedance":
         return _get_seedance_provider()
+    # Backward compat: treat "google", "veo", "aistudio" as vertex
+    elif name in ("google", "veo", "aistudio"):
+        return _get_vertex_provider()
     else:
-        # Try the router's provider lookup as fallback
         return video_router.get_provider(name)
 
 
 # ── Router ────────────────────────────────────────────────────
 class VideoRouter:
     """
-    Route Veo video generation to available Google providers with automatic fallback.
+    Route video generation to available providers.
 
-    Tries providers in priority order based on VIDEO_PROVIDER setting:
-      - VIDEO_PROVIDER=vertex (default): Vertex -> AI Studio
-      - VIDEO_PROVIDER=aistudio:         AI Studio -> Vertex
-
-    Falls back on:
-      - Configuration errors (provider not set up)
-      - Quota exhaustion (daily limits)
-      - Authentication failures
-
-    Does NOT fall back on:
-      - Validation errors (caller's fault)
+    Uses Vertex AI as the primary provider.
+    Falls back on configuration errors or quota exhaustion.
+    Does NOT fall back on validation errors (caller's fault).
     """
 
     def __init__(self, providers: List[VideoProvider] | None = None):
-        # Use dynamic provider ordering if not explicitly provided
         self.providers = providers if providers is not None else _get_ordered_providers()
 
     # ── queries ───────────────────────────────────────────────
@@ -253,7 +158,6 @@ class VideoRouter:
         Raises:
             ProviderUnavailableError – no providers configured
             QuotaExhaustedError      – all providers quota-exhausted
-            GeminiValidationError    – invalid parameters (not retryable)
         """
         return self._route("text2video", prompt=prompt, **params)
 
@@ -289,13 +193,12 @@ class VideoRouter:
             except QuotaExhaustedError as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
-            except (GeminiAuthError, GeminiConfigError, VertexAuthError, VertexConfigError) as e:
+            except (VertexAuthError, VertexConfigError) as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} auth/config error: {e}, trying next…")
             except VertexQuotaError as e:
                 last_error = QuotaExhaustedError(provider.name, str(e))
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
-            # Let GeminiValidationError and other RuntimeErrors propagate
 
         if isinstance(last_error, QuotaExhaustedError):
             raise last_error
