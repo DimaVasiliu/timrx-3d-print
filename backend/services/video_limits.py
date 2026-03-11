@@ -450,19 +450,23 @@ def validate_video_rate_limits(
 # QUEUE POSITION & ESTIMATED RENDER TIME  (Parts 1 & 2)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Average generation time per provider (seconds)
+# Average generation time per provider+tier (seconds)
 # Observed PiAPI timings (2026-03-10):
 #   fast:    7-8 min total (queue + render)
 #   preview: 20-100+ min (highly variable queue)
 AVERAGE_GENERATION_TIME = {
-    "vertex": 80,      # 45–120s
-    "seedance": 480,   # ~8 min (fast tier typical)
+    "vertex": 80,               # 45–120s
+    "seedance": 480,            # ~8 min (fast tier typical)
+    "seedance_fast": 480,       # ~8 min
+    "seedance_preview": 1200,   # ~20 min (highly variable)
 }
 
 # Estimated render time ranges shown to user
 RENDER_TIME_RANGE = {
     "vertex": (45, 120),
-    "seedance": (300, 600),  # 5-10 min (fast tier)
+    "seedance": (300, 600),          # 5-10 min (fast tier default)
+    "seedance_fast": (300, 600),     # 5-10 min
+    "seedance_preview": (600, 3600), # 10-60 min (variable queue)
 }
 
 
@@ -505,15 +509,17 @@ def get_queue_position(job_id: str) -> Dict[str, Any]:
         return {"queue_position": 0, "estimated_start_seconds": 0}
 
 
-def get_estimated_render_time(provider: str = "vertex") -> Dict[str, int]:
+def get_estimated_render_time(provider: str = "vertex", seedance_tier: str = "fast") -> Dict[str, int]:
     """
-    Return estimated render time range for a provider.
+    Return estimated render time range for a provider (tier-aware for Seedance).
 
     Returns:
         {"estimated_min_seconds": 45, "estimated_max_seconds": 120, "estimated_duration_seconds": 80}
     """
-    low, high = RENDER_TIME_RANGE.get(provider, (30, 90))
-    avg = AVERAGE_GENERATION_TIME.get(provider, 60)
+    # Try tier-specific key first (e.g. "seedance_fast"), then bare provider
+    key = f"{provider}_{seedance_tier}" if provider == "seedance" else provider
+    low, high = RENDER_TIME_RANGE.get(key, RENDER_TIME_RANGE.get(provider, (30, 90)))
+    avg = AVERAGE_GENERATION_TIME.get(key, AVERAGE_GENERATION_TIME.get(provider, 60))
     return {
         "estimated_min_seconds": low,
         "estimated_max_seconds": high,
