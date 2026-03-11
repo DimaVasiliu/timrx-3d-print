@@ -74,10 +74,10 @@ _VIDEO_PACK_TIER_MAP = {
 # Estimated provider cost per video job in GBP (used for daily spend guardrails)
 # Keyed by (provider, duration_seconds). Approximate real API costs.
 PROVIDER_COST_GBP: Dict[Tuple[str, int], float] = {
-    # Veo (Google Vertex)
-    ("veo", 4): 0.30,
-    ("veo", 6): 0.45,
-    ("veo", 8): 0.60,
+    # Vertex (Veo)
+    ("vertex", 4): 0.30,
+    ("vertex", 6): 0.45,
+    ("vertex", 8): 0.60,
     # Seedance Fast (PiAPI)
     ("seedance_fast", 5): 0.25,
     ("seedance_fast", 10): 0.50,
@@ -239,7 +239,7 @@ def estimate_video_provider_cost(provider: str, duration_seconds: int, seedance_
     if provider == "seedance":
         key = (f"seedance_{seedance_tier}", int(duration_seconds))
     else:
-        key = ("veo", int(duration_seconds))
+        key = ("vertex", int(duration_seconds))
 
     cost = PROVIDER_COST_GBP.get(key)
     if cost is not None:
@@ -282,7 +282,7 @@ def get_daily_user_video_provider_spend(identity_id: str) -> float:
                     meta = json.loads(meta)
                 except Exception:
                     meta = {}
-            prov = r.get("provider") or meta.get("provider", "veo")
+            prov = r.get("provider") or meta.get("provider", "vertex")
             dur = meta.get("duration_seconds", 6)
             tier = meta.get("seedance_tier", "fast")
             total += estimate_video_provider_cost(prov, dur, tier)
@@ -317,7 +317,7 @@ def get_daily_global_video_provider_spend() -> float:
                     meta = json.loads(meta)
                 except Exception:
                     meta = {}
-            prov = r.get("provider") or meta.get("provider", "veo")
+            prov = r.get("provider") or meta.get("provider", "vertex")
             dur = meta.get("duration_seconds", 6)
             tier = meta.get("seedance_tier", "fast")
             total += estimate_video_provider_cost(prov, dur, tier)
@@ -333,7 +333,7 @@ def get_daily_global_video_provider_spend() -> float:
 
 def validate_video_rate_limits(
     identity_id: str,
-    provider: str = "veo",
+    provider: str = "vertex",
     duration_seconds: int = 6,
     seedance_tier: str = "fast",
 ) -> Optional[Tuple]:
@@ -455,13 +455,13 @@ def validate_video_rate_limits(
 #   fast:    7-8 min total (queue + render)
 #   preview: 20-100+ min (highly variable queue)
 AVERAGE_GENERATION_TIME = {
-    "veo": 80,         # 45–120s
+    "vertex": 80,      # 45–120s
     "seedance": 480,   # ~8 min (fast tier typical)
 }
 
 # Estimated render time ranges shown to user
 RENDER_TIME_RANGE = {
-    "veo": (45, 120),
+    "vertex": (45, 120),
     "seedance": (300, 600),  # 5-10 min (fast tier)
 }
 
@@ -505,7 +505,7 @@ def get_queue_position(job_id: str) -> Dict[str, Any]:
         return {"queue_position": 0, "estimated_start_seconds": 0}
 
 
-def get_estimated_render_time(provider: str = "veo") -> Dict[str, int]:
+def get_estimated_render_time(provider: str = "vertex") -> Dict[str, int]:
     """
     Return estimated render time range for a provider.
 
@@ -582,7 +582,7 @@ def get_active_video_worker_count() -> int:
 QUEUE_THRESHOLD_FOR_CHEAPER_PROVIDER = 20
 
 
-def select_video_provider(requested_provider: str = "veo") -> str:
+def select_video_provider(requested_provider: str = "vertex") -> str:
     """
     Select the optimal video provider based on queue conditions.
     Only overrides when user did NOT explicitly select a provider.
@@ -593,8 +593,8 @@ def select_video_provider(requested_provider: str = "veo") -> str:
     if requested_provider in ("seedance",):
         return requested_provider
 
-    # Only apply dynamic routing when user selected "veo" (default)
-    if requested_provider != "veo":
+    # Only apply dynamic routing when user selected "vertex" (default)
+    if requested_provider != "vertex":
         return requested_provider
 
     queue_len = get_total_queued_video_jobs()
