@@ -99,6 +99,15 @@ def create_seedance_task(
     if image_urls:
         body["input"]["image_urls"] = image_urls
 
+    # Attach webhook config when enabled so PiAPI sends task completion callbacks.
+    webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
+    if webhook_url:
+        wh_cfg: Dict[str, str] = {"endpoint": webhook_url}
+        webhook_secret = getattr(config, "PIAPI_WEBHOOK_SECRET", "")
+        if webhook_secret:
+            wh_cfg["secret"] = webhook_secret
+        body["webhook_config"] = wh_cfg
+
     try:
         resp = requests.post(
             f"{PIAPI_BASE}/task",
