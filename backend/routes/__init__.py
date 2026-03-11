@@ -53,6 +53,7 @@ def register_blueprints(app):
     from backend.routes.contact import bp as contact_bp
     from backend.routes.video import bp as video_bp
     from backend.routes.prompt_enhance import bp as prompt_enhance_bp
+    from backend.routes.webhooks import bp as webhooks_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -102,6 +103,7 @@ def register_blueprints(app):
     else:
         print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
     app.register_blueprint(contact_bp, url_prefix="/api")
+    app.register_blueprint(webhooks_bp, url_prefix="/api")
 
     # Also register under /api for backward compatibility (cached frontend)
     # These must match the legacy app.py routes exactly
