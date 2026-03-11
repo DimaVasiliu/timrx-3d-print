@@ -28,6 +28,55 @@ from backend.services.gemini_video_service import extract_video_thumbnail
 from backend.services.video_errors import is_quota_error as _is_quota_error
 
 
+def _ensure_public_image_url(image_data: str) -> str:
+    """
+    Ensure image_data is a public URL suitable for PiAPI image_urls.
+
+    If image_data is a base64 data URI, upload it to S3 first and return
+    the public URL. If it's already an http(s) URL, return as-is.
+
+    Seedance (PiAPI) requires image_urls to be publicly accessible URLs —
+    it does NOT accept inline base64 data.
+    """
+    if not image_data:
+        return image_data
+
+    # Already a public URL — pass through
+    if image_data.startswith("http://") or image_data.startswith("https://"):
+        print(f"[SEEDANCE] image-to-video input type=url")
+        return image_data
+
+    # Base64 data URI — upload to S3 first
+    if image_data.startswith("data:"):
+        print(f"[SEEDANCE] image-to-video input type=base64 ({len(image_data) // 1024}KB) -> uploading to S3")
+        try:
+            from backend.services.s3_service import upload_base64_to_s3
+            result = upload_base64_to_s3(
+                data_url=image_data,
+                prefix="video-input",
+                name="seedance_ref",
+                user_id="seedance",
+            )
+            # upload_base64_to_s3 returns either a string URL or a dict with 'url'
+            if isinstance(result, dict):
+                url = result.get("url", "")
+            else:
+                url = str(result)
+            if url:
+                print(f"[SEEDANCE] image uploaded to S3: {url[:80]}...")
+                return url
+            else:
+                print("[SEEDANCE] WARNING: S3 upload returned empty URL, falling back to raw data")
+                return image_data
+        except Exception as e:
+            print(f"[SEEDANCE] ERROR uploading image to S3: {e} — falling back to raw data")
+            return image_data
+
+    # Unknown format — pass through and let PiAPI reject if invalid
+    print(f"[SEEDANCE] WARNING: unknown image_data format (len={len(image_data)}), passing as-is")
+    return image_data
+
+
 # ── Seedance constraints ────────────────────────────────────────
 SUPPORTED_DURATIONS = frozenset({5, 10, 15})
 SUPPORTED_ASPECTS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4"})
@@ -142,12 +191,15 @@ class SeedanceProvider:
             tier=params.get("tier"),
             seedance_variant=params.get("task_type") or params.get("seedance_variant"),
         )
+        # PiAPI requires image_urls to be publicly accessible URLs.
+        # If the client sent a base64 data URI, upload to S3 first.
+        public_url = _ensure_public_image_url(image_data) if image_data else None
         try:
             return create_seedance_task(
                 prompt=prompt,
                 duration=clean["duration_seconds"],
                 aspect_ratio=clean["aspect_ratio"],
-                image_urls=[image_data] if image_data else None,
+                image_urls=[public_url] if public_url else None,
                 task_type=clean["task_type"],
             )
         except SeedanceQuotaError as e:
