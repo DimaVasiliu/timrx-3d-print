@@ -17,13 +17,13 @@ SOURCE OF TRUTH (critical for audit/debugging)
 
 ═══════════════════════════════════════════════════════════════════════════════
 
-UNIFIED CREDITS MODEL (Feb 2026):
-  All actions (3D, images, AND video) now use GENERAL credits from a single
-  pool. The CreditType.VIDEO constant and balance_video_credits DB column
-  still exist for backward compatibility / ledger history, but all new
-  reservations and charges use CreditType.GENERAL.
+SPLIT CREDITS MODEL:
+  Two separate credit pools:
+  - GENERAL: 3D models, images (balance_credits column)
+  - VIDEO:   Video generation (balance_video_credits column)
 
-  Video plan codes (video_starter_300, etc.) now grant GENERAL credits.
+  Video is sold separately. Users must purchase video plans to generate video.
+  General credits cannot be used for video, and vice versa.
 
 Ledger entry types:
 - purchase_credit: Credits from buying a plan
@@ -40,9 +40,9 @@ from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, 
 
 
 class CreditType:
-    """Credit type constants. All actions now use GENERAL (unified pool)."""
-    GENERAL = "general"  # Unified pool: 3D, images, AND video
-    VIDEO = "video"      # Legacy — retained for DB/ledger backward compat only
+    """Credit type constants — two separate pools."""
+    GENERAL = "general"  # 3D models, images
+    VIDEO = "video"      # Video generation (sold separately)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,8 +57,7 @@ class CreditType:
 #         accidentally consuming cheaper general credits.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Action codes for video generation (now use GENERAL credits, but kept as
-# a separate set for fail-closed validation and action classification).
+# Action codes for video generation — these use VIDEO credits (separate pool).
 VIDEO_ACTION_CODES = {
     # Legacy codes (backwards compatibility)
     "VIDEO_GENERATE",
@@ -122,11 +121,11 @@ KNOWN_ACTION_CODES = VIDEO_ACTION_CODES | GENERAL_ACTION_CODES
 #         to VIDEO_PLAN_CODES or GENERAL_PLAN_CODES below.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Video plan codes (now grant GENERAL credits under unified model, Feb 2026)
+# Video plan codes — grant VIDEO credits (separate pool, sold separately)
 VIDEO_PLAN_CODES = {
-    "video_starter_300",   # £9.99 → 300 credits (general pool)
-    "video_creator_900",   # £29.99 → 900 credits (general pool)
-    "video_studio_2000",   # £59.99 → 2000 credits (general pool)
+    "video_starter_300",   # £9.99 → 300 video credits
+    "video_creator_900",   # £29.99 → 900 video credits
+    "video_studio_2000",   # £59.99 → 2000 video credits
 }
 
 # Plan codes that grant GENERAL credits (one-time purchases)
@@ -157,10 +156,8 @@ def get_credit_type_for_action(action_code: str) -> str:
     """
     Determine credit type based on action code.
 
-    UNIFIED CREDITS MODEL (Feb 2026):
-    All actions now use GENERAL credits. Video actions previously required separate
-    video credits, but this caused UX confusion. Now everything uses one unified
-    credit pool for simplicity.
+    Video actions use VIDEO credits (separate pool, sold separately).
+    All other actions use GENERAL credits.
 
     FAIL-CLOSED: Raises ValueError for unknown action codes.
 
@@ -168,22 +165,20 @@ def get_credit_type_for_action(action_code: str) -> str:
         action_code: DB action code (e.g., "VIDEO_GENERATE", "MESHY_TEXT_TO_3D")
 
     Returns:
-        CreditType.GENERAL (always - unified credits model)
+        CreditType.VIDEO for video actions, CreditType.GENERAL otherwise.
 
     Raises:
         ValueError: If action_code is not in KNOWN_ACTION_CODES
     """
-    # UNIFIED: All actions use general credits (single pool)
     if action_code in VIDEO_ACTION_CODES:
-        return CreditType.GENERAL  # Video actions now use unified pool
+        return CreditType.VIDEO
     if action_code in GENERAL_ACTION_CODES:
         return CreditType.GENERAL
 
     # Dynamic recognition: Seedance variant codes follow a known pattern
-    # This prevents hard-coded set from going stale if new tiers/durations are added
     from backend.services.pricing_service import _is_seedance_variant_code
     if _is_seedance_variant_code(action_code):
-        return CreditType.GENERAL
+        return CreditType.VIDEO
 
     raise ValueError(
         f"Unknown action code: {action_code}. "
@@ -195,27 +190,22 @@ def get_credit_type_for_plan(plan_code: str) -> str:
     """
     Determine credit type based on plan code.
 
-    UNIFIED CREDITS MODEL (Feb 2026):
-    All plans now grant GENERAL credits. Video plans previously granted separate
-    video credits, but this caused UX confusion (users couldn't see their balance
-    because UI only displayed general credits). Now everything uses one unified
-    credit pool for simplicity.
+    Video plans grant VIDEO credits (separate pool).
+    All other plans grant GENERAL credits.
 
-    FAIL-CLOSED: Raises ValueError for unknown plan codes to prevent
-    accidentally granting credits for invalid plans.
+    FAIL-CLOSED: Raises ValueError for unknown plan codes.
 
     Args:
         plan_code: Plan code (e.g., "video_starter_300", "starter_250")
 
     Returns:
-        CreditType.GENERAL (always - unified credits model)
+        CreditType.VIDEO for video plans, CreditType.GENERAL otherwise.
 
     Raises:
         ValueError: If plan_code is not in KNOWN_PLAN_CODES
     """
-    # UNIFIED: All plans grant general credits (single pool)
     if plan_code in VIDEO_PLAN_CODES:
-        return CreditType.GENERAL  # Video plans now use unified pool
+        return CreditType.VIDEO
     if plan_code in GENERAL_PLAN_CODES:
         return CreditType.GENERAL
     if plan_code in SUBSCRIPTION_PLAN_CODES:
