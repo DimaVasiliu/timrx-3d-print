@@ -542,8 +542,12 @@ class Config:
     # Stale sweep: periodic server-side check for stuck jobs
     STALE_SWEEP_ENABLED: bool = field(default_factory=lambda: _get_env_bool("STALE_SWEEP_ENABLED", True))
     STALE_SWEEP_INTERVAL_S: int = field(default_factory=lambda: _get_env_int("STALE_SWEEP_INTERVAL_S", 60))
-    STALE_PENDING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_PENDING_AGE_S", 900))        # 15 min
+    STALE_PENDING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_PENDING_AGE_S", 900))        # 15 min (Vertex default)
     STALE_PROCESSING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_PROCESSING_AGE_S", 1200))  # 20 min
+
+    # Seedance-specific overrides: PiAPI queue can exceed 2 hours under load
+    STALE_PENDING_AGE_SEEDANCE_S: int = field(default_factory=lambda: _get_env_int("STALE_PENDING_AGE_SEEDANCE_S", 7200))     # 2 hours
+    STALE_PROCESSING_AGE_SEEDANCE_S: int = field(default_factory=lambda: _get_env_int("STALE_PROCESSING_AGE_SEEDANCE_S", 3600))  # 1 hour
     STALE_FINALIZING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_FINALIZING_AGE_S", 300))   # 5 min
     STALE_DISPATCHED_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_DISPATCHED_AGE_S", 600))   # 10 min
 
