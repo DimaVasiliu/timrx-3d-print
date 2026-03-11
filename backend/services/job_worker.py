@@ -47,6 +47,11 @@ import uuid
 from typing import Any, Dict, Optional
 
 from backend.db import USE_DB, get_conn, Tables
+from backend.services.video_errors import (
+    TERMINAL_STATES as _SHARED_TERMINAL_STATES,
+    TERMINAL_ERROR_CODES as _SHARED_TERMINAL_ERROR_CODES,
+    get_failure_message,
+)
 
 try:
     from backend.db import _create_connection
@@ -91,46 +96,13 @@ _PROVIDER_TIMEOUTS = {
 }
 _DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
 
-# Provider-neutral failure reason map. Code format: "{provider}_{reason}"
-# falls back to generic messages when provider-specific not found.
-_FAILURE_REASON_MAP = {
-    "pending_timeout": "Provider queue timed out — job was not started in time",
-    "processing_timeout": "Render timed out — provider started but did not finish in time",
-    "poll_error": "Lost connection to provider during generation",
-    "generation_failed": "Provider rejected this generation",
-    "no_result_url": "Generation completed but no result was returned",
-    "auth_error": "Provider authentication failed",
-    # Seedance-specific (backward compat)
-    "seedance_pending_timeout": "Provider queue timed out -- Seedance did not start this job in time",
-    "seedance_processing_timeout": "Render timed out -- Seedance started but did not finish in time",
-    "seedance_poll_error": "Lost connection to provider during generation",
-    "seedance_generation_failed": "Seedance rejected this generation",
-    "seedance_no_video_url": "Generation completed but no video was returned",
-    "seedance_auth_error": "Provider authentication failed",
-}
+# Terminal states -- worker must never touch these (shared source of truth)
+TERMINAL_STATES = _SHARED_TERMINAL_STATES
 
-# Terminal states -- worker must never touch these
-TERMINAL_STATES = {
-    "succeeded", "failed", "refunded", "ready", "ready_unbilled",
-    "abandoned_legacy", "recovery_blocked",
-}
-
-# Error codes that warrant credit release (terminal, confirmed failures).
+# Error codes that warrant credit release (shared source of truth).
 # Timeouts and poll errors do NOT release credits — the provider may still
 # complete the job, and the rescue service can recover it later.
-_TERMINAL_ERROR_CODES = {
-    "generation_failed",            # Provider confirmed failure (generic)
-    "no_result_url",                # Provider said done but no URL (generic)
-    "auth_error",                   # Auth failure (generic)
-    "seedance_generation_failed",   # Provider confirmed failure (legacy)
-    "seedance_no_video_url",        # Provider said done but no URL (legacy)
-    "seedance_auth_error",          # Auth failure (legacy)
-    "max_attempts_exceeded",        # Exhausted all retries
-    "dispatch_failed",              # Could not dispatch to provider
-    "no_upstream_id",               # Missing upstream ID
-    "missing_fields",               # Required fields missing
-    "unsupported_recovery_provider",  # Provider not supported for recovery
-}
+_TERMINAL_ERROR_CODES = _SHARED_TERMINAL_ERROR_CODES
 
 
 # ── Worker Thread Management ────────────────────────────────
@@ -1041,10 +1013,11 @@ def _fail_job(
     else:
         print(f"[JOB] credits N/A job={job_id} no_reservation provider={provider_name}")
 
-    # Resolve user-facing message: try provider-specific, then generic suffix
-    user_message = _FAILURE_REASON_MAP.get(error_code)
-    if not user_message:
-        user_message = _FAILURE_REASON_MAP.get(suffix, error_msg)
+    # Resolve user-facing message from shared error taxonomy
+    user_message = get_failure_message(error_code)
+    if user_message == f"Video generation failed ({error_code})":
+        # No specific message for this code — try the generic suffix
+        user_message = get_failure_message(suffix) if suffix != error_code else error_msg
 
     _transition_job(job_id, "failed", {
         "last_error_code": error_code,
