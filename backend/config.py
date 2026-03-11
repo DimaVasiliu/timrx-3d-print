@@ -522,6 +522,20 @@ class Config:
     PIAPI_WEBHOOK_SECRET: str = field(default_factory=lambda: _get_env("PIAPI_WEBHOOK_SECRET"))
     PIAPI_WEBHOOK_LOG_BODY: bool = field(default_factory=lambda: _get_env_bool("PIAPI_WEBHOOK_LOG_BODY", False))
 
+    @property
+    def PIAPI_WEBHOOK_URL(self) -> str:
+        """
+        Full URL for PiAPI task-level webhook callbacks.
+
+        Derived from PUBLIC_BASE_URL. Empty string when PUBLIC_BASE_URL is
+        not set or webhooks are disabled, which causes seedance_service to
+        skip including webhook_config in task creation.
+        """
+        if not self.PIAPI_WEBHOOK_ENABLED or not self.PUBLIC_BASE_URL:
+            return ""
+        base = self.PUBLIC_BASE_URL.rstrip("/")
+        return f"{base}/api/webhooks/piapi/task"
+
     # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
     # ─────────────────────────────────────────────────────────────
