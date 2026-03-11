@@ -469,7 +469,7 @@ class Config:
     # ─────────────────────────────────────────────────────────────
     # Vertex AI (Veo) Video Generation
     # ─────────────────────────────────────────────────────────────
-    # Provider selection: "vertex" (production) or "aistudio" (fallback)
+    # Active video providers: "vertex" (Veo 3.1) and "seedance" (PiAPI)
     VIDEO_PROVIDER: str = field(default_factory=lambda: _get_env("VIDEO_PROVIDER", "vertex").lower())
 
     # Google Cloud project and credentials
@@ -496,8 +496,8 @@ class Config:
 
     @property
     def USE_AISTUDIO_VIDEO(self) -> bool:
-        """True if AI Studio should be used for video generation."""
-        return self.VIDEO_PROVIDER == "aistudio"
+        """Deprecated: AI Studio provider removed. Always returns False."""
+        return False
 
     @property
     def VERTEX_VEO_MODEL(self) -> str:
