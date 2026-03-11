@@ -63,13 +63,6 @@ class VideoProvider:
         raise NotImplementedError
 
 
-# ── Helpers ───────────────────────────────────────────────────
-def _is_quota_error(msg: str) -> bool:
-    """Detect quota / billing errors from error messages."""
-    lower = msg.lower()
-    return any(tok in lower for tok in ("quota", "billing", "resource_exhausted", "rate_limit", "429"))
-
-
 # ── Provider registry ─────────────────────────────────────────
 from backend.services.video_providers.vertex_provider import VertexVeoProvider
 
