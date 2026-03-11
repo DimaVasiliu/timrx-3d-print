@@ -244,11 +244,11 @@ def _process_candidate(
         hard_timeout = _get_hard_timeout(provider, upstream_status)
         if elapsed_s and hard_timeout and elapsed_s > hard_timeout * 2:
             print(f"[RESCUE] job={job_id} pending too long ({elapsed_s}s > 2x hard {hard_timeout}s), "
-                  f"NOT requeuing — marking upstream_failed")
+                  f"NOT requeuing — will re-check next cycle in case provider completes later")
             _enrich_error(job_id, ErrorCategory.INTERNAL,
                           f"Upstream stuck in {upstream_status} for {elapsed_s}s")
-            return {"job_id": job_id, "action": "upstream_failed",
-                    "reason": f"stuck_{upstream_status}_{elapsed_s}s"}
+            return {"job_id": job_id, "action": "still_running",
+                    "reason": f"stuck_{upstream_status}_{elapsed_s}s_will_recheck"}
 
         print(f"[RESCUE] job={job_id} still running ({upstream_status}, {progress}%), attempting requeue")
         requeued = _requeue_for_worker(job_id)
