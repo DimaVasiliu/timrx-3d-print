@@ -337,18 +337,20 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                     f"claimed_by={row.get('claimed_by')} attempt={attempt}"
                 )
 
+                # NOTE: Do NOT increment attempt_count here — it tracks
+                # error retries, not normal poll cycles. Only _handle_job_error
+                # should bump it.
                 cur.execute(
                     f"""
                     UPDATE {Tables.JOBS}
                     SET claimed_by = %s,
                         claimed_at = NOW(),
                         heartbeat_at = NOW(),
-                        attempt_count = %s,
                         updated_at = NOW()
                     WHERE id = %s
                     RETURNING *
                     """,
-                    (WORKER_ID, attempt + 1, row["id"]),
+                    (WORKER_ID, row["id"]),
                 )
                 claimed = cur.fetchone()
             conn.commit()
@@ -823,10 +825,20 @@ def _poll_provider_once(
 
         return
 
-    # Pending — schedule next poll
+    # Pending — schedule next poll (with progressive backoff for long waits)
     if status == "pending":
         past_soft = pending_elapsed >= pend_soft
-        poll_interval = 15 if past_soft else POLL_SLEEP_PENDING
+        if past_soft:
+            # Progressive backoff: 30s → 60s → 120s based on how far past soft
+            overshoot = pending_elapsed - pend_soft
+            if overshoot > 1800:    # 30+ min past soft → poll every 120s
+                poll_interval = 120
+            elif overshoot > 600:   # 10+ min past soft → poll every 60s
+                poll_interval = 60
+            else:                   # just past soft → poll every 30s
+                poll_interval = 30
+        else:
+            poll_interval = POLL_SLEEP_PENDING
         print(
             f"[JOB][DEBUG] status=pending job={job_id} poll_interval={poll_interval}s "
             f"past_soft={past_soft} pending_elapsed={int(pending_elapsed)}s"
@@ -846,7 +858,14 @@ def _poll_provider_once(
             print(f"[JOB] job={job_id} transitioned pending->processing after {int(pending_elapsed)}s provider={provider_name}")
 
         past_soft = processing_elapsed >= proc_soft if processing_started_at else False
-        poll_interval = 15 if past_soft else POLL_SLEEP_PROCESSING
+        if past_soft:
+            overshoot = processing_elapsed - proc_soft
+            if overshoot > 600:
+                poll_interval = 60
+            else:
+                poll_interval = 30
+        else:
+            poll_interval = POLL_SLEEP_PROCESSING
         print(
             f"[JOB][DEBUG] status=processing job={job_id} poll_interval={poll_interval}s "
             f"past_soft={past_soft} processing_elapsed={int(processing_elapsed)}s"
@@ -1143,7 +1162,7 @@ def _handle_job_error(job: Dict[str, Any], error_msg: str):
     job_id = str(job["id"])
     meta = _parse_meta(job.get("meta"))
     provider_name = job.get("provider") or "unknown"
-    attempt = job.get("attempt_count", 0)
+    attempt = job.get("attempt_count", 0) + 1  # increment on error
 
     if attempt >= MAX_ATTEMPTS:
         print(f"[JOB] FAIL job={job_id} reason=max_attempts attempts={attempt}/{MAX_ATTEMPTS} provider={provider_name}")
@@ -1151,6 +1170,7 @@ def _handle_job_error(job: Dict[str, Any], error_msg: str):
     else:
         backoff = _get_backoff(attempt)
         _transition_job(job_id, "stalled", {
+            "attempt_count": attempt,
             "last_error_code": "worker_error",
             "last_error_message": error_msg[:500],
             "next_poll_at": f"NOW() + INTERVAL '{backoff} seconds'",
