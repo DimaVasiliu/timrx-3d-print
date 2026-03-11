@@ -4,11 +4,12 @@ Video Provider Router with Fallback.
 Routes video generation requests to available providers.
 
 Active providers:
-- vertex   (Vertex AI Veo) — production default
+- vertex   (Vertex AI Veo 3.1) — production default
 - seedance (PiAPI Seedance 2.0)
 
-Provider selection:
-- VIDEO_PROVIDER=vertex (default): Use Vertex AI
+Normalization:
+- normalize_provider_name() is the single entry point for provider alias resolution.
+  Legacy names ("veo", "google", "aistudio", "video") all resolve to "vertex".
 """
 
 from __future__ import annotations
@@ -102,26 +103,42 @@ def _get_ordered_providers() -> List[VideoProvider]:
     return [_get_vertex_provider()]
 
 
+# Legacy provider aliases that all resolve to "vertex".
+_VERTEX_ALIASES = frozenset({"google", "veo", "aistudio", "video"})
+
+# The two canonical provider names accepted by the system.
+CANONICAL_PROVIDERS = frozenset({"vertex", "seedance"})
+
+
+def normalize_provider_name(raw: str | None) -> str:
+    """
+    Normalize any provider string to a canonical name.
+
+    Returns "vertex" or "seedance".  Legacy aliases ("veo", "google",
+    "aistudio", "video") are mapped to "vertex".  Unknown values
+    default to "vertex".
+    """
+    name = (raw or "").strip().lower()
+    if name in CANONICAL_PROVIDERS:
+        return name
+    if name in _VERTEX_ALIASES:
+        return "vertex"
+    return "vertex"
+
+
 def resolve_video_provider(provider_name: str):
     """
-    Resolve a provider by name. Safe for import from any module.
+    Resolve a provider instance by name.
 
-    Args:
-        provider_name: "vertex", "seedance"
-
-    Returns:
-        The provider instance, or None if not found.
+    Accepts any raw provider string (canonical or legacy alias).
+    Returns the provider instance, or None if lookup fails.
     """
-    name = (provider_name or "").lower()
+    name = normalize_provider_name(provider_name)
     if name == "vertex":
         return _get_vertex_provider()
-    elif name == "seedance":
+    if name == "seedance":
         return _get_seedance_provider()
-    # Backward compat: treat "google", "veo", "aistudio" as vertex
-    elif name in ("google", "veo", "aistudio"):
-        return _get_vertex_provider()
-    else:
-        return video_router.get_provider(name)
+    return video_router.get_provider(name)
 
 
 # ── Router ────────────────────────────────────────────────────
