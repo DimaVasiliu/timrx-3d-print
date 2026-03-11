@@ -202,6 +202,11 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
     piapi_status = task_data.get("status", "unknown")
     internal_status = _STATUS_MAP.get(piapi_status, "pending")
 
+    # Debug: log raw PiAPI status for rescue diagnostics
+    print(f"[Seedance] status check task={task_id[:12]}... "
+          f"raw_status={piapi_status!r} -> {internal_status} "
+          f"keys={list(task_data.keys())[:8]}")
+
     # Extract timing metadata
     started_at = task_data.get("started_at") or task_data.get("start_time")
     ended_at = task_data.get("ended_at") or task_data.get("end_time")
