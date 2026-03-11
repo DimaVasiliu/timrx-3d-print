@@ -1489,53 +1489,64 @@ def run_stale_sweep():
                     for r in rows:
                         details.append(f"job={r['id']} was={r['status']} provider={r.get('provider','?')} reason=dispatched_age")
 
-                # 2. provider_pending too long
-                pending_age = _cfg.STALE_PENDING_AGE_S
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'stalled',
-                        claimed_by = NULL,
-                        claimed_at = NULL,
-                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "pending_age"}}'::jsonb,
-                        updated_at = NOW()
-                    WHERE status = 'provider_pending'
-                      AND provider IN ({provider_list})
-                      AND stage = 'video'
-                      AND updated_at < NOW() - INTERVAL '{pending_age} seconds'
-                      AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
-                    RETURNING id, status, provider
-                    """,
-                )
-                rows = cur.fetchall() or []
-                if rows:
-                    swept_total += len(rows)
-                    for r in rows:
-                        details.append(f"job={r['id']} was=provider_pending provider={r.get('provider','?')} reason=pending_age")
+                # 2. provider_pending too long (provider-aware thresholds)
+                # Seedance queue can take 2+ hours under load; Vertex is typically fast.
+                _pending_thresholds = {
+                    "seedance": getattr(_cfg, "STALE_PENDING_AGE_SEEDANCE_S", 7200),
+                    "vertex": _cfg.STALE_PENDING_AGE_S,
+                }
+                for _prov, _age in _pending_thresholds.items():
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = 'stalled',
+                            claimed_by = NULL,
+                            claimed_at = NULL,
+                            meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "pending_age"}}'::jsonb,
+                            updated_at = NOW()
+                        WHERE status = 'provider_pending'
+                          AND provider = %s
+                          AND stage = 'video'
+                          AND updated_at < NOW() - INTERVAL '{_age} seconds'
+                          AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
+                        RETURNING id, status, provider
+                        """,
+                        (_prov,),
+                    )
+                    rows = cur.fetchall() or []
+                    if rows:
+                        swept_total += len(rows)
+                        for r in rows:
+                            details.append(f"job={r['id']} was=provider_pending provider={r.get('provider','?')} reason=pending_age({_age}s)")
 
-                # 3. provider_processing too long
-                processing_age = _cfg.STALE_PROCESSING_AGE_S
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'stalled',
-                        claimed_by = NULL,
-                        claimed_at = NULL,
-                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "processing_age"}}'::jsonb,
-                        updated_at = NOW()
-                    WHERE status = 'provider_processing'
-                      AND provider IN ({provider_list})
-                      AND stage = 'video'
-                      AND updated_at < NOW() - INTERVAL '{processing_age} seconds'
-                      AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
-                    RETURNING id, status, provider
-                    """,
-                )
-                rows = cur.fetchall() or []
-                if rows:
-                    swept_total += len(rows)
-                    for r in rows:
-                        details.append(f"job={r['id']} was=provider_processing provider={r.get('provider','?')} reason=processing_age")
+                # 3. provider_processing too long (provider-aware thresholds)
+                _processing_thresholds = {
+                    "seedance": getattr(_cfg, "STALE_PROCESSING_AGE_SEEDANCE_S", 3600),
+                    "vertex": _cfg.STALE_PROCESSING_AGE_S,
+                }
+                for _prov, _age in _processing_thresholds.items():
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.JOBS}
+                        SET status = 'stalled',
+                            claimed_by = NULL,
+                            claimed_at = NULL,
+                            meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "processing_age"}}'::jsonb,
+                            updated_at = NOW()
+                        WHERE status = 'provider_processing'
+                          AND provider = %s
+                          AND stage = 'video'
+                          AND updated_at < NOW() - INTERVAL '{_age} seconds'
+                          AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
+                        RETURNING id, status, provider
+                        """,
+                        (_prov,),
+                    )
+                    rows = cur.fetchall() or []
+                    if rows:
+                        swept_total += len(rows)
+                        for r in rows:
+                            details.append(f"job={r['id']} was=provider_processing provider={r.get('provider','?')} reason=processing_age({_age}s)")
 
                 # 4. finalizing too long (crash during S3 upload / credit capture)
                 finalizing_age = _cfg.STALE_FINALIZING_AGE_S
