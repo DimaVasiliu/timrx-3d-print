@@ -844,7 +844,21 @@ def _poll_provider_once(
     if status == "failed":
         error_code = status_resp.get("error", f"{provider_name}_generation_failed")
         error_msg = status_resp.get("message", "Provider generation failed")
-        print(f"[JOB] FAIL job={job_id} reason=upstream_failed error={error_code}: {error_msg} provider={provider_name}")
+        provider_error_code = status_resp.get("provider_error_code")
+        provider_logs = status_resp.get("provider_logs")
+        print(
+            f"[JOB] FAIL job={job_id} reason=upstream_failed error={error_code}: {error_msg} "
+            f"provider={provider_name} provider_error_code={provider_error_code}"
+        )
+        # Enrich meta with upstream error details before failing
+        if provider_error_code:
+            meta["provider_error_code"] = provider_error_code
+        if provider_logs:
+            # Truncate logs to avoid bloating JSONB
+            if isinstance(provider_logs, list):
+                meta["provider_logs"] = provider_logs[:10]
+            else:
+                meta["provider_logs"] = str(provider_logs)[:1000]
         _fail_job(job_id, meta, f"{error_code}: {error_msg}", error_code, provider_name)
         return
 
@@ -1148,16 +1162,23 @@ def _fail_job(
         # No specific message for this code — try the generic suffix
         user_message = get_failure_message(suffix) if suffix != error_code else error_msg
 
-    _transition_job(job_id, "failed", {
-        "last_error_code": error_code,
-        "last_error_message": error_msg[:500],
-        "completed_at": "NOW()",
-    }, meta_patch={
+    fail_meta = {
         "error_code": error_code,
         "error_message": error_msg,
         "failure_reason": user_message,
         "failure_provider": provider_name,
-    })
+    }
+    # Carry through any upstream provider error details the caller enriched
+    if meta.get("provider_error_code"):
+        fail_meta["provider_error_code"] = meta["provider_error_code"]
+    if meta.get("provider_logs"):
+        fail_meta["provider_logs"] = meta["provider_logs"]
+
+    _transition_job(job_id, "failed", {
+        "last_error_code": error_code,
+        "last_error_message": error_msg[:500],
+        "completed_at": "NOW()",
+    }, meta_patch=fail_meta)
 
     # Update in-memory store for frontend
     from backend.services.job_service import load_store, save_store
