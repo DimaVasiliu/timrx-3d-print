@@ -1,4 +1,3 @@
-
 """
 S3 service migrated from app.py.
 
@@ -427,7 +426,7 @@ def upload_image_to_s3(url, job_id, filename_hint=None, provider: str = "openai"
     """
     # Safeguard: normalize provider to known values
     safe_provider = provider.lower() if provider else "unknown"
-    if safe_provider not in ("openai", "google", "meshy", "user"):
+    if safe_provider not in ("openai", "google", "vertex", "seedance", "meshy", "user"):
         print(f"[S3] Warning: unknown provider '{provider}', using 'unknown' folder")
         safe_provider = "unknown"
 
@@ -442,6 +441,92 @@ def upload_image_to_s3(url, job_id, filename_hint=None, provider: str = "openai"
     )
     u, h, k, reused = unpack_upload_result(result)
     return {"url": u, "hash": h, "key": k, "reused": bool(reused)}
+
+
+def upload_video_to_s3(
+    video_bytes: bytes,
+    job_id: str,
+    identity_id: str = "",
+    provider: str = "seedance",
+    content_type: str = "video/mp4",
+) -> dict:
+    """
+    Upload video bytes to S3 with content-hash deduplication.
+
+    S3 key convention: videos/{provider}/{content_hash}{ext}
+    This is idempotent -- re-uploading the same bytes returns the existing URL.
+
+    Args:
+        video_bytes: Raw video bytes
+        job_id: Job identifier (for logging)
+        identity_id: User identity (for logging)
+        provider: "seedance" or "vertex" (determines S3 folder)
+        content_type: MIME type (video/mp4 or video/webm)
+
+    Returns:
+        Dict with url, hash, key, reused
+    """
+    safe_provider = provider.lower() if provider else "unknown"
+    if safe_provider not in ("vertex", "seedance"):
+        safe_provider = "unknown"
+
+    content_hash = compute_sha256(video_bytes)
+    ext = ".webm" if "webm" in content_type else ".mp4"
+    s3_key = f"videos/{safe_provider}/{content_hash}{ext}"
+
+    if s3_key_exists(s3_key):
+        s3_url = build_s3_url(s3_key)
+        return {"url": s3_url, "hash": content_hash, "key": s3_key, "reused": True}
+
+    _s3.put_object(
+        Bucket=config.AWS_BUCKET_MODELS,
+        Key=s3_key,
+        Body=video_bytes,
+        ContentType=content_type,
+    )
+    s3_url = build_s3_url(s3_key)
+    return {"url": s3_url, "hash": content_hash, "key": s3_key, "reused": False}
+
+
+def upload_thumbnail_to_s3(
+    thumb_bytes: bytes,
+    job_id: str,
+    identity_id: str = "",
+    provider: str = "seedance",
+) -> dict:
+    """
+    Upload thumbnail bytes to S3 with content-hash deduplication.
+
+    S3 key convention: thumbnails/{provider}/{content_hash}.jpg
+
+    Args:
+        thumb_bytes: Raw JPEG thumbnail bytes
+        job_id: Job identifier (for logging)
+        identity_id: User identity (for logging)
+        provider: "seedance" or "vertex"
+
+    Returns:
+        Dict with url, hash, key, reused
+    """
+    safe_provider = provider.lower() if provider else "unknown"
+    if safe_provider not in ("vertex", "seedance"):
+        safe_provider = "unknown"
+
+    content_hash = compute_sha256(thumb_bytes)
+    s3_key = f"thumbnails/{safe_provider}/{content_hash}.jpg"
+
+    if s3_key_exists(s3_key):
+        s3_url = build_s3_url(s3_key)
+        return {"url": s3_url, "hash": content_hash, "key": s3_key, "reused": True}
+
+    _s3.put_object(
+        Bucket=config.AWS_BUCKET_MODELS,
+        Key=s3_key,
+        Body=thumb_bytes,
+        ContentType="image/jpeg",
+    )
+    s3_url = build_s3_url(s3_key)
+    return {"url": s3_url, "hash": content_hash, "key": s3_key, "reused": False}
 
 
 def save_finished_job_to_normalized_db(job_id, status_out, meta, job_type, user_id) -> dict:
