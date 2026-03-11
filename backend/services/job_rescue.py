@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.config import AWS_BUCKET_MODELS
+from backend.services.video_errors import ErrorCategory
 
 
 # Statuses eligible for rescue
@@ -219,7 +220,7 @@ def _process_candidate(
         video_url = status_resp.get("video_url")
         if not video_url:
             print(f"[RESCUE] failed job={job_id} reason=done_but_no_video_url")
-            _enrich_error(job_id, "rescue_no_video_url", "Upstream completed but no video URL")
+            _enrich_error(job_id, ErrorCategory.NO_OUTPUT, "Upstream completed but no video URL")
             return {"job_id": job_id, "action": "upstream_failed", "reason": "no_video_url"}
 
         return _rescue_completed_job(job, meta, video_url, reservation_id, identity_id)
@@ -239,7 +240,7 @@ def _process_candidate(
     elif upstream_status == "failed":
         error_msg = status_resp.get("message", "Provider confirmed failure")
         print(f"[RESCUE] failed job={job_id} reason=upstream_confirmed_failed")
-        _enrich_error(job_id, "upstream_confirmed_failed", error_msg)
+        _enrich_error(job_id, ErrorCategory.INTERNAL, error_msg)
         return {"job_id": job_id, "action": "upstream_failed", "reason": error_msg}
 
     elif upstream_status == "error":
@@ -339,7 +340,7 @@ def _mark_failed_finalizing(
                     UPDATE {Tables.JOBS}
                     SET status = 'failed',
                         error_message = %s,
-                        last_error_code = 'finalizing_exhausted',
+                        last_error_code = 'finalization_failed',
                         last_error_message = %s,
                         completed_at = NOW(),
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
@@ -358,7 +359,7 @@ def _mark_failed_finalizing(
     if reservation_id:
         try:
             from backend.services.credits_helper import release_job_credits
-            release_job_credits(reservation_id, "finalizing_exhausted", job_id)
+            release_job_credits(reservation_id, ErrorCategory.FINALIZATION_FAILED, job_id)
         except Exception as e:
             print(f"[RESCUE] Error releasing credits for finalizing-failed job={job_id}: {e}")
 
