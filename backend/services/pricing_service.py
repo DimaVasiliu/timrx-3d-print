@@ -258,7 +258,7 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
     {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "video"},
-    {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "google"},
+    {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "vertex"},
     # Lowercase legacy codes
     {"action_code": "video_generate", "cost_credits": 70, "provider": "video"},
     {"action_code": "video_text_generate", "cost_credits": 70, "provider": "video"},
@@ -286,7 +286,7 @@ SEEDANCE_CREDITS_PER_SEC = {
 }
 SEEDANCE_VALID_DURATIONS = [5, 10, 15]
 
-# Valid durations per resolution (Gemini/Veo constraints)
+# Valid durations per resolution (Vertex/Veo constraints)
 VIDEO_VALID_DURATIONS = {
     "720p": [4, 6, 8],
     "1080p": [8],
@@ -297,7 +297,7 @@ def get_video_action_code(
     task: str,
     duration_seconds: int,
     resolution: str,
-    provider: str = "veo",
+    provider: str = "vertex",
     seedance_tier: str = "fast",
 ) -> str:
     """
@@ -307,7 +307,7 @@ def get_video_action_code(
         task: "text2video" or "image2video"
         duration_seconds: Duration in seconds
         resolution: "720p" or "1080p"
-        provider: "veo" or "seedance"
+        provider: "vertex" or "seedance"
         seedance_tier: "fast" or "preview" (only for seedance)
 
     Returns:
@@ -327,7 +327,7 @@ def get_video_action_code(
 def get_video_credit_cost(
     duration_seconds: int,
     resolution: str,
-    provider: str = "veo",
+    provider: str = "vertex",
     seedance_tier: str = "fast",
 ) -> int:
     """
@@ -336,7 +336,7 @@ def get_video_credit_cost(
     Args:
         duration_seconds: Duration in seconds
         resolution: "720p" or "1080p"
-        provider: "veo" or "seedance"
+        provider: "vertex" or "seedance"
         seedance_tier: "fast" or "preview" (only for seedance)
 
     Returns:
