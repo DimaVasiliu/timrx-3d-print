@@ -779,8 +779,15 @@ def _poll_provider_once(
     # Route by status
     if status == "done":
         video_url = status_resp.get("video_url")
+        video_bytes = status_resp.get("video_bytes")
         if video_url:
             _finalize_success(job_id, identity_id, reservation_id, video_url, meta, provider_name)
+        elif video_bytes:
+            _finalize_success_with_bytes(
+                job_id, identity_id, reservation_id,
+                video_bytes, status_resp.get("content_type", "video/mp4"),
+                meta, provider_name,
+            )
         else:
             error_code = f"{provider_name}_no_result_url"
             _fail_job(job_id, meta, "Completed but no video URL", error_code, provider_name)
@@ -972,6 +979,63 @@ def _finalize_success(
     })
 
     print(f"[JOB] succeeded job={job_id} provider={provider_name}")
+
+
+def _finalize_success_with_bytes(
+    job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    video_bytes: bytes,
+    content_type: str,
+    meta: Dict[str, Any],
+    provider_name: str,
+):
+    """
+    Finalize when the provider returns inline video bytes (e.g. Vertex base64).
+    Uploads to S3 first, then marks job as ready.
+    """
+    print(f"[JOB] finalizing job={job_id} provider={provider_name} video_bytes={len(video_bytes)} bytes")
+
+    if not _try_transition_to_finalizing(job_id):
+        print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal (webhook?)")
+        return
+
+    from backend.services.async_dispatch import _finalize_video_success_with_bytes
+
+    store_meta = {
+        "status": "processing",
+        "provider": provider_name,
+        "upstream_id": meta.get("upstream_id", ""),
+        "operation_name": meta.get("upstream_id", ""),
+        "prompt": meta.get("prompt", ""),
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "duration_seconds": meta.get("duration_seconds"),
+        "aspect_ratio": meta.get("aspect_ratio"),
+        "resolution": meta.get("resolution"),
+        "task_type": meta.get("task_type", ""),
+        "stage": "video",
+        "task": meta.get("task", "text2video"),
+        "internal_job_id": job_id,
+    }
+
+    _finalize_video_success_with_bytes(
+        internal_job_id=job_id,
+        identity_id=identity_id,
+        reservation_id=reservation_id,
+        video_bytes=video_bytes,
+        content_type=content_type,
+        store_meta=store_meta,
+        provider_name=provider_name,
+    )
+
+    _transition_job(job_id, "ready", {
+        "completed_at": "NOW()",
+        "claimed_by": None,
+        "claimed_at": None,
+    })
+
+    print(f"[JOB] succeeded job={job_id} provider={provider_name} (bytes path)")
 
 
 # ── Failure Handling ────────────────────────────────────────
