@@ -392,14 +392,29 @@ def piapi_task_webhook():
     Idempotency: duplicate deliveries are safe — the atomic transition
     ensures only the first delivery triggers state changes.
     """
+    # Entry-point log — proves the request reached the backend
+    content_length = request.content_length or 0
+    has_secret_header = bool(request.headers.get("X-Webhook-Secret"))
+    has_secret_query = bool(request.args.get("secret"))
+    print(
+        f"[WEBHOOK] HIT /api/webhooks/piapi/task method={request.method} "
+        f"content_length={content_length} "
+        f"secret_header={'yes' if has_secret_header else 'no'} "
+        f"secret_query={'yes' if has_secret_query else 'no'} "
+        f"remote={request.remote_addr}"
+    )
+
     # Gate
     if not config.PIAPI_WEBHOOK_ENABLED:
+        print("[WEBHOOK] IGNORED: webhook_disabled in config")
         return jsonify({"error": "webhook_disabled"}), 403
 
     # Auth
     if not _webhook_secret_is_valid():
-        print("[WEBHOOK] rejected: invalid secret")
+        print("[WEBHOOK] REJECTED: invalid secret (header/query mismatch)")
         return jsonify({"error": "unauthorized"}), 401
+
+    print("[WEBHOOK] auth passed")
 
     # Parse
     data, err = _safe_get_json()
@@ -415,7 +430,7 @@ def piapi_task_webhook():
     task_id = task_data.get("task_id") or data.get("task_id")
 
     if not task_id:
-        print(f"[WEBHOOK] ignored: no task_id in payload keys={sorted(data.keys())}")
+        print(f"[WEBHOOK] IGNORED: no task_id in payload keys={sorted(data.keys())}")
         return jsonify({"ok": True, "action": "ignored_no_task_id"}), 200
 
     # Map provider status to internal status
@@ -423,7 +438,7 @@ def piapi_task_webhook():
     internal_status = _STATUS_MAP.get(raw_status, "unknown")
 
     print(
-        f"[WEBHOOK] received task_id={task_id} status={raw_status} "
+        f"[WEBHOOK] received task_id={task_id} raw_status={raw_status} "
         f"internal={internal_status} progress={task_data.get('progress', '?')}"
     )
 
