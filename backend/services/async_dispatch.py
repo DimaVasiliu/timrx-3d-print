@@ -773,10 +773,13 @@ def dispatch_gemini_video_async(
         )
 
         # Route to the requested provider
-        requested_provider = store_meta.get("provider", "veo").lower()
+        requested_provider = store_meta.get("provider", "vertex").lower()
+        # Backward compat: treat legacy names as vertex
+        if requested_provider in ("veo", "google", "aistudio"):
+            requested_provider = "vertex"
 
         if requested_provider == "seedance":
-            # Direct Seedance routing (no Veo fallback)
+            # Direct Seedance routing (no Vertex fallback)
             from backend.services.video_router import resolve_video_provider
             seedance = resolve_video_provider("seedance")
             if not seedance:
@@ -801,7 +804,7 @@ def dispatch_gemini_video_async(
                 resp = seedance.start_text_to_video(prompt=prompt, **route_params)
             provider_used = "seedance"
         else:
-            # Veo routing with provider fallback
+            # Vertex routing with provider fallback
             try:
                 if task == "image2video":
                     prompt = payload.get("motion") or payload.get("prompt", "")
@@ -816,9 +819,9 @@ def dispatch_gemini_video_async(
                         prompt=prompt,
                         **route_params,
                     )
-            except (ProviderUnavailableError, RuntimeError) as veo_err:
-                # Part 5: Provider failover — try Seedance once if Veo fails
-                print(f"[ASYNC] Veo failed for job {internal_job_id}: {veo_err}, attempting Seedance failover")
+            except (ProviderUnavailableError, RuntimeError) as vertex_err:
+                # Provider failover — try Seedance once if Vertex fails
+                print(f"[ASYNC] Vertex failed for job {internal_job_id}: {vertex_err}, attempting Seedance failover")
                 from backend.services.video_router import resolve_video_provider as _resolve
                 _failover = _resolve("seedance")
                 if _failover:
@@ -836,9 +839,9 @@ def dispatch_gemini_video_async(
                         provider_used = "seedance"
                         print(f"[ASYNC] Seedance failover succeeded for job {internal_job_id}")
                     else:
-                        raise veo_err
+                        raise vertex_err
                 else:
-                    raise veo_err
+                    raise vertex_err
 
         # Track which provider actually handled the request
         store_meta["provider"] = provider_used
