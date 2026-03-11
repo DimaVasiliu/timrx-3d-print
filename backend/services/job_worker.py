@@ -384,14 +384,6 @@ def _release_claim(job_id: str):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Read next_poll_at BEFORE releasing, so we can log it
-                cur.execute(
-                    f"SELECT next_poll_at FROM {Tables.JOBS} WHERE id::text = %s",
-                    (job_id,),
-                )
-                npa_row = cur.fetchone()
-                npa_val = npa_row["next_poll_at"] if npa_row else "NOT_FOUND"
-
                 cur.execute(
                     f"""
                     UPDATE {Tables.JOBS}
@@ -404,10 +396,28 @@ def _release_claim(job_id: str):
                     (job_id, WORKER_ID),
                 )
             conn.commit()
-        print(
-            f"[JOB][DEBUG] _release_claim job={job_id} next_poll_at={npa_val} "
-            f"(job should NOT be re-claimed until next_poll_at)"
-        )
+
+        # Post-commit verification: read next_poll_at on a SEPARATE connection
+        # to confirm it survived the release transaction.
+        with get_conn() as conn2:
+            with conn2.cursor() as cur2:
+                cur2.execute(
+                    f"SELECT next_poll_at, NOW() AS db_now, claimed_by, status "
+                    f"FROM {Tables.JOBS} WHERE id::text = %s",
+                    (job_id,),
+                )
+                verify = cur2.fetchone()
+        if verify:
+            npa = verify["next_poll_at"]
+            db_now = verify["db_now"]
+            delta = f"{npa - db_now}" if npa and db_now else "N/A"
+            print(
+                f"[JOB][DEBUG] _release_claim job={job_id} "
+                f"next_poll_at={npa} db_now={db_now} delta={delta} "
+                f"claimed_by={verify['claimed_by']} status={verify['status']}"
+            )
+        else:
+            print(f"[JOB][DEBUG] _release_claim job={job_id} — row not found in verification read")
     except Exception as e:
         print(f"[JOB] Release claim error for {job_id}: {e}")
 
@@ -792,19 +802,25 @@ def _poll_provider_once(
 
     # Monotonic state guard: once processing has started locally, upstream
     # "pending" (from PiAPI "Staged" etc.) must NOT demote back to pending.
+    # Two independent signals trigger the guard:
+    #   1. processing_started_at is set in meta (processing was recorded)
+    #   2. local DB status is already provider_processing
     current_local_status = job.get("status", "")
-    if status == "pending" and processing_started_at:
+    already_processing = bool(processing_started_at) or current_local_status == "provider_processing"
+    if status == "pending" and already_processing:
         print(
-            f"[JOB] prevented backward transition job={job_id} "
-            f"upstream={provider_status} -> pending BLOCKED because "
-            f"processing_started_at is set (local={current_local_status}), "
-            f"treating as processing"
+            f"[JOB] MONOTONIC GUARD: prevented backward transition job={job_id} "
+            f"upstream_raw={provider_status} mapped=pending BLOCKED "
+            f"local_status={current_local_status} "
+            f"processing_started_at={processing_started_at} "
+            f"-> treating as processing"
         )
         status = "processing"
 
     print(
         f"[JOB] poll result job={job_id} upstream={upstream_id} provider={provider_name} "
         f"status={status} provider_status={provider_status} progress={progress} "
+        f"local_status={current_local_status} "
         f"pending={int(pending_elapsed)}s processing={int(processing_elapsed)}s"
     )
 
