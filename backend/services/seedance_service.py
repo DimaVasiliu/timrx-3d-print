@@ -30,7 +30,7 @@ _api_key_present = bool(getattr(config, "PIAPI_API_KEY", ""))
 _webhook_enabled = getattr(config, "PIAPI_WEBHOOK_ENABLED", False)
 _webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
 print(f"[SEEDANCE] api_key configured={_api_key_present}")
-print(f"[SEEDANCE] webhook enabled={_webhook_enabled} endpoint={'set' if _webhook_url else 'EMPTY'}")
+print(f"[SEEDANCE] webhook enabled={_webhook_enabled} url={_webhook_url or 'NONE'}")
 if not _api_key_present:
     print("[SEEDANCE] WARNING: PIAPI_API_KEY is not set — Seedance video generation will fail")
 
@@ -118,20 +118,15 @@ def create_seedance_task(
     webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
     webhook_secret = getattr(config, "PIAPI_WEBHOOK_SECRET", "")
 
-    print(f"[Seedance] Webhook check: enabled={webhook_enabled} "
-          f"url={'set' if webhook_url else 'EMPTY'} "
-          f"secret_present={bool(webhook_secret)} "
-          f"public_base_url={'set' if getattr(config, 'PUBLIC_BASE_URL', '') else 'EMPTY'}")
-
     if webhook_url:
         wh_cfg: Dict[str, str] = {"endpoint": webhook_url}
         if webhook_secret:
             wh_cfg["secret"] = webhook_secret
         body["webhook_config"] = wh_cfg
-        print(f"[Seedance] webhook_config attached: endpoint={webhook_url}")
-    elif webhook_enabled:
-        print(f"[Seedance] WARNING: webhooks enabled but URL is empty "
-              f"(PUBLIC_BASE_URL={getattr(config, 'PUBLIC_BASE_URL', '')!r})")
+        print(f"[Seedance] webhook_config attached: enabled={webhook_enabled} endpoint={webhook_url}")
+    else:
+        print(f"[Seedance] webhook_config NOT attached: enabled={webhook_enabled} "
+              f"url={webhook_url or 'NONE'} public_base_url={getattr(config, 'PUBLIC_BASE_URL', '') or 'NONE'}")
 
     try:
         resp = requests.post(
