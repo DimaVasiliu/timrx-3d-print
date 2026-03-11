@@ -128,6 +128,17 @@ def create_seedance_task(
         print(f"[Seedance] webhook_config NOT attached: enabled={webhook_enabled} "
               f"url={webhook_url or 'NONE'} public_base_url={getattr(config, 'PUBLIC_BASE_URL', '') or 'NONE'}")
 
+    # Log the exact request body (redact API key from headers, keep webhook visible)
+    _prompt_preview = (body.get("input", {}).get("prompt") or "")[:60]
+    _log_body_safe = {
+        "model": body.get("model"),
+        "task_type": body.get("task_type"),
+        "input_keys": sorted(body.get("input", {}).keys()),
+        "prompt_preview": _prompt_preview,
+        "webhook_config": body.get("webhook_config", "NOT_SET"),
+    }
+    print(f"[Seedance] REQUEST body: {_log_body_safe}")
+
     try:
         resp = requests.post(
             f"{PIAPI_BASE}/task",
@@ -137,6 +148,12 @@ def create_seedance_task(
         )
     except requests.RequestException as e:
         raise RuntimeError(f"seedance_network_error: {e}")
+
+    # Log response immediately (safe: no secrets in response)
+    print(
+        f"[Seedance] RESPONSE status={resp.status_code} "
+        f"body={resp.text[:500]}"
+    )
 
     if resp.status_code == 401 or resp.status_code == 403:
         raise SeedanceAuthError(f"PiAPI auth failed: {resp.status_code} {resp.text[:200]}")
@@ -156,7 +173,12 @@ def create_seedance_task(
     if not task_id:
         raise RuntimeError(f"seedance_no_task_id: {data}")
 
-    print(f"[Seedance] Task created: {task_id}")
+    # Log whether provider echoed back our webhook_config
+    provider_webhook = task_data.get("webhook_config")
+    if provider_webhook:
+        print(f"[Seedance] Task created: {task_id} provider_webhook_config={provider_webhook}")
+    else:
+        print(f"[Seedance] Task created: {task_id} (provider did NOT echo webhook_config)")
 
     return {
         "task_id": task_id,
@@ -251,11 +273,15 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
     elif internal_status == "failed":
         error = task_data.get("error", {})
         result["error"] = ErrorCategory.INTERNAL
-        result["message"] = (
-            error.get("message", "")
-            if isinstance(error, dict)
-            else str(error) or "Seedance generation failed"
-        )
+        if isinstance(error, dict):
+            result["message"] = error.get("message", "") or "Seedance generation failed"
+            result["provider_error_code"] = error.get("code")
+        else:
+            result["message"] = str(error) or "Seedance generation failed"
+        # Capture provider logs if present (PiAPI includes these for debugging)
+        provider_logs = task_data.get("logs") or task_data.get("log")
+        if provider_logs:
+            result["provider_logs"] = provider_logs
 
     return result
 
