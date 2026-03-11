@@ -25,6 +25,7 @@ from backend.services.seedance_service import (
     download_seedance_video,
 )
 from backend.services.gemini_video_service import extract_video_thumbnail
+from backend.services.video_errors import is_quota_error as _is_quota_error
 
 
 # ── Seedance constraints ────────────────────────────────────────
@@ -171,7 +172,5 @@ class SeedanceProvider:
         return extract_video_thumbnail(video_bytes, timestamp_sec)
 
 
-def _is_quota_error(msg: str) -> bool:
-    """Detect quota/rate limit errors from error messages."""
-    lower = msg.lower()
-    return any(tok in lower for tok in ("quota", "rate_limit", "429", "too_many"))
+
+# _is_quota_error imported from backend.services.video_errors
