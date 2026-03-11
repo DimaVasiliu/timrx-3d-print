@@ -906,6 +906,40 @@ def _ts(val) -> Optional[float]:
 
 # ── Finalization ────────────────────────────────────────────
 
+def _try_transition_to_finalizing(job_id: str) -> bool:
+    """
+    Atomically transition job to 'finalizing' only if not already terminal.
+
+    Returns True if this worker won the transition, False if the job was
+    already in a terminal or finalizing state (e.g. webhook got there first).
+    """
+    if not USE_DB:
+        return True
+
+    excluded = ", ".join(f"'{s}'" for s in TERMINAL_STATES | {"finalizing"})
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'finalizing',
+                        last_provider_status = 'done',
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                      AND status NOT IN ({excluded})
+                    RETURNING id
+                    """,
+                    (job_id,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return row is not None
+    except Exception as e:
+        print(f"[JOB] _try_transition_to_finalizing error job={job_id}: {e}")
+        return False
+
+
 def _finalize_success(
     job_id: str,
     identity_id: str,
@@ -917,15 +951,16 @@ def _finalize_success(
     """
     Finalize a successful video generation.
 
-    1. Transition to 'finalizing' (prevents double finalization)
+    1. Atomically transition to 'finalizing' (prevents double finalization
+       if webhook already claimed this job)
     2. Delegate to existing finalization logic (S3, credits, history)
     3. Mark as 'ready'
     """
     print(f"[JOB] finalizing job={job_id} provider={provider_name} video_url={video_url[:80]}...")
 
-    _transition_job(job_id, "finalizing", {
-        "last_provider_status": "done",
-    })
+    if not _try_transition_to_finalizing(job_id):
+        print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal (webhook?)")
+        return
 
     from backend.services.async_dispatch import _finalize_video_success
 
