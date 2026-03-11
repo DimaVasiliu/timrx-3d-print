@@ -218,6 +218,15 @@ def _process_candidate(
 
     if upstream_status == "done":
         video_url = status_resp.get("video_url")
+        video_bytes = status_resp.get("video_bytes")
+
+        if video_bytes and not video_url:
+            # Vertex returns inline base64 bytes — upload to S3 to get a URL
+            video_url = _upload_bytes_to_s3(
+                job_id, identity_id, video_bytes,
+                status_resp.get("content_type", "video/mp4"), provider,
+            )
+
         if not video_url:
             print(f"[RESCUE] failed job={job_id} reason=done_but_no_video_url")
             _enrich_error(job_id, ErrorCategory.NO_OUTPUT, "Upstream completed but no video URL")
@@ -538,6 +547,37 @@ def _handle_credits(
     # Unknown state
     print(f"[RESCUE] Reservation {reservation_id} has unknown status={status}")
     return f"unknown_{status}"
+
+
+def _upload_bytes_to_s3(
+    job_id: str,
+    identity_id: str,
+    video_bytes: bytes,
+    content_type: str,
+    provider_name: str,
+) -> Optional[str]:
+    """Upload inline video bytes (e.g. Vertex base64) to S3 and return the URL."""
+    import base64
+    from backend.services.s3_service import safe_upload_to_s3
+
+    ext = ".webm" if "webm" in content_type else ".mp4"
+    try:
+        b64_data = f"data:{content_type};base64,{base64.b64encode(video_bytes).decode('utf-8')}"
+        s3_url = safe_upload_to_s3(
+            b64_data,
+            content_type,
+            "videos",
+            f"{provider_name}_{job_id}",
+            user_id=identity_id,
+            key_base=f"videos/{provider_name}/{identity_id or 'public'}/{job_id}{ext}",
+            provider=provider_name,
+        )
+        if s3_url:
+            print(f"[RESCUE] uploaded inline bytes to S3 job={job_id}")
+        return s3_url
+    except Exception as e:
+        print(f"[RESCUE] failed to upload inline bytes job={job_id}: {e}")
+        return None
 
 
 # ── S3 Upload ───────────────────────────────────────────────
