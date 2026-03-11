@@ -682,6 +682,108 @@ def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, p
     )
 
 
+def _safe_int_duration(raw) -> int:
+    """Parse duration to int, stripping 's'/'sec' suffixes. Falls back to 6."""
+    try:
+        if isinstance(raw, str):
+            return int(raw.replace("s", "").replace("sec", "").strip())
+        return int(raw)
+    except (ValueError, TypeError):
+        return 6
+
+
+def _dispatch_to_seedance(
+    internal_job_id: str,
+    task: str,
+    prompt: str,
+    payload: dict,
+    route_params: dict,
+    store_meta: dict,
+) -> tuple:
+    """Route directly to Seedance (no Vertex fallback)."""
+    from backend.services.video_router import (
+        resolve_video_provider,
+        ProviderUnavailableError,
+    )
+
+    seedance = resolve_video_provider("seedance")
+    if not seedance:
+        raise ProviderUnavailableError("Seedance provider not available")
+    configured, err = seedance.is_configured()
+    if not configured:
+        raise ProviderUnavailableError(f"Seedance not configured: {err}")
+
+    # Pass task_type so provider sends correct model tier
+    seedance_variant = (
+        payload.get("seedance_variant")
+        or store_meta.get("seedance_variant")
+        or "seedance-2-fast-preview"
+    )
+    route_params["task_type"] = seedance_variant
+
+    if task == "image2video":
+        prompt = payload.get("motion") or prompt
+        resp = seedance.start_image_to_video(
+            image_data=payload.get("image_data", ""),
+            prompt=prompt,
+            **route_params,
+        )
+    else:
+        resp = seedance.start_text_to_video(prompt=prompt, **route_params)
+
+    return resp, "seedance"
+
+
+def _dispatch_to_vertex_with_fallback(
+    internal_job_id: str,
+    task: str,
+    prompt: str,
+    payload: dict,
+    route_params: dict,
+    router,
+) -> tuple:
+    """Route to Vertex via the router; fall back to Seedance on failure."""
+    from backend.services.video_router import (
+        resolve_video_provider,
+        ProviderUnavailableError,
+    )
+
+    try:
+        if task == "image2video":
+            prompt = payload.get("motion") or prompt
+            resp, provider_used = router.route_image_to_video(
+                image_data=payload.get("image_data", ""),
+                prompt=prompt,
+                **route_params,
+            )
+        else:
+            resp, provider_used = router.route_text_to_video(
+                prompt=prompt,
+                **route_params,
+            )
+        return resp, provider_used
+
+    except (ProviderUnavailableError, RuntimeError) as vertex_err:
+        print(f"[ASYNC] Vertex failed for job {internal_job_id}: {vertex_err}, attempting Seedance failover")
+        failover = resolve_video_provider("seedance")
+        if failover:
+            configured, _ = failover.is_configured()
+            if configured:
+                route_params["task_type"] = "seedance-2-fast-preview"
+                if task == "image2video":
+                    fp = payload.get("motion") or payload.get("prompt", "")
+                    resp = failover.start_image_to_video(
+                        image_data=payload.get("image_data", ""), prompt=fp, **route_params,
+                    )
+                else:
+                    resp = failover.start_text_to_video(
+                        prompt=payload.get("prompt", ""), **route_params,
+                    )
+                print(f"[ASYNC] Seedance failover succeeded for job {internal_job_id}")
+                return resp, "seedance"
+        raise vertex_err
+
+
 def dispatch_gemini_video_async(
     internal_job_id: str,
     identity_id: str,
@@ -692,22 +794,14 @@ def dispatch_gemini_video_async(
     """
     Dispatch video generation asynchronously via the provider router.
 
-    Uses VideoRouter for automatic provider fallback.  On quota
-    exhaustion, the job is enqueued in VideoJobQueue for later retry
-    instead of failing immediately.
-
-    Payload parameters:
-    - task: "text2video" or "image2video"
-    - prompt: Text prompt for video generation
-    - image_data: Base64 image for image2video
-    - aspect_ratio: "16:9" or "9:16"
-    - resolution: "720p", "1080p", or "4k"
-    - duration_seconds: 4, 6, or 8 (integer, NOT string!)
-    - negative_prompt: Optional things to avoid
-    - seed: Optional random seed
+    Expects already-normalized parameters from video.py endpoints.
+    Routes to Seedance or Vertex based on store_meta["provider"].
+    On quota exhaustion, enqueues for later retry.
     """
     from backend.services.video_router import (
         video_router,
+        normalize_provider_name,
+        resolve_video_provider,
         QuotaExhaustedError,
         ProviderUnavailableError,
     )
@@ -718,16 +812,14 @@ def dispatch_gemini_video_async(
         record_video_request,
     )
 
-    # Global worker limit: wait for a slot (Part 3)
+    # Global worker limit: wait for a slot
     if not acquire_video_worker():
         print(f"[ASYNC] Worker limit reached for job {internal_job_id}, queuing")
-        # Retry after a short delay — up to 5 attempts, 10s apart
         for _wait_attempt in range(5):
             time.sleep(10)
             if acquire_video_worker():
                 break
         else:
-            # Still no slot — release credits and fail gracefully
             release_job_credits(reservation_id, "worker_limit_exceeded", internal_job_id)
             ExpenseGuard.unregister_active_job(internal_job_id)
             store = load_store()
@@ -741,29 +833,17 @@ def dispatch_gemini_video_async(
     start_time = time.time()
     task = payload.get("task", "text2video")
 
-    # Record for abuse detection (Part 7)
+    # Record for abuse detection
     record_video_request(identity_id, payload.get("prompt", ""))
 
     try:
-        # Extract parameters (use new names, fallback to old for compatibility)
+        # Extract parameters (already normalized by video.py, but ensure int duration)
         aspect_ratio = payload.get("aspect_ratio", "16:9")
         resolution = payload.get("resolution", "720p")
-        duration_seconds = payload.get("duration_seconds") or payload.get("duration_sec", 6)
+        duration_seconds = _safe_int_duration(payload.get("duration_seconds") or payload.get("duration_sec", 6))
         negative_prompt = payload.get("negative_prompt", "")
         seed = payload.get("seed")
 
-        # CRITICAL: Ensure duration_seconds is an integer (Gemini API requires number, not string!)
-        try:
-            if isinstance(duration_seconds, str):
-                duration_seconds = int(duration_seconds.replace("s", "").replace("sec", "").strip())
-            else:
-                duration_seconds = int(duration_seconds)
-        except (ValueError, TypeError):
-            duration_seconds = 6  # Safe default
-
-        # print(f"[ASYNC] Video params: aspect_ratio={aspect_ratio}, resolution={resolution}, duration_seconds={duration_seconds}")
-
-        # Build common params for the router
         route_params = dict(
             aspect_ratio=aspect_ratio,
             resolution=resolution,
@@ -772,104 +852,37 @@ def dispatch_gemini_video_async(
             seed=seed,
         )
 
-        # Route to the requested provider
-        requested_provider = store_meta.get("provider", "vertex").lower()
-        # Backward compat: treat legacy names as vertex
-        if requested_provider in ("veo", "google", "aistudio"):
-            requested_provider = "vertex"
+        # Resolve provider (normalized by caller, but safe to re-normalize)
+        requested_provider = normalize_provider_name(store_meta.get("provider"))
+        prompt = payload.get("prompt", "")
 
         if requested_provider == "seedance":
-            # Direct Seedance routing (no Vertex fallback)
-            from backend.services.video_router import resolve_video_provider
-            seedance = resolve_video_provider("seedance")
-            if not seedance:
-                raise ProviderUnavailableError("Seedance provider not available")
-            configured, err = seedance.is_configured()
-            if not configured:
-                raise ProviderUnavailableError(f"Seedance not configured: {err}")
-
-            # Pass task_type (seedance_variant) so provider sends correct model tier
-            seedance_variant = payload.get("seedance_variant") or store_meta.get("seedance_variant") or "seedance-2-fast-preview"
-            route_params["task_type"] = seedance_variant
-
-            prompt = payload.get("prompt", "")
-            if task == "image2video":
-                prompt = payload.get("motion") or prompt
-                resp = seedance.start_image_to_video(
-                    image_data=payload.get("image_data", ""),
-                    prompt=prompt,
-                    **route_params,
-                )
-            else:
-                resp = seedance.start_text_to_video(prompt=prompt, **route_params)
-            provider_used = "seedance"
+            resp, provider_used = _dispatch_to_seedance(
+                internal_job_id, task, prompt, payload, route_params, store_meta,
+            )
         else:
-            # Vertex routing with provider fallback
-            try:
-                if task == "image2video":
-                    prompt = payload.get("motion") or payload.get("prompt", "")
-                    resp, provider_used = video_router.route_image_to_video(
-                        image_data=payload.get("image_data", ""),
-                        prompt=prompt,
-                        **route_params,
-                    )
-                else:  # text2video
-                    prompt = payload.get("prompt", "")
-                    resp, provider_used = video_router.route_text_to_video(
-                        prompt=prompt,
-                        **route_params,
-                    )
-            except (ProviderUnavailableError, RuntimeError) as vertex_err:
-                # Provider failover — try Seedance once if Vertex fails
-                print(f"[ASYNC] Vertex failed for job {internal_job_id}: {vertex_err}, attempting Seedance failover")
-                from backend.services.video_router import resolve_video_provider as _resolve
-                _failover = _resolve("seedance")
-                if _failover:
-                    _configured, _ = _failover.is_configured()
-                    if _configured:
-                        route_params["task_type"] = "seedance-2-fast-preview"
-                        prompt = payload.get("prompt", "")
-                        if task == "image2video":
-                            prompt = payload.get("motion") or prompt
-                            resp = _failover.start_image_to_video(
-                                image_data=payload.get("image_data", ""), prompt=prompt, **route_params,
-                            )
-                        else:
-                            resp = _failover.start_text_to_video(prompt=prompt, **route_params)
-                        provider_used = "seedance"
-                        print(f"[ASYNC] Seedance failover succeeded for job {internal_job_id}")
-                    else:
-                        raise vertex_err
-                else:
-                    raise vertex_err
+            resp, provider_used = _dispatch_to_vertex_with_fallback(
+                internal_job_id, task, prompt, payload, route_params, video_router,
+            )
 
         # Track which provider actually handled the request
         store_meta["provider"] = provider_used
 
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        # Providers return different upstream identifiers:
-        #   Veo/Gemini  → {"operation_name": "..."}
-        #   Seedance    → {"task_id": "..."}
+        # Upstream identifier: Vertex → operation_name, Seedance → task_id
         upstream_id = resp.get("operation_name") or resp.get("task_id")
 
         if upstream_id:
-            # Long-running operation — hand off to durable worker for polling.
-            # Update job with upstream ID and set status so the DB worker claims it.
             update_job_with_upstream_id(internal_job_id, upstream_id)
 
-            # Store upstream id for frontend status polling
             store = load_store()
-            store_meta["operation_name"] = upstream_id  # kept for backward compat
+            store_meta["operation_name"] = upstream_id  # backward compat
             store_meta["upstream_id"] = upstream_id
             store_meta["status"] = "processing"
             store[internal_job_id] = store_meta
             save_store(store)
 
-            # Transition to dispatched — the durable worker picks this up
             _mark_job_for_worker(internal_job_id, upstream_id, provider_used, store_meta)
         else:
-            # Immediate result (unexpected for video)
             video_url = resp.get("video_url")
             if video_url:
                 _finalize_video_success(
@@ -878,10 +891,8 @@ def dispatch_gemini_video_async(
             else:
                 raise RuntimeError("video_failed: No upstream task id or video_url in response")
 
-    except QuotaExhaustedError as e:
-        # All providers quota-exhausted — enqueue for later retry
-        duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] Quota exhausted for job {internal_job_id} after {duration_ms}ms, enqueueing for retry")
+    except QuotaExhaustedError:
+        print(f"[ASYNC] Quota exhausted for job {internal_job_id}, enqueueing for retry")
         video_queue.enqueue({
             "internal_job_id": internal_job_id,
             "identity_id": identity_id,
@@ -891,7 +902,6 @@ def dispatch_gemini_video_async(
         })
 
     except ProviderUnavailableError as e:
-        duration_ms = int((time.time() - start_time) * 1000)
         print(f"[ASYNC] ERROR: No video providers available for job {internal_job_id}: {e}")
         if reservation_id:
             release_job_credits(reservation_id, "no_provider_available", internal_job_id)
