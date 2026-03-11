@@ -3,6 +3,12 @@ Vertex AI Veo Video Provider.
 
 Wraps the vertex_video_service to provide a consistent interface
 for the VideoRouter.
+
+Supported options:
+- durations:    4, 6, 8 seconds
+- aspect ratios: 16:9, 9:16  (NO 1:1 for video)
+- resolutions:  720p, 1080p, 4k
+- CONSTRAINT:   1080p / 4k require duration = 8
 """
 
 from __future__ import annotations
@@ -23,12 +29,72 @@ from backend.services.vertex_video_service import (
 from backend.services.gemini_video_service import extract_video_thumbnail
 
 
+# ── Vertex constraints ──────────────────────────────────────────
+SUPPORTED_DURATIONS = frozenset({4, 6, 8})
+SUPPORTED_ASPECTS = frozenset({"16:9", "9:16"})
+SUPPORTED_RESOLUTIONS = frozenset({"720p", "1080p", "4k"})
+HIGH_RES_REQUIRES_8S = frozenset({"1080p", "4k"})
+
+DEFAULT_DURATION = 6
+DEFAULT_ASPECT = "16:9"
+DEFAULT_RESOLUTION = "720p"
+
+# Duration mapping: snap UI values to nearest valid Vertex duration.
+_DURATION_SNAP = {
+    4: 4, 5: 4, 6: 6, 7: 6, 8: 8, 10: 8,
+}
+
+
+def normalize_vertex_params(
+    duration_seconds: int | str = DEFAULT_DURATION,
+    aspect_ratio: str = DEFAULT_ASPECT,
+    resolution: str = DEFAULT_RESOLUTION,
+) -> Dict[str, Any]:
+    """
+    Normalize and validate Vertex-specific parameters.
+
+    Returns a clean dict with:
+      duration_seconds (int), aspect_ratio (str), resolution (str)
+
+    Falls back to safe defaults for invalid values.
+    Enforces the 1080p/4k → duration=8 constraint.
+    """
+    # Duration
+    try:
+        dur = int(str(duration_seconds).replace("s", "").replace("sec", "").strip())
+    except (ValueError, TypeError):
+        dur = DEFAULT_DURATION
+    dur = _DURATION_SNAP.get(dur, DEFAULT_DURATION)
+
+    # Resolution
+    res = (resolution or DEFAULT_RESOLUTION).strip().lower()
+    if res == "4K":
+        res = "4k"
+    if res not in SUPPORTED_RESOLUTIONS:
+        res = DEFAULT_RESOLUTION
+
+    # Enforce: high-res requires 8s
+    if res in HIGH_RES_REQUIRES_8S and dur != 8:
+        dur = 8
+
+    # Aspect ratio
+    ar = (aspect_ratio or DEFAULT_ASPECT).strip()
+    if ar not in SUPPORTED_ASPECTS:
+        ar = DEFAULT_ASPECT
+
+    return {
+        "duration_seconds": dur,
+        "aspect_ratio": ar,
+        "resolution": res,
+    }
+
+
 class VertexVeoProvider:
     """
-    Vertex AI Veo video generation provider.
+    Vertex AI Veo 3.1 video generation provider.
 
     Uses service account authentication and Vertex AI REST API.
-    Intended as the production provider with AI Studio as fallback.
+    Production-grade provider with quota-based fallback to Seedance.
     """
 
     name = "vertex"
@@ -39,17 +105,21 @@ class VertexVeoProvider:
 
     def start_text_to_video(self, prompt: str, **params) -> Dict[str, Any]:
         """Start text-to-video generation."""
+        clean = normalize_vertex_params(
+            duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
+            aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
+            resolution=params.get("resolution", DEFAULT_RESOLUTION),
+        )
         try:
             return vertex_text_to_video(
                 prompt=prompt,
-                aspect_ratio=params.get("aspect_ratio", "16:9"),
-                resolution=params.get("resolution", "720p"),
-                duration_seconds=params.get("duration_seconds", 6),
+                aspect_ratio=clean["aspect_ratio"],
+                resolution=clean["resolution"],
+                duration_seconds=clean["duration_seconds"],
                 negative_prompt=params.get("negative_prompt"),
                 seed=params.get("seed"),
             )
         except VertexQuotaError as e:
-            # Re-raise as QuotaExhaustedError for router to handle
             from backend.services.video_router import QuotaExhaustedError
             raise QuotaExhaustedError(self.name, str(e))
         except RuntimeError as e:
@@ -60,13 +130,18 @@ class VertexVeoProvider:
 
     def start_image_to_video(self, image_data: str, prompt: str, **params) -> Dict[str, Any]:
         """Start image-to-video generation."""
+        clean = normalize_vertex_params(
+            duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
+            aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
+            resolution=params.get("resolution", DEFAULT_RESOLUTION),
+        )
         try:
             return vertex_image_to_video(
                 image_data=image_data,
                 motion_prompt=prompt,
-                aspect_ratio=params.get("aspect_ratio", "16:9"),
-                resolution=params.get("resolution", "720p"),
-                duration_seconds=params.get("duration_seconds", 6),
+                aspect_ratio=clean["aspect_ratio"],
+                resolution=clean["resolution"],
+                duration_seconds=clean["duration_seconds"],
                 negative_prompt=params.get("negative_prompt"),
                 seed=params.get("seed"),
             )
