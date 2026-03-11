@@ -105,13 +105,24 @@ def create_seedance_task(
         body["input"]["image_urls"] = image_urls
 
     # Attach webhook config when enabled so PiAPI sends task completion callbacks.
+    webhook_enabled = getattr(config, "PIAPI_WEBHOOK_ENABLED", False)
     webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
+    webhook_secret = getattr(config, "PIAPI_WEBHOOK_SECRET", "")
+
+    print(f"[Seedance] Webhook check: enabled={webhook_enabled} "
+          f"url={'set' if webhook_url else 'EMPTY'} "
+          f"secret_present={bool(webhook_secret)} "
+          f"public_base_url={'set' if getattr(config, 'PUBLIC_BASE_URL', '') else 'EMPTY'}")
+
     if webhook_url:
         wh_cfg: Dict[str, str] = {"endpoint": webhook_url}
-        webhook_secret = getattr(config, "PIAPI_WEBHOOK_SECRET", "")
         if webhook_secret:
             wh_cfg["secret"] = webhook_secret
         body["webhook_config"] = wh_cfg
+        print(f"[Seedance] webhook_config attached: endpoint={webhook_url}")
+    elif webhook_enabled:
+        print(f"[Seedance] WARNING: webhooks enabled but URL is empty "
+              f"(PUBLIC_BASE_URL={getattr(config, 'PUBLIC_BASE_URL', '')!r})")
 
     try:
         resp = requests.post(
