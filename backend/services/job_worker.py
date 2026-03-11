@@ -76,7 +76,7 @@ BACKOFF_STEPS = [30, 60, 120, 300]  # seconds
 # ── Provider Configuration ───────────────────────────────────
 # Only these provider/stage combinations are handled by the durable worker.
 # Everything else (meshy 3D, image gen, etc.) uses legacy dispatch paths.
-_SUPPORTED_PROVIDERS = {"seedance", "vertex", "google", "veo"}
+_SUPPORTED_PROVIDERS = {"seedance", "vertex"}
 _SUPPORTED_STAGES = {"video"}
 
 # Per-provider timeout config: (pend_soft, pend_hard, proc_soft, proc_hard)
@@ -86,10 +86,8 @@ _PROVIDER_TIMEOUTS = {
     "seedance:seedance-2-fast-preview": (5 * 60, 15 * 60, 10 * 60, 20 * 60),
     "seedance:seedance-2-preview":      (15 * 60, 30 * 60, 15 * 60, 30 * 60),
     "seedance":                         (5 * 60, 15 * 60, 10 * 60, 20 * 60),
-    # Vertex / Google Veo — faster models, tighter timeouts
+    # Vertex (Veo) — faster models, tighter timeouts
     "vertex":                           (2 * 60, 6 * 60, 4 * 60, 10 * 60),
-    "google":                           (2 * 60, 6 * 60, 4 * 60, 10 * 60),
-    "veo":                              (2 * 60, 6 * 60, 4 * 60, 10 * 60),
 }
 _DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
 
@@ -458,6 +456,9 @@ def _process_job(job: Dict[str, Any]):
     job_id = str(job["id"])
     meta = _parse_meta(job.get("meta"))
     provider_name = job.get("provider") or meta.get("provider", "")
+    # Normalize legacy provider names to canonical
+    if provider_name in ("veo", "google", "aistudio"):
+        provider_name = "vertex"
     stage = job.get("stage") or meta.get("stage", "")
     upstream_id = job.get("upstream_job_id") or meta.get("upstream_id", "")
 
