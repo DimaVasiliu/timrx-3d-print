@@ -53,11 +53,11 @@ class CanonicalActions:
     REFINE = "refine"
     REMESH = "remesh"
     RETEXTURE = "retexture"
-    # Video generation (separate credits)
+    # Video generation (uses general credits under unified model)
     VIDEO_GENERATE = "video_generate"
     VIDEO_TEXT_GENERATE = "video_text_generate"
     VIDEO_IMAGE_ANIMATE = "video_image_animate"
-    GEMINI_VIDEO = "gemini_video"
+    GEMINI_VIDEO = "gemini_video"  # Legacy alias for Vertex video — retained for DB compat
 
 
 # Canonical key -> DB action code mapping
@@ -227,19 +227,19 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "OPENAI_IMAGE", "cost_credits": 5, "provider": "openai"},       # Standard
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 7, "provider": "openai"},    # 2K
     {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 10, "provider": "openai"},   # 4K
-    # Video Generation - Variant costs by duration/resolution (lowercase canonical)
+    # Video Generation - Vertex (Veo) variant costs by duration/resolution
     # Text-to-Video variants
-    {"action_code": "video_text_generate_4s_720p", "cost_credits": 70, "provider": "video"},
-    {"action_code": "video_text_generate_6s_720p", "cost_credits": 90, "provider": "video"},
-    {"action_code": "video_text_generate_8s_720p", "cost_credits": 110, "provider": "video"},
-    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 130, "provider": "video"},
-    {"action_code": "video_text_generate_8s_4k", "cost_credits": 160, "provider": "video"},
+    {"action_code": "video_text_generate_4s_720p", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "video_text_generate_6s_720p", "cost_credits": 90, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_720p", "cost_credits": 110, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 130, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_4k", "cost_credits": 160, "provider": "vertex"},
     # Image-to-Video (animate) variants
-    {"action_code": "video_image_animate_4s_720p", "cost_credits": 70, "provider": "video"},
-    {"action_code": "video_image_animate_6s_720p", "cost_credits": 90, "provider": "video"},
-    {"action_code": "video_image_animate_8s_720p", "cost_credits": 110, "provider": "video"},
-    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 130, "provider": "video"},
-    {"action_code": "video_image_animate_8s_4k", "cost_credits": 160, "provider": "video"},
+    {"action_code": "video_image_animate_4s_720p", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "video_image_animate_6s_720p", "cost_credits": 90, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_720p", "cost_credits": 110, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 130, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_4k", "cost_credits": 160, "provider": "vertex"},
     # ── Seedance 2.0 — Text-to-Video (Fast: 14 cps, Preview: 24 cps) ──
     {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 70, "provider": "seedance"},
     {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 140, "provider": "seedance"},
@@ -254,15 +254,15 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 120, "provider": "seedance"},
     {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 240, "provider": "seedance"},
     {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 360, "provider": "seedance"},
-    # Legacy fallback codes (for backwards compatibility)
-    {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "video"},
-    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "video"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "video"},
+    # Legacy fallback codes (backward compat — provider label kept generic)
+    {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "vertex"},
     {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "vertex"},
     # Lowercase legacy codes
-    {"action_code": "video_generate", "cost_credits": 70, "provider": "video"},
-    {"action_code": "video_text_generate", "cost_credits": 70, "provider": "video"},
-    {"action_code": "video_image_animate", "cost_credits": 70, "provider": "video"},
+    {"action_code": "video_generate", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "video_text_generate", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "video_image_animate", "cost_credits": 70, "provider": "vertex"},
 ]
 
 
