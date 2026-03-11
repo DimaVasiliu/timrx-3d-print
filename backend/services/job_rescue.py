@@ -1,9 +1,12 @@
 """
-Job Rescue Service — Late Success Recovery for Seedance Jobs.
+Job Rescue Service — Late Success Recovery for Video Jobs.
 
-Rescues jobs that were marked failed/provider_stalled locally but later
-completed successfully at PiAPI. This happens when PiAPI queue times out
+Rescues jobs that were marked failed/stalled locally but later
+completed successfully upstream. This happens when provider queue times out
 locally but the provider eventually processes the job.
+
+Also handles finalizing-stuck recovery: jobs where upstream succeeded but
+finalization (S3 upload, credit capture) crashed or timed out.
 
 Credit safety:
   - If the reservation is still 'held', finalize it normally (charge credits).
@@ -26,13 +29,19 @@ from backend.db import USE_DB, get_conn, Tables
 from backend.config import AWS_BUCKET_MODELS
 
 
+# Statuses eligible for rescue
+_RESCUE_STATUSES = ("failed", "provider_stalled", "stalled")
+
+# Providers supported for rescue (upstream status check)
+_RESCUE_PROVIDERS = ("seedance", "vertex")
+
 def rescue_late_completed_jobs(
     hours: int = 72,
     dry_run: bool = False,
     max_jobs: int = 50,
 ) -> Dict[str, Any]:
     """
-    Find locally-failed Seedance jobs that completed upstream, and rescue them.
+    Find locally-failed/stalled video jobs that completed upstream, and rescue them.
 
     Args:
         hours: Look back window in hours (default 72h).
@@ -54,6 +63,8 @@ def rescue_late_completed_jobs(
         "upstream_not_found": 0,
         "errors": 0,
         "requeued": 0,
+        "finalizing_retried": 0,
+        "finalizing_exhausted": 0,
         "details": [],
     }
 
@@ -62,7 +73,6 @@ def rescue_late_completed_jobs(
     results["candidates"] = len(candidates)
 
     if not candidates:
-        print(f"[RESCUE] No candidates found in the last {hours}h")
         return results
 
     print(f"[RESCUE] Found {len(candidates)} candidate jobs")
@@ -72,8 +82,10 @@ def rescue_late_completed_jobs(
             job_id = str(job["id"])
             upstream = job.get("upstream_job_id", "?")
             status = job["status"]
+            provider = job.get("provider", "?")
             error = job.get("last_error_code") or job.get("error_message", "")[:60]
-            print(f"[RESCUE] [DRY RUN] candidate job={job_id} upstream={upstream} local_status={status} error={error}")
+            print(f"[RESCUE] [DRY RUN] candidate job={job_id} upstream={upstream} "
+                  f"provider={provider} local_status={status} error={error}")
             results["details"].append({
                 "job_id": job_id,
                 "upstream_job_id": upstream,
@@ -86,10 +98,11 @@ def rescue_late_completed_jobs(
     for job in candidates:
         job_id = str(job["id"])
         upstream_id = job.get("upstream_job_id")
-        local_status = job["status"]
+        provider = job.get("provider", "seedance")
         meta = _parse_meta(job.get("meta"))
 
-        print(f"[RESCUE] candidate job={job_id} upstream={upstream_id} local_status={local_status}")
+        print(f"[RESCUE] candidate job={job_id} upstream={upstream_id} "
+              f"provider={provider} local_status={job['status']}")
 
         if not upstream_id:
             print(f"[RESCUE] skipped job={job_id} reason=no_upstream_id")
@@ -99,7 +112,7 @@ def rescue_late_completed_jobs(
             continue
 
         try:
-            result = _process_candidate(job, meta)
+            result = _process_candidate(job, meta, provider)
             action = result.get("action", "error")
 
             if action == "rescued":
@@ -114,6 +127,10 @@ def rescue_late_completed_jobs(
                 results["upstream_failed"] += 1
             elif action == "upstream_not_found":
                 results["upstream_not_found"] += 1
+            elif action == "finalizing_retried":
+                results["finalizing_retried"] += 1
+            elif action == "finalizing_exhausted":
+                results["finalizing_exhausted"] += 1
             else:
                 results["errors"] += 1
 
@@ -133,7 +150,10 @@ def rescue_late_completed_jobs(
 # ── Candidate Query ─────────────────────────────────────────
 
 def _find_candidates(hours: int, limit: int) -> List[Dict[str, Any]]:
-    """Find locally-failed Seedance jobs with an upstream_job_id."""
+    """Find locally-failed/stalled video jobs with an upstream_job_id."""
+    provider_list = ", ".join(f"'{p}'" for p in _RESCUE_PROVIDERS)
+    status_list = ", ".join(f"'{s}'" for s in _RESCUE_STATUSES)
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -146,8 +166,8 @@ def _find_candidates(hours: int, limit: int) -> List[Dict[str, Any]]:
                            j.result_url, j.cost_credits,
                            j.created_at, j.updated_at
                     FROM {Tables.JOBS} j
-                    WHERE j.provider = 'seedance'
-                      AND j.status IN ('failed', 'provider_stalled')
+                    WHERE j.provider IN ({provider_list})
+                      AND j.status IN ({status_list})
                       AND j.upstream_job_id IS NOT NULL
                       AND j.created_at > NOW() - %s * INTERVAL '1 hour'
                       AND j.result_url IS NULL
@@ -164,7 +184,11 @@ def _find_candidates(hours: int, limit: int) -> List[Dict[str, Any]]:
 
 # ── Per-Job Processing ──────────────────────────────────────
 
-def _process_candidate(job: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, Any]:
+def _process_candidate(
+    job: Dict[str, Any],
+    meta: Dict[str, Any],
+    provider: str,
+) -> Dict[str, Any]:
     """
     Check upstream status and take action.
 
@@ -180,12 +204,16 @@ def _process_candidate(job: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, A
         print(f"[RESCUE] skipped job={job_id} reason=already_succeeded")
         return {"job_id": job_id, "action": "already_rescued"}
 
+    # For stalled jobs that came from finalizing, check retry count
+    sweep_reason = meta.get("sweep_reason", "")
+    if sweep_reason == "finalizing_stuck":
+        return _handle_finalizing_retry(job, meta, provider, upstream_id, identity_id, reservation_id)
+
     # Poll upstream
-    from backend.services.seedance_service import check_seedance_status
-    status_resp = check_seedance_status(upstream_id)
+    status_resp = _check_upstream(upstream_id, provider)
     upstream_status = status_resp.get("status", "unknown")
 
-    print(f"[RESCUE] job={job_id} upstream_status={upstream_status}")
+    print(f"[RESCUE] job={job_id} provider={provider} upstream_status={upstream_status}")
 
     if upstream_status == "done":
         video_url = status_resp.get("video_url")
@@ -221,6 +249,154 @@ def _process_candidate(job: Dict[str, Any], meta: Dict[str, Any]) -> Dict[str, A
     else:
         print(f"[RESCUE] skipped job={job_id} reason=unknown_status_{upstream_status}")
         return {"job_id": job_id, "action": "upstream_not_found", "reason": f"unknown_status: {upstream_status}"}
+
+
+# ── Finalizing Retry ───────────────────────────────────────
+
+def _handle_finalizing_retry(
+    job: Dict[str, Any],
+    meta: Dict[str, Any],
+    provider: str,
+    upstream_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Handle a job that was stuck in 'finalizing' and swept to 'stalled'.
+
+    The upstream likely already succeeded — re-check and retry finalization.
+    Tracks retry count to avoid infinite loops.
+    """
+    from backend.config import config as _cfg
+
+    job_id = str(job["id"])
+    retry_count = meta.get("finalizing_retry_count", 0)
+    max_retries = _cfg.RESCUE_FINALIZING_MAX_RETRIES
+
+    if retry_count >= max_retries:
+        print(f"[RESCUE] job={job_id} finalizing retries exhausted ({retry_count}/{max_retries})")
+        _mark_failed_finalizing(job_id, reservation_id,
+                                f"Finalization failed after {retry_count} retries")
+        return {"job_id": job_id, "action": "finalizing_exhausted", "retries": retry_count}
+
+    # Re-check upstream
+    status_resp = _check_upstream(upstream_id, provider)
+    upstream_status = status_resp.get("status", "unknown")
+
+    print(f"[RESCUE] finalizing retry job={job_id} provider={provider} "
+          f"upstream={upstream_status} retry={retry_count + 1}/{max_retries}")
+
+    if upstream_status == "done":
+        video_url = status_resp.get("video_url")
+        if not video_url:
+            _mark_failed_finalizing(job_id, reservation_id,
+                                    "Upstream done but no video URL on retry")
+            return {"job_id": job_id, "action": "finalizing_exhausted", "reason": "no_video_url"}
+
+        # Increment retry count before attempting
+        _increment_finalizing_retry(job_id, retry_count)
+
+        # Attempt rescue (reuses standard rescue path with idempotent guards)
+        result = _rescue_completed_job(job, meta, video_url, reservation_id, identity_id)
+
+        if result.get("action") == "rescued":
+            return {"job_id": job_id, "action": "finalizing_retried",
+                    "retry": retry_count + 1, "video_url": result.get("video_url")}
+        return result
+
+    elif upstream_status == "failed":
+        _mark_failed_finalizing(job_id, reservation_id,
+                                "Upstream confirmed failed on finalizing retry")
+        return {"job_id": job_id, "action": "upstream_failed", "reason": "failed_on_retry"}
+
+    elif upstream_status in ("processing", "pending"):
+        # Still running — requeue for worker (unusual for a previously-finalizing job)
+        _requeue_for_worker(job_id)
+        return {"job_id": job_id, "action": "requeued", "reason": "still_running_on_retry"}
+
+    else:
+        # Network error or unknown — leave for next cycle
+        print(f"[RESCUE] finalizing retry skipped job={job_id} upstream={upstream_status}")
+        return {"job_id": job_id, "action": "error", "reason": f"retry_upstream_{upstream_status}"}
+
+
+def _mark_failed_finalizing(
+    job_id: str,
+    reservation_id: Optional[str],
+    reason: str,
+):
+    """Mark a finalizing-stuck job as permanently failed and release credits."""
+    try:
+        meta_patch = {
+            "finalizing_failed": True,
+            "finalizing_failed_at": time.time(),
+            "finalizing_fail_reason": reason,
+        }
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'failed',
+                        error_message = %s,
+                        last_error_code = 'finalizing_exhausted',
+                        last_error_message = %s,
+                        completed_at = NOW(),
+                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled')
+                    """,
+                    (reason[:500], reason[:500],
+                     json.dumps(meta_patch, default=str), job_id),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[RESCUE] Error marking finalizing-failed job={job_id}: {e}")
+
+    # Release credits
+    if reservation_id:
+        try:
+            from backend.services.credits_helper import release_job_credits
+            release_job_credits(reservation_id, "finalizing_exhausted", job_id)
+        except Exception as e:
+            print(f"[RESCUE] Error releasing credits for finalizing-failed job={job_id}: {e}")
+
+
+def _increment_finalizing_retry(job_id: str, current_count: int):
+    """Increment the finalizing retry counter in job meta."""
+    try:
+        meta_patch = {"finalizing_retry_count": current_count + 1,
+                      "finalizing_last_retry_at": time.time()}
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                    """,
+                    (json.dumps(meta_patch, default=str), job_id),
+                )
+            conn.commit()
+    except Exception:
+        pass  # Non-critical
+
+
+# ── Upstream Status Check ──────────────────────────────────
+
+def _check_upstream(upstream_id: str, provider: str) -> Dict[str, Any]:
+    """Check upstream status for a given provider."""
+    if provider == "seedance":
+        from backend.services.seedance_service import check_seedance_status
+        return check_seedance_status(upstream_id)
+    elif provider == "vertex":
+        from backend.services.video_providers.vertex_provider import VertexVeoProvider
+        vp = VertexVeoProvider()
+        return vp.check_status(upstream_id)
+    else:
+        return {"status": "error", "message": f"Unsupported provider: {provider}"}
 
 
 # ── Rescue a Completed Job ──────────────────────────────────
@@ -273,11 +449,11 @@ def _rescue_completed_job(
     _save_to_history(job_id, identity_id, final_video_url, s3_video_url,
                      s3_thumbnail_url, prompt, meta, provider_name)
 
-    # Step 4: Update job row
+    # Step 4: Update job row (guarded — won't overwrite terminal states)
     rescued_status = "ready"  # frontend-compatible terminal success state
     _update_rescued_job(
         job_id, rescued_status, final_video_url, s3_thumbnail_url,
-        credit_action, meta,
+        credit_action,
     )
 
     print(f"[RESCUE] completed job={job_id} uploaded=true history_saved=true credits={credit_action}")
@@ -459,9 +635,8 @@ def _update_rescued_job(
     result_url: str,
     thumbnail_url: Optional[str],
     credit_action: str,
-    meta: Dict[str, Any],
 ):
-    """Update the job row with rescue results."""
+    """Update the job row with rescue results. Guarded against overwriting terminal states."""
     try:
         meta_patch = {
             "rescued": True,
@@ -488,11 +663,18 @@ def _update_rescued_job(
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                         updated_at = NOW()
                     WHERE id::text = %s
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled')
+                    RETURNING id
                     """,
                     (status, result_url, thumbnail_url,
                      json.dumps(meta_patch, default=str), job_id),
                 )
+                row = cur.fetchone()
             conn.commit()
+
+        if not row:
+            print(f"[RESCUE] job={job_id} already in terminal state, skipped update")
+
     except Exception as e:
         print(f"[RESCUE] Error updating job {job_id}: {e}")
 
@@ -516,6 +698,7 @@ def _requeue_for_worker(job_id: str) -> bool:
                         updated_at = NOW()
                     WHERE id::text = %s
                       AND claimed_by IS NULL
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled')
                     RETURNING id
                     """,
                     (job_id,),
@@ -527,7 +710,7 @@ def _requeue_for_worker(job_id: str) -> bool:
             print(f"[RESCUE] requeued job={job_id}")
             return True
         else:
-            print(f"[RESCUE] could not requeue job={job_id} (already claimed or missing)")
+            print(f"[RESCUE] could not requeue job={job_id} (already claimed or terminal)")
             return False
 
     except Exception as e:
@@ -582,5 +765,8 @@ def _summary(results: Dict[str, Any]) -> str:
     return (
         f"rescued={results['rescued']} already={results['already_rescued']} "
         f"requeued={results['requeued']} still_running={results['still_running']} "
-        f"upstream_failed={results['upstream_failed']} errors={results['errors']}"
+        f"upstream_failed={results['upstream_failed']} "
+        f"finalizing_retried={results.get('finalizing_retried', 0)} "
+        f"finalizing_exhausted={results.get('finalizing_exhausted', 0)} "
+        f"errors={results['errors']}"
     )
