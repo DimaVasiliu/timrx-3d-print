@@ -1391,6 +1391,154 @@ def detect_stalled_jobs():
         return 0
 
 
+# ── Stale Sweep ────────────────────────────────────────────
+# Unlike stall detection (which only catches jobs with expired heartbeats),
+# the stale sweep catches jobs stuck in non-terminal states beyond age
+# thresholds, regardless of claim status. This covers:
+# - unclaimed jobs that never got picked up
+# - jobs stuck in finalizing after crash
+# - jobs whose worker died without heartbeating
+
+def run_stale_sweep():
+    """
+    Periodic server-side sweep for jobs stuck too long in non-terminal states.
+
+    Uses config-driven thresholds. Actions per status:
+    - queued/dispatched past age: mark stalled (worker re-claims)
+    - provider_pending past age: mark stalled (worker re-evaluates)
+    - provider_processing past age: mark stalled (worker re-evaluates)
+    - finalizing past age: mark stalled (rescue retries finalization)
+
+    Does NOT touch jobs actively heartbeating (within HEARTBEAT_TIMEOUT).
+    Does NOT touch terminal states.
+    Returns summary dict.
+    """
+    if not USE_DB:
+        return {"swept": 0}
+
+    from backend.config import config as _cfg
+
+    provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
+    terminal_list = ", ".join(f"'{s}'" for s in TERMINAL_STATES)
+
+    swept_total = 0
+    details = []
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1. Queued/dispatched too long (never reached provider or got stuck)
+                dispatched_age = _cfg.STALE_DISPATCHED_AGE_S
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'stalled',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "dispatched_age"}}'::jsonb,
+                        updated_at = NOW()
+                    WHERE status IN ('queued', 'dispatched')
+                      AND provider IN ({provider_list})
+                      AND stage = 'video'
+                      AND updated_at < NOW() - INTERVAL '{dispatched_age} seconds'
+                      AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
+                      AND status NOT IN ({terminal_list})
+                    RETURNING id, status, provider
+                    """,
+                )
+                rows = cur.fetchall() or []
+                if rows:
+                    swept_total += len(rows)
+                    for r in rows:
+                        details.append(f"job={r['id']} was={r['status']} provider={r.get('provider','?')} reason=dispatched_age")
+
+                # 2. provider_pending too long
+                pending_age = _cfg.STALE_PENDING_AGE_S
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'stalled',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "pending_age"}}'::jsonb,
+                        updated_at = NOW()
+                    WHERE status = 'provider_pending'
+                      AND provider IN ({provider_list})
+                      AND stage = 'video'
+                      AND updated_at < NOW() - INTERVAL '{pending_age} seconds'
+                      AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
+                    RETURNING id, status, provider
+                    """,
+                )
+                rows = cur.fetchall() or []
+                if rows:
+                    swept_total += len(rows)
+                    for r in rows:
+                        details.append(f"job={r['id']} was=provider_pending provider={r.get('provider','?')} reason=pending_age")
+
+                # 3. provider_processing too long
+                processing_age = _cfg.STALE_PROCESSING_AGE_S
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'stalled',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "processing_age"}}'::jsonb,
+                        updated_at = NOW()
+                    WHERE status = 'provider_processing'
+                      AND provider IN ({provider_list})
+                      AND stage = 'video'
+                      AND updated_at < NOW() - INTERVAL '{processing_age} seconds'
+                      AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
+                    RETURNING id, status, provider
+                    """,
+                )
+                rows = cur.fetchall() or []
+                if rows:
+                    swept_total += len(rows)
+                    for r in rows:
+                        details.append(f"job={r['id']} was=provider_processing provider={r.get('provider','?')} reason=processing_age")
+
+                # 4. finalizing too long (crash during S3 upload / credit capture)
+                finalizing_age = _cfg.STALE_FINALIZING_AGE_S
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'stalled',
+                        claimed_by = NULL,
+                        claimed_at = NULL,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"stale_swept": true, "sweep_reason": "finalizing_stuck"}}'::jsonb,
+                        updated_at = NOW()
+                    WHERE status = 'finalizing'
+                      AND provider IN ({provider_list})
+                      AND stage = 'video'
+                      AND updated_at < NOW() - INTERVAL '{finalizing_age} seconds'
+                    RETURNING id, status, provider
+                    """,
+                )
+                rows = cur.fetchall() or []
+                if rows:
+                    swept_total += len(rows)
+                    for r in rows:
+                        details.append(f"job={r['id']} was=finalizing provider={r.get('provider','?')} reason=finalizing_stuck")
+
+            conn.commit()
+
+        if swept_total > 0:
+            print(f"[SWEEP] swept {swept_total} stale jobs")
+            for d in details:
+                print(f"[SWEEP]   {d}")
+        else:
+            print("[SWEEP] no stale jobs found")
+
+        return {"swept": swept_total, "details": details}
+
+    except Exception as e:
+        print(f"[SWEEP] error: {e}")
+        return {"swept": 0, "error": str(e)}
+
+
 # ── Startup Recovery ────────────────────────────────────────
 
 def recover_stale_jobs():
@@ -1411,7 +1559,7 @@ def recover_stale_jobs():
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                # Recover recent supported jobs
+                # Recover recent supported jobs (including finalizing)
                 cur.execute(
                     f"""
                     UPDATE {Tables.JOBS}
@@ -1421,7 +1569,8 @@ def recover_stale_jobs():
                         updated_at = NOW()
                     WHERE status IN (
                         'queued', 'dispatched', 'pending', 'processing',
-                        'provider_pending', 'provider_processing', 'recovering'
+                        'provider_pending', 'provider_processing', 'recovering',
+                        'finalizing'
                     )
                     AND provider IN ({provider_list})
                     AND stage = 'video'
@@ -1442,7 +1591,8 @@ def recover_stale_jobs():
                         updated_at = NOW()
                     WHERE status IN (
                         'queued', 'dispatched', 'pending', 'processing',
-                        'provider_pending', 'provider_processing', 'recovering', 'stalled'
+                        'provider_pending', 'provider_processing', 'recovering', 'stalled',
+                        'finalizing'
                     )
                     AND created_at <= NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
                     AND status NOT IN ({', '.join(f"'{s}'" for s in TERMINAL_STATES)})
@@ -1475,48 +1625,98 @@ def recover_stale_jobs():
         return {"recovered": 0, "abandoned": 0, "error": str(e)}
 
 
-# ── Stall Detection + Rescue Thread ─────────────────────────
+# ── Operations Thread (Sweep + Rescue) ─────────────────────
+# Combines stall detection, stale sweep, and rescue into a single
+# background loop with config-driven intervals.
 
-_stall_thread: Optional[threading.Thread] = None
+_ops_thread: Optional[threading.Thread] = None
 
 
-def start_stall_detector(interval: int = 60):
+def start_operations_loop():
     """
-    Start a background thread that periodically:
-    1. Detects stalled jobs (expired heartbeats)
-    2. Runs a rescue pass for failed jobs with completed upstream
+    Start the unified background operations thread.
+
+    Runs three periodic tasks at independent intervals:
+    1. Stall detection (every sweep interval) — catches expired heartbeats
+    2. Stale sweep (every sweep interval) — catches age-threshold stuck jobs
+    3. Rescue (every rescue interval) — recovers late-completed upstream jobs
+
+    Config-driven via config.STALE_SWEEP_* and config.RESCUE_*.
+    Replaces the old start_stall_detector().
     """
-    global _stall_thread
+    global _ops_thread
+    if _ops_thread and _ops_thread.is_alive():
+        print("[OPS] operations loop already running")
+        return
+
+    from backend.config import config as _cfg
+
+    sweep_enabled = _cfg.STALE_SWEEP_ENABLED
+    sweep_interval = _cfg.STALE_SWEEP_INTERVAL_S
+    rescue_enabled = _cfg.RESCUE_ENABLED
+    rescue_interval = max(_cfg.RESCUE_INTERVAL_S, sweep_interval)  # at least as often as sweep
+    rescue_lookback = _cfg.RESCUE_LOOKBACK_HOURS
+    rescue_max = _cfg.RESCUE_MAX_CANDIDATES
+
+    # How many sweep cycles per rescue cycle
+    rescue_every_n = max(1, rescue_interval // sweep_interval)
 
     def _loop():
         cycle = 0
+        print(f"[OPS] operations loop started sweep_interval={sweep_interval}s "
+              f"sweep_enabled={sweep_enabled} rescue_enabled={rescue_enabled} "
+              f"rescue_every={rescue_every_n} cycles ({rescue_interval}s)")
+
         while not _worker_stop.is_set():
+            cycle += 1
+
+            # -- Stall detection (always runs, lightweight) --
             try:
                 detect_stalled_jobs()
             except Exception as e:
-                print(f"[JOB] stall detector error: {e}")
+                print(f"[OPS] stall detection error: {e}")
 
-            # Run rescue pass every 5th cycle (every ~5 minutes)
-            cycle += 1
-            if cycle % 5 == 0:
+            # -- Stale sweep --
+            if sweep_enabled:
+                try:
+                    run_stale_sweep()
+                except Exception as e:
+                    print(f"[OPS] stale sweep error: {e}")
+
+            # -- Rescue pass --
+            if rescue_enabled and cycle % rescue_every_n == 0:
                 try:
                     from backend.services.job_rescue import rescue_late_completed_jobs
-                    result = rescue_late_completed_jobs(hours=24, dry_run=False, max_jobs=10)
+                    print(f"[OPS] rescue pass starting lookback={rescue_lookback}h max={rescue_max}")
+                    result = rescue_late_completed_jobs(
+                        hours=rescue_lookback,
+                        dry_run=False,
+                        max_jobs=rescue_max,
+                    )
                     rescued = result.get("rescued", 0)
-                    if rescued > 0:
-                        print(f"[JOB] rescue pass: rescued={rescued}")
+                    requeued = result.get("requeued", 0)
+                    candidates = result.get("candidates", 0)
+                    if rescued > 0 or requeued > 0:
+                        print(f"[OPS] rescue pass done candidates={candidates} rescued={rescued} requeued={requeued}")
+                    else:
+                        print(f"[OPS] rescue pass done candidates={candidates} no_actions")
                 except Exception as e:
-                    print(f"[JOB] rescue pass error: {e}")
+                    print(f"[OPS] rescue pass error: {e}")
 
-            _worker_stop.wait(timeout=interval)
+            _worker_stop.wait(timeout=sweep_interval)
 
-    _stall_thread = threading.Thread(
+    _ops_thread = threading.Thread(
         target=_loop,
-        name="job-stall-detector",
+        name="job-ops-loop",
         daemon=True,
     )
-    _stall_thread.start()
-    print(f"[JOB] stall detector started (interval={interval}s, rescue every {interval * 5}s)")
+    _ops_thread.start()
+
+
+# Legacy alias for backward compatibility
+def start_stall_detector(interval: int = 60):  # noqa: ARG001
+    """Start the operations loop. Legacy name kept for backward compat."""
+    start_operations_loop()
 
 
 # ── Helpers ─────────────────────────────────────────────────
