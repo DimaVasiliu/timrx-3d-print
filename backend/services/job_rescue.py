@@ -824,12 +824,20 @@ def _job_elapsed_seconds(job: Dict[str, Any]) -> Optional[float]:
     return time.time() - ref
 
 
-def _get_hard_timeout(_provider: str, upstream_status: str) -> Optional[int]:
-    """Get the hard timeout for the pending/processing phase."""
+def _get_hard_timeout(provider: str, upstream_status: str) -> Optional[int]:
+    """Get the hard timeout for the pending/processing phase (provider-aware).
+
+    Seedance (PiAPI) queue can take 2+ hours under load, so it gets
+    much longer thresholds than Vertex.
+    """
     from backend.config import config as _cfg
     if upstream_status == "pending":
+        if provider == "seedance":
+            return getattr(_cfg, "STALE_PENDING_AGE_SEEDANCE_S", 7200)
         return getattr(_cfg, "STALE_PENDING_AGE_S", 900)
     elif upstream_status == "processing":
+        if provider == "seedance":
+            return getattr(_cfg, "STALE_PROCESSING_AGE_SEEDANCE_S", 3600)
         return getattr(_cfg, "STALE_PROCESSING_AGE_S", 1200)
     return None
 
