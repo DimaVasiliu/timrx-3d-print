@@ -190,12 +190,18 @@ FAILURE_MESSAGES = {
     "generation_failed": "Provider rejected this generation",
     "no_result_url": "Generation completed but no result was returned",
     "auth_error": "Provider authentication failed",
-    "seedance_pending_timeout": "Provider queue timed out -- Seedance did not start this job in time",
-    "seedance_processing_timeout": "Render timed out -- Seedance started but did not finish in time",
-    "seedance_poll_error": "Lost connection to provider during generation",
+    # Seedance-specific
+    "seedance_pending_timeout": "Seedance queue timed out -- job was not started in time",
+    "seedance_processing_timeout": "Seedance render timed out -- started but did not finish",
+    "seedance_poll_error": "Lost connection to Seedance during generation",
     "seedance_generation_failed": "Seedance rejected this generation",
-    "seedance_no_video_url": "Generation completed but no video was returned",
-    "seedance_auth_error": "Provider authentication failed",
+    "seedance_no_video_url": "Seedance completed but no video was returned",
+    "seedance_auth_error": "Seedance authentication failed",
+    # Vertex-specific
+    "vertex_no_result_url": "Veo completed but no video was returned",
+    "vertex_timeout": "Veo generation timed out",
+    "vertex_auth_error": "Veo authentication failed",
+    "vertex_quota": "Veo quota reached -- try again later",
 }
 
 
