@@ -121,10 +121,11 @@ def _get_video_tier(identity_id: str) -> str:
         try:
             row = query_one(
                 f"""
-                SELECT p.plan_code
+                SELECT pl.code AS plan_code
                 FROM {Tables.PURCHASES} p
+                JOIN {Tables.PLANS} pl ON pl.id = p.plan_id
                 WHERE p.identity_id = %s
-                  AND p.plan_code LIKE 'video_%%'
+                  AND pl.code LIKE 'video_%%'
                   AND p.status = 'completed'
                 ORDER BY p.created_at DESC
                 LIMIT 1
