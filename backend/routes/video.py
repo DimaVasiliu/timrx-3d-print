@@ -802,7 +802,14 @@ def _video_status_handler(job_id: str):
 
                 if job["status"] == "provider_pending":
                     pending_secs = job_meta.get("pending_seconds", 0)
-                    msg = "Queued with provider" if pending_secs < 120 else "Provider queue busy — your video is still queued"
+                    prov = (meta.get("provider") or job_meta.get("provider") or "vertex").capitalize()
+                    if prov == "Vertex": prov = "Veo"
+                    if pending_secs < 60:
+                        msg = f"Queued with {prov}"
+                    elif pending_secs < 300:
+                        msg = f"{prov} queue busy — your video is still waiting"
+                    else:
+                        msg = f"{prov} queue is slow — still waiting ({pending_secs // 60}m elapsed)"
                     return jsonify({
                         "ok": True,
                         "status": "provider_pending",
@@ -831,11 +838,13 @@ def _video_status_handler(job_id: str):
                     else:
                         time_hint = f"{lo}–{hi}s"
 
+                    prov_label = (provider_hint or "vertex").capitalize()
+                    if prov_label == "Vertex": prov_label = "Veo"
                     return jsonify({
                         "ok": True,
                         "status": "processing",
                         "job_id": job_id,
-                        "message": f"Rendering (estimated {time_hint})",
+                        "message": f"{prov_label} rendering (estimated {time_hint})",
                         "progress": progress,
                         "estimated_duration_seconds": rtime["estimated_duration_seconds"],
                     })
@@ -1132,6 +1141,103 @@ def video_admin_provider_info():
         "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
         "active_providers": available_names,
         "providers": providers_info,
+    })
+
+
+# ── GET /video/admin/diagnostics — Lightweight operator dashboard ──
+@bp.route("/video/admin/diagnostics", methods=["GET", "OPTIONS"])
+@with_session
+def video_admin_diagnostics():
+    """
+    Lightweight operator diagnostics for the video pipeline.
+
+    Returns job counts by status, provider health, and recent failures.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    from backend.db import query_all
+    from backend.config import config
+
+    # Job counts by status (last 24h)
+    status_counts = query_all(f"""
+        SELECT status, COUNT(*) AS cnt
+        FROM {Tables.JOBS}
+        WHERE stage = 'video'
+          AND created_at > NOW() - INTERVAL '24 hours'
+        GROUP BY status
+        ORDER BY cnt DESC
+    """)
+
+    # Job counts by provider (last 24h)
+    provider_counts = query_all(f"""
+        SELECT provider, status, COUNT(*) AS cnt
+        FROM {Tables.JOBS}
+        WHERE stage = 'video'
+          AND created_at > NOW() - INTERVAL '24 hours'
+        GROUP BY provider, status
+        ORDER BY provider, cnt DESC
+    """)
+
+    # Recent failures (last 10)
+    recent_failures = query_all(f"""
+        SELECT id, provider, error_code, error_message, created_at, updated_at
+        FROM {Tables.JOBS}
+        WHERE stage = 'video' AND status = 'failed'
+        ORDER BY updated_at DESC
+        LIMIT 10
+    """)
+
+    # In-flight jobs (not terminal)
+    in_flight = query_all(f"""
+        SELECT id, provider, status, created_at, updated_at
+        FROM {Tables.JOBS}
+        WHERE stage = 'video'
+          AND status NOT IN ('ready', 'failed', 'refunded', 'succeeded',
+                             'abandoned_legacy', 'recovery_blocked', 'ready_unbilled')
+        ORDER BY created_at DESC
+        LIMIT 20
+    """)
+
+    # Provider configuration
+    available = video_router.get_available_providers()
+    providers = []
+    for idx, provider in enumerate(video_router.providers):
+        configured, err = provider.is_configured()
+        providers.append({
+            "name": provider.name,
+            "configured": configured,
+            "primary": idx == 0,
+            "error": err if not configured else None,
+        })
+
+    # Serialise datetimes
+    def _ser(rows):
+        out = []
+        for r in rows:
+            row = dict(r)
+            for k, v in row.items():
+                if hasattr(v, 'isoformat'):
+                    row[k] = v.isoformat()
+            out.append(row)
+        return out
+
+    return jsonify({
+        "ok": True,
+        "status_counts_24h": {r["status"]: r["cnt"] for r in status_counts},
+        "provider_breakdown_24h": _ser(provider_counts),
+        "in_flight_jobs": _ser(in_flight),
+        "recent_failures": _ser(recent_failures),
+        "providers": providers,
+        "config": {
+            "video_provider": getattr(config, 'VIDEO_PROVIDER', 'vertex'),
+            "vertex_model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown'),
+            "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
+        },
     })
 
 
