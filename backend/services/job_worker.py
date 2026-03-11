@@ -331,11 +331,27 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                     return None
 
                 attempt = (row.get("attempt_count") or 0)
+                npa = row.get("next_poll_at")
+
+                # Diagnostic: read server NOW() to compare with next_poll_at
+                cur.execute("SELECT NOW() AS db_now")
+                db_now = cur.fetchone()["db_now"]
+
                 print(
                     f"[JOB][DEBUG] _claim_next_job FOUND job={row['id']} "
-                    f"status={row['status']} next_poll_at={row.get('next_poll_at')} "
+                    f"status={row['status']} next_poll_at={npa} db_now={db_now} "
                     f"claimed_by={row.get('claimed_by')} attempt={attempt}"
                 )
+
+                # Belt-and-suspenders: if next_poll_at is in the future despite
+                # the WHERE clause, skip this claim to prevent aggressive re-poll.
+                if npa is not None and npa > db_now:
+                    print(
+                        f"[JOB][WARN] _claim_next_job SKIPPED job={row['id']} "
+                        f"next_poll_at={npa} is AFTER db_now={db_now} "
+                        f"(delta={npa - db_now}) — WHERE clause did not filter"
+                    )
+                    return None
 
                 # NOTE: Do NOT increment attempt_count here — it tracks
                 # error retries, not normal poll cycles. Only _handle_job_error
@@ -709,7 +725,9 @@ def _poll_provider_once(
     # Hard timeout checks BEFORE polling
     last_status = job.get("last_provider_status") or meta.get("provider_status", "pending")
 
-    if last_status in ("pending", "queued", "staged") and pending_elapsed >= pend_hard:
+    # Once processing has started, skip the pending timeout entirely — use
+    # the processing timeout instead (checked below).
+    if last_status in ("pending", "queued", "staged") and not processing_started_at and pending_elapsed >= pend_hard:
         # Seedance-specific: attempt preview -> fast fallback
         if provider_name == "seedance" and task_type == "seedance-2-preview":
             from backend.services.video_router import resolve_video_provider
@@ -771,6 +789,18 @@ def _poll_provider_once(
     status = status_resp.get("status", "pending")
     provider_status = status_resp.get("provider_status", status)
     progress = status_resp.get("progress", 0)
+
+    # Monotonic state guard: once processing has started locally, upstream
+    # "pending" (from PiAPI "Staged" etc.) must NOT demote back to pending.
+    current_local_status = job.get("status", "")
+    if status == "pending" and processing_started_at:
+        print(
+            f"[JOB] prevented backward transition job={job_id} "
+            f"upstream={provider_status} -> pending BLOCKED because "
+            f"processing_started_at is set (local={current_local_status}), "
+            f"treating as processing"
+        )
+        status = "processing"
 
     print(
         f"[JOB] poll result job={job_id} upstream={upstream_id} provider={provider_name} "
