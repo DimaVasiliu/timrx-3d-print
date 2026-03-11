@@ -14,6 +14,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from backend.config import config
+from backend.services.video_errors import (
+    PIAPI_STATUS_MAP,
+    PIAPI_ZERO_TIMESTAMPS,
+    ErrorCategory,
+)
 
 
 # ── Constants ────────────────────────────────────────────────
@@ -145,23 +150,9 @@ def create_seedance_task(
 
 
 # ── Check status ─────────────────────────────────────────────
-# PiAPI status → internal status.
-# "Pending"/"Staged" are now distinguished from "Processing".
-_STATUS_MAP = {
-    "Completed": "done",
-    "completed": "done",
-    "Processing": "processing",
-    "processing": "processing",
-    "Pending": "pending",
-    "pending": "pending",
-    "Staged": "pending",
-    "staged": "pending",
-    "Failed": "failed",
-    "failed": "failed",
-}
-
-# Zero-value timestamp from PiAPI means "not started yet"
-_ZERO_TIMESTAMPS = {"0001-01-01T00:00:00Z", "", None}
+# PiAPI status → internal status (shared source of truth in video_errors.py)
+_STATUS_MAP = PIAPI_STATUS_MAP
+_ZERO_TIMESTAMPS = PIAPI_ZERO_TIMESTAMPS
 
 
 def check_seedance_status(task_id: str) -> Dict[str, Any]:
@@ -189,10 +180,10 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
         return {"status": "error", "message": f"Network error: {e}"}
 
     if resp.status_code == 401 or resp.status_code == 403:
-        return {"status": "failed", "error": "seedance_auth_error", "message": "PiAPI auth failed"}
+        return {"status": "failed", "error": ErrorCategory.AUTH, "message": "PiAPI auth failed"}
 
     if resp.status_code >= 400:
-        return {"status": "error", "message": f"PiAPI error: {resp.status_code}"}
+        return {"status": "error", "error": ErrorCategory.NETWORK, "message": f"PiAPI error: {resp.status_code}"}
 
     data = resp.json()
     task_data = data.get("data", data)
@@ -233,12 +224,12 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
             result["video_url"] = video_url
         else:
             result["status"] = "failed"
-            result["error"] = "seedance_no_video_url"
+            result["error"] = ErrorCategory.NO_OUTPUT
             result["message"] = "Task completed but no video URL found"
 
     elif internal_status == "failed":
         error = task_data.get("error", {})
-        result["error"] = "seedance_generation_failed"
+        result["error"] = ErrorCategory.INTERNAL
         result["message"] = (
             error.get("message", "")
             if isinstance(error, dict)
