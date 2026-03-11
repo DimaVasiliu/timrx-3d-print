@@ -3,14 +3,16 @@ Video Generation Routes Blueprint.
 ----------------------------------
 Registered under /api/_mod and /api for compatibility.
 
-Veo Endpoints (Google Vertex/AI Studio with fallback):
+Active providers: vertex (Veo 3.1), seedance (PiAPI Seedance 2.0)
+
+Endpoints:
 - POST /video/generate   - Unified start (text2video or image2video) — legacy
 - POST /video/text        - Text → short cinematic clip
 - POST /video/animate     - Image → animated video clip
 - GET  /video/status/<job_id>          - Poll job status (canonical)
 - GET  /video/generate/status/<job_id> - Poll job status (legacy alias)
 
-Veo 3.1 Constraints:
+Vertex (Veo 3.1) Constraints:
 - aspectRatio: ONLY "16:9" or "9:16" (NO "1:1" for video)
 - resolution: "720p", "1080p", "4k" (lowercase 4k)
 - durationSeconds: 4, 6, 8 (integers, NOT strings!)
@@ -79,7 +81,7 @@ def generate_video():
 
     Request body:
     {
-        "provider": "google",           # Provider (only google supported)
+        "provider": "vertex",           # Provider: "vertex" or "seedance"
         "task": "text2video",           # "text2video" or "image2video"
         "prompt": "A serene forest...", # Required for text2video
         "image_data": "base64...",      # Required for image2video
@@ -131,7 +133,10 @@ def generate_video():
     # Parse request body
     body = request.get_json(silent=True) or {}
 
-    provider = (body.get("provider") or "video").lower()
+    provider = (body.get("provider") or "vertex").lower()
+    # Backward compat: treat legacy names as vertex
+    if provider in ("veo", "google", "aistudio", "video"):
+        provider = "vertex"
     task = (body.get("task") or "text2video").lower()
 
     # Validate task type
@@ -370,7 +375,7 @@ def _dispatch_video_job(
     seed: int | None,
     style_preset: str | None = None,
     motion_preset: str | None = None,
-    provider: str = "veo",
+    provider: str = "vertex",
     seedance_variant: str | None = None,
     seedance_tier: str = "fast",
 ):
@@ -612,7 +617,10 @@ def video_text():
     if not raw_prompt:
         return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
 
-    provider = (body.get("provider") or "veo").lower()
+    provider = (body.get("provider") or "vertex").lower()
+    # Backward compat: treat legacy names as vertex
+    if provider in ("veo", "google", "aistudio", "video"):
+        provider = "vertex"
     raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider == "seedance" else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
     resolution = body.get("resolution") or "720p"
@@ -704,7 +712,10 @@ def video_animate():
     if not image_data:
         return jsonify({"error": "invalid_params", "message": "image_data, image_url, or image_id is required", "field": "image_data"}), 400
 
-    provider = (body.get("provider") or "veo").lower()
+    provider = (body.get("provider") or "vertex").lower()
+    # Backward compat: treat legacy names as vertex
+    if provider in ("veo", "google", "aistudio", "video"):
+        provider = "vertex"
     raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
     raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider == "seedance" else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
@@ -992,7 +1003,7 @@ def _video_status_handler(job_id: str):
                 if job["status"] == "queued":
                     from backend.services.video_limits import get_queue_position, get_estimated_render_time
                     qpos = get_queue_position(job_id)
-                    provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
+                    provider_hint = meta.get("provider") or job_meta.get("provider") or "vertex"
                     rtime = get_estimated_render_time(provider_hint)
                     return jsonify({
                         "ok": True,
@@ -1038,7 +1049,7 @@ def _video_status_handler(job_id: str):
 
                 if job["status"] in ("processing", "provider_processing"):
                     real_progress = meta.get("progress") or job_meta.get("progress") or 0
-                    provider_hint = meta.get("provider") or job_meta.get("provider") or "veo"
+                    provider_hint = meta.get("provider") or job_meta.get("provider") or "vertex"
                     from backend.services.video_limits import get_estimated_render_time
                     rtime = get_estimated_render_time(provider_hint)
 
@@ -1178,7 +1189,7 @@ def _video_status_handler(job_id: str):
         })
 
     if meta.get("status") in ("queued", "processing"):
-        provider_hint = meta.get("provider", "veo")
+        provider_hint = meta.get("provider", "vertex")
         from backend.services.video_limits import get_estimated_render_time
         rtime = get_estimated_render_time(provider_hint)
         real_progress = meta.get("progress", 0)
