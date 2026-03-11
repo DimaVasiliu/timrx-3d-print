@@ -25,6 +25,15 @@ from backend.services.video_errors import (
 PIAPI_BASE = "https://api.piapi.ai/api/v1"
 PIAPI_TIMEOUT = 30  # seconds
 
+# Startup diagnostic (safe — never logs the key itself)
+_api_key_present = bool(getattr(config, "PIAPI_API_KEY", ""))
+_webhook_enabled = getattr(config, "PIAPI_WEBHOOK_ENABLED", False)
+_webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
+print(f"[SEEDANCE] api_key configured={_api_key_present}")
+print(f"[SEEDANCE] webhook enabled={_webhook_enabled} endpoint={'set' if _webhook_url else 'EMPTY'}")
+if not _api_key_present:
+    print("[SEEDANCE] WARNING: PIAPI_API_KEY is not set — Seedance video generation will fail")
+
 
 # ── Errors ───────────────────────────────────────────────────
 class SeedanceConfigError(Exception):
