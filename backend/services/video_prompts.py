@@ -150,9 +150,8 @@ MOTION_PRESETS = {
     ),
 }
 
-# ── Camera motion chip mappings for Luma ──────────────────────
-# These map UI chip selections to prompt additions for Luma
-# since Luma uses prompt-based camera control
+# ── Camera motion chip mappings ───────────────────────────────
+# Map UI chip selections to prompt additions for camera control
 CAMERA_MOTION_PROMPTS = {
     "pan": "slow lateral camera pan",
     "pan_left": "slow camera pan from right to left",
@@ -208,7 +207,7 @@ def normalize_text_prompt(
     # User's creative prompt (the core)
     parts.append(user_prompt)
 
-    # Duration hint (helps Veo/Luma pace the action)
+    # Duration hint (helps pace the action)
     if duration_seconds <= 4:
         parts.append("Short burst, fast-paced action compressed into a few seconds.")
     elif duration_seconds >= 8:
