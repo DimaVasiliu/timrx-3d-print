@@ -537,6 +537,24 @@ class Config:
         return f"{base}/api/webhooks/piapi/task"
 
     # ─────────────────────────────────────────────────────────────
+    # Job Recovery & Stale Sweep Configuration
+    # ─────────────────────────────────────────────────────────────
+    # Stale sweep: periodic server-side check for stuck jobs
+    STALE_SWEEP_ENABLED: bool = field(default_factory=lambda: _get_env_bool("STALE_SWEEP_ENABLED", True))
+    STALE_SWEEP_INTERVAL_S: int = field(default_factory=lambda: _get_env_int("STALE_SWEEP_INTERVAL_S", 60))
+    STALE_PENDING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_PENDING_AGE_S", 900))        # 15 min
+    STALE_PROCESSING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_PROCESSING_AGE_S", 1200))  # 20 min
+    STALE_FINALIZING_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_FINALIZING_AGE_S", 300))   # 5 min
+    STALE_DISPATCHED_AGE_S: int = field(default_factory=lambda: _get_env_int("STALE_DISPATCHED_AGE_S", 600))   # 10 min
+
+    # Rescue: automated late-success recovery for failed/stalled jobs
+    RESCUE_ENABLED: bool = field(default_factory=lambda: _get_env_bool("RESCUE_ENABLED", True))
+    RESCUE_INTERVAL_S: int = field(default_factory=lambda: _get_env_int("RESCUE_INTERVAL_S", 300))            # 5 min
+    RESCUE_LOOKBACK_HOURS: int = field(default_factory=lambda: _get_env_int("RESCUE_LOOKBACK_HOURS", 48))
+    RESCUE_MAX_CANDIDATES: int = field(default_factory=lambda: _get_env_int("RESCUE_MAX_CANDIDATES", 20))
+    RESCUE_FINALIZING_MAX_RETRIES: int = field(default_factory=lambda: _get_env_int("RESCUE_FINALIZING_MAX_RETRIES", 3))
+
+    # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
     # ─────────────────────────────────────────────────────────────
     DEFAULT_MODEL_TITLE: str = "3D Model"
