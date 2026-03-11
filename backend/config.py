@@ -518,6 +518,9 @@ class Config:
     # Seedance (PiAPI) Video Generation
     # ─────────────────────────────────────────────────────────────
     PIAPI_API_KEY: str = field(default_factory=lambda: _get_env("PIAPI_API_KEY"))
+    PIAPI_WEBHOOK_ENABLED: bool = field(default_factory=lambda: _get_env_bool("PIAPI_WEBHOOK_ENABLED", False))
+    PIAPI_WEBHOOK_SECRET: str = field(default_factory=lambda: _get_env("PIAPI_WEBHOOK_SECRET"))
+    PIAPI_WEBHOOK_LOG_BODY: bool = field(default_factory=lambda: _get_env_bool("PIAPI_WEBHOOK_LOG_BODY", False))
 
     # ─────────────────────────────────────────────────────────────
     # Generation Defaults & Action Keys
