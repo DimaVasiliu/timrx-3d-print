@@ -227,6 +227,20 @@ def _process_candidate(
 
     elif upstream_status in ("processing", "pending"):
         progress = status_resp.get("progress", 0)
+
+        # Guard against zombie requeue loops: if the job has been pending
+        # longer than the hard timeout, the worker will just fail it again.
+        # Leave it failed and let credits release naturally.
+        elapsed_s = _job_elapsed_seconds(job)
+        hard_timeout = _get_hard_timeout(provider, upstream_status)
+        if elapsed_s and hard_timeout and elapsed_s > hard_timeout * 2:
+            print(f"[RESCUE] job={job_id} pending too long ({elapsed_s}s > 2x hard {hard_timeout}s), "
+                  f"NOT requeuing — marking upstream_failed")
+            _enrich_error(job_id, ErrorCategory.INTERNAL,
+                          f"Upstream stuck in {upstream_status} for {elapsed_s}s")
+            return {"job_id": job_id, "action": "upstream_failed",
+                    "reason": f"stuck_{upstream_status}_{elapsed_s}s"}
+
         print(f"[RESCUE] job={job_id} still running ({upstream_status}, {progress}%), attempting requeue")
         requeued = _requeue_for_worker(job_id)
         action = "requeued" if requeued else "still_running"
@@ -748,6 +762,37 @@ def _enrich_error(job_id: str, error_code: str, error_message: str):
 
 
 # ── Helpers ─────────────────────────────────────────────────
+
+def _job_elapsed_seconds(job: Dict[str, Any]) -> Optional[float]:
+    """Seconds since job was created (or dispatched)."""
+    meta = _parse_meta(job.get("meta"))
+    dispatched_at = meta.get("dispatched_at")
+    created_at = job.get("created_at")
+
+    ref = None
+    if dispatched_at:
+        try:
+            ref = float(dispatched_at)
+        except (ValueError, TypeError):
+            pass
+    if ref is None and created_at:
+        from datetime import datetime, timezone
+        if hasattr(created_at, "timestamp"):
+            ref = created_at.timestamp()
+    if ref is None:
+        return None
+    return time.time() - ref
+
+
+def _get_hard_timeout(_provider: str, upstream_status: str) -> Optional[int]:
+    """Get the hard timeout for the pending/processing phase."""
+    from backend.config import config as _cfg
+    if upstream_status == "pending":
+        return getattr(_cfg, "STALE_PENDING_AGE_S", 900)
+    elif upstream_status == "processing":
+        return getattr(_cfg, "STALE_PROCESSING_AGE_S", 1200)
+    return None
+
 
 def _parse_meta(meta) -> Dict[str, Any]:
     if meta is None:
