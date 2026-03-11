@@ -28,29 +28,13 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Blueprint, request, jsonify
 
 from backend.config import config
+from backend.services.video_errors import (
+    PIAPI_STATUS_MAP as _STATUS_MAP,
+    TERMINAL_AND_FINALIZING as _TERMINAL_AND_FINALIZING,
+    ErrorCategory,
+)
 
 bp = Blueprint("webhooks", __name__)
-
-
-# ── Status mapping (same as seedance_service._STATUS_MAP) ────
-_STATUS_MAP = {
-    "Completed": "done",
-    "completed": "done",
-    "Processing": "processing",
-    "processing": "processing",
-    "Pending": "pending",
-    "pending": "pending",
-    "Staged": "pending",
-    "staged": "pending",
-    "Failed": "failed",
-    "failed": "failed",
-}
-
-# States that must never be overwritten by a webhook.
-_TERMINAL_AND_FINALIZING = frozenset({
-    "succeeded", "failed", "refunded", "ready", "ready_unbilled",
-    "abandoned_legacy", "recovery_blocked", "finalizing",
-})
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -484,7 +468,7 @@ def piapi_task_webhook():
     # ── Failure ──────────────────────────────────────────────
     if internal_status == "failed":
         error_msg = _extract_error_message(task_data)
-        error_code = "seedance_generation_failed"
+        error_code = ErrorCategory.INTERNAL  # Provider confirmed failure
 
         job = _find_and_claim_job(task_id, "failed")
         if not job:
