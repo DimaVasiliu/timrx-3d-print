@@ -2,7 +2,7 @@
 Vertex AI Veo Video Provider.
 
 Wraps the vertex_video_service to provide a consistent interface
-for the VideoRouter to use alongside AI Studio and Runway providers.
+for the VideoRouter.
 """
 
 from __future__ import annotations
