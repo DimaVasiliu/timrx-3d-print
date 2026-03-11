@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import jsonify
 
 from backend.db import USE_DB, query_one, query_all, Tables
+from backend.services.video_errors import ACTIVE_VIDEO_STATUSES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,16 +164,17 @@ def get_video_plan_limits(identity_id: str) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def count_active_video_jobs(identity_id: str) -> int:
-    """Count video jobs in processing/queued state for this user."""
+    """Count video jobs in any active (in-flight) state for this user."""
     if not USE_DB:
         return 0
+    status_list = ", ".join(f"'{s}'" for s in ACTIVE_VIDEO_STATUSES)
     try:
         row = query_one(
             f"""
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
             WHERE identity_id = %s
-              AND status IN ('queued', 'processing')
+              AND status IN ({status_list})
               AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
             """,
             (identity_id,),
@@ -528,15 +530,16 @@ def get_estimated_render_time(provider: str = "vertex", seedance_tier: str = "fa
 
 
 def get_total_queued_video_jobs() -> int:
-    """Count all queued video jobs system-wide."""
+    """Count all in-flight video jobs system-wide."""
     if not USE_DB:
         return 0
+    status_list = ", ".join(f"'{s}'" for s in ACTIVE_VIDEO_STATUSES)
     try:
         row = query_one(
             f"""
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
-            WHERE status IN ('queued', 'processing')
+            WHERE status IN ({status_list})
               AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
             """,
         )
@@ -558,7 +561,7 @@ _worker_lock = threading.Lock()
 def acquire_video_worker() -> bool:
     """
     Try to acquire a video worker slot. Returns True if acquired, False if at capacity.
-    Called at the START of dispatch_gemini_video_async.
+    Called at the START of video job dispatch.
     """
     global _active_video_workers
     max_workers = getattr(_cfg(), "MAX_VIDEO_WORKERS", 8)
@@ -741,23 +744,24 @@ def get_video_metrics() -> Dict[str, Any]:
         return metrics
 
     try:
-        # Active jobs (queued + processing)
+        # Active jobs (all in-flight statuses)
+        active_list = ", ".join(f"'{s}'" for s in ACTIVE_VIDEO_STATUSES)
         row = query_one(
             f"""
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
-            WHERE status IN ('queued', 'processing')
+            WHERE status IN ({active_list})
               AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
             """,
         )
         metrics["active_jobs"] = row["cnt"] if row else 0
 
-        # Queue length (queued only)
+        # Queue length (queued + dispatched, not yet with provider)
         row = query_one(
             f"""
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
-            WHERE status = 'queued'
+            WHERE status IN ('queued', 'dispatched')
               AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
             """,
         )
