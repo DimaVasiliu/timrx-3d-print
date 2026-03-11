@@ -446,10 +446,17 @@ def history_mod():
                                     image_id = item.get("image_id")
                                     lookup_reason = None
 
-                                    # Video items use video_id, not model_id/image_id — skip XOR check
+                                    # Video items use video_id, not model_id/image_id
+                                    video_id = None
                                     if item_type == "video":
                                         model_id = None
                                         image_id = None
+                                        video_id = item.get("video_id")
+                                        if not video_id:
+                                            # Failed videos have no video record — skip to avoid XOR constraint violation
+                                            print(f"[History][mod] Skipping video item {item_id} — no video_id (status={status})")
+                                            skipped_items.append({"client_id": str(item_id), "reason": "no_video_id"})
+                                            continue
                                     else:
                                         if not model_id and not image_id:
                                             model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
@@ -468,9 +475,9 @@ def history_mod():
 
                                     cur.execute(
                                         f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
-                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, video_id, payload)
                                            VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s, %s, %s)
+                                               %s, %s, %s, %s, %s, %s, %s, %s)
                                            ON CONFLICT (id) DO UPDATE
                                            SET item_type = EXCLUDED.item_type,
                                                status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
@@ -490,6 +497,7 @@ def history_mod():
                                                image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
                                                model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
                                                image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
+                                               video_id = COALESCE(EXCLUDED.video_id, {Tables.HISTORY_ITEMS}.video_id),
                                                payload = EXCLUDED.payload,
                                                updated_at = NOW();""",
                                         (
@@ -506,6 +514,7 @@ def history_mod():
                                             image_url,
                                             model_id,
                                             image_id,
+                                            video_id,
                                             json.dumps(item),
                                         ),
                                     )
