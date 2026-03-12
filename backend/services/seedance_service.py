@@ -184,12 +184,15 @@ def create_seedance_task(
     if not task_id:
         raise RuntimeError(f"seedance_no_task_id: {data}")
 
-    # Log whether provider echoed back our webhook_config
+    # Log whether provider echoed back our webhook_config.
+    # PiAPI Seedance (seedance-2-fast-preview, seedance-2-preview) appears to
+    # ignore webhook_config — treat as poll-driven unless provider behavior changes.
     provider_webhook = task_data.get("webhook_config")
-    if provider_webhook:
-        print(f"[Seedance] Task created: {task_id} provider_webhook_config={provider_webhook}")
+    wh_endpoint = (provider_webhook or {}).get("endpoint", "") if isinstance(provider_webhook, dict) else ""
+    if wh_endpoint:
+        print(f"[Seedance] Task created: {task_id} webhook_config echoed (endpoint={wh_endpoint[:60]})")
     else:
-        print(f"[Seedance] Task created: {task_id} (provider did NOT echo webhook_config)")
+        print(f"[Seedance] Task created: {task_id} — provider ignored webhook_config; polling lifecycle active")
 
     return {
         "task_id": task_id,
