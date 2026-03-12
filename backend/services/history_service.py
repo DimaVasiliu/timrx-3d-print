@@ -900,6 +900,198 @@ def save_image_to_normalized_db(
         return None
 
 
+def create_video_record(
+    job_id: str,
+    identity_id: str,
+    prompt: str,
+    provider: str,
+    *,
+    duration_seconds: int | None = None,
+    aspect_ratio: str | None = None,
+    resolution: str | None = None,
+) -> str | None:
+    """
+    Create a videos row early at dispatch time (status='queued').
+
+    Returns the videos.id UUID string, or None on error.
+    This UUID must be used as history_items.video_id (NOT job.id).
+    """
+    if not USE_DB:
+        return None
+
+    import uuid as _uuid
+    video_uuid = str(_uuid.uuid4())
+
+    try:
+        title = derive_display_title(prompt, None)
+        video_meta = json.dumps({
+            "prompt": prompt,
+            "job_id": job_id,
+            "duration_seconds": duration_seconds,
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+            "provider": provider,
+        })
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.VIDEOS} (
+                        id, identity_id,
+                        title, prompt,
+                        provider, status,
+                        duration_seconds, resolution, aspect_ratio,
+                        meta
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        video_uuid,
+                        identity_id,
+                        title,
+                        prompt,
+                        provider,
+                        "queued",
+                        duration_seconds,
+                        resolution,
+                        aspect_ratio,
+                        video_meta,
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        if row:
+            print(f"[DB] video record created: video_uuid={video_uuid} job_id={job_id} provider={provider} status=queued")
+            return str(row["id"])
+        return None
+    except Exception as e:
+        print(f"[DB] Failed to create video record for job {job_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def update_video_record(
+    video_uuid: str,
+    *,
+    upstream_id: str | None = None,
+    status: str | None = None,
+    error_message: str | None = None,
+    video_url: str | None = None,
+    thumbnail_url: str | None = None,
+    s3_video_url: str | None = None,
+    meta_patch: dict | None = None,
+) -> bool:
+    """
+    Update an existing videos row (identified by videos.id).
+
+    Used to progress the video through its lifecycle:
+      queued -> processing -> ready/failed
+    """
+    if not USE_DB:
+        return False
+
+    set_clauses = ["updated_at = NOW()"]
+    params: list = []
+
+    if upstream_id is not None:
+        set_clauses.append("upstream_id = %s")
+        params.append(upstream_id)
+    if status is not None:
+        set_clauses.append("status = %s")
+        params.append(status)
+    if error_message is not None:
+        set_clauses.append("error_message = %s")
+        params.append(error_message)
+    if video_url is not None:
+        set_clauses.append("video_url = %s")
+        params.append(video_url)
+    if thumbnail_url is not None:
+        set_clauses.append("thumbnail_url = %s")
+        params.append(thumbnail_url)
+    if s3_video_url is not None:
+        from backend.services.s3_service import get_s3_key_from_url
+        s3_key = get_s3_key_from_url(s3_video_url)
+        set_clauses.append("video_s3_key = %s")
+        params.append(s3_key)
+    if meta_patch:
+        set_clauses.append("meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb")
+        params.append(json.dumps(meta_patch, default=str))
+
+    params.append(video_uuid)
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.VIDEOS}
+                    SET {', '.join(set_clauses)}
+                    WHERE id::text = %s
+                    """,
+                    tuple(params),
+                )
+                updated = cur.rowcount
+            conn.commit()
+        return updated > 0
+    except Exception as e:
+        print(f"[DB] Failed to update video record {video_uuid}: {e}")
+        return False
+
+
+def resolve_video_uuid(job_id: str, identity_id: str | None = None) -> str | None:
+    """
+    Look up the videos.id for a given job_id.
+
+    Checks jobs.meta->>'video_uuid' first, then falls back to
+    searching the videos table by meta->>'job_id'.
+    """
+    if not USE_DB:
+        return None
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # Path 1: Check jobs.meta for video_uuid
+                cur.execute(
+                    f"""
+                    SELECT meta->>'video_uuid' AS video_uuid
+                    FROM {Tables.JOBS}
+                    WHERE id::text = %s
+                    """,
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if row and row.get("video_uuid"):
+                    return row["video_uuid"]
+
+                # Path 2: Search videos table by meta->>'job_id'
+                cur.execute(
+                    f"""
+                    SELECT id FROM {Tables.VIDEOS}
+                    WHERE meta->>'job_id' = %s
+                    LIMIT 1
+                    """,
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return str(row["id"])
+
+        return None
+    except Exception as e:
+        print(f"[DB] Failed to resolve video_uuid for job {job_id}: {e}")
+        return None
+
+
 def save_video_to_normalized_db(
     video_id: str,
     video_url: str,
@@ -960,7 +1152,11 @@ def save_video_to_normalized_db(
                 # Use video_id (job_id) directly as history_items.id to ensure
                 # frontend can PATCH /api/_mod/history/item/<jobId> without 404
                 history_uuid = existing_history_id or video_id
-                video_uuid = str(uuid.uuid4())
+
+                # Check if a videos row was already created at dispatch time
+                # (via create_video_record). If so, UPDATE it instead of INSERT.
+                existing_video_uuid = resolve_video_uuid(video_id, user_id)
+                video_uuid = existing_video_uuid or str(uuid.uuid4())
                 upstream_id = video_id
 
                 # Use S3 URL if available, otherwise use original
