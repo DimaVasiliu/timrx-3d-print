@@ -17,6 +17,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 import uuid
 from flask import Blueprint, jsonify, request
 
@@ -26,6 +27,7 @@ from backend.services.async_dispatch import get_executor
 from backend.services.credits_helper import start_paid_job, release_job_credits
 from backend.services.expense_guard import ExpenseGuard
 from backend.services.identity_service import require_identity
+from backend.services.history_service import create_video_record
 from backend.services.job_service import create_internal_job_row, load_store, save_store
 from backend.services.gemini_video_service import (
     validate_video_params,
@@ -320,6 +322,40 @@ def _dispatch_video_job(
             "message": "Failed to create internal job record. Credits have been released. Please try again.",
         }), 500
 
+    # Create a videos row early so history_items.video_id always has a valid FK target.
+    # This row starts as status='queued' and is updated as the job progresses.
+    video_uuid = create_video_record(
+        job_id=internal_job_id,
+        identity_id=identity_id,
+        prompt=prompt,
+        provider=provider,
+        duration_seconds=duration_seconds,
+        aspect_ratio=aspect_ratio,
+        resolution=resolution,
+    )
+    if video_uuid:
+        store_meta["video_uuid"] = video_uuid
+        store[internal_job_id] = store_meta
+        save_store(store)
+        # Also patch the video_uuid into jobs.meta so it can be resolved later
+        if USE_DB:
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.JOBS}
+                            SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
+                            WHERE id::text = %s
+                            """,
+                            (json.dumps({"video_uuid": video_uuid}), internal_job_id),
+                        )
+                    conn.commit()
+            except Exception as e:
+                print(f"[VIDEO] WARNING: Failed to store video_uuid in jobs.meta: {e}")
+    else:
+        print(f"[VIDEO] WARNING: create_video_record failed for job {internal_job_id}, history FK may fail")
+
     payload = {
         "task": task,
         "prompt": prompt,
@@ -353,6 +389,7 @@ def _dispatch_video_job(
         "ok": True,
         "job_id": internal_job_id,
         "video_id": internal_job_id,
+        "video_uuid": video_uuid,
         "reservation_id": reservation_id,
         "status": "queued",
         "task": task,
@@ -891,6 +928,7 @@ def _video_status_handler(job_id: str):
                         "status": "done",
                         "job_id": job_id,
                         "video_id": job_id,
+                        "video_uuid": job_meta.get("video_uuid") or job_id,
                         "video_url": video_url,
                         "thumbnail_url": thumbnail_url,
                         "duration_seconds": meta.get("duration_seconds") or job_meta.get("duration_seconds"),
