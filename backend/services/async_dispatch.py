@@ -628,7 +628,9 @@ def _mark_job_for_worker(job_id: str, upstream_id: str, provider_name: str, stor
                     (upstream_id, json.dumps(meta_patch), job_id),
                 )
             conn.commit()
-        print(f"[ASYNC] Job {job_id} queued for durable worker (upstream={upstream_id}, provider={provider_name})")
+        # Seedance: poll-first (PiAPI strips webhook_config). Vertex: poll-only.
+        completion_note = "poll-first; webhook best-effort only" if provider_name == "seedance" else "poll-only"
+        print(f"[ASYNC] Job {job_id} queued for durable worker (upstream={upstream_id}, provider={provider_name}, completion={completion_note})")
     except Exception as e:
         print(f"[ASYNC] ERROR marking job {job_id} for worker: {e}")
 
