@@ -457,6 +457,24 @@ def history_mod():
                                             print(f"[History][mod] Skipping video item {item_id} — no video_id (status={status})")
                                             skipped_items.append({"client_id": str(item_id), "reason": "no_video_id"})
                                             continue
+
+                                        # Validate video_id references videos table (not jobs table).
+                                        # Frontend may send job_id as video_id — resolve to real videos.id.
+                                        cur.execute(
+                                            f"SELECT id FROM {Tables.VIDEOS} WHERE id::text = %s LIMIT 1",
+                                            (str(video_id),),
+                                        )
+                                        if not cur.fetchone():
+                                            # video_id is not in videos table — try resolving via jobs.meta
+                                            from backend.services.history_service import resolve_video_uuid
+                                            resolved = resolve_video_uuid(str(video_id), identity_id)
+                                            if resolved:
+                                                print(f"[History][mod] Resolved job_id={video_id} -> video_uuid={resolved}")
+                                                video_id = resolved
+                                            else:
+                                                print(f"[History][mod] Skipping video item {item_id} — video_id={video_id} not in videos table (FK would fail)")
+                                                skipped_items.append({"client_id": str(item_id), "reason": "video_id_not_in_videos"})
+                                                continue
                                     else:
                                         if not model_id and not image_id:
                                             model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
