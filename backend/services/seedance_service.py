@@ -242,22 +242,23 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
     # Extract timing metadata
     started_at = task_data.get("started_at") or task_data.get("start_time")
     ended_at = task_data.get("ended_at") or task_data.get("end_time")
-    actually_started = started_at not in _ZERO_TIMESTAMPS
+    has_start_timestamp = started_at not in _ZERO_TIMESTAMPS
+
+    # PiAPI often returns zero/missing timestamps even when genuinely
+    # processing. Trust the explicit status from PiAPI over timestamps.
+    # "started" here means: provider says processing OR we have a real timestamp.
+    started = has_start_timestamp or internal_status == "processing"
 
     # Debug: log raw PiAPI status for rescue diagnostics
     print(f"[Seedance] status check task={task_id[:12]}... "
           f"raw_status={piapi_status!r} -> {internal_status} "
-          f"actually_started={actually_started} "
+          f"started={started} (has_ts={has_start_timestamp}) "
           f"keys={list(task_data.keys())[:8]}")
-
-    # NOTE: Previously we demoted "processing" to "pending" when started_at
-    # was a zero timestamp. Removed — PiAPI often omits timing fields even
-    # when genuinely processing. Trust the explicit status from PiAPI.
 
     result: Dict[str, Any] = {
         "status": internal_status,
         "provider_status": piapi_status,
-        "started_at": started_at if actually_started else None,
+        "started_at": started_at if has_start_timestamp else None,
         "ended_at": ended_at if ended_at not in _ZERO_TIMESTAMPS else None,
         "progress": task_data.get("progress", 0),
     }
