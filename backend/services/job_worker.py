@@ -1180,6 +1180,21 @@ def _fail_job(
         "completed_at": "NOW()",
     }, meta_patch=fail_meta)
 
+    # Update the early-created videos row to status='failed'
+    video_uuid = meta.get("video_uuid")
+    if video_uuid:
+        try:
+            from backend.services.history_service import update_video_record
+            update_video_record(
+                video_uuid,
+                status="failed",
+                error_message=error_msg[:500],
+                meta_patch={"error_code": error_code, "failure_provider": provider_name},
+            )
+            print(f"[JOB] videos row updated: video_uuid={video_uuid} status=failed")
+        except Exception as e:
+            print(f"[JOB] WARNING: failed to update videos row {video_uuid}: {e}")
+
     # Update in-memory store for frontend
     from backend.services.job_service import load_store, save_store
     store = load_store()

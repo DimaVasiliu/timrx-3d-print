@@ -378,6 +378,23 @@ def _mark_failed_finalizing(
     except Exception as e:
         print(f"[RESCUE] Error marking finalizing-failed job={job_id}: {e}")
 
+    # Update videos row to failed
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT meta->>'video_uuid' AS video_uuid FROM {Tables.JOBS} WHERE id::text = %s",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+        video_uuid = row.get("video_uuid") if row else None
+        if video_uuid:
+            from backend.services.history_service import update_video_record
+            update_video_record(video_uuid, status="failed", error_message=reason[:500])
+            print(f"[RESCUE] videos row updated: video_uuid={video_uuid} status=failed")
+    except Exception as e:
+        print(f"[RESCUE] WARNING: failed to update videos row for job={job_id}: {e}")
+
     # Release credits
     if reservation_id:
         try:
@@ -732,6 +749,28 @@ def _update_rescued_job(
 
     except Exception as e:
         print(f"[RESCUE] Error updating job {job_id}: {e}")
+
+    # Update videos row to ready (separate connection)
+    try:
+        with get_conn() as conn2:
+            with conn2.cursor() as cur2:
+                cur2.execute(
+                    f"SELECT meta->>'video_uuid' AS video_uuid FROM {Tables.JOBS} WHERE id::text = %s",
+                    (job_id,),
+                )
+                vrow = cur2.fetchone()
+        video_uuid = vrow.get("video_uuid") if vrow else None
+        if video_uuid:
+            from backend.services.history_service import update_video_record
+            update_video_record(
+                video_uuid,
+                status="ready",
+                video_url=result_url,
+                thumbnail_url=thumbnail_url,
+            )
+            print(f"[RESCUE] videos row updated: video_uuid={video_uuid} status=ready")
+    except Exception as ve:
+        print(f"[RESCUE] WARNING: failed to update videos row for job={job_id}: {ve}")
 
 
 # ── Requeue for Worker ──────────────────────────────────────
