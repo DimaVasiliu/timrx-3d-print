@@ -691,6 +691,39 @@ def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, p
     )
 
 
+def _fail_video_record(store_meta: dict, error_message: str):
+    """Update the early-created videos row to status='failed' and write history on dispatch errors."""
+    video_uuid = store_meta.get("video_uuid")
+    if not video_uuid:
+        return
+    try:
+        from backend.services.history_service import update_video_record
+        update_video_record(video_uuid, status="failed", error_message=error_message[:500])
+        print(f"[ASYNC] videos row updated: video_uuid={video_uuid} status=failed")
+    except Exception as e:
+        print(f"[ASYNC] WARNING: failed to update videos row {video_uuid}: {e}")
+
+    # Write history_items row so failed video appears in user history
+    try:
+        identity_id = store_meta.get("identity_id") or store_meta.get("user_id", "")
+        job_id = store_meta.get("internal_job_id", "")
+        if identity_id and job_id:
+            from backend.services.history_service import save_failed_video_to_history
+            save_failed_video_to_history(
+                job_id=job_id,
+                identity_id=identity_id,
+                video_uuid=video_uuid,
+                prompt=store_meta.get("prompt", ""),
+                error_message=error_message[:500],
+                provider=store_meta.get("provider", "unknown"),
+                duration_seconds=store_meta.get("duration_seconds"),
+                aspect_ratio=store_meta.get("aspect_ratio"),
+                resolution=store_meta.get("resolution"),
+            )
+    except Exception as e:
+        print(f"[ASYNC] WARNING: failed to write failed history for {video_uuid}: {e}")
+
+
 def _safe_int_duration(raw) -> int:
     """Parse duration to int, stripping 's'/'sec' suffixes. Falls back to 6."""
     try:
@@ -837,6 +870,7 @@ def dispatch_gemini_video_async(
             store[internal_job_id] = store_meta
             save_store(store)
             _update_job_status(internal_job_id, "failed", error_message="worker_limit_exceeded: No worker slot available")
+            _fail_video_record(store_meta, "worker_limit_exceeded: No worker slot available")
             return
 
     start_time = time.time()
@@ -915,6 +949,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "no_provider_available", internal_job_id)
         update_job_status_failed(internal_job_id, f"no_provider_available: {e}")
+        _fail_video_record(store_meta, f"no_provider_available: {e}")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiConfigError as e:
@@ -923,6 +958,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "provider_not_configured", internal_job_id)
         update_job_status_failed(internal_job_id, f"provider_not_configured: {e}")
+        _fail_video_record(store_meta, f"provider_not_configured: {e}")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiValidationError as e:
@@ -931,6 +967,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "validation_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"invalid_params: {e.message}")
+        _fail_video_record(store_meta, f"invalid_params: {e.message}")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiAuthError as e:
@@ -939,6 +976,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "provider_auth_failed", internal_job_id)
         update_job_status_failed(internal_job_id, f"provider_auth_failed: {e}")
+        _fail_video_record(store_meta, f"provider_auth_failed: {e}")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except RuntimeError as e:
@@ -948,6 +986,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "video_failed", internal_job_id)
         update_job_status_failed(internal_job_id, error_str)
+        _fail_video_record(store_meta, error_str)
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except Exception as e:
@@ -956,6 +995,7 @@ def dispatch_gemini_video_async(
         if reservation_id:
             release_job_credits(reservation_id, "video_error", internal_job_id)
         update_job_status_failed(internal_job_id, f"video_failed: {e}")
+        _fail_video_record(store_meta, f"video_failed: {e}")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     finally:
@@ -1811,6 +1851,7 @@ def _finalize_video_success_with_bytes(
         if reservation_id:
             release_job_credits(reservation_id, "s3_upload_failed", internal_job_id)
         update_job_status_failed(internal_job_id, "s3_upload_failed: Could not upload video to storage")
+        _fail_video_record(store_meta, "s3_upload_failed: Could not upload video to storage")
         ExpenseGuard.unregister_active_job(internal_job_id)
         return
 
@@ -2098,5 +2139,3 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
-
-

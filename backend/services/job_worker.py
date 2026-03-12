@@ -1195,6 +1195,24 @@ def _fail_job(
         except Exception as e:
             print(f"[JOB] WARNING: failed to update videos row {video_uuid}: {e}")
 
+        # Write history_items row so failed video appears in user history
+        try:
+            identity_id = str(meta.get("identity_id") or meta.get("user_id", ""))
+            from backend.services.history_service import save_failed_video_to_history
+            save_failed_video_to_history(
+                job_id=job_id,
+                identity_id=identity_id,
+                video_uuid=video_uuid,
+                prompt=meta.get("prompt", ""),
+                error_message=error_msg[:500],
+                provider=provider_name,
+                duration_seconds=meta.get("duration_seconds"),
+                aspect_ratio=meta.get("aspect_ratio"),
+                resolution=meta.get("resolution"),
+            )
+        except Exception as e:
+            print(f"[JOB] WARNING: failed to write failed history for job {job_id}: {e}")
+
     # Update in-memory store for frontend
     from backend.services.job_service import load_store, save_store
     store = load_store()

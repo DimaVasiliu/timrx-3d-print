@@ -1348,6 +1348,98 @@ def save_video_to_normalized_db(
         return None
 
 
+def save_failed_video_to_history(
+    job_id: str,
+    identity_id: str,
+    video_uuid: str,
+    prompt: str,
+    error_message: str,
+    *,
+    provider: str = "unknown",
+    duration_seconds: int | None = None,
+    aspect_ratio: str | None = None,
+    resolution: str | None = None,
+) -> str | None:
+    """
+    Write a history_items row for a failed video so it appears in user history.
+
+    Requires the videos row to already exist (created at dispatch time).
+    The history_items.video_id references the videos.id (video_uuid), NOT job.id.
+
+    Returns the history_items.id or None on error.
+    """
+    if not USE_DB:
+        return None
+
+    if not identity_id:
+        print(f"[DB] SKIPPED save_failed_video_to_history: no identity_id for job {job_id}")
+        return None
+
+    try:
+        title = derive_display_title(prompt, None)
+        # Use job_id as history_items.id so frontend can look it up
+        history_uuid = job_id
+
+        payload = {
+            "original_id": job_id,
+            "duration_seconds": duration_seconds,
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
+            "provider": provider,
+            "error_message": error_message[:500] if error_message else None,
+            "failed": True,
+        }
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.HISTORY_ITEMS} (
+                        id, identity_id, item_type, status, stage,
+                        title, prompt,
+                        video_id,
+                        payload
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s,
+                        %s
+                    )
+                    ON CONFLICT (id) DO UPDATE
+                    SET status = EXCLUDED.status,
+                        video_id = EXCLUDED.video_id,
+                        model_id = NULL,
+                        image_id = NULL,
+                        payload = EXCLUDED.payload,
+                        updated_at = NOW()
+                    RETURNING id
+                    """,
+                    (
+                        history_uuid,
+                        identity_id,
+                        "video",
+                        "failed",
+                        "video",
+                        title,
+                        prompt,
+                        video_uuid,
+                        json.dumps(payload),
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        if row:
+            print(f"[DB] failed video history written: history_id={row['id']} video_uuid={video_uuid} job_id={job_id}")
+            return str(row["id"])
+        return None
+    except Exception as e:
+        print(f"[DB] Failed to save failed video history for job {job_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta: dict, job_type: str = "model", user_id: str | None = None):
     """
     Save finished job data to normalized tables (history_items, models, images).
