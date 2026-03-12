@@ -1182,70 +1182,126 @@ def save_video_to_normalized_db(
                     "provider": provider,
                 }
 
-                # Insert into videos table
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.VIDEOS} (
-                        id, identity_id,
-                        title, prompt,
-                        provider, upstream_id, status,
-                        s3_bucket, video_s3_key,
-                        video_url, thumbnail_url,
-                        duration_seconds, resolution, aspect_ratio,
-                        meta
-                    ) VALUES (
-                        %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        %s, %s, %s,
-                        %s
-                    )
-                    ON CONFLICT (provider, upstream_id) WHERE upstream_id IS NOT NULL DO UPDATE
-                    SET identity_id = COALESCE(EXCLUDED.identity_id, {Tables.VIDEOS}.identity_id),
-                        title = CASE
-                            WHEN EXCLUDED.title IS NOT NULL AND EXCLUDED.title <> ''
-                            THEN EXCLUDED.title
-                            ELSE {Tables.VIDEOS}.title
-                        END,
-                        prompt = COALESCE(EXCLUDED.prompt, {Tables.VIDEOS}.prompt),
-                        status = EXCLUDED.status,
-                        s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.VIDEOS}.s3_bucket),
-                        video_s3_key = COALESCE(EXCLUDED.video_s3_key, {Tables.VIDEOS}.video_s3_key),
-                        video_url = COALESCE(EXCLUDED.video_url, {Tables.VIDEOS}.video_url),
-                        thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.VIDEOS}.thumbnail_url),
-                        duration_seconds = COALESCE(EXCLUDED.duration_seconds, {Tables.VIDEOS}.duration_seconds),
-                        resolution = COALESCE(EXCLUDED.resolution, {Tables.VIDEOS}.resolution),
-                        aspect_ratio = COALESCE(EXCLUDED.aspect_ratio, {Tables.VIDEOS}.aspect_ratio),
-                        meta = EXCLUDED.meta,
-                        updated_at = NOW()
-                    RETURNING id
-                    """,
-                    (
-                        video_uuid,
-                        user_id,
-                        title,
-                        prompt,
-                        provider,
-                        upstream_id,
-                        "ready",
-                        AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
-                        video_s3_key,
-                        final_video_url,
-                        thumbnail_url,
-                        duration_seconds,
-                        resolution,
-                        aspect_ratio,
-                        video_meta,
-                    ),
-                )
+                # ── Update or insert videos row ──
+                # Prefer UPDATE on existing row (created at dispatch time).
+                # Only fall back to INSERT if row truly doesn't exist.
+                returned_video_id = None
 
-                video_row = cur.fetchone()
-                if not video_row:
-                    raise RuntimeError("[DB] Failed to upsert videos row (no id returned)")
-                returned_video_id = video_row["id"]
-                # print(f"[DB] video persisted: video_id={returned_video_id} video_url={final_video_url}")
+                if existing_video_uuid:
+                    # Row exists from create_video_record() — UPDATE to ready
+                    print(f"[DB] finalizing existing video row: video_uuid={existing_video_uuid} job_id={video_id}")
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.VIDEOS}
+                        SET status = 'ready',
+                            upstream_id = COALESCE(%s, upstream_id),
+                            identity_id = COALESCE(%s, identity_id),
+                            title = CASE
+                                WHEN %s IS NOT NULL AND %s <> ''
+                                THEN %s ELSE title
+                            END,
+                            prompt = COALESCE(%s, prompt),
+                            s3_bucket = COALESCE(%s, s3_bucket),
+                            video_s3_key = COALESCE(%s, video_s3_key),
+                            video_url = COALESCE(%s, video_url),
+                            thumbnail_url = COALESCE(%s, thumbnail_url),
+                            duration_seconds = COALESCE(%s, duration_seconds),
+                            resolution = COALESCE(%s, resolution),
+                            aspect_ratio = COALESCE(%s, aspect_ratio),
+                            meta = %s,
+                            error_message = NULL,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING id
+                        """,
+                        (
+                            upstream_id,
+                            user_id,
+                            title, title, title,
+                            prompt,
+                            AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
+                            video_s3_key,
+                            final_video_url,
+                            thumbnail_url,
+                            duration_seconds,
+                            resolution,
+                            aspect_ratio,
+                            video_meta,
+                            existing_video_uuid,
+                        ),
+                    )
+                    video_row = cur.fetchone()
+                    if video_row:
+                        returned_video_id = video_row["id"]
+                        print(f"[DB] video row marked ready: video_uuid={returned_video_id}")
+
+                if not returned_video_id:
+                    # No existing row — fallback INSERT (pre-fix jobs or edge cases)
+                    print(f"[DB][WARN] finalization fallback insert used because row missing: video_uuid={video_uuid} job_id={video_id}")
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.VIDEOS} (
+                            id, identity_id,
+                            title, prompt,
+                            provider, upstream_id, status,
+                            s3_bucket, video_s3_key,
+                            video_url, thumbnail_url,
+                            duration_seconds, resolution, aspect_ratio,
+                            meta
+                        ) VALUES (
+                            %s, %s,
+                            %s, %s,
+                            %s, %s, %s,
+                            %s, %s,
+                            %s, %s,
+                            %s, %s, %s,
+                            %s
+                        )
+                        ON CONFLICT (id) DO UPDATE
+                        SET status = 'ready',
+                            upstream_id = COALESCE(EXCLUDED.upstream_id, {Tables.VIDEOS}.upstream_id),
+                            identity_id = COALESCE(EXCLUDED.identity_id, {Tables.VIDEOS}.identity_id),
+                            title = CASE
+                                WHEN EXCLUDED.title IS NOT NULL AND EXCLUDED.title <> ''
+                                THEN EXCLUDED.title
+                                ELSE {Tables.VIDEOS}.title
+                            END,
+                            prompt = COALESCE(EXCLUDED.prompt, {Tables.VIDEOS}.prompt),
+                            s3_bucket = COALESCE(EXCLUDED.s3_bucket, {Tables.VIDEOS}.s3_bucket),
+                            video_s3_key = COALESCE(EXCLUDED.video_s3_key, {Tables.VIDEOS}.video_s3_key),
+                            video_url = COALESCE(EXCLUDED.video_url, {Tables.VIDEOS}.video_url),
+                            thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.VIDEOS}.thumbnail_url),
+                            duration_seconds = COALESCE(EXCLUDED.duration_seconds, {Tables.VIDEOS}.duration_seconds),
+                            resolution = COALESCE(EXCLUDED.resolution, {Tables.VIDEOS}.resolution),
+                            aspect_ratio = COALESCE(EXCLUDED.aspect_ratio, {Tables.VIDEOS}.aspect_ratio),
+                            meta = EXCLUDED.meta,
+                            error_message = NULL,
+                            updated_at = NOW()
+                        RETURNING id
+                        """,
+                        (
+                            video_uuid,
+                            user_id,
+                            title,
+                            prompt,
+                            provider,
+                            upstream_id,
+                            "ready",
+                            AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
+                            video_s3_key,
+                            final_video_url,
+                            thumbnail_url,
+                            duration_seconds,
+                            resolution,
+                            aspect_ratio,
+                            video_meta,
+                        ),
+                    )
+                    video_row = cur.fetchone()
+                    if not video_row:
+                        raise RuntimeError("[DB] Failed to upsert videos row (no id returned)")
+                    returned_video_id = video_row["id"]
+                    print(f"[DB] video row created via fallback: video_uuid={returned_video_id}")
 
                 # Insert or update history_items
                 if existing_history_id:

@@ -1039,6 +1039,7 @@ def _finalize_success(
         "stage": "video",
         "task": meta.get("task", "text2video"),
         "internal_job_id": job_id,
+        "video_uuid": meta.get("video_uuid"),
     }
 
     _finalize_video_success(
@@ -1096,6 +1097,7 @@ def _finalize_success_with_bytes(
         "stage": "video",
         "task": meta.get("task", "text2video"),
         "internal_job_id": job_id,
+        "video_uuid": meta.get("video_uuid"),
     }
 
     _finalize_video_success_with_bytes(
