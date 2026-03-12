@@ -6,8 +6,12 @@ Two webhook endpoints:
 1. POST /api/webhooks/piapi        — PiAPI account-level notifications (quota, suspension)
 2. POST /api/webhooks/piapi/task   — PiAPI task-level completion callbacks (video jobs)
 
-The task webhook is the real completion path for Seedance video jobs.
-Polling in job_worker.py remains as a fallback safety net.
+Provider completion models:
+  - Seedance: POLL-FIRST. PiAPI currently strips webhook_config for Seedance
+    models (confirmed March 2025). Polling via job_worker.py is the canonical
+    completion path. If PiAPI ever starts delivering webhooks for Seedance,
+    this endpoint will accelerate completion as an optional fast path.
+  - Vertex: Poll-only (no webhook API in Vertex AI Veo).
 
 Render env vars:
     PIAPI_WEBHOOK_ENABLED   — "true" to accept webhooks (default: false)
@@ -379,8 +383,11 @@ def piapi_task_webhook():
     """
     Receive PiAPI task-level completion callbacks for video jobs.
 
-    This is the fast completion path. When a Seedance video job finishes
-    (success or failure), PiAPI posts the task result here. The handler:
+    Currently an optional accelerator — not the primary completion path.
+    Seedance jobs complete via durable polling in job_worker.py (PiAPI strips
+    webhook_config for Seedance models as of March 2025). If PiAPI begins
+    delivering webhooks in the future, this handler will accelerate completion.
+    The handler:
 
     1. Verifies the shared secret
     2. Extracts the task_id and status from the payload
