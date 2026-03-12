@@ -631,6 +631,13 @@ def _mark_job_for_worker(job_id: str, upstream_id: str, provider_name: str, stor
         # Seedance: poll-first (PiAPI strips webhook_config). Vertex: poll-only.
         completion_note = "poll-first; webhook best-effort only" if provider_name == "seedance" else "poll-only"
         print(f"[ASYNC] Job {job_id} queued for durable worker (upstream={upstream_id}, provider={provider_name}, completion={completion_note})")
+
+        # Update the early-created videos row with the provider's upstream_id
+        video_uuid = store_meta.get("video_uuid")
+        if video_uuid:
+            from backend.services.history_service import update_video_record
+            update_video_record(video_uuid, upstream_id=upstream_id, status="processing")
+            print(f"[ASYNC] videos row updated: video_uuid={video_uuid} upstream_id={upstream_id} status=processing")
     except Exception as e:
         print(f"[ASYNC] ERROR marking job {job_id} for worker: {e}")
 
