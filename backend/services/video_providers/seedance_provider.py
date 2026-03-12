@@ -1,8 +1,13 @@
 """
-Seedance Video Provider (via PiAPI).
+Seedance Video Provider (via PiAPI) — POLL-FIRST provider.
 
 Wraps seedance_service to provide a consistent interface
 for the VideoRouter to use alongside VertexVeoProvider.
+
+Completion model: polling via durable job worker.
+PiAPI ignores/strips webhook_config for Seedance models (confirmed March 2025).
+Webhook config is still sent best-effort but all completion, failure, timeout,
+and credit logic works correctly without webhook delivery.
 
 Supported options:
 - durations:     5, 10, 15 seconds
