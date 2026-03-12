@@ -969,7 +969,7 @@ def _try_transition_to_finalizing(job_id: str) -> bool:
     Atomically transition job to 'finalizing' only if not already terminal.
 
     Returns True if this worker won the transition, False if the job was
-    already in a terminal or finalizing state (e.g. webhook got there first).
+    already in a terminal or finalizing state (e.g. another poll cycle or webhook got there first).
     """
     if not USE_DB:
         return True
@@ -1010,14 +1010,14 @@ def _finalize_success(
     Finalize a successful video generation.
 
     1. Atomically transition to 'finalizing' (prevents double finalization
-       if webhook already claimed this job)
+       from concurrent poll cycles or a future webhook delivery)
     2. Delegate to existing finalization logic (S3, credits, history)
     3. Mark as 'ready'
     """
     print(f"[JOB] finalizing job={job_id} provider={provider_name} video_url={video_url[:80]}...")
 
     if not _try_transition_to_finalizing(job_id):
-        print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal (webhook?)")
+        print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal")
         return
 
     from backend.services.async_dispatch import _finalize_video_success
@@ -1076,7 +1076,7 @@ def _finalize_success_with_bytes(
     print(f"[JOB] finalizing job={job_id} provider={provider_name} video_bytes={len(video_bytes)} bytes")
 
     if not _try_transition_to_finalizing(job_id):
-        print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal (webhook?)")
+        print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal")
         return
 
     from backend.services.async_dispatch import _finalize_video_success_with_bytes
