@@ -25,12 +25,25 @@ from backend.services.video_errors import (
 PIAPI_BASE = "https://api.piapi.ai/api/v1"
 PIAPI_TIMEOUT = 30  # seconds
 
+# ── Provider capability note ─────────────────────────────────
+# Seedance via PiAPI is a POLL-FIRST provider. Observed behavior (March 2025):
+#   - We send webhook_config in the create-task request body
+#   - PiAPI returns webhook_config with empty endpoint/secret in the response
+#   - No webhook deliveries are received for seedance-2-fast-preview or
+#     seedance-2-preview task types
+# Conclusion: PiAPI ignores or strips webhook_config for Seedance models.
+# Polling via the durable job worker is the primary and required completion
+# mechanism. Webhook config is still sent best-effort for future compatibility
+# but all Seedance logic (completion, failure, timeout, credits) must work
+# correctly without webhook delivery.
+
 # Startup diagnostic (safe — never logs the key itself)
 _api_key_present = bool(getattr(config, "PIAPI_API_KEY", ""))
 _webhook_enabled = getattr(config, "PIAPI_WEBHOOK_ENABLED", False)
 _webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
 print(f"[SEEDANCE] api_key configured={_api_key_present}")
 print(f"[SEEDANCE] webhook enabled={_webhook_enabled} url={_webhook_url or 'NONE'}")
+print("[SEEDANCE] mode=poll-first (webhook optional, PiAPI strips webhook_config for seedance models)")
 if not _api_key_present:
     print("[SEEDANCE] WARNING: PIAPI_API_KEY is not set — Seedance video generation will fail")
 
@@ -113,8 +126,8 @@ def create_seedance_task(
     if image_urls:
         body["input"]["image_urls"] = image_urls
 
-    # Attach webhook config when enabled so PiAPI sends task completion callbacks.
-    webhook_enabled = getattr(config, "PIAPI_WEBHOOK_ENABLED", False)
+    # Best-effort webhook config: PiAPI currently strips this for Seedance models,
+    # but we include it for forward compatibility. Polling is the primary path.
     webhook_url = getattr(config, "PIAPI_WEBHOOK_URL", "")
     webhook_secret = getattr(config, "PIAPI_WEBHOOK_SECRET", "")
 
@@ -123,10 +136,8 @@ def create_seedance_task(
         if webhook_secret:
             wh_cfg["secret"] = webhook_secret
         body["webhook_config"] = wh_cfg
-        print(f"[Seedance] webhook_config attached: enabled={webhook_enabled} endpoint={webhook_url}")
-    else:
-        print(f"[Seedance] webhook_config NOT attached: enabled={webhook_enabled} "
-              f"url={webhook_url or 'NONE'} public_base_url={getattr(config, 'PUBLIC_BASE_URL', '') or 'NONE'}")
+
+    print(f"[Seedance] operating in poll-first mode (webhook optional, sent={bool(webhook_url)})")
 
     # Log the exact request body (redact API key from headers, keep webhook visible)
     _prompt_preview = (body.get("input", {}).get("prompt") or "")[:60]
