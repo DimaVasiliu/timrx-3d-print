@@ -1945,6 +1945,12 @@ def _finalize_video_success_with_bytes(
 
     print(f"[ASYNC] {provider_name} video job {internal_job_id} completed successfully")
 
+    return {
+        "final_video_url": final_video_url,
+        "s3_video_url": s3_video_url,
+        "s3_thumbnail_url": s3_thumbnail_url,
+    }
+
 
 def _finalize_video_success(
     internal_job_id: str,
@@ -1953,7 +1959,7 @@ def _finalize_video_success(
     video_url: str,
     store_meta: dict,
     provider_name: str = "google",
-):
+) -> dict:
     """
     Finalize a successful video generation.
 
@@ -1961,6 +1967,9 @@ def _finalize_video_success(
     2. Upload to S3 (if configured)
     3. Update job status and store
     4. Finalize credits
+
+    Returns dict with final URLs:
+        {"final_video_url": ..., "s3_video_url": ..., "s3_thumbnail_url": ...}
 
     Works for any provider — uses the VideoRouter to get the right
     download method.
@@ -2133,9 +2142,16 @@ def _finalize_video_success(
         except Exception as e:
             print(f"[ASYNC] Error updating video_url for {internal_job_id}: {e}")
 
-    # print(f"[ASYNC] {provider_name} video job {internal_job_id} completed successfully")
+    # Return final URLs so the caller can persist them in the jobs table
+    return {
+        "final_video_url": final_video_url,
+        "s3_video_url": s3_video_url,
+        "s3_thumbnail_url": s3_thumbnail_url,
+    }
 
 
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+

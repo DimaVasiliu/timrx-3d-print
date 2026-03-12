@@ -1412,10 +1412,32 @@ def save_video_to_normalized_db(
         # print(f"[DB] Saved video {video_id} -> {history_uuid} to normalized tables (user_id={user_id})")
         return returned_video_id
     except Exception as e:
-        print(f"[DB] Failed to save video {video_id}: {e}")
+        print(f"[DB] Failed to save video {video_id} (attempt 1): {e}")
         import traceback
         traceback.print_exc()
-        return None
+
+        # Retry once after a short delay — transient DB errors (connection resets,
+        # serialization conflicts) are common under load.
+        import time
+        time.sleep(0.5)
+        try:
+            print(f"[DB] Retrying save_video_to_normalized_db for {video_id} (attempt 2)...")
+            return save_video_to_normalized_db(
+                video_id=video_id,
+                video_url=video_url,
+                prompt=prompt,
+                duration_seconds=duration_seconds,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                thumbnail_url=thumbnail_url,
+                user_id=user_id,
+                provider=provider,
+                s3_video_url=s3_video_url,
+            )
+        except Exception as retry_err:
+            print(f"[DB] CRITICAL: Retry also failed for video {video_id}: {retry_err}")
+            traceback.print_exc()
+            return None
 
 
 def save_failed_video_to_history(

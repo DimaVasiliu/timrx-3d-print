@@ -1092,23 +1092,32 @@ def _finalize_success(
         "video_uuid": meta.get("video_uuid"),
     }
 
-    _finalize_video_success(
+    finalize_urls = _finalize_video_success(
         internal_job_id=job_id,
         identity_id=identity_id,
         reservation_id=reservation_id,
         video_url=video_url,
         store_meta=store_meta,
         provider_name=provider_name,
-    )
+    ) or {}
 
-    _transition_job(job_id, "ready", {
-        "result_url": video_url,
+    # Persist the S3 URL (not the ephemeral provider URL) so recovery
+    # queries always find permanent URLs in jobs.result_url / thumbnail_url.
+    persisted_url = finalize_urls.get("s3_video_url") or finalize_urls.get("final_video_url") or video_url
+    persisted_thumb = finalize_urls.get("s3_thumbnail_url")
+
+    transition_cols = {
+        "result_url": persisted_url,
         "completed_at": "NOW()",
         "claimed_by": None,
         "claimed_at": None,
-    })
+    }
+    if persisted_thumb:
+        transition_cols["thumbnail_url"] = persisted_thumb
 
-    print(f"[JOB] succeeded job={job_id} provider={provider_name}")
+    _transition_job(job_id, "ready", transition_cols)
+
+    print(f"[JOB] succeeded job={job_id} provider={provider_name} result_url={persisted_url[:80]}...")
 
 
 def _finalize_success_with_bytes(
@@ -1150,7 +1159,7 @@ def _finalize_success_with_bytes(
         "video_uuid": meta.get("video_uuid"),
     }
 
-    _finalize_video_success_with_bytes(
+    finalize_urls = _finalize_video_success_with_bytes(
         internal_job_id=job_id,
         identity_id=identity_id,
         reservation_id=reservation_id,
@@ -1158,15 +1167,24 @@ def _finalize_success_with_bytes(
         content_type=content_type,
         store_meta=store_meta,
         provider_name=provider_name,
-    )
+    ) or {}
 
-    _transition_job(job_id, "ready", {
+    persisted_url = finalize_urls.get("s3_video_url") or finalize_urls.get("final_video_url")
+    persisted_thumb = finalize_urls.get("s3_thumbnail_url")
+
+    transition_cols = {
         "completed_at": "NOW()",
         "claimed_by": None,
         "claimed_at": None,
-    })
+    }
+    if persisted_url:
+        transition_cols["result_url"] = persisted_url
+    if persisted_thumb:
+        transition_cols["thumbnail_url"] = persisted_thumb
 
-    print(f"[JOB] succeeded job={job_id} provider={provider_name} (bytes path)")
+    _transition_job(job_id, "ready", transition_cols)
+
+    print(f"[JOB] succeeded job={job_id} provider={provider_name} (bytes path) result_url={persisted_url[:80] if persisted_url else 'NONE'}...")
 
 
 # ── Failure Handling ────────────────────────────────────────
