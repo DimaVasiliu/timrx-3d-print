@@ -518,44 +518,68 @@ def _ensure_timeout_anchor(job_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ensure the job has a valid dispatched_at timestamp for timeout tracking.
 
-    For stalled jobs being reclaimed, the original dispatched_at might be
-    very old (or missing). In that case, set a fresh anchor so the job
-    gets a fair chance to be polled before timing out.
+    Key invariant: `first_dispatched_at` is set ONCE (at original dispatch) and
+    NEVER overwritten. It represents the true age of the job for timeout math.
+    `dispatched_at` may be refreshed on recovery for bookkeeping but is NOT used
+    for elapsed-time computation (see _poll_provider_once).
+
+    For jobs older than MAX_RECOVERY_AGE_HOURS, the job is abandoned rather than
+    getting an infinite timeout extension.
 
     Returns updated meta dict.
     """
     now = time.time()
     dispatched_at = meta.get("dispatched_at")
+    first_dispatched_at = meta.get("first_dispatched_at")
 
     if not dispatched_at:
         # No dispatch timestamp at all — set fresh anchor
         meta["dispatched_at"] = now
+        # Preserve first_dispatched_at if it already exists (should not happen,
+        # but defensive). Otherwise set it to now.
+        if not first_dispatched_at:
+            meta["first_dispatched_at"] = now
         meta["recovery_anchor_set"] = True
         _transition_job(job_id, None, meta_patch={
             "dispatched_at": now,
+            "first_dispatched_at": meta["first_dispatched_at"],
             "recovery_anchor_set": True,
         })
         print(f"[JOB] set fresh timeout anchor job={job_id} reason=no_dispatched_at")
         return meta
 
-    # Check if the dispatch timestamp is absurdly old (> MAX_RECOVERY_AGE_HOURS)
-    age_hours = (now - dispatched_at) / 3600
+    # Backfill first_dispatched_at for jobs dispatched before this code change
+    if not first_dispatched_at:
+        meta["first_dispatched_at"] = dispatched_at
+        _transition_job(job_id, None, meta_patch={
+            "first_dispatched_at": dispatched_at,
+        })
+        print(f"[JOB] backfilled first_dispatched_at={dispatched_at} job={job_id}")
+
+    # Check if the job is absurdly old (> MAX_RECOVERY_AGE_HOURS from FIRST dispatch)
+    true_age = meta["first_dispatched_at"]
+    age_hours = (now - true_age) / 3600
     if age_hours > MAX_RECOVERY_AGE_HOURS:
-        # Reset the timeout anchor so the job gets polled before timing out
+        # Record recovery bookkeeping but do NOT reset first_dispatched_at
         meta["dispatched_at"] = now
-        meta["original_dispatched_at"] = dispatched_at
         meta["recovery_anchor_set"] = True
         _transition_job(job_id, None, meta_patch={
             "dispatched_at": now,
-            "original_dispatched_at": dispatched_at,
             "recovery_anchor_set": True,
         })
         print(
-            f"[JOB] reset timeout anchor job={job_id} "
-            f"reason=stale_dispatch age={int(age_hours)}h original_at={dispatched_at}"
+            f"[JOB] reset recovery anchor job={job_id} "
+            f"reason=stale_dispatch age={int(age_hours)}h "
+            f"first_dispatched_at={true_age} (PRESERVED)"
         )
         return meta
 
+    # Fresh enough — just ensure first_dispatched_at is set (already done above)
+    print(
+        f"[JOB] timeout anchor OK job={job_id} "
+        f"first_dispatched_at={meta['first_dispatched_at']} "
+        f"dispatched_at={dispatched_at} age={int(age_hours)}h"
+    )
     return meta
 
 
@@ -668,6 +692,7 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
         if not upstream_id:
             raise RuntimeError("Provider returned no task ID")
 
+        dispatch_ts = time.time()
         _transition_job(job_id, "dispatched", {
             "upstream_job_id": upstream_id,
             "last_provider_status": "pending",
@@ -676,7 +701,8 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
             "upstream_id": upstream_id,
             "provider": provider_name,
             "dispatched_by": WORKER_ID,
-            "dispatched_at": time.time(),
+            "dispatched_at": dispatch_ts,
+            "first_dispatched_at": dispatch_ts,
             "consecutive_errors": 0,
         })
 
@@ -714,18 +740,27 @@ def _poll_provider_once(
         _fail_job(job_id, meta, "No upstream job ID", "no_upstream_id", provider_name)
         return
 
-    # Compute elapsed times from timestamps
+    # Compute elapsed times from timestamps.
+    # Use first_dispatched_at (stable, never reset) for true pending age.
+    # Falls back to dispatched_at, then job.created_at for pre-migration jobs.
+    first_dispatched_at = meta.get("first_dispatched_at")
     dispatched_at = meta.get("dispatched_at") or _ts(job.get("created_at"))
+    pending_anchor = first_dispatched_at or dispatched_at
     processing_started_at = meta.get("processing_started_at")
     now = time.time()
-    pending_elapsed = now - dispatched_at if dispatched_at else 0
+    pending_elapsed = now - pending_anchor if pending_anchor else 0
     processing_elapsed = (now - processing_started_at) if processing_started_at else 0
 
     # Unpack provider-specific timeout thresholds
     pend_soft, pend_hard, proc_soft, proc_hard = timeouts
 
     # Log elapsed sources for debugging
-    elapsed_source = "meta.dispatched_at" if meta.get("dispatched_at") else "job.created_at"
+    if first_dispatched_at:
+        elapsed_source = "meta.first_dispatched_at"
+    elif meta.get("dispatched_at"):
+        elapsed_source = "meta.dispatched_at (no first_dispatched_at)"
+    else:
+        elapsed_source = "job.created_at (fallback)"
     print(
         f"[JOB] poll prep job={job_id} provider={provider_name} upstream={upstream_id} "
         f"elapsed_source={elapsed_source} pending={int(pending_elapsed)}s "
@@ -734,6 +769,7 @@ def _poll_provider_once(
 
     # Hard timeout checks BEFORE polling
     last_status = job.get("last_provider_status") or meta.get("provider_status", "pending")
+    was_queued_upstream = meta.get("queued_upstream", False)
 
     # Once processing has started, skip the pending timeout entirely — use
     # the processing timeout instead (checked below).
@@ -747,9 +783,10 @@ def _poll_provider_once(
                 print(f"[JOB] fallback job={job_id} new_upstream={fallback} reason=pending_timeout provider=seedance")
                 return
 
+        queue_info = " (stuck_in_provider_queue)" if was_queued_upstream else ""
         error_code = f"{provider_name}_pending_timeout"
-        print(f"[JOB] FAIL job={job_id} reason=pending_timeout elapsed={int(pending_elapsed)}s hard={pend_hard}s provider={provider_name}")
-        _fail_job(job_id, meta, f"Provider never started after {int(pending_elapsed)}s", error_code, provider_name)
+        print(f"[JOB] FAIL job={job_id} reason=pending_timeout{queue_info} elapsed={int(pending_elapsed)}s hard={pend_hard}s last_raw={last_status} provider={provider_name}")
+        _fail_job(job_id, meta, f"Provider never started after {int(pending_elapsed)}s (last_raw={last_status})", error_code, provider_name)
         return
 
     if processing_started_at and processing_elapsed >= proc_hard:
@@ -799,6 +836,7 @@ def _poll_provider_once(
     status = status_resp.get("status", "pending")
     provider_status = status_resp.get("provider_status", status)
     progress = status_resp.get("progress", 0)
+    queued_upstream = status_resp.get("queued_upstream", False)
 
     # Monotonic state guard: once processing has started locally, upstream
     # "pending" (from PiAPI "Staged" etc.) must NOT demote back to pending.
@@ -817,9 +855,11 @@ def _poll_provider_once(
         )
         status = "processing"
 
+    # Label for logging: distinguish "queued at provider" from "actively pending"
+    queue_label = " (QUEUED_UPSTREAM)" if queued_upstream else ""
     print(
         f"[JOB] poll result job={job_id} upstream={upstream_id} provider={provider_name} "
-        f"status={status} provider_status={provider_status} progress={progress} "
+        f"status={status}{queue_label} provider_status={provider_status} progress={progress} "
         f"local_status={current_local_status} "
         f"pending={int(pending_elapsed)}s processing={int(processing_elapsed)}s"
     )
@@ -900,14 +940,24 @@ def _poll_provider_once(
         else:
             poll_interval = POLL_SLEEP_PENDING
         print(
-            f"[JOB][DEBUG] status=pending job={job_id} poll_interval={poll_interval}s "
+            f"[JOB][DEBUG] status=pending{queue_label} job={job_id} poll_interval={poll_interval}s "
             f"past_soft={past_soft} pending_elapsed={int(pending_elapsed)}s"
         )
 
-        _update_job_state(job_id, "provider_pending", provider_status, progress, poll_interval, {
+        meta_patch = {
             "pending_seconds": int(pending_elapsed),
             "consecutive_errors": 0,
-        })
+        }
+        # Track queue state so we know if the job has ever left the provider queue
+        if queued_upstream:
+            meta_patch["queued_upstream"] = True
+        elif meta.get("queued_upstream"):
+            # Transitioned from queued → actively pending
+            meta_patch["queued_upstream"] = False
+            meta_patch["left_queue_at"] = now
+            print(f"[JOB] job={job_id} left provider queue after {int(pending_elapsed)}s provider={provider_name}")
+
+        _update_job_state(job_id, "provider_pending", provider_status, progress, poll_interval, meta_patch)
         _update_store(job_id, meta, upstream_id, "provider_pending", progress=progress)
 
     # Processing
@@ -1333,6 +1383,9 @@ def _attempt_seedance_fallback(job_id: str, meta: Dict[str, Any], provider) -> O
                             "fallback_from": "seedance-2-preview",
                             "fallback_reason": "pending_timeout",
                             "dispatched_at": time.time(),
+                            "fallback_dispatched_at": time.time(),
+                            # first_dispatched_at intentionally NOT reset —
+                            # preserves true user-facing wait time
                             "processing_started_at": None,
                             "consecutive_errors": 0,
                         }),

@@ -1190,45 +1190,59 @@ def save_video_to_normalized_db(
                 if existing_video_uuid:
                     # Row exists from create_video_record() — UPDATE to ready
                     print(f"[DB] finalizing existing video row: video_uuid={existing_video_uuid} job_id={video_id}")
+
+                    # Debug: log parameter types to diagnose IndeterminateDatatype
+                    _update_params = (
+                        upstream_id,                                        # $1  upstream_id     text
+                        user_id,                                            # $2  identity_id     uuid
+                        title, title, title,                                # $3-5 title          text
+                        prompt,                                             # $6  prompt          text
+                        AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,   # $7  s3_bucket       text
+                        video_s3_key,                                       # $8  video_s3_key    text
+                        final_video_url,                                    # $9  video_url       text
+                        thumbnail_url,                                      # $10 thumbnail_url   text
+                        duration_seconds,                                   # $11 duration_seconds int
+                        resolution,                                         # $12 resolution      text
+                        aspect_ratio,                                       # $13 aspect_ratio    text
+                        video_meta,                                         # $14 meta            jsonb
+                        existing_video_uuid,                                # $15 WHERE id        uuid
+                    )
+                    _param_names = [
+                        "upstream_id", "identity_id",
+                        "title_check", "title_cmp", "title_val",
+                        "prompt", "s3_bucket", "video_s3_key",
+                        "video_url", "thumbnail_url",
+                        "duration_seconds", "resolution", "aspect_ratio",
+                        "meta", "where_id",
+                    ]
+                    for _i, (_pn, _pv) in enumerate(zip(_param_names, _update_params), 1):
+                        print(f"[DB][DEBUG] update param ${_i} field={_pn} type={type(_pv).__name__} is_none={_pv is None}")
+
                     cur.execute(
                         f"""
                         UPDATE {Tables.VIDEOS}
                         SET status = 'ready',
-                            upstream_id = COALESCE(%s, upstream_id),
-                            identity_id = COALESCE(%s, identity_id),
+                            upstream_id = COALESCE(%s::text, upstream_id),
+                            identity_id = COALESCE(%s::uuid, identity_id),
                             title = CASE
-                                WHEN %s IS NOT NULL AND %s <> ''
-                                THEN %s ELSE title
+                                WHEN %s::text IS NOT NULL AND %s::text <> ''
+                                THEN %s::text ELSE title
                             END,
-                            prompt = COALESCE(%s, prompt),
-                            s3_bucket = COALESCE(%s, s3_bucket),
-                            video_s3_key = COALESCE(%s, video_s3_key),
-                            video_url = COALESCE(%s, video_url),
-                            thumbnail_url = COALESCE(%s, thumbnail_url),
-                            duration_seconds = COALESCE(%s, duration_seconds),
-                            resolution = COALESCE(%s, resolution),
-                            aspect_ratio = COALESCE(%s, aspect_ratio),
-                            meta = %s,
+                            prompt = COALESCE(%s::text, prompt),
+                            s3_bucket = COALESCE(%s::text, s3_bucket),
+                            video_s3_key = COALESCE(%s::text, video_s3_key),
+                            video_url = COALESCE(%s::text, video_url),
+                            thumbnail_url = COALESCE(%s::text, thumbnail_url),
+                            duration_seconds = COALESCE(%s::int, duration_seconds),
+                            resolution = COALESCE(%s::text, resolution),
+                            aspect_ratio = COALESCE(%s::text, aspect_ratio),
+                            meta = %s::jsonb,
                             error_message = NULL,
                             updated_at = NOW()
-                        WHERE id = %s
+                        WHERE id = %s::uuid
                         RETURNING id
                         """,
-                        (
-                            upstream_id,
-                            user_id,
-                            title, title, title,
-                            prompt,
-                            AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
-                            video_s3_key,
-                            final_video_url,
-                            thumbnail_url,
-                            duration_seconds,
-                            resolution,
-                            aspect_ratio,
-                            video_meta,
-                            existing_video_uuid,
-                        ),
+                        _update_params,
                     )
                     video_row = cur.fetchone()
                     if video_row:
@@ -1249,13 +1263,13 @@ def save_video_to_normalized_db(
                             duration_seconds, resolution, aspect_ratio,
                             meta
                         ) VALUES (
-                            %s, %s,
-                            %s, %s,
-                            %s, %s, %s,
-                            %s, %s,
-                            %s, %s,
-                            %s, %s, %s,
-                            %s
+                            %s::uuid, %s::uuid,
+                            %s::text, %s::text,
+                            %s::text, %s::text, %s::text,
+                            %s::text, %s::text,
+                            %s::text, %s::text,
+                            %s::int, %s::text, %s::text,
+                            %s::jsonb
                         )
                         ON CONFLICT (id) DO UPDATE
                         SET status = 'ready',
@@ -1308,24 +1322,24 @@ def save_video_to_normalized_db(
                     cur.execute(
                         f"""
                         UPDATE {Tables.HISTORY_ITEMS}
-                        SET item_type = %s,
-                            status = %s,
-                            stage = %s,
+                        SET item_type = %s::text,
+                            status = %s::text,
+                            stage = %s::text,
                             title = CASE
-                                WHEN %s IS NOT NULL AND %s <> ''
-                                THEN %s
+                                WHEN %s::text IS NOT NULL AND %s::text <> ''
+                                THEN %s::text
                                 ELSE title
                             END,
-                            prompt = COALESCE(%s, prompt),
-                            identity_id = COALESCE(%s, identity_id),
-                            thumbnail_url = COALESCE(%s, thumbnail_url),
-                            video_url = %s,
-                            video_id = %s,
+                            prompt = COALESCE(%s::text, prompt),
+                            identity_id = COALESCE(%s::uuid, identity_id),
+                            thumbnail_url = COALESCE(%s::text, thumbnail_url),
+                            video_url = %s::text,
+                            video_id = %s::uuid,
                             model_id = NULL,
                             image_id = NULL,
-                            payload = %s,
+                            payload = %s::jsonb,
                             updated_at = NOW()
-                        WHERE id = %s
+                        WHERE id = %s::uuid
                         """,
                         (
                             "video",
@@ -1354,12 +1368,12 @@ def save_video_to_normalized_db(
                             video_id,
                             payload
                         ) VALUES (
-                            %s, %s, %s, %s, %s,
-                            %s, %s,
-                            %s,
-                            %s,
-                            %s,
-                            %s
+                            %s::uuid, %s::uuid, %s::text, %s::text, %s::text,
+                            %s::text, %s::text,
+                            %s::text,
+                            %s::text,
+                            %s::uuid,
+                            %s::jsonb
                         )
                         ON CONFLICT (id) DO UPDATE
                         SET item_type = EXCLUDED.item_type,

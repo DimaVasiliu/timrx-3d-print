@@ -242,6 +242,11 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
     piapi_status = task_data.get("status", "unknown")
     internal_status = _STATUS_MAP.get(piapi_status, "pending")
 
+    # Determine if the job is queued upstream (staged) vs actively pending/processing.
+    # PiAPI "Staged"/"staged" means the task is queued at the provider but NOT yet
+    # actively running. This distinction matters for timeout behavior.
+    is_queued_upstream = piapi_status.lower() == "staged"
+
     # Extract timing metadata
     started_at = task_data.get("started_at") or task_data.get("start_time")
     ended_at = task_data.get("ended_at") or task_data.get("end_time")
@@ -253,14 +258,16 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
     started = has_start_timestamp or internal_status == "processing"
 
     # Debug: log raw PiAPI status for rescue diagnostics
+    queue_label = " (QUEUED_UPSTREAM)" if is_queued_upstream else ""
     print(f"[Seedance] status check task={task_id[:12]}... "
-          f"raw_status={piapi_status!r} -> {internal_status} "
+          f"raw_status={piapi_status!r} -> {internal_status}{queue_label} "
           f"started={started} (has_ts={has_start_timestamp}) "
           f"keys={list(task_data.keys())[:8]}")
 
     result: Dict[str, Any] = {
         "status": internal_status,
         "provider_status": piapi_status,
+        "queued_upstream": is_queued_upstream,
         "started_at": started_at if has_start_timestamp else None,
         "ended_at": ended_at if ended_at not in _ZERO_TIMESTAMPS else None,
         "progress": task_data.get("progress", 0),

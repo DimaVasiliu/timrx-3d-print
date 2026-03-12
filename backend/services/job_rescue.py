@@ -862,9 +862,10 @@ def _enrich_error(job_id: str, error_code: str, error_message: str):
 # ── Helpers ─────────────────────────────────────────────────
 
 def _job_elapsed_seconds(job: Dict[str, Any]) -> Optional[float]:
-    """Seconds since job was created (or dispatched)."""
+    """Seconds since job was first dispatched (or created)."""
     meta = _parse_meta(job.get("meta"))
-    dispatched_at = meta.get("dispatched_at")
+    # Prefer first_dispatched_at (stable, never reset on recovery) over dispatched_at
+    dispatched_at = meta.get("first_dispatched_at") or meta.get("dispatched_at")
     created_at = job.get("created_at")
 
     ref = None
