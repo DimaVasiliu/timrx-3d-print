@@ -690,23 +690,29 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
         else:
             resp = provider.start_text_to_video(prompt=prompt, **route_params)
 
-        upstream_id = resp.get("operation_name") or resp.get("task_id")
+        upstream_id = resp.get("operation_name") or resp.get("task_id") or resp.get("request_id")
         if not upstream_id:
             raise RuntimeError("Provider returned no task ID")
 
         dispatch_ts = time.time()
-        _transition_job(job_id, "dispatched", {
-            "upstream_job_id": upstream_id,
-            "last_provider_status": "pending",
-            "next_poll_at": "NOW() + INTERVAL '5 seconds'",
-        }, meta_patch={
+        dispatch_meta = {
             "upstream_id": upstream_id,
             "provider": provider_name,
             "dispatched_by": WORKER_ID,
             "dispatched_at": dispatch_ts,
             "first_dispatched_at": dispatch_ts,
             "consecutive_errors": 0,
-        })
+        }
+        # Persist fal metadata for polling
+        for fal_key in ("fal_model_id", "fal_status_url", "fal_response_url", "fal_cancel_url"):
+            if resp.get(fal_key):
+                dispatch_meta[fal_key] = resp[fal_key]
+
+        _transition_job(job_id, "dispatched", {
+            "upstream_job_id": upstream_id,
+            "last_provider_status": "pending",
+            "next_poll_at": "NOW() + INTERVAL '5 seconds'",
+        }, meta_patch=dispatch_meta)
 
         print(f"[JOB] dispatched job={job_id} upstream={upstream_id} provider={provider_name}")
 

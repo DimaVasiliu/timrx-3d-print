@@ -231,12 +231,17 @@ def _dispatch_video_job(
 
     internal_job_id = str(uuid.uuid4())
 
-    # Credit calculation
+    # Credit calculation — server is sole authority on action code
     action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
     expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
 
+    print(
+        f"[VIDEO] resolved provider={provider} task={task} duration={duration_seconds}s "
+        f"resolution={resolution} action_code={action_key} cost={expected_cost}"
+    )
+
     if expected_cost <= 0:
-        print(f"[VIDEO] REJECTED: action_key={action_key} resolved to 0 credits")
+        print(f"[VIDEO] REJECTED: action_key={action_key} resolved to 0 credits provider={provider} duration={duration_seconds}")
         return jsonify({
             "ok": False,
             "error": "unknown_action_code",
@@ -271,6 +276,11 @@ def _dispatch_video_job(
     )
     if credit_error:
         return credit_error
+
+    print(
+        f"[BILLING] reservation created job={internal_job_id} action_code={action_key} "
+        f"cost={expected_cost} reservation_id={reservation_id}"
+    )
 
     store_meta = {
         "stage": "video",

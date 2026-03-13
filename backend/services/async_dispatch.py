@@ -988,6 +988,11 @@ def dispatch_gemini_video_async(
             store[internal_job_id] = store_meta
             save_store(store)
 
+            # Log fal metadata persistence for debugging polling issues
+            if provider_used == "fal_seedance":
+                fal_keys = [k for k in ("fal_model_id", "fal_status_url", "fal_response_url", "fal_cancel_url") if store_meta.get(k)]
+                print(f"[FAL_SEEDANCE] meta persisted job={internal_job_id} keys={fal_keys}")
+
             _mark_job_for_worker(internal_job_id, upstream_id, provider_used, store_meta)
         else:
             video_url = resp.get("video_url")
