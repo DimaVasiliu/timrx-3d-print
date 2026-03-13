@@ -38,6 +38,22 @@ from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("image_gen", __name__)
 
+
+# ── Image quality → action key mapping ────────────────────────
+# Maps image_size (Google) or resolution tier to the correct action key.
+# Must match pricing_service.py DEFAULT_ACTION_COSTS.
+_IMAGE_ACTION_BY_SIZE = {
+    "1K": "image_generate",       # Standard → OPENAI_IMAGE (10 credits)
+    "2K": "image_generate_2k",    # 2K       → OPENAI_IMAGE_2K (15 credits)
+    "4K": "image_generate_4k",    # 4K       → OPENAI_IMAGE_4K (20 credits)
+}
+
+
+def _get_image_action_key(image_size: str = "1K") -> str:
+    """Return the canonical action key for the given image quality/size tier."""
+    return _IMAGE_ACTION_BY_SIZE.get(image_size, "image_generate")
+
+
 # OpenAI blob hosts (from monolith)
 ALLOWED_IMAGE_HOSTS = {
     "oaidalleapiprodscus.blob.core.windows.net",
@@ -164,7 +180,7 @@ def _handle_gemini_image_generate(body: dict):
     internal_job_id = str(uuid.uuid4())
 
     # Reserve credits (creates held reservation in DB)
-    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
+    action_key = _get_image_action_key(image_size)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
@@ -455,7 +471,7 @@ def gemini_image_mod():
     internal_job_id = str(uuid.uuid4())
 
     # Reserve credits (creates held reservation in DB)
-    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
+    action_key = _get_image_action_key(image_size)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
