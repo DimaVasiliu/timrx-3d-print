@@ -42,6 +42,9 @@ from backend.services.video_router import (
 from backend.services.video_providers.seedance_provider import (
     normalize_seedance_params,
 )
+from backend.services.video_providers.fal_seedance_provider import (
+    normalize_fal_seedance_params,
+)
 from backend.services.video_providers.vertex_provider import (
     normalize_vertex_params,
 )
@@ -121,6 +124,15 @@ def generate_video():
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
         resolution = "720p"  # Seedance has no resolution concept
+    elif provider == "fal_seedance":
+        fc = normalize_fal_seedance_params(
+            duration_seconds=raw_duration,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+        duration_seconds = fc["duration_seconds"]
+        aspect_ratio = fc["aspect_ratio"]
+        resolution = fc["resolution"]
     else:
         vc = normalize_vertex_params(
             duration_seconds=raw_duration,
@@ -452,6 +464,16 @@ def video_text():
         seedance_tier = sc["tier"]
         resolution = "720p"
         prompt = raw_prompt  # No style normalization for Seedance
+    elif provider == "fal_seedance":
+        fc = normalize_fal_seedance_params(
+            duration_seconds=raw_duration,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+        duration_seconds = fc["duration_seconds"]
+        aspect_ratio = fc["aspect_ratio"]
+        resolution = fc["resolution"]
+        prompt = raw_prompt  # No style normalization for fal Seedance
     else:
         vc = normalize_vertex_params(
             duration_seconds=raw_duration,
@@ -536,6 +558,16 @@ def video_animate():
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
         resolution = "720p"
+        prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
+    elif provider == "fal_seedance":
+        fc = normalize_fal_seedance_params(
+            duration_seconds=raw_duration,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+        )
+        duration_seconds = fc["duration_seconds"]
+        aspect_ratio = fc["aspect_ratio"]
+        resolution = fc["resolution"]
         prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
     else:
         vc = normalize_vertex_params(
