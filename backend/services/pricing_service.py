@@ -811,7 +811,7 @@ class PricingService:
             return db_code
 
         # Video/Seedance variant codes ARE their own DB action codes
-        if _is_video_variant_code(canonical) or _is_seedance_variant_code(canonical):
+        if _is_video_variant_code(canonical) or _is_seedance_variant_code(canonical) or _is_fal_seedance_variant_code(canonical):
             return canonical
 
         # Already a DB code?
@@ -871,7 +871,7 @@ class PricingService:
 
         # Video variant codes ARE the DB action codes (lowercase canonical format)
         # e.g., video_text_generate_4s_720p, seedance_fast_text_generate_5s
-        if _is_video_variant_code(canonical) or _is_seedance_variant_code(canonical):
+        if _is_video_variant_code(canonical) or _is_seedance_variant_code(canonical) or _is_fal_seedance_variant_code(canonical):
             return canonical
 
         # For other actions, look up the DB code mapping
