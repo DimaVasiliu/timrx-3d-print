@@ -825,7 +825,15 @@ def _dispatch_to_seedance(
     )
     route_params["task_type"] = seedance_variant
 
-    if task == "image2video":
+    if task == "experimental_morph":
+        prompt = payload.get("motion") or prompt
+        resp = seedance.start_experimental_morph(
+            start_image=payload.get("start_image", ""),
+            end_image=payload.get("end_image", ""),
+            prompt=prompt,
+            **route_params,
+        )
+    elif task == "image2video":
         prompt = payload.get("motion") or prompt
         resp = seedance.start_image_to_video(
             image_data=payload.get("image_data", ""),

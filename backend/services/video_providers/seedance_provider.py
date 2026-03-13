@@ -162,6 +162,11 @@ class SeedanceProvider:
     reference image only — there is no end_image, last_frame, or keyframe
     interpolation field in the Seedance PiAPI schema. Do NOT expose transition
     in the UI for this provider. See VIDEO_PROVIDER_CONFIG.seedance.capabilities.
+
+    Experimental Morph (Beta): passes image_urls=[url1, url2] — two reference
+    images in the existing list field. PiAPI may only use the first image;
+    behavior is undocumented and results are unpredictable. This is NOT true
+    first-to-last-frame interpolation. Billed at image animate rates.
     """
 
     name = "seedance"
@@ -211,6 +216,55 @@ class SeedanceProvider:
                 duration=clean["duration_seconds"],
                 aspect_ratio=clean["aspect_ratio"],
                 image_urls=[public_url] if public_url else None,
+                task_type=clean["task_type"],
+            )
+        except SeedanceQuotaError as e:
+            from backend.services.video_router import QuotaExhaustedError
+            raise QuotaExhaustedError(self.name, str(e))
+        except RuntimeError as e:
+            if _is_quota_error(str(e)):
+                from backend.services.video_router import QuotaExhaustedError
+                raise QuotaExhaustedError(self.name, str(e))
+            raise
+
+    def start_experimental_morph(self, start_image: str, end_image: str, prompt: str, **params) -> Dict[str, Any]:
+        """
+        EXPERIMENTAL: Start two-image morph via Seedance.
+
+        Passes image_urls=[start_url, end_url] — two reference images in the
+        existing list field. PiAPI documentation only describes single-image
+        usage; behavior with two URLs is undocumented and may:
+          - Use only the first image (ignoring the second)
+          - Use both as multi-reference context
+          - Error out on some task types
+
+        This is NOT true first-to-last-frame interpolation. Results are
+        unpredictable. Billed at the same rate as image animate.
+        """
+        clean = normalize_seedance_params(
+            duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
+            aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
+            tier=params.get("tier"),
+            seedance_variant=params.get("task_type") or params.get("seedance_variant"),
+        )
+        # Convert both images to public URLs (PiAPI requires http(s) URLs)
+        start_url = _ensure_public_image_url(start_image) if start_image else None
+        end_url = _ensure_public_image_url(end_image) if end_image else None
+
+        if not start_url or not end_url:
+            raise RuntimeError("experimental_morph requires two valid images")
+
+        print(
+            f"[SEEDANCE] experimental_morph: passing image_urls=[start, end] "
+            f"tier={clean['tier']} duration={clean['duration_seconds']}s"
+        )
+
+        try:
+            return create_seedance_task(
+                prompt=prompt,
+                duration=clean["duration_seconds"],
+                aspect_ratio=clean["aspect_ratio"],
+                image_urls=[start_url, end_url],
                 task_type=clean["task_type"],
             )
         except SeedanceQuotaError as e:

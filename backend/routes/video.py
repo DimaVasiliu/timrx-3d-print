@@ -550,23 +550,27 @@ def video_animate():
     # Seedance 2.0 via PiAPI does NOT support end_image — no transition.
     _TRANSITION_PROVIDERS = frozenset({"vertex", "fal_seedance"})
     is_transition = animate_mode == "image_transition" and provider in _TRANSITION_PROVIDERS
+    # Experimental Morph (Beta): Seedance-only, passes image_urls=[url1, url2]
+    is_experimental_morph = animate_mode == "experimental_morph" and provider == "seedance"
+    is_two_image = is_transition or is_experimental_morph
 
     # ── Image validation (mode-dependent) ──
     image_data = ""
     start_image = ""
     end_image = ""
 
-    if is_transition:
+    if is_two_image:
         # Transition mode: require start + end images
         start_image = body.get("start_image") or body.get("start_image_data") or body.get("start_image_url") or ""
         end_image = body.get("end_image") or body.get("end_image_data") or body.get("end_image_url") or ""
 
+        _mode_label = "Experimental morph" if is_experimental_morph else "Image transition"
         if not start_image:
-            return jsonify({"error": "invalid_params", "message": "Image transition requires both start and end images", "field": "start_image"}), 400
+            return jsonify({"error": "invalid_params", "message": f"{_mode_label} requires both start and end images", "field": "start_image"}), 400
         if not end_image:
-            return jsonify({"error": "invalid_params", "message": "Image transition requires both start and end images", "field": "end_image"}), 400
+            return jsonify({"error": "invalid_params", "message": f"{_mode_label} requires both start and end images", "field": "end_image"}), 400
 
-        print(f"[VIDEO] animate mode=image_transition provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
+        print(f"[VIDEO] animate mode={'experimental_morph' if is_experimental_morph else 'image_transition'} provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
     else:
         # Single-image animate mode
         image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
@@ -602,7 +606,10 @@ def video_animate():
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
         resolution = "720p"
-        prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
+        if is_experimental_morph:
+            prompt = raw_user_prompt or "Smooth morph transition between these two images"
+        else:
+            prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
     elif provider == "fal_seedance":
         fc = normalize_fal_seedance_params(
             duration_seconds=raw_duration,
@@ -629,7 +636,7 @@ def video_animate():
 
     return _dispatch_video_job(
         identity_id=identity_id or "",
-        task="image_transition" if is_transition else "image2video",
+        task=_resolve_animate_task(is_transition, is_experimental_morph),
         prompt=prompt,
         image_data=image_data,
         aspect_ratio=aspect_ratio,
@@ -642,12 +649,21 @@ def video_animate():
         provider=provider,
         seedance_variant=seedance_variant,
         seedance_tier=seedance_tier,
-        start_image=start_image if is_transition else None,
-        end_image=end_image if is_transition else None,
+        start_image=start_image if is_two_image else None,
+        end_image=end_image if is_two_image else None,
     )
 
 
 # ── Helper: resolve image_id → image_url from DB ─────────────
+def _resolve_animate_task(is_transition: bool, is_experimental_morph: bool) -> str:
+    """Map animate sub-mode flags to the internal task string."""
+    if is_transition:
+        return "image_transition"
+    if is_experimental_morph:
+        return "experimental_morph"
+    return "image2video"
+
+
 def _resolve_image_id(image_id: str, identity_id: str | None) -> str | None:
     """Look up an image URL from our images table by image_id, scoped to the requesting user."""
     if not USE_DB or not image_id or not identity_id:
