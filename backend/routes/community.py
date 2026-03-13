@@ -306,8 +306,12 @@ def community_discord_share():
             "footer": {"text": footer_text},
         }
 
-        if thumbnail_url:
+        # Only include image if URL is valid HTTP(S) — data URIs and blob URLs
+        # are rejected by Discord's embed validation.
+        if isinstance(thumbnail_url, str) and thumbnail_url.startswith(("http://", "https://")):
             embed["image"] = {"url": thumbnail_url}
+        elif thumbnail_url:
+            logger.info("[Discord] Skipping non-HTTP thumbnail_url: %s", str(thumbnail_url)[:30])
 
         # Remove None values from embed
         embed = {k: v for k, v in embed.items() if v is not None}
@@ -321,7 +325,20 @@ def community_discord_share():
             resp = http_requests.post(webhook_url, json=payload, timeout=5)
             if resp.status_code in (200, 204):
                 return jsonify({"ok": True})
-            logger.warning(f"[Discord] Webhook returned {resp.status_code}: {resp.text[:200]}")
+            logger.warning("[Discord] Webhook returned %s: %s | keys=%s",
+                           resp.status_code, resp.text[:500], list(embed.keys()))
+            # Fallback: retry with plain content if embed was rejected
+            if resp.status_code == 400:
+                fallback = {
+                    "username": "TimrX Generator",
+                    "content": f"New {label} on TimrX" + (f"\nPrompt: {prompt[:200]}" if prompt else ""),
+                }
+                try:
+                    fb_resp = http_requests.post(webhook_url, json=fallback, timeout=5)
+                    if fb_resp.status_code in (200, 204):
+                        return jsonify({"ok": True})
+                except Exception:
+                    pass
             return jsonify({"ok": False, "error": {"code": "WEBHOOK_FAILED"}}), 502
         except Exception as e:
             logger.error(f"[Discord] Webhook error: {e}")
