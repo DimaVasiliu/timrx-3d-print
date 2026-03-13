@@ -188,6 +188,8 @@ def _dispatch_video_job(
     provider: str = "vertex",
     seedance_variant: str | None = None,
     seedance_tier: str = "fast",
+    start_image: str | None = None,
+    end_image: str | None = None,
 ):
     """
     Shared helper: validate, reserve credits, create job row, dispatch async, return response.
@@ -390,6 +392,10 @@ def _dispatch_video_job(
         "seed": seed,
         "seedance_variant": seedance_variant,
     }
+    if start_image:
+        payload["start_image"] = start_image
+    if end_image:
+        payload["end_image"] = end_image
 
     from backend.services.async_dispatch import dispatch_gemini_video_async
 
@@ -536,16 +542,39 @@ def video_animate():
 
     body = request.get_json(silent=True) or {}
 
-    image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
-    image_id = body.get("image_id")
-
-    if not image_data and image_id:
-        image_data = _resolve_image_id(image_id, identity_id)
-
-    if not image_data:
-        return jsonify({"error": "invalid_params", "message": "image_data, image_url, or image_id is required", "field": "image_data"}), 400
-
     provider = normalize_provider_name(body.get("provider"))
+    animate_mode = body.get("mode") or "animate_image"
+    is_transition = animate_mode == "image_transition" and provider in ("fal_seedance", "seedance")
+
+    # ── Image validation (mode-dependent) ──
+    image_data = ""
+    start_image = ""
+    end_image = ""
+
+    if is_transition:
+        # Transition mode: require start + end images
+        start_image = body.get("start_image") or body.get("start_image_data") or body.get("start_image_url") or ""
+        end_image = body.get("end_image") or body.get("end_image_data") or body.get("end_image_url") or ""
+
+        if not start_image:
+            return jsonify({"error": "invalid_params", "message": "Seedance transition requires both start and end images", "field": "start_image"}), 400
+        if not end_image:
+            return jsonify({"error": "invalid_params", "message": "Seedance transition requires both start and end images", "field": "end_image"}), 400
+
+        print(f"[VIDEO] animate mode=image_transition provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
+    else:
+        # Single-image animate mode
+        image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
+        image_id = body.get("image_id")
+
+        if not image_data and image_id:
+            image_data = _resolve_image_id(image_id, identity_id)
+
+        if not image_data:
+            return jsonify({"error": "invalid_params", "message": "Seedance animate requires one source image" if provider in ("fal_seedance", "seedance") else "image_data, image_url, or image_id is required", "field": "image_data"}), 400
+
+        print(f"[VIDEO] animate mode=animate_image provider={provider} image={'present' if image_data else 'MISSING'}")
+
     raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
     raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
@@ -568,7 +597,7 @@ def video_animate():
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
         resolution = "720p"
-        prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
+        prompt = raw_user_prompt or ("Transition between these two images" if is_transition else "Animate this image with natural, smooth motion")
     elif provider == "fal_seedance":
         fc = normalize_fal_seedance_params(
             duration_seconds=raw_duration,
@@ -578,7 +607,7 @@ def video_animate():
         duration_seconds = fc["duration_seconds"]
         aspect_ratio = fc["aspect_ratio"]
         resolution = fc["resolution"]
-        prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
+        prompt = raw_user_prompt or ("Transition between these two images" if is_transition else "Animate this image with natural, smooth motion")
     else:
         vc = normalize_vertex_params(
             duration_seconds=raw_duration,
@@ -592,7 +621,7 @@ def video_animate():
 
     return _dispatch_video_job(
         identity_id=identity_id or "",
-        task="image2video",
+        task="image_transition" if is_transition else "image2video",
         prompt=prompt,
         image_data=image_data,
         aspect_ratio=aspect_ratio,
@@ -605,6 +634,8 @@ def video_animate():
         provider=provider,
         seedance_variant=seedance_variant,
         seedance_tier=seedance_tier,
+        start_image=start_image if is_transition else None,
+        end_image=end_image if is_transition else None,
     )
 
 

@@ -758,7 +758,16 @@ def _dispatch_to_fal_seedance(
         configured, err = fal.is_configured()
         if configured:
             try:
-                if task == "image2video":
+                if task == "image_transition":
+                    # Two-image transition
+                    fp = payload.get("motion") or prompt
+                    resp = fal.start_image_transition(
+                        start_image=payload.get("start_image", ""),
+                        end_image=payload.get("end_image", ""),
+                        prompt=fp,
+                        **route_params,
+                    )
+                elif task == "image2video":
                     fp = payload.get("motion") or prompt
                     resp = fal.start_image_to_video(
                         image_data=payload.get("image_data", ""),

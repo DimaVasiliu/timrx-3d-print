@@ -87,6 +87,7 @@ def submit_fal_seedance_task(
     duration: int = 5,
     aspect_ratio: str = "16:9",
     image_url: Optional[str] = None,
+    end_image_url: Optional[str] = None,
     task: str = "text2video",
 ) -> Dict[str, Any]:
     """
@@ -96,7 +97,8 @@ def submit_fal_seedance_task(
         prompt: Text prompt for video generation.
         duration: Video duration in seconds (5 or 10).
         aspect_ratio: Output aspect ratio (16:9, 9:16, 1:1).
-        image_url: Image URL for image-to-video (must be publicly accessible).
+        image_url: Start/source image URL for image-to-video (must be publicly accessible).
+        end_image_url: End image URL for image transition (must be publicly accessible).
         task: "text2video" or "image2video".
 
     Returns:
@@ -121,9 +123,13 @@ def submit_fal_seedance_task(
         "enable_safety_checker": getattr(config, "FAL_SEEDANCE_ENABLE_SAFETY_CHECKER", True),
     }
 
-    # Image-to-video: add image_url
+    # Image-to-video: add image_url (start/source image)
     if task in ("image2video", "image_to_video", "i2v") and image_url:
         body["image_url"] = image_url
+
+    # Image transition: add end_image_url
+    if end_image_url:
+        body["end_image_url"] = end_image_url
 
     # Optional: fixed camera (fal expects boolean, not object)
     if getattr(config, "FAL_SEEDANCE_CAMERA_FIXED", False):
@@ -131,9 +137,16 @@ def submit_fal_seedance_task(
 
     # Log request (safe: no secrets)
     _prompt_preview = (prompt or "")[:60]
+    if end_image_url:
+        _mode = "transition"
+    elif image_url:
+        _mode = "animate"
+    else:
+        _mode = "text2video"
     print(
-        f"[FAL_SEEDANCE] SUBMIT model={model_id} task={task} "
-        f"dur={duration}s ar={aspect_ratio} prompt={_prompt_preview!r}"
+        f"[FAL_SEEDANCE] SUBMIT model={model_id} task={task} mode={_mode} "
+        f"dur={duration}s ar={aspect_ratio} image_url={'yes' if image_url else 'no'} "
+        f"end_image_url={'yes' if end_image_url else 'no'} prompt={_prompt_preview!r}"
     )
 
     try:

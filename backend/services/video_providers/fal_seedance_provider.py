@@ -186,6 +186,38 @@ class FalSeedanceProvider:
                 raise QuotaExhaustedError(self.name, str(e))
             raise
 
+    def start_image_transition(self, start_image: str, end_image: str, prompt: str, **params) -> Dict[str, Any]:
+        """Start image-to-image transition video generation (two images)."""
+        clean = normalize_fal_seedance_params(
+            duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
+            aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
+            resolution=params.get("resolution", DEFAULT_RESOLUTION),
+        )
+        # fal.ai requires publicly accessible URLs
+        start_url = _ensure_public_image_url(start_image) if start_image else None
+        end_url = _ensure_public_image_url(end_image) if end_image else None
+        print(
+            f"[FAL_SEEDANCE] image transition start_image={'present' if start_url else 'MISSING'} "
+            f"end_image={'present' if end_url else 'MISSING'} dur={clean['duration_seconds']}s"
+        )
+        try:
+            return submit_fal_seedance_task(
+                prompt=prompt,
+                duration=clean["duration_seconds"],
+                aspect_ratio=clean["aspect_ratio"],
+                image_url=start_url,
+                end_image_url=end_url,
+                task="image2video",
+            )
+        except FalSeedanceQuotaError as e:
+            from backend.services.video_router import QuotaExhaustedError
+            raise QuotaExhaustedError(self.name, str(e))
+        except RuntimeError as e:
+            if _is_quota_error(str(e)):
+                from backend.services.video_router import QuotaExhaustedError
+                raise QuotaExhaustedError(self.name, str(e))
+            raise
+
     def check_status(
         self,
         request_id: str,
