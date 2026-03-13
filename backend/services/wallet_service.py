@@ -81,6 +81,12 @@ VIDEO_ACTION_CODES = {
     "video_image_animate_8s_720p",   # 170 credits
     "video_image_animate_8s_1080p",  # 200 credits
     "video_image_animate_8s_4k",     # 250 credits
+    # Image Transition (two-image, first+last frame) — same pricing as image animate
+    "video_image_transition_4s_720p",   # 110 credits
+    "video_image_transition_6s_720p",   # 140 credits
+    "video_image_transition_8s_720p",   # 170 credits
+    "video_image_transition_8s_1080p",  # 200 credits
+    "video_image_transition_8s_4k",     # 250 credits
     # Seedance 2.0 — Text-to-Video (Fast / Preview)
     "seedance_fast_text_generate_5s",       # 80 credits
     "seedance_fast_text_generate_10s",      # 150 credits

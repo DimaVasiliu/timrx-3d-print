@@ -156,6 +156,12 @@ class SeedanceProvider:
 
     Supports text-to-video and image-to-video with durations 5/10/15s,
     aspect ratios 16:9 / 9:16 / 1:1, and two quality tiers (fast / preview).
+
+    Image Transition (two-image interpolation) is NOT supported.
+    PiAPI's create_seedance_task() accepts image_urls: List[str] for a single
+    reference image only — there is no end_image, last_frame, or keyframe
+    interpolation field in the Seedance PiAPI schema. Do NOT expose transition
+    in the UI for this provider. See VIDEO_PROVIDER_CONFIG.seedance.capabilities.
     """
 
     name = "seedance"

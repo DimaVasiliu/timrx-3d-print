@@ -853,7 +853,20 @@ def _dispatch_to_vertex_with_fallback(
     )
 
     try:
-        if task == "image2video":
+        if task == "image_transition":
+            # Two-image transition via Vertex (first-frame + last-frame conditioning)
+            vertex = resolve_video_provider("vertex")
+            if not vertex:
+                raise ProviderUnavailableError("Vertex provider not available for transition")
+            fp = payload.get("motion") or prompt
+            resp = vertex.start_image_transition(
+                start_image=payload.get("start_image", ""),
+                end_image=payload.get("end_image", ""),
+                prompt=fp,
+                **route_params,
+            )
+            return resp, "vertex"
+        elif task == "image2video":
             prompt = payload.get("motion") or prompt
             resp, provider_used = router.route_image_to_video(
                 image_data=payload.get("image_data", ""),
@@ -868,6 +881,11 @@ def _dispatch_to_vertex_with_fallback(
         return resp, provider_used
 
     except (ProviderUnavailableError, RuntimeError) as vertex_err:
+        # Transition jobs must NOT silently fall back — Seedance has no transition support
+        if task == "image_transition":
+            print(f"[ASYNC] Vertex transition failed for job {internal_job_id}: {vertex_err} — NO fallback available")
+            raise vertex_err
+
         print(f"[ASYNC] Vertex failed for job {internal_job_id}: {vertex_err}, attempting Seedance failover")
         failover = resolve_video_provider("seedance")
         if failover:
@@ -2233,3 +2251,5 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+

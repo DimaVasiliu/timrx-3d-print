@@ -269,6 +269,12 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_image_animate_8s_720p", "cost_credits": 170, "provider": "vertex"},
     {"action_code": "video_image_animate_8s_1080p", "cost_credits": 200, "provider": "vertex"},
     {"action_code": "video_image_animate_8s_4k", "cost_credits": 250, "provider": "vertex"},
+    # Image Transition (two-image, first+last frame) — same pricing as image animate
+    {"action_code": "video_image_transition_4s_720p", "cost_credits": 110, "provider": "vertex"},
+    {"action_code": "video_image_transition_6s_720p", "cost_credits": 140, "provider": "vertex"},
+    {"action_code": "video_image_transition_8s_720p", "cost_credits": 170, "provider": "vertex"},
+    {"action_code": "video_image_transition_8s_1080p", "cost_credits": 200, "provider": "vertex"},
+    {"action_code": "video_image_transition_8s_4k", "cost_credits": 250, "provider": "vertex"},
     # ── Seedance 2.0 — Text-to-Video (Fast / Preview) ──
     {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 80, "provider": "seedance"},
     {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 150, "provider": "seedance"},
@@ -309,16 +315,18 @@ DEFAULT_ACTION_COSTS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Video credit costs by resolution and duration (must match frontend)
-# Note: 4K removed from UI - not available to users (requires GCP allowlisting)
+# 4K requires VERTEX_ALLOW_4K env var — backend rejects if not allowlisted.
 VIDEO_CREDIT_COSTS = {
     "720p": {4: 75, 6: 100, 8: 125},
     "1080p": {8: 150},
+    "4k": {8: 200},
 }
 
-# Image-to-Video costs (premium over text-to-video)
+# Image-to-Video / Image Transition costs (premium over text-to-video)
 VIDEO_IMAGE_CREDIT_COSTS = {
     "720p": {4: 110, 6: 140, 8: 170},
     "1080p": {8: 200},
+    "4k": {8: 250},
 }
 
 # Seedance 2.0 credit costs by tier and duration (explicit lookup, DB is authoritative)
@@ -343,6 +351,7 @@ FAL_SEEDANCE_VALID_DURATIONS = [5, 10]
 VIDEO_VALID_DURATIONS = {
     "720p": [4, 6, 8],
     "1080p": [8],
+    "4k": [8],
 }
 
 

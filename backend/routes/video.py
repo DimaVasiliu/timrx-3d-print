@@ -544,9 +544,12 @@ def video_animate():
 
     provider = normalize_provider_name(body.get("provider"))
     animate_mode = body.get("mode") or "animate_image"
-    # Image Transition is only supported by fal Seedance (which has start_image_transition()).
-    # Seedance 2.0 via PiAPI does NOT support end_image / two-image interpolation.
-    is_transition = animate_mode == "image_transition" and provider == "fal_seedance"
+    # Image Transition (two-image interpolation) is supported by:
+    #   - vertex:       Veo 3.1 first-frame + last-frame conditioning
+    #   - fal_seedance: fal.ai Seedance with end_image_url
+    # Seedance 2.0 via PiAPI does NOT support end_image — no transition.
+    _TRANSITION_PROVIDERS = frozenset({"vertex", "fal_seedance"})
+    is_transition = animate_mode == "image_transition" and provider in _TRANSITION_PROVIDERS
 
     # ── Image validation (mode-dependent) ──
     image_data = ""
@@ -559,9 +562,9 @@ def video_animate():
         end_image = body.get("end_image") or body.get("end_image_data") or body.get("end_image_url") or ""
 
         if not start_image:
-            return jsonify({"error": "invalid_params", "message": "Seedance transition requires both start and end images", "field": "start_image"}), 400
+            return jsonify({"error": "invalid_params", "message": "Image transition requires both start and end images", "field": "start_image"}), 400
         if not end_image:
-            return jsonify({"error": "invalid_params", "message": "Seedance transition requires both start and end images", "field": "end_image"}), 400
+            return jsonify({"error": "invalid_params", "message": "Image transition requires both start and end images", "field": "end_image"}), 400
 
         print(f"[VIDEO] animate mode=image_transition provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
     else:
@@ -619,7 +622,10 @@ def video_animate():
         duration_seconds = vc["duration_seconds"]
         aspect_ratio = vc["aspect_ratio"]
         resolution = vc["resolution"]
-        prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
+        if is_transition:
+            prompt = raw_user_prompt or "Smooth cinematic transition between these two images"
+        else:
+            prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
 
     return _dispatch_video_job(
         identity_id=identity_id or "",

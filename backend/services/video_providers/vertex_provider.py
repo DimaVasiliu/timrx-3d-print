@@ -23,6 +23,7 @@ from backend.services.vertex_video_service import (
     check_vertex_configured,
     download_video_bytes,
     vertex_image_to_video,
+    vertex_image_transition,
     vertex_text_to_video,
     vertex_video_status,
 )
@@ -140,6 +141,33 @@ class VertexVeoProvider:
             return vertex_image_to_video(
                 image_data=image_data,
                 motion_prompt=prompt,
+                aspect_ratio=clean["aspect_ratio"],
+                resolution=clean["resolution"],
+                duration_seconds=clean["duration_seconds"],
+                negative_prompt=params.get("negative_prompt"),
+                seed=params.get("seed"),
+            )
+        except VertexQuotaError as e:
+            from backend.services.video_router import QuotaExhaustedError
+            raise QuotaExhaustedError(self.name, str(e))
+        except RuntimeError as e:
+            if _is_quota_error(str(e)):
+                from backend.services.video_router import QuotaExhaustedError
+                raise QuotaExhaustedError(self.name, str(e))
+            raise
+
+    def start_image_transition(self, start_image: str, end_image: str, prompt: str, **params) -> Dict[str, Any]:
+        """Start image-to-image transition video generation (two images, first+last frame)."""
+        clean = normalize_vertex_params(
+            duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
+            aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
+            resolution=params.get("resolution", DEFAULT_RESOLUTION),
+        )
+        try:
+            return vertex_image_transition(
+                start_image=start_image,
+                end_image=end_image,
+                prompt=prompt,
                 aspect_ratio=clean["aspect_ratio"],
                 resolution=clean["resolution"],
                 duration_seconds=clean["duration_seconds"],

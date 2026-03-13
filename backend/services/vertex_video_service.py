@@ -488,6 +488,91 @@ def vertex_image_to_video(
     return _execute_video_start_request(url, payload, "image-to-video")
 
 
+def vertex_image_transition(
+    start_image: str,
+    end_image: str,
+    prompt: str = "",
+    aspect_ratio: str = "16:9",
+    resolution: str = "720p",
+    duration_seconds: Any = 6,
+    negative_prompt: Optional[str] = None,
+    seed: Optional[int] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Start a video generation transitioning between two images using Vertex AI Veo 3.1.
+
+    Uses first-frame (image) + last-frame (lastImage) conditioning to generate
+    a video that smoothly interpolates from start_image to end_image.
+
+    Args:
+        start_image: Base64-encoded start image or data URL (first frame)
+        end_image: Base64-encoded end image or data URL (last frame)
+        prompt: Description of the transition (optional)
+        aspect_ratio: "16:9" or "9:16"
+        resolution: "720p", "1080p", or "4k"
+        duration_seconds: 4, 6, or 8 (integer)
+        negative_prompt: Things to avoid (optional)
+        seed: Random seed (optional)
+        model: Override model (optional)
+
+    Returns:
+        Dict with operation_name for polling
+    """
+    duration_int = _normalize_duration(duration_seconds)
+    _validate_params(aspect_ratio, resolution, duration_int)
+
+    # Parse both images
+    start_bytes, start_mime = _parse_image_data(start_image)
+    if not start_bytes:
+        raise RuntimeError("vertex_video_failed: No valid start image data provided")
+
+    end_bytes, end_mime = _parse_image_data(end_image)
+    if not end_bytes:
+        raise RuntimeError("vertex_video_failed: No valid end image data provided")
+
+    project = _get_project_id()
+    location = _get_vertex_location()
+    model_id = model or _get_veo_model()
+
+    url = (
+        f"https://{location}-aiplatform.googleapis.com/v1/"
+        f"projects/{project}/locations/{location}/"
+        f"publishers/google/models/{model_id}:predictLongRunning"
+    )
+
+    # Build payload with first-frame (image) + last-frame (lastImage) conditioning.
+    # Veo 3.1 generates a video that transitions from the start image to the end image.
+    payload = {
+        "instances": [{
+            "prompt": prompt or "Smooth cinematic transition between these two images",
+            "image": {
+                "bytesBase64Encoded": start_bytes,
+                "mimeType": start_mime,
+            },
+            "lastImage": {
+                "bytesBase64Encoded": end_bytes,
+                "mimeType": end_mime,
+            },
+        }],
+        "parameters": {
+            "aspectRatio": aspect_ratio,
+            "resolution": resolution,
+            "durationSeconds": duration_int,
+        }
+    }
+
+    if negative_prompt:
+        payload["parameters"]["negativePrompt"] = negative_prompt
+    if seed is not None:
+        payload["parameters"]["seed"] = int(seed)
+
+    print(f"[Vertex Veo] image-transition: model={model_id}, duration={duration_int}s, "
+          f"aspect={aspect_ratio}, resolution={resolution}")
+
+    return _execute_video_start_request(url, payload, "image-transition")
+
+
 def _parse_operation_name(operation_name: str) -> Dict[str, str]:
     """
     Parse operation name to extract project, location, and model.
