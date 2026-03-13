@@ -1482,8 +1482,22 @@ def save_failed_video_to_history(
             "failed": True,
         }
 
+        # Verify video row exists before inserting FK reference
+        safe_video_id = video_uuid
         with get_conn() as conn:
             with conn.cursor() as cur:
+                if video_uuid:
+                    cur.execute(
+                        f"SELECT 1 FROM {Tables.VIDEOS} WHERE id::text = %s LIMIT 1",
+                        (video_uuid,),
+                    )
+                    if not cur.fetchone():
+                        print(f"[DB] WARNING: video_id={video_uuid} not found in videos table "
+                              f"for job {job_id} — setting video_id=NULL to avoid FK violation")
+                        safe_video_id = None
+                        payload["video_id_missing"] = True
+                        payload["original_video_uuid"] = video_uuid
+
                 cur.execute(
                     f"""
                     INSERT INTO {Tables.HISTORY_ITEMS} (
@@ -1514,7 +1528,7 @@ def save_failed_video_to_history(
                         "video",
                         title,
                         prompt,
-                        video_uuid,
+                        safe_video_id,
                         json.dumps(payload),
                     ),
                 )
@@ -1522,7 +1536,7 @@ def save_failed_video_to_history(
             conn.commit()
 
         if row:
-            print(f"[DB] failed video history written: history_id={row['id']} video_uuid={video_uuid} job_id={job_id}")
+            print(f"[DB] failed video history written: history_id={row['id']} video_uuid={safe_video_id} job_id={job_id}")
             return str(row["id"])
         return None
     except Exception as e:

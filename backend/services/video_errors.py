@@ -41,6 +41,7 @@ PIAPI_ZERO_TIMESTAMPS = frozenset({"0001-01-01T00:00:00Z", "", None})
 TERMINAL_STATES = frozenset({
     "succeeded", "failed", "refunded", "ready", "ready_unbilled",
     "abandoned_legacy", "recovery_blocked",
+    "deleted_by_user", "upstream_timeout_final",
 })
 
 # States that must never be overwritten by a webhook or sweep.

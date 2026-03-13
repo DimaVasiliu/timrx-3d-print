@@ -1018,6 +1018,7 @@ def history_item_update_mod(item_id: str):
 
                         print(f"[DELETE] history_item={item_id} model_id={model_id} image_id={image_id} video_id={video_id} s3_keys={len(s3_keys)}")
 
+                        orphaned_jobs = []
                         with conn.cursor() as cur:
                             cur.execute(
                                 f"""
@@ -1032,9 +1033,50 @@ def history_item_update_mod(item_id: str):
                             if image_id:
                                 cur.execute(f"DELETE FROM {Tables.IMAGES} WHERE id = %s AND identity_id = %s", (image_id, identity_id))
                             if video_id:
+                                # Collect reservation_ids from linked jobs before marking them terminal
+                                cur.execute(
+                                    f"""
+                                    SELECT id::text AS job_id, reservation_id::text AS reservation_id
+                                    FROM {Tables.JOBS}
+                                    WHERE meta->>'video_uuid' = %s
+                                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user')
+                                    """,
+                                    (str(video_id),),
+                                )
+                                orphaned_jobs = cur.fetchall() or []
+
+                                # Mark linked jobs as deleted_by_user so rescue never revives them
+                                if orphaned_jobs:
+                                    cur.execute(
+                                        f"""
+                                        UPDATE {Tables.JOBS}
+                                        SET status = 'deleted_by_user',
+                                            completed_at = COALESCE(completed_at, NOW()),
+                                            meta = COALESCE(meta, '{{}}'::jsonb) || '{{"deleted_by_user": true}}'::jsonb,
+                                            updated_at = NOW()
+                                        WHERE meta->>'video_uuid' = %s
+                                          AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user')
+                                        """,
+                                        (str(video_id),),
+                                    )
+                                    print(f"[DELETE] marked {len(orphaned_jobs)} linked job(s) as deleted_by_user for video_id={video_id}")
+
                                 cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s AND identity_id = %s", (video_id, identity_id))
                         conn.commit()
                         db_ok = True
+
+                        # Release held credits for orphaned jobs (after commit, best-effort)
+                        if video_id and orphaned_jobs:
+                            from backend.services.credits_helper import release_job_credits
+                            from backend.services.video_errors import ErrorCategory
+                            for oj in orphaned_jobs:
+                                res_id = oj.get("reservation_id")
+                                if res_id:
+                                    try:
+                                        release_job_credits(res_id, ErrorCategory.INTERNAL, oj["job_id"])
+                                        print(f"[DELETE] released credits reservation={res_id} job={oj['job_id']}")
+                                    except Exception as cre:
+                                        print(f"[DELETE] WARNING: credit release failed reservation={res_id}: {cre}")
 
                         # Delete S3 objects (idempotent - safe to retry, logs errors)
                         if s3_keys:

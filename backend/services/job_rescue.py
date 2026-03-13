@@ -66,6 +66,8 @@ def rescue_late_completed_jobs(
         "requeued": 0,
         "finalizing_retried": 0,
         "finalizing_exhausted": 0,
+        "skipped_orphan": 0,
+        "skipped_max_rescue": 0,
         "details": [],
     }
 
@@ -132,6 +134,10 @@ def rescue_late_completed_jobs(
                 results["finalizing_retried"] += 1
             elif action == "finalizing_exhausted":
                 results["finalizing_exhausted"] += 1
+            elif action == "skipped_orphan":
+                results["skipped_orphan"] += 1
+            elif action == "skipped_max_rescue":
+                results["skipped_max_rescue"] += 1
             else:
                 results["errors"] += 1
 
@@ -204,6 +210,29 @@ def _process_candidate(
     if job.get("result_url"):
         print(f"[RESCUE] skipped job={job_id} reason=already_succeeded")
         return {"job_id": job_id, "action": "already_rescued"}
+
+    # Guard: skip orphaned jobs whose linked video row was deleted by user
+    video_uuid = meta.get("video_uuid")
+    if video_uuid and not _video_row_exists(video_uuid):
+        print(f"[RESCUE] ORPHAN DETECTED job={job_id} video_uuid={video_uuid} — "
+              f"video row missing (deleted by user). Marking deleted_by_user.")
+        _mark_deleted_by_user(job_id, reservation_id, f"video row {video_uuid} no longer exists")
+        return {"job_id": job_id, "action": "skipped_orphan",
+                "reason": "video_row_deleted"}
+
+    # Guard: hard ceiling on rescue attempts to prevent infinite loops
+    rescue_count = meta.get("rescue_attempt_count", 0)
+    max_rescue = 2
+    if rescue_count >= max_rescue:
+        print(f"[RESCUE] job={job_id} exceeded max rescue attempts ({rescue_count}/{max_rescue}). "
+              f"Marking upstream_timeout_final.")
+        _mark_upstream_timeout_final(job_id, reservation_id,
+                                     f"Rescue attempts exhausted ({rescue_count}/{max_rescue})")
+        return {"job_id": job_id, "action": "skipped_max_rescue",
+                "reason": f"rescue_count_{rescue_count}_exceeded_max_{max_rescue}"}
+
+    # Increment rescue attempt counter
+    _increment_rescue_count(job_id, rescue_count)
 
     # For stalled jobs that came from finalizing, check retry count
     sweep_reason = meta.get("sweep_reason", "")
@@ -369,7 +398,7 @@ def _mark_failed_finalizing(
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                         updated_at = NOW()
                     WHERE id::text = %s
-                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled')
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user', 'upstream_timeout_final')
                     """,
                     (reason[:500], reason[:500],
                      json.dumps(meta_patch, default=str), job_id),
@@ -378,7 +407,7 @@ def _mark_failed_finalizing(
     except Exception as e:
         print(f"[RESCUE] Error marking finalizing-failed job={job_id}: {e}")
 
-    # Update videos row to failed + write history_items row
+    # Update videos row to failed + write history_items row (only if video still exists)
     video_uuid = None
     try:
         with get_conn() as conn:
@@ -390,6 +419,10 @@ def _mark_failed_finalizing(
                 row = cur.fetchone()
         if row:
             video_uuid = row.get("video_uuid")
+            if video_uuid and not _video_row_exists(video_uuid):
+                print(f"[RESCUE] skipping video/history update for finalizing-failed job={job_id}: "
+                      f"video row {video_uuid} no longer exists (deleted by user)")
+                video_uuid = None  # skip downstream updates
             if video_uuid:
                 from backend.services.history_service import update_video_record
                 update_video_record(video_uuid, status="failed", error_message=reason[:500])
@@ -754,7 +787,7 @@ def _update_rescued_job(
                         meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
                         updated_at = NOW()
                     WHERE id::text = %s
-                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled')
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user', 'upstream_timeout_final')
                     RETURNING id
                     """,
                     (status, result_url, thumbnail_url,
@@ -769,7 +802,7 @@ def _update_rescued_job(
     except Exception as e:
         print(f"[RESCUE] Error updating job {job_id}: {e}")
 
-    # Update videos row to ready (separate connection)
+    # Update videos row to ready (separate connection, only if row still exists)
     try:
         with get_conn() as conn2:
             with conn2.cursor() as cur2:
@@ -779,7 +812,10 @@ def _update_rescued_job(
                 )
                 vrow = cur2.fetchone()
         video_uuid = vrow.get("video_uuid") if vrow else None
-        if video_uuid:
+        if video_uuid and not _video_row_exists(video_uuid):
+            print(f"[RESCUE] skipping videos row update for job={job_id}: "
+                  f"video row {video_uuid} no longer exists (deleted by user)")
+        elif video_uuid:
             from backend.services.history_service import update_video_record
             update_video_record(
                 video_uuid,
@@ -811,7 +847,7 @@ def _requeue_for_worker(job_id: str) -> bool:
                         updated_at = NOW()
                     WHERE id::text = %s
                       AND claimed_by IS NULL
-                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled')
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user', 'upstream_timeout_final')
                     RETURNING id
                     """,
                     (job_id,),
@@ -912,6 +948,123 @@ def _parse_meta(meta) -> Dict[str, Any]:
         except (json.JSONDecodeError, TypeError):
             return {}
     return {}
+
+
+def _increment_rescue_count(job_id: str, current_count: int):
+    """Increment the rescue attempt counter in job meta."""
+    try:
+        meta_patch = {
+            "rescue_attempt_count": current_count + 1,
+            "rescue_last_attempt_at": time.time(),
+        }
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                    """,
+                    (json.dumps(meta_patch, default=str), job_id),
+                )
+            conn.commit()
+    except Exception:
+        pass  # Non-critical
+
+
+def _mark_upstream_timeout_final(job_id: str, reservation_id: Optional[str], reason: str):
+    """Mark a job as upstream_timeout_final (terminal) and release credits."""
+    try:
+        meta_patch = {
+            "upstream_timeout_final": True,
+            "upstream_timeout_final_at": time.time(),
+            "upstream_timeout_reason": reason,
+        }
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'upstream_timeout_final',
+                        completed_at = COALESCE(completed_at, NOW()),
+                        error_message = %s,
+                        last_error_code = 'upstream_timeout_final',
+                        last_error_message = %s,
+                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user', 'upstream_timeout_final')
+                    """,
+                    (reason[:500], reason[:500],
+                     json.dumps(meta_patch, default=str), job_id),
+                )
+            conn.commit()
+        print(f"[RESCUE] job={job_id} marked upstream_timeout_final reason={reason}")
+    except Exception as e:
+        print(f"[RESCUE] ERROR marking job={job_id} upstream_timeout_final: {e}")
+
+    # Release held credits — generation never produced a result
+    if reservation_id:
+        try:
+            from backend.services.credits_helper import release_job_credits
+            release_job_credits(reservation_id, ErrorCategory.PENDING_TIMEOUT, job_id)
+            print(f"[RESCUE] released credits for timed-out job={job_id} reservation={reservation_id}")
+        except Exception as e:
+            print(f"[RESCUE] WARNING: credit release failed for timed-out job={job_id}: {e}")
+
+
+def _video_row_exists(video_uuid: str) -> bool:
+    """Check if the videos row still exists in the database."""
+    try:
+        from backend.db import Tables as _T
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT 1 FROM {_T.VIDEOS} WHERE id::text = %s LIMIT 1",
+                    (video_uuid,),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        print(f"[RESCUE] WARNING: could not check video row existence for {video_uuid}: {e}")
+        return True  # fail-open: assume exists if check fails
+
+
+def _mark_deleted_by_user(job_id: str, reservation_id: Optional[str], reason: str):
+    """Mark a job as deleted_by_user (terminal) and release any held credits."""
+    try:
+        meta_patch = {
+            "deleted_by_user": True,
+            "deleted_detected_at": time.time(),
+            "delete_reason": reason,
+        }
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'deleted_by_user',
+                        completed_at = COALESCE(completed_at, NOW()),
+                        meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE id::text = %s
+                      AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user', 'upstream_timeout_final')
+                    """,
+                    (json.dumps(meta_patch, default=str), job_id),
+                )
+            conn.commit()
+        print(f"[RESCUE] job={job_id} marked deleted_by_user reason={reason}")
+    except Exception as e:
+        print(f"[RESCUE] ERROR marking job={job_id} deleted_by_user: {e}")
+
+    # Release held credits
+    if reservation_id:
+        try:
+            from backend.services.credits_helper import release_job_credits
+            release_job_credits(reservation_id, ErrorCategory.INTERNAL, job_id)
+            print(f"[RESCUE] released credits for deleted job={job_id} reservation={reservation_id}")
+        except Exception as e:
+            print(f"[RESCUE] WARNING: credit release failed for deleted job={job_id}: {e}")
 
 
 def _summary(results: Dict[str, Any]) -> str:
