@@ -153,7 +153,8 @@ def normalize_action_key(action_key: str) -> str:
 
     # Video variant codes are canonical by design
     # Veo: video_text_generate_4s_720p  |  Seedance: seedance_fast_text_generate_5s
-    if _is_video_variant_code(normalized) or _is_seedance_variant_code(normalized):
+    # fal Seedance: fal_seedance_text_generate_5s
+    if _is_video_variant_code(normalized) or _is_seedance_variant_code(normalized) or _is_fal_seedance_variant_code(normalized):
         return normalized
 
     # Unknown - log warning and return as-is
@@ -199,6 +200,27 @@ def _is_seedance_variant_code(action_key: str) -> bool:
         if action_key.startswith(prefix):
             suffix = action_key[len(prefix):]
             return suffix in {"5s", "10s", "15s"}
+
+    return False
+
+
+def _is_fal_seedance_variant_code(action_key: str) -> bool:
+    """
+    Check if an action key is a fal Seedance variant code.
+
+    Pattern: fal_seedance_{text_generate|image_animate}_{duration}s
+    """
+    if not action_key.startswith("fal_seedance_"):
+        return False
+
+    valid_prefixes = (
+        "fal_seedance_text_generate_",
+        "fal_seedance_image_animate_",
+    )
+    for prefix in valid_prefixes:
+        if action_key.startswith(prefix):
+            suffix = action_key[len(prefix):]
+            return suffix in {"5s", "10s"}
 
     return False
 
@@ -254,6 +276,12 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 120, "provider": "seedance"},
     {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 240, "provider": "seedance"},
     {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 360, "provider": "seedance"},
+    # ── fal Seedance 1.5 Pro — Text-to-Video (14 cps) ──
+    {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 70, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 140, "provider": "fal_seedance"},
+    # ── fal Seedance 1.5 Pro — Image-to-Video (14 cps) ──
+    {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 70, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 140, "provider": "fal_seedance"},
     # Legacy fallback codes (backward compat — provider label kept generic)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "vertex"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "vertex"},
@@ -286,6 +314,10 @@ SEEDANCE_CREDITS_PER_SEC = {
 }
 SEEDANCE_VALID_DURATIONS = [5, 10, 15]
 
+# fal Seedance 1.5 Pro credit costs: flat 14 credits/sec (single tier)
+FAL_SEEDANCE_CREDITS_PER_SEC = 14
+FAL_SEEDANCE_VALID_DURATIONS = [5, 10]
+
 # Valid durations per resolution (Vertex/Veo constraints)
 VIDEO_VALID_DURATIONS = {
     "720p": [4, 6, 8],
@@ -315,6 +347,9 @@ def get_video_action_code(
     """
     task_part = "text_generate" if task.lower() in ("text2video", "text_to_video", "text") else "image_animate"
 
+    if provider == "fal_seedance":
+        return f"fal_seedance_{task_part}_{duration_seconds}s"
+
     if provider == "seedance":
         tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
         return f"seedance_{tier}_{task_part}_{duration_seconds}s"
@@ -342,6 +377,9 @@ def get_video_credit_cost(
     Returns:
         Credit cost
     """
+    if provider == "fal_seedance":
+        return FAL_SEEDANCE_CREDITS_PER_SEC * int(duration_seconds)
+
     if provider == "seedance":
         tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
         cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 14)
@@ -717,6 +755,18 @@ class PricingService:
         canonical_from_db = PricingService.DB_TO_CANONICAL.get(action_key)
         if canonical_from_db and canonical_from_db in costs:
             return costs[canonical_from_db]
+
+        # fal Seedance variant fallback: compute from CPS if not yet in DB cache
+        # Pattern: fal_seedance_{text_generate|image_animate}_{duration}s
+        if _is_fal_seedance_variant_code(canonical):
+            suffix = canonical.rsplit("_", 1)[-1]  # e.g. "10s"
+            try:
+                duration = int(suffix.rstrip("s"))
+            except ValueError:
+                duration = 5
+            computed = FAL_SEEDANCE_CREDITS_PER_SEC * duration
+            print(f"[PRICING] fal Seedance fallback cost: {canonical} -> {computed} credits ({FAL_SEEDANCE_CREDITS_PER_SEC} x {duration}s)")
+            return computed
 
         # Seedance variant fallback: compute from CPS if not yet in DB cache
         # Pattern: seedance_{fast|preview}_{text_generate|image_animate}_{duration}s

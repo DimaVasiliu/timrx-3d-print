@@ -68,6 +68,7 @@ from backend.services.video_providers.vertex_provider import VertexVeoProvider
 
 _VERTEX_PROVIDER: Optional[VertexVeoProvider] = None
 _SEEDANCE_PROVIDER = None
+_FAL_SEEDANCE_PROVIDER = None
 
 
 def _get_vertex_provider() -> VertexVeoProvider:
@@ -87,6 +88,15 @@ def _get_seedance_provider():
     return _SEEDANCE_PROVIDER
 
 
+def _get_fal_seedance_provider():
+    """Lazy-load fal Seedance provider."""
+    global _FAL_SEEDANCE_PROVIDER
+    if _FAL_SEEDANCE_PROVIDER is None:
+        from backend.services.video_providers.fal_seedance_provider import FalSeedanceProvider
+        _FAL_SEEDANCE_PROVIDER = FalSeedanceProvider()
+    return _FAL_SEEDANCE_PROVIDER
+
+
 def _get_ordered_providers() -> List[VideoProvider]:
     """
     Get video providers ordered by priority.
@@ -99,8 +109,11 @@ def _get_ordered_providers() -> List[VideoProvider]:
 # Legacy provider aliases that all resolve to "vertex".
 _VERTEX_ALIASES = frozenset({"google", "veo", "aistudio", "video"})
 
-# The two canonical provider names accepted by the system.
-CANONICAL_PROVIDERS = frozenset({"vertex", "seedance"})
+# Aliases that resolve to "fal_seedance".
+_FAL_SEEDANCE_ALIASES = frozenset({"fal", "fal-seedance", "fal_seedance_pro"})
+
+# The canonical provider names accepted by the system.
+CANONICAL_PROVIDERS = frozenset({"vertex", "seedance", "fal_seedance"})
 
 
 def normalize_provider_name(raw: str | None) -> str:
@@ -114,6 +127,8 @@ def normalize_provider_name(raw: str | None) -> str:
     name = (raw or "").strip().lower()
     if name in CANONICAL_PROVIDERS:
         return name
+    if name in _FAL_SEEDANCE_ALIASES:
+        return "fal_seedance"
     if name in _VERTEX_ALIASES:
         return "vertex"
     return "vertex"
@@ -129,6 +144,8 @@ def resolve_video_provider(provider_name: str):
     name = normalize_provider_name(provider_name)
     if name == "vertex":
         return _get_vertex_provider()
+    if name == "fal_seedance":
+        return _get_fal_seedance_provider()
     if name == "seedance":
         return _get_seedance_provider()
     return video_router.get_provider(name)

@@ -734,6 +734,53 @@ def _safe_int_duration(raw) -> int:
         return 6
 
 
+def _dispatch_to_fal_seedance(
+    internal_job_id: str,
+    task: str,
+    prompt: str,
+    payload: dict,
+    route_params: dict,
+    store_meta: dict,
+) -> tuple:
+    """Route to fal Seedance with dispatch-time fallback to PiAPI Seedance."""
+    from backend.services.video_router import (
+        resolve_video_provider,
+        ProviderUnavailableError,
+    )
+    from backend.config import config as _cfg
+
+    fal = resolve_video_provider("fal_seedance")
+    if fal:
+        configured, err = fal.is_configured()
+        if configured:
+            try:
+                if task == "image2video":
+                    fp = payload.get("motion") or prompt
+                    resp = fal.start_image_to_video(
+                        image_data=payload.get("image_data", ""),
+                        prompt=fp,
+                        **route_params,
+                    )
+                else:
+                    resp = fal.start_text_to_video(prompt=prompt, **route_params)
+                return resp, "fal_seedance"
+            except Exception as e:
+                print(f"[ASYNC] fal_seedance failed for job {internal_job_id}: {e}")
+                # Fall through to PiAPI Seedance fallback
+        else:
+            print(f"[ASYNC] fal_seedance not configured: {err}")
+
+    # Dispatch-time fallback to PiAPI Seedance (if enabled)
+    fallback_enabled = getattr(_cfg, "FAL_SEEDANCE_FALLBACK_TO_PIAPI", True)
+    if fallback_enabled:
+        print(f"[ASYNC] Falling back to PiAPI Seedance for job {internal_job_id}")
+        return _dispatch_to_seedance(
+            internal_job_id, task, prompt, payload, route_params, store_meta,
+        )
+
+    raise ProviderUnavailableError("fal Seedance not available and fallback disabled")
+
+
 def _dispatch_to_seedance(
     internal_job_id: str,
     task: str,
@@ -899,7 +946,11 @@ def dispatch_gemini_video_async(
         requested_provider = normalize_provider_name(store_meta.get("provider"))
         prompt = payload.get("prompt", "")
 
-        if requested_provider == "seedance":
+        if requested_provider == "fal_seedance":
+            resp, provider_used = _dispatch_to_fal_seedance(
+                internal_job_id, task, prompt, payload, route_params, store_meta,
+            )
+        elif requested_provider == "seedance":
             resp, provider_used = _dispatch_to_seedance(
                 internal_job_id, task, prompt, payload, route_params, store_meta,
             )
@@ -911,8 +962,8 @@ def dispatch_gemini_video_async(
         # Track which provider actually handled the request
         store_meta["provider"] = provider_used
 
-        # Upstream identifier: Vertex → operation_name, Seedance → task_id
-        upstream_id = resp.get("operation_name") or resp.get("task_id")
+        # Upstream identifier: Vertex → operation_name, Seedance → task_id, fal → request_id
+        upstream_id = resp.get("operation_name") or resp.get("task_id") or resp.get("request_id")
 
         if upstream_id:
             update_job_with_upstream_id(internal_job_id, upstream_id)
@@ -921,6 +972,9 @@ def dispatch_gemini_video_async(
             store_meta["operation_name"] = upstream_id  # backward compat
             store_meta["upstream_id"] = upstream_id
             store_meta["status"] = "processing"
+            # Preserve fal model_id for status polling (model-scoped endpoints)
+            if resp.get("fal_model_id"):
+                store_meta["fal_model_id"] = resp["fal_model_id"]
             store[internal_job_id] = store_meta
             save_store(store)
 

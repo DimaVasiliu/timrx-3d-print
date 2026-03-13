@@ -106,6 +106,12 @@ _PROVIDER_ERROR_MAP = {
     # Generation failures
     "generation_failed": ErrorCategory.INTERNAL,
     "seedance_generation_failed": ErrorCategory.INTERNAL,
+    # fal.ai Seedance
+    "fal_seedance_auth_error": ErrorCategory.AUTH,
+    "fal_seedance_network_error": ErrorCategory.NETWORK,
+    "fal_seedance_no_request_id": ErrorCategory.NO_OUTPUT,
+    "fal_seedance_api_error": ErrorCategory.INTERNAL,
+    "fal_seedance_download_error": ErrorCategory.NETWORK,
 }
 
 
@@ -166,6 +172,10 @@ TERMINAL_ERROR_CODES = frozenset({
     "no_upstream_id",
     "missing_fields",
     "unsupported_recovery_provider",
+    # fal.ai Seedance
+    "fal_seedance_auth_error",
+    "fal_seedance_no_request_id",
+    "fal_seedance_api_error",
 })
 
 
@@ -202,6 +212,12 @@ FAILURE_MESSAGES = {
     "vertex_timeout": "Veo generation timed out",
     "vertex_auth_error": "Veo authentication failed",
     "vertex_quota": "Veo quota reached -- try again later",
+    # fal.ai Seedance-specific
+    "fal_seedance_auth_error": "fal Seedance authentication failed",
+    "fal_seedance_network_error": "Lost connection to fal Seedance during generation",
+    "fal_seedance_no_request_id": "fal Seedance completed but no video was returned",
+    "fal_seedance_api_error": "fal Seedance rejected this generation",
+    "fal_seedance_download_error": "Failed to download video from fal Seedance",
 }
 
 

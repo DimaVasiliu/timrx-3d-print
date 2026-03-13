@@ -87,6 +87,9 @@ PROVIDER_COST_GBP: Dict[Tuple[str, int], float] = {
     ("seedance_preview", 5): 0.45,
     ("seedance_preview", 10): 0.90,
     ("seedance_preview", 15): 1.35,
+    # fal Seedance 1.5 Pro
+    ("fal_seedance", 5): 0.25,
+    ("fal_seedance", 10): 0.50,
 }
 
 # Cooldown between video starts (seconds)
@@ -176,7 +179,7 @@ def count_active_video_jobs(identity_id: str) -> int:
             FROM {Tables.JOBS}
             WHERE identity_id = %s
               AND status IN ({status_list})
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             """,
             (identity_id,),
         )
@@ -197,7 +200,7 @@ def count_video_jobs_last_hour(identity_id: str) -> int:
             FROM {Tables.JOBS}
             WHERE identity_id = %s
               AND created_at >= NOW() - INTERVAL '1 hour'
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             """,
             (identity_id,),
         )
@@ -217,7 +220,7 @@ def get_last_video_job_started_at(identity_id: str) -> Optional[datetime]:
             SELECT created_at
             FROM {Tables.JOBS}
             WHERE identity_id = %s
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -239,7 +242,9 @@ def estimate_video_provider_cost(provider: str, duration_seconds: int, seedance_
 
     Returns approximate cost in GBP.
     """
-    if provider == "seedance":
+    if provider == "fal_seedance":
+        key = ("fal_seedance", int(duration_seconds))
+    elif provider == "seedance":
         key = (f"seedance_{seedance_tier}", int(duration_seconds))
     else:
         key = ("vertex", int(duration_seconds))
@@ -249,7 +254,9 @@ def estimate_video_provider_cost(provider: str, duration_seconds: int, seedance_
         return cost
 
     # Fallback: linear estimate based on closest known cost
-    if provider == "seedance":
+    if provider == "fal_seedance":
+        rate = 0.05
+    elif provider == "seedance":
         rate = 0.05 if seedance_tier == "fast" else 0.09
     else:
         rate = 0.075
@@ -272,7 +279,7 @@ def get_daily_user_video_provider_spend(identity_id: str) -> float:
             FROM {Tables.JOBS}
             WHERE identity_id = %s
               AND created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
               AND status NOT IN ('failed', 'refunded', 'abandoned_legacy', 'recovery_blocked')
             """,
             (identity_id,),
@@ -308,7 +315,7 @@ def get_daily_global_video_provider_spend() -> float:
             SELECT provider, meta
             FROM {Tables.JOBS}
             WHERE created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
               AND status NOT IN ('failed', 'refunded', 'abandoned_legacy', 'recovery_blocked')
             """,
         )
@@ -462,6 +469,7 @@ AVERAGE_GENERATION_TIME = {
     "seedance": 480,            # ~8 min (fast tier typical)
     "seedance_fast": 480,       # ~8 min
     "seedance_preview": 1200,   # ~20 min (highly variable)
+    "fal_seedance": 120,        # ~2 min (estimated)
 }
 
 # Estimated render time ranges shown to user
@@ -470,6 +478,7 @@ RENDER_TIME_RANGE = {
     "seedance": (300, 600),          # 5-10 min (fast tier default)
     "seedance_fast": (300, 600),     # 5-10 min
     "seedance_preview": (600, 3600), # 10-60 min (variable queue)
+    "fal_seedance": (60, 300),       # 1-5 min (estimated)
 }
 
 
@@ -489,7 +498,7 @@ def get_queue_position(job_id: str) -> Dict[str, Any]:
             SELECT COUNT(*) AS pos
             FROM {Tables.JOBS}
             WHERE status IN ('queued', 'processing')
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
               AND created_at < (
                   SELECT created_at FROM {Tables.JOBS} WHERE id::text = %s LIMIT 1
               )
@@ -541,7 +550,7 @@ def get_total_queued_video_jobs() -> int:
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
             WHERE status IN ({status_list})
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             """,
         )
         return row["cnt"] if row else 0
@@ -752,7 +761,7 @@ def get_video_metrics() -> Dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
             WHERE status IN ({active_list})
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             """,
         )
         metrics["active_jobs"] = row["cnt"] if row else 0
@@ -763,7 +772,7 @@ def get_video_metrics() -> Dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
             WHERE status IN ('queued', 'dispatched')
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             """,
         )
         metrics["queue_length"] = row["cnt"] if row else 0
@@ -774,7 +783,7 @@ def get_video_metrics() -> Dict[str, Any]:
             SELECT COUNT(*) AS cnt
             FROM {Tables.JOBS}
             WHERE created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
             """,
         )
         metrics["videos_generated_today"] = row["cnt"] if row else 0
@@ -789,7 +798,7 @@ def get_video_metrics() -> Dict[str, Any]:
             FROM {Tables.JOBS}
             WHERE status = 'ready'
               AND created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
-              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%'])
+              AND action_code LIKE ANY(ARRAY['video_%%', 'seedance_%%', 'fal_seedance_%%'])
               AND updated_at IS NOT NULL
             """,
         )

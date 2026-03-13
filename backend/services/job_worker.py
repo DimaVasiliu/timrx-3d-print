@@ -81,7 +81,7 @@ BACKOFF_STEPS = [30, 60, 120, 300]  # seconds
 # ── Provider Configuration ───────────────────────────────────
 # Only these provider/stage combinations are handled by the durable worker.
 # Everything else (meshy 3D, image gen, etc.) uses legacy dispatch paths.
-_SUPPORTED_PROVIDERS = {"seedance", "vertex"}
+_SUPPORTED_PROVIDERS = {"seedance", "vertex", "fal_seedance"}
 _SUPPORTED_STAGES = {"video"}
 
 # Per-provider timeout config: (pend_soft, pend_hard, proc_soft, proc_hard)
@@ -93,6 +93,8 @@ _PROVIDER_TIMEOUTS = {
     "seedance":                         (5 * 60, 15 * 60, 10 * 60, 20 * 60),
     # Vertex (Veo) — faster models, tighter timeouts
     "vertex":                           (2 * 60, 6 * 60, 4 * 60, 10 * 60),
+    # fal.ai Seedance 1.5 Pro — moderate timeouts
+    "fal_seedance":                     (3 * 60, 10 * 60, 8 * 60, 15 * 60),
 }
 _DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
 
@@ -804,7 +806,11 @@ def _poll_provider_once(
 
     try:
         if provider_obj:
-            status_resp = provider_obj.check_status(upstream_id)
+            # fal_seedance needs model_id from meta for model-scoped status endpoints
+            if provider_name == "fal_seedance" and meta.get("fal_model_id"):
+                status_resp = provider_obj.check_status(upstream_id, model_id=meta["fal_model_id"])
+            else:
+                status_resp = provider_obj.check_status(upstream_id)
         else:
             from backend.services.seedance_service import check_seedance_status
             status_resp = check_seedance_status(upstream_id)

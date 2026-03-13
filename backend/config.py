@@ -537,6 +537,23 @@ class Config:
         return f"{base}/api/webhooks/piapi/task"
 
     # ─────────────────────────────────────────────────────────────
+    # fal.ai Seedance 1.5 Pro Video Generation
+    # ─────────────────────────────────────────────────────────────
+    FAL_KEY: str = field(default_factory=lambda: _get_env("FAL_KEY"))
+    FAL_SEEDANCE_ENABLED: bool = field(default_factory=lambda: _get_env_bool("FAL_SEEDANCE_ENABLED", True))
+    FAL_SEEDANCE_T2V_MODEL: str = field(default_factory=lambda: _get_env("FAL_SEEDANCE_T2V_MODEL", "fal-ai/bytedance/seedance/v1.5/pro/text-to-video"))
+    FAL_SEEDANCE_I2V_MODEL: str = field(default_factory=lambda: _get_env("FAL_SEEDANCE_I2V_MODEL", "fal-ai/bytedance/seedance/v1.5/pro/image-to-video"))
+    FAL_SEEDANCE_DEFAULT_DURATION: int = field(default_factory=lambda: _get_env_int("FAL_SEEDANCE_DEFAULT_DURATION", 5))
+    FAL_SEEDANCE_DEFAULT_RESOLUTION: str = field(default_factory=lambda: _get_env("FAL_SEEDANCE_DEFAULT_RESOLUTION", "720p"))
+    FAL_SEEDANCE_DEFAULT_ASPECT_RATIO: str = field(default_factory=lambda: _get_env("FAL_SEEDANCE_DEFAULT_ASPECT_RATIO", "16:9"))
+    FAL_SEEDANCE_GENERATE_AUDIO: bool = field(default_factory=lambda: _get_env_bool("FAL_SEEDANCE_GENERATE_AUDIO", True))
+    FAL_SEEDANCE_ENABLE_SAFETY_CHECKER: bool = field(default_factory=lambda: _get_env_bool("FAL_SEEDANCE_ENABLE_SAFETY_CHECKER", True))
+    FAL_SEEDANCE_CAMERA_FIXED: bool = field(default_factory=lambda: _get_env_bool("FAL_SEEDANCE_CAMERA_FIXED", False))
+    FAL_SEEDANCE_POLL_INTERVAL_SEC: int = field(default_factory=lambda: _get_env_int("FAL_SEEDANCE_POLL_INTERVAL_SEC", 5))
+    FAL_SEEDANCE_MAX_POLLS: int = field(default_factory=lambda: _get_env_int("FAL_SEEDANCE_MAX_POLLS", 120))
+    FAL_SEEDANCE_FALLBACK_TO_PIAPI: bool = field(default_factory=lambda: _get_env_bool("FAL_SEEDANCE_FALLBACK_TO_PIAPI", True))
+
+    # ─────────────────────────────────────────────────────────────
     # Job Recovery & Stale Sweep Configuration
     # ─────────────────────────────────────────────────────────────
     # Stale sweep: periodic server-side check for stuck jobs
