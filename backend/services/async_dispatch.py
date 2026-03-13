@@ -783,15 +783,17 @@ def _dispatch_to_fal_seedance(
         else:
             print(f"[ASYNC] fal_seedance not configured: {err}")
 
-    # Dispatch-time fallback to PiAPI Seedance (if enabled)
+    # Dispatch-time fallback to PiAPI Seedance (if enabled).
+    # PiAPI does NOT support image_transition — only fall back for text2video/image2video.
     fallback_enabled = getattr(_cfg, "FAL_SEEDANCE_FALLBACK_TO_PIAPI", True)
-    if fallback_enabled:
+    if fallback_enabled and task != "image_transition":
         print(f"[ASYNC] Falling back to PiAPI Seedance for job {internal_job_id}")
         return _dispatch_to_seedance(
             internal_job_id, task, prompt, payload, route_params, store_meta,
         )
 
-    raise ProviderUnavailableError("fal Seedance not available and fallback disabled")
+    reason = "image_transition not supported by PiAPI fallback" if task == "image_transition" else "fallback disabled"
+    raise ProviderUnavailableError(f"fal Seedance not available and {reason}")
 
 
 def _dispatch_to_seedance(

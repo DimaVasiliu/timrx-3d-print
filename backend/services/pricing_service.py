@@ -667,9 +667,9 @@ class PricingService:
         # Get base plans with perks
         plans = PricingService.get_plans_with_perks(active_only)
 
-        # Get action costs for estimates (use new lower costs)
+        # Get action costs for estimates
         costs = PricingService.get_action_costs()
-        image_cost = costs.get("image_generate", 5)           # Standard image
+        image_cost = costs.get("image_generate", 10)          # Standard image
         text_to_3d_cost = costs.get("text_to_3d_generate", 20)
         image_to_3d_cost = costs.get("image_to_3d_generate", 30)
 

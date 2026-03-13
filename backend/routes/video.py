@@ -1,1508 +1,2031 @@
-"""
-Video Generation Routes Blueprint.
-----------------------------------
-Registered under /api/_mod and /api for compatibility.
+/**
+ * workspace-credits.js
+ * Manages credits/wallet state for the 3dprint.html workspace.
+ * Fetches wallet balance and action costs on load, provides helpers for credit checks.
+ */
 
-Active providers:
-- vertex   (Veo 3.1)       — durations 4/6/8s, aspects 16:9/9:16, resolutions 720p/1080p/4k
-- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 16:9/9:16/1:1, tiers fast/preview
+import { BACKEND, log, apiFetch, updateSessionInfo, readWalletCache, writeWalletCache, clearWalletCache } from './config.js';
 
-Endpoints:
-- POST /video/generate   — Unified start (text2video or image2video) — legacy
-- POST /video/text       — Text → short cinematic clip
-- POST /video/animate    — Image → animated video clip
-- GET  /video/status/<job_id>          — Poll job status (canonical)
-- GET  /video/generate/status/<job_id> — Poll job status (legacy alias)
-"""
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
-from __future__ import annotations
+const CREDITS_CACHE_KEY = 'timrx_credits_last';
+const VIDEO_CREDITS_CACHE_KEY = 'timrx_video_credits_last';
 
-import json
-import uuid
-from flask import Blueprint, jsonify, request
+// ============================================================================
+// SINGLE-FLIGHT GUARD
+// ============================================================================
 
-from backend.db import USE_DB, get_conn, Tables
-from backend.middleware import with_session
-from backend.services.async_dispatch import get_executor
-from backend.services.credits_helper import start_paid_job, release_job_credits
-from backend.services.expense_guard import ExpenseGuard
-from backend.services.identity_service import require_identity
-from backend.services.history_service import create_video_record
-from backend.services.job_service import create_internal_job_row, load_store, save_store
-from backend.services.gemini_video_service import (
-    validate_video_params,
-    GeminiValidationError,
-)
-from backend.services.vertex_video_service import check_vertex_resolution
-from backend.services.video_router import (
-    video_router,
-    resolve_video_provider,
-    normalize_provider_name,
-)
-from backend.services.video_providers.seedance_provider import (
-    normalize_seedance_params,
-)
-from backend.services.video_providers.fal_seedance_provider import (
-    normalize_fal_seedance_params,
-)
-from backend.services.video_providers.vertex_provider import (
-    normalize_vertex_params,
-)
-from backend.services.video_prompts import (
-    normalize_text_prompt,
-    normalize_motion_prompt,
-    get_style_presets,
-    get_motion_presets,
-)
-from backend.services.pricing_service import (
-    get_video_action_code,
-    get_video_credit_cost,
-)
-from backend.services.video_limits import validate_video_rate_limits
-from backend.utils.helpers import now_s, log_event
+// Track in-flight fetch promises to prevent duplicate requests
+let walletFetchInFlight = null;
+let refreshInFlight = null;
+let pendingRetry = false; // Flag for window.focus retry
+let lastRefreshTime = 0; // Track last refresh for visibility/focus throttling
+const MIN_REFRESH_INTERVAL_MS = 5000; // Don't refresh more than once per 5s
 
-bp = Blueprint("video", __name__)
+// ============================================================================
+// STATE
+// ============================================================================
 
+const creditsState = {
+  wallet: {
+    balance: 0,
+    reserved: 0,
+    available: 0,
+    // Video credits (separate pool)
+    videoBalance: 0,
+    videoReserved: 0,
+    videoAvailable: 0,
+  },
+  identityId: null,
+  email: null,  // User's email (null if not attached)
+  emailVerified: false,
+  actionCosts: {},
+  loaded: false,
+  loading: false,
+  error: null,
+  // Optimistic updates tracking
+  pendingDeductions: [],  // Array of { id, amount, action, timestamp }
+  lastServerBalance: null,
+  // Reservation tracking (credits held during generation)
+  reservations: new Map(),  // Map<jobId, { amount, action, timestamp }>
+  totalReserved: 0,  // Sum of all active reservations
+};
 
-@bp.route("/video/generate", methods=["POST", "OPTIONS"])
-@with_session
-def generate_video():
-    """
-    Legacy unified endpoint: start text2video or image2video.
+// Idempotency: track job IDs that have already been charged
+// Prevents duplicate deductions from double-clicks or retries
+const chargedJobs = new Set();
 
-    Delegates to _dispatch_video_job after provider-specific normalization.
-    New code should use POST /video/text or POST /video/animate instead.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
+// ============================================================================
+// EARLY RENDER (for perceived performance)
+// ============================================================================
 
-    available_providers = video_router.get_available_providers()
-    if not available_providers:
-        return jsonify({
-            "error": "video_not_configured",
-            "message": "No video generation providers are configured",
-            "details": {"hint": "Set GEMINI_API_KEY environment variable"}
-        }), 500
+/**
+ * Check if we should force a fresh fetch (e.g., after purchase redirect).
+ * URL params: ?refresh=1 or referrer from hub after purchase
+ */
+function shouldForceRefresh() {
+  const params = new URLSearchParams(window.location.search);
+  // Force refresh if ?refresh=1 is in URL (set by hub after purchase)
+  if (params.get('refresh') === '1') {
+    // Clear the param from URL to avoid repeated refreshes on reload
+    const url = new URL(window.location.href);
+    url.searchParams.delete('refresh');
+    window.history.replaceState({}, '', url.toString());
+    log('[Credits] Force refresh requested via URL param');
+    return true;
+  }
+  // Force refresh if coming from hub (different origin purchase flow)
+  if (document.referrer && document.referrer.includes('timrx.live') && !document.referrer.includes('3d.timrx.live')) {
+    log('[Credits] Force refresh: navigated from hub');
+    return true;
+  }
+  return false;
+}
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
+// Track if force refresh was requested (checked at module load time)
+const FORCE_REFRESH = shouldForceRefresh();
 
-    body = request.get_json(silent=True) or {}
+/**
+ * Render cached credits immediately on page load (before async fetch).
+ * This provides instant visual feedback using the last known balance.
+ * Call this as early as possible - even before DOM ready if elements exist.
+ */
+function renderCachedCreditsEarly() {
+  const creditsPill = document.getElementById('workspaceCredits');
+  const creditsValue = document.getElementById('workspaceCreditsValue');
+  const creditsGroup = document.getElementById('workspaceCreditsGroup');
 
-    provider = normalize_provider_name(body.get("provider"))
-    task = (body.get("task") or "text2video").lower()
-
-    if task not in ("text2video", "image2video"):
-        return jsonify({
-            "error": "invalid_params",
-            "message": "task must be 'text2video' or 'image2video'",
-            "field": "task",
-            "allowed": ["text2video", "image2video"]
-        }), 400
-
-    # Raw parameters from request
-    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or (5 if provider in ("seedance", "fal_seedance") else 6)
-    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
-    resolution = body.get("resolution") or "720p"
-    motion = (body.get("motion") or "").strip()
-    negative_prompt = (body.get("negative_prompt") or body.get("negativePrompt") or "").strip()
-    seed = body.get("seed")
-
-    seedance_variant = None
-    seedance_tier = "fast"
-
-    # ── Provider-specific normalization ──
-    if provider == "seedance":
-        sc = normalize_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            seedance_variant=body.get("seedance_variant"),
-        )
-        duration_seconds = sc["duration_seconds"]
-        aspect_ratio = sc["aspect_ratio"]
-        seedance_variant = sc["task_type"]
-        seedance_tier = sc["tier"]
-        resolution = "720p"  # Seedance has no resolution concept
-    elif provider == "fal_seedance":
-        fc = normalize_fal_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = fc["duration_seconds"]
-        aspect_ratio = fc["aspect_ratio"]
-        resolution = fc["resolution"]
-    else:
-        vc = normalize_vertex_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = vc["duration_seconds"]
-        aspect_ratio = vc["aspect_ratio"]
-        resolution = vc["resolution"]
-
-    # Task-specific validation
-    if task == "text2video":
-        prompt = (body.get("prompt") or "").strip()
-        if not prompt:
-            return jsonify({"error": "invalid_params", "message": "prompt is required for text2video", "field": "prompt"}), 400
-        image_data = None
-    else:
-        image_data = body.get("image_data") or body.get("image") or ""
-        if not image_data:
-            return jsonify({"error": "invalid_params", "message": "image_data is required for image2video", "field": "image_data"}), 400
-        prompt = motion or "Animate this image with natural, smooth motion"
-
-    return _dispatch_video_job(
-        identity_id=identity_id or "",
-        task=task,
-        prompt=prompt,
-        image_data=image_data,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration_seconds=duration_seconds,
-        motion=motion,
-        negative_prompt=negative_prompt,
-        seed=seed,
-        provider=provider,
-        seedance_variant=seedance_variant,
-        seedance_tier=seedance_tier,
-    )
-
-
-def _dispatch_video_job(
-    identity_id: str,
-    task: str,
-    prompt: str,
-    image_data: str | None,
-    aspect_ratio: str,
-    resolution: str,
-    duration_seconds: int,
-    motion: str,
-    negative_prompt: str,
-    seed: int | None,
-    style_preset: str | None = None,
-    motion_preset: str | None = None,
-    provider: str = "vertex",
-    seedance_variant: str | None = None,
-    seedance_tier: str = "fast",
-    start_image: str | None = None,
-    end_image: str | None = None,
-):
-    """
-    Shared helper: validate, reserve credits, create job row, dispatch async, return response.
-
-    Expects already-normalized provider-specific parameters (callers must
-    run normalize_seedance_params or normalize_vertex_params before calling).
-    """
-    # Dynamic provider routing — auto-select cheaper provider under load
-    from backend.services.video_limits import select_video_provider
-    provider = select_video_provider(provider)
-
-    # Vertex: final validation via gemini_video_service (catches edge cases)
-    if provider == "vertex":
-        try:
-            aspect_ratio, resolution, duration_seconds = validate_video_params(
-                aspect_ratio, resolution, duration_seconds
-            )
-        except GeminiValidationError as e:
-            print(f"[VIDEO] Vertex validation failed: {e.message}")
-            return jsonify({
-                "ok": False,
-                "error": "invalid_params",
-                "message": e.message,
-                "field": e.field,
-                "value": e.value,
-                "allowed": e.allowed,
-            }), 400
-
-        # Pre-flight: reject 4k if Vertex project is not allowlisted
-        resolution_ok, resolution_err = check_vertex_resolution(resolution)
-        if not resolution_ok:
-            print(f"[VIDEO] Vertex resolution check failed: {resolution_err}")
-            return jsonify({
-                "ok": False,
-                "error": "vertex_resolution_not_allowed",
-                "message": resolution_err,
-                "field": "resolution",
-                "value": resolution,
-                "allowed": ["720p", "1080p"],
-            }), 400
-
-    internal_job_id = str(uuid.uuid4())
-
-    # Credit calculation — server is sole authority on action code
-    action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
-    expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier, task=task)
-
-    print(
-        f"[VIDEO] resolved provider={provider} task={task} duration={duration_seconds}s "
-        f"resolution={resolution} action_code={action_key} cost={expected_cost}"
-    )
-
-    if expected_cost <= 0:
-        print(f"[VIDEO] REJECTED: action_key={action_key} resolved to 0 credits provider={provider} duration={duration_seconds}")
-        return jsonify({
-            "ok": False,
-            "error": "unknown_action_code",
-            "message": f"Unknown video action code: {action_key}. Cannot determine cost.",
-        }), 400
-
-    # RATE LIMITS: concurrency, hourly cap, cooldown, spend guardrails
-    rate_error = validate_video_rate_limits(
-        identity_id,
-        provider=provider,
-        duration_seconds=duration_seconds,
-        seedance_tier=seedance_tier,
-    )
-    if rate_error:
-        return rate_error
-
-    print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
-
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {
-            "task": task,
-            "prompt": prompt[:100] if prompt else None,
-            "duration_seconds": duration_seconds,
-            "resolution": resolution,
-            "style_preset": style_preset,
-            "motion_preset": motion_preset,
-            "expected_cost": expected_cost,
-        },
-    )
-    if credit_error:
-        return credit_error
-
-    print(
-        f"[BILLING] reservation created job={internal_job_id} action_code={action_key} "
-        f"cost={expected_cost} reservation_id={reservation_id}"
-    )
-
-    store_meta = {
-        "stage": "video",
-        "created_at": now_s() * 1000,
-        "task": task,
-        "provider": provider,
-        "prompt": prompt,
-        "duration_seconds": duration_seconds,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "motion": motion,
-        "negative_prompt": negative_prompt,
-        "seed": seed,
-        "style_preset": style_preset,
-        "motion_preset": motion_preset,
-        "seedance_variant": seedance_variant,
-        "seedance_tier": seedance_tier if provider == "seedance" else None,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
+  // If UI elements don't exist yet, try again after DOM ready
+  if (!creditsValue) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', renderCachedCreditsEarly, { once: true });
     }
+    return;
+  }
 
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    # Part 8: Priority queue — derive priority from user tier
-    from backend.services.video_limits import get_job_priority
-    job_priority = get_job_priority(identity_id)
-
-    # FAIL-CLOSED: Job row MUST exist before dispatching upstream provider task.
-    # If the insert fails (e.g. FK constraint on action_code), abort and release credits.
-    job_created = create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider=provider,
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-        priority=str(job_priority),
-        stage="video",
-    )
-    if not job_created:
-        print(f"[VIDEO] CRITICAL: Job row creation failed for {internal_job_id}, aborting dispatch. action_key={action_key}")
-        # Release reserved credits
-        if reservation_id:
-            try:
-                release_job_credits(reservation_id, job_id=internal_job_id, reason="job_row_creation_failed")
-            except Exception as rel_err:
-                print(f"[VIDEO] ERROR releasing reservation {reservation_id}: {rel_err}")
-        # Clean up in-memory store
-        store.pop(internal_job_id, None)
-        save_store(store)
-        return jsonify({
-            "ok": False,
-            "error": "internal_job_creation_failed",
-            "message": "Failed to create internal job record. Credits have been released. Please try again.",
-        }), 500
-
-    # Create a videos row early so history_items.video_id always has a valid FK target.
-    # This row starts as status='queued' and is updated as the job progresses.
-    video_uuid = create_video_record(
-        job_id=internal_job_id,
-        identity_id=identity_id,
-        prompt=prompt,
-        provider=provider,
-        duration_seconds=duration_seconds,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-    )
-    if video_uuid:
-        store_meta["video_uuid"] = video_uuid
-        store[internal_job_id] = store_meta
-        save_store(store)
-        # Also patch the video_uuid into jobs.meta so it can be resolved later
-        if USE_DB:
-            try:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            f"""
-                            UPDATE {Tables.JOBS}
-                            SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
-                            WHERE id::text = %s
-                            """,
-                            (json.dumps({"video_uuid": video_uuid}), internal_job_id),
-                        )
-                    conn.commit()
-            except Exception as e:
-                print(f"[VIDEO] WARNING: Failed to store video_uuid in jobs.meta: {e}")
-    else:
-        print(f"[VIDEO] WARNING: create_video_record failed for job {internal_job_id}, history FK may fail")
-
-    payload = {
-        "task": task,
-        "prompt": prompt,
-        "image_data": image_data,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "duration_seconds": duration_seconds,
-        "motion": motion,
-        "negative_prompt": negative_prompt,
-        "seed": seed,
-        "seedance_variant": seedance_variant,
+  // Skip cache if force refresh was requested (show syncing immediately)
+  if (FORCE_REFRESH) {
+    log('[Credits] Skipping cache render due to force refresh');
+    creditsValue.textContent = '—';
+    if (creditsGroup) creditsGroup.classList.add('syncing');
+    if (creditsPill) {
+      creditsPill.classList.add('syncing');
+      creditsPill.setAttribute('title', 'Syncing credits...');
     }
-    if start_image:
-        payload["start_image"] = start_image
-    if end_image:
-        payload["end_image"] = end_image
-
-    from backend.services.async_dispatch import dispatch_gemini_video_async
-
-    get_executor().submit(
-        dispatch_gemini_video_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        payload,
-        store_meta,
-    )
-
-    log_event(f"video/{task}:dispatched", {"internal_job_id": internal_job_id})
-
-    # D1: Return fast — skip balance query (frontend caches wallet separately)
-    from backend.services.video_limits import get_estimated_render_time
-    rtime = get_estimated_render_time(provider)
-    return jsonify({
-        "ok": True,
-        "job_id": internal_job_id,
-        "video_id": internal_job_id,
-        "video_uuid": video_uuid,
-        "reservation_id": reservation_id,
-        "status": "queued",
-        "task": task,
-        "params": {
-            "aspect_ratio": aspect_ratio,
-            "resolution": resolution,
-            "duration_seconds": duration_seconds,
-        },
-        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-    })
-
-
-# ── POST /video/text — Text → short cinematic clip ───────────
-@bp.route("/video/text", methods=["POST", "OPTIONS"])
-@with_session
-def video_text():
-    """
-    Generate a short cinematic video clip from a text prompt.
-
-    Provider-specific normalization happens here so _dispatch_video_job
-    receives clean, validated parameters.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    available_providers = video_router.get_available_providers()
-    if not available_providers:
-        return jsonify({"error": "video_not_configured", "message": "No video generation providers are configured"}), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    body = request.get_json(silent=True) or {}
-
-    raw_prompt = (body.get("prompt") or "").strip()
-    if not raw_prompt:
-        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
-
-    provider = normalize_provider_name(body.get("provider"))
-    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
-    aspect_ratio = body.get("aspect_ratio") or "16:9"
-    resolution = body.get("resolution") or "720p"
-    negative_prompt = (body.get("negative_prompt") or "").strip()
-    seed = body.get("seed")
-    style_preset = body.get("style_preset")
-
-    seedance_variant = None
-    seedance_tier = "fast"
-
-    if provider == "seedance":
-        sc = normalize_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            seedance_variant=body.get("seedance_variant"),
-        )
-        duration_seconds = sc["duration_seconds"]
-        aspect_ratio = sc["aspect_ratio"]
-        seedance_variant = sc["task_type"]
-        seedance_tier = sc["tier"]
-        resolution = "720p"
-        prompt = raw_prompt  # No style normalization for Seedance
-    elif provider == "fal_seedance":
-        fc = normalize_fal_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = fc["duration_seconds"]
-        aspect_ratio = fc["aspect_ratio"]
-        resolution = fc["resolution"]
-        prompt = raw_prompt  # No style normalization for fal Seedance
-    else:
-        vc = normalize_vertex_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = vc["duration_seconds"]
-        aspect_ratio = vc["aspect_ratio"]
-        resolution = vc["resolution"]
-        prompt = normalize_text_prompt(raw_prompt, style_preset, duration_seconds)
-
-    return _dispatch_video_job(
-        identity_id=identity_id or "",
-        task="text2video",
-        prompt=prompt,
-        image_data=None,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration_seconds=duration_seconds,
-        motion="",
-        negative_prompt=negative_prompt,
-        seed=seed,
-        style_preset=style_preset,
-        provider=provider,
-        seedance_variant=seedance_variant,
-        seedance_tier=seedance_tier,
-    )
-
-
-# ── POST /video/animate — Image → animated video clip ────────
-@bp.route("/video/animate", methods=["POST", "OPTIONS"])
-@with_session
-def video_animate():
-    """
-    Animate a single image into a short video clip.
-
-    Provider-specific normalization happens here so _dispatch_video_job
-    receives clean, validated parameters.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    available_providers = video_router.get_available_providers()
-    if not available_providers:
-        return jsonify({"error": "video_not_configured", "message": "No video generation providers are configured"}), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    body = request.get_json(silent=True) or {}
-
-    provider = normalize_provider_name(body.get("provider"))
-    animate_mode = body.get("mode") or "animate_image"
-    is_transition = animate_mode == "image_transition" and provider in ("fal_seedance", "seedance")
-
-    # ── Image validation (mode-dependent) ──
-    image_data = ""
-    start_image = ""
-    end_image = ""
-
-    if is_transition:
-        # Transition mode: require start + end images
-        start_image = body.get("start_image") or body.get("start_image_data") or body.get("start_image_url") or ""
-        end_image = body.get("end_image") or body.get("end_image_data") or body.get("end_image_url") or ""
-
-        if not start_image:
-            return jsonify({"error": "invalid_params", "message": "Seedance transition requires both start and end images", "field": "start_image"}), 400
-        if not end_image:
-            return jsonify({"error": "invalid_params", "message": "Seedance transition requires both start and end images", "field": "end_image"}), 400
-
-        print(f"[VIDEO] animate mode=image_transition provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
-    else:
-        # Single-image animate mode
-        image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
-        image_id = body.get("image_id")
-
-        if not image_data and image_id:
-            image_data = _resolve_image_id(image_id, identity_id)
-
-        if not image_data:
-            return jsonify({"error": "invalid_params", "message": "Seedance animate requires one source image" if provider in ("fal_seedance", "seedance") else "image_data, image_url, or image_id is required", "field": "image_data"}), 400
-
-        print(f"[VIDEO] animate mode=animate_image provider={provider} image={'present' if image_data else 'MISSING'}")
-
-    raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
-    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
-    aspect_ratio = body.get("aspect_ratio") or "16:9"
-    resolution = body.get("resolution") or "720p"
-    negative_prompt = (body.get("negative_prompt") or "").strip()
-    seed = body.get("seed")
-    motion_preset = body.get("motion_preset")
-
-    seedance_variant = None
-    seedance_tier = "fast"
-
-    if provider == "seedance":
-        sc = normalize_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            seedance_variant=body.get("seedance_variant"),
-        )
-        duration_seconds = sc["duration_seconds"]
-        aspect_ratio = sc["aspect_ratio"]
-        seedance_variant = sc["task_type"]
-        seedance_tier = sc["tier"]
-        resolution = "720p"
-        prompt = raw_user_prompt or ("Transition between these two images" if is_transition else "Animate this image with natural, smooth motion")
-    elif provider == "fal_seedance":
-        fc = normalize_fal_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = fc["duration_seconds"]
-        aspect_ratio = fc["aspect_ratio"]
-        resolution = fc["resolution"]
-        prompt = raw_user_prompt or ("Transition between these two images" if is_transition else "Animate this image with natural, smooth motion")
-    else:
-        vc = normalize_vertex_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = vc["duration_seconds"]
-        aspect_ratio = vc["aspect_ratio"]
-        resolution = vc["resolution"]
-        prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
-
-    return _dispatch_video_job(
-        identity_id=identity_id or "",
-        task="image_transition" if is_transition else "image2video",
-        prompt=prompt,
-        image_data=image_data,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration_seconds=duration_seconds,
-        motion=prompt,
-        negative_prompt=negative_prompt,
-        seed=seed,
-        motion_preset=motion_preset,
-        provider=provider,
-        seedance_variant=seedance_variant,
-        seedance_tier=seedance_tier,
-        start_image=start_image if is_transition else None,
-        end_image=end_image if is_transition else None,
-    )
-
-
-# ── Helper: resolve image_id → image_url from DB ─────────────
-def _resolve_image_id(image_id: str, identity_id: str | None) -> str | None:
-    """Look up an image URL from our images table by image_id, scoped to the requesting user."""
-    if not USE_DB or not image_id or not identity_id:
-        return None
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT image_url FROM {Tables.IMAGES}
-                    WHERE id::text = %s AND identity_id = %s AND deleted_at IS NULL
-                    LIMIT 1
-                    """,
-                    (image_id, identity_id),
-                )
-                row = cur.fetchone()
-        if row and row.get("image_url"):
-            print(f"[VIDEO] Resolved image_id={image_id} → {row['image_url'][:80]}...")
-            return row["image_url"]
-    except Exception as e:
-        print(f"[VIDEO] Error resolving image_id={image_id}: {e}")
-    return None
-
-
-# ── GET /video/presets — Available style & motion presets ─────
-@bp.route("/video/presets", methods=["GET", "OPTIONS"])
-def video_presets():
-    """Return available style and motion presets for the frontend."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-    return jsonify({
-        "ok": True,
-        "style_presets": get_style_presets(),
-        "motion_presets": get_motion_presets(),
-    })
-
-
-# ── GET /video/status/<job_id> — Canonical status endpoint ───
-@bp.route("/video/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
-def video_status_canonical(job_id: str):
-    """Canonical status endpoint (delegates to shared handler)."""
-    return _video_status_handler(job_id)
-
-
-# ── GET /video/generate/status/<job_id> — Legacy alias ───────
-@bp.route("/video/generate/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
-def video_status(job_id: str):
-    """Legacy status endpoint (delegates to shared handler)."""
-    return _video_status_handler(job_id)
-
-
-# ── Live PiAPI re-check helpers for orphaned Seedance jobs ───
-_STALE_THRESHOLD_SECONDS = 10 * 60  # 10 minutes without DB update → stale
-
-
-def _estimate_video_progress(job_row, job_meta, estimated_duration: int) -> int:
-    """Estimate video generation progress from elapsed time (asymptotic to 95%)."""
-    import math
-    from datetime import datetime, timezone
-
-    # Use processing_started_at > dispatched_at > created_at
-    started = job_meta.get("processing_started_at") or job_meta.get("dispatched_at")
-    if not started:
-        created = job_row.get("created_at")
-        if created and hasattr(created, 'timestamp'):
-            started = created.timestamp()
-
-    if not started:
-        return 0
-
-    now = datetime.now(timezone.utc).timestamp()
-    if isinstance(started, (int, float)):
-        elapsed = now - started
-    else:
-        try:
-            elapsed = now - started.timestamp()
-        except Exception:
-            return 0
-
-    if elapsed <= 0 or estimated_duration <= 0:
-        return 0
-
-    # Asymptotic curve: approaches 95% as elapsed -> estimated_duration
-    # progress = 95 * (1 - e^(-2 * elapsed / estimated_duration))
-    ratio = elapsed / estimated_duration
-    progress = int(95 * (1 - math.exp(-2 * ratio)))
-    return max(1, min(progress, 95))
-
-
-def _is_stale_seedance_job(job_row, job_meta) -> bool:
-    """Return True if this looks like a Seedance job whose polling thread died."""
-    provider = job_meta.get("provider", "")
-    if provider != "seedance":
-        return False
-    upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
-    if not upstream_id:
-        return False
-    updated_at = job_row.get("updated_at")
-    if not updated_at:
-        return True
-    from datetime import datetime, timezone
-    if hasattr(updated_at, 'tzinfo') and updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
-    return age > _STALE_THRESHOLD_SECONDS
-
-
-def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | None):
-    """
-    One-shot live check against PiAPI for an orphaned Seedance job.
-
-    If PiAPI says done → finalize (upload to S3, update DB, update history).
-    If PiAPI says failed → mark failed.
-    If still processing → return None (let normal status response handle it).
-    """
-    upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
-    if not upstream_id:
-        return None
-
-    try:
-        from backend.services.seedance_service import check_seedance_status
-        status_resp = check_seedance_status(upstream_id)
-    except Exception as e:
-        print(f"[VIDEO STATUS] Live PiAPI check failed for {job_id}: {e}")
-        return None
-
-    status = status_resp.get("status")
-
-    if status == "done":
-        video_url = status_resp.get("video_url")
-        if not video_url:
-            return None
-
-        print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI! Finalizing now.")
-
-        # Finalize in background to not block the status response
-        try:
-            from backend.services.async_dispatch import (
-                _finalize_video_success,
-                load_store,
-            )
-            store = load_store()
-            store_meta = store.get(job_id) or job_meta
-            reservation_id = store_meta.get("reservation_id") or job_meta.get("reservation_id")
-
-            _finalize_video_success(
-                job_id, identity_id or "", reservation_id,
-                video_url, store_meta, provider_name="seedance",
-            )
-        except Exception as e:
-            print(f"[VIDEO STATUS] Live finalize failed for {job_id}: {e}")
-
-        return jsonify({
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "video_url": video_url,
-            "message": "Video ready",
-        })
-
-    if status == "failed":
-        return _live_check_mark_failed(job_id, job_meta, status_resp)
-
-    # Still pending/processing on PiAPI — return None to use normal response
-    return None
-
-
-def _live_check_mark_failed(job_id, job_meta, status_resp):
-    """Handle a live PiAPI check that returned failed."""
-    error_code = status_resp.get("error", "seedance_generation_failed")
-    error_msg = status_resp.get("message", "Seedance generation failed")
-    print(f"[VIDEO STATUS] Live check: job {job_id} failed on PiAPI: {error_code}")
-    try:
-        from backend.services.async_dispatch import update_job_status_failed, ExpenseGuard
-        reservation_id = job_meta.get("reservation_id")
-        if reservation_id:
-            from backend.services.credits_helper import release_job_credits
-            release_job_credits(reservation_id, error_code, job_id)
-        update_job_status_failed(job_id, f"{error_code}: {error_msg}")
-        ExpenseGuard.unregister_active_job(job_id)
-    except Exception as e:
-        print(f"[VIDEO STATUS] Live fail-update error for {job_id}: {e}")
-    return jsonify({
-        "ok": False, "status": "failed", "job_id": job_id,
-        "error": error_code, "message": error_msg,
-    })
-
-
-# ── Shared status handler ────────────────────────────────────
-def _video_status_handler(job_id: str):
-    """
-    Get the status of a video generation job.
-
-    Returns:
-        queued      — waiting to start
-        processing  — generating (with progress %)
-        done        — ready with video_url, thumbnail_url
-        failed      — error with message
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    # Try job store first
-    store = load_store()
-    meta = store.get(job_id) or {}
-
-    # Check database for job status
-    if USE_DB:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT id, status, error_message, meta, updated_at
-                        FROM {Tables.JOBS}
-                        WHERE id::text = %s AND identity_id = %s
-                        LIMIT 1
-                        """,
-                        (job_id, identity_id),
-                    )
-                    job = cur.fetchone()
-
-            if job:
-                job_meta = job.get("meta") or {}
-                if isinstance(job_meta, str):
-                    try:
-                        job_meta = __import__('json').loads(job_meta)
-                    except Exception:
-                        job_meta = {}
-
-                if job["status"] == "queued":
-                    from backend.services.video_limits import get_queue_position, get_estimated_render_time
-                    qpos = get_queue_position(job_id)
-                    provider_hint = meta.get("provider") or job_meta.get("provider") or "vertex"
-                    rtime = get_estimated_render_time(provider_hint)
-                    return jsonify({
-                        "ok": True,
-                        "status": "queued",
-                        "job_id": job_id,
-                        "message": f"Queue position #{qpos['queue_position']}",
-                        "progress": 0,
-                        "queue_position": qpos["queue_position"],
-                        "estimated_start_seconds": qpos["estimated_start_seconds"],
-                        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-                    })
-
-                if job["status"] == "quota_queued":
-                    return jsonify({
-                        "ok": True,
-                        "status": "queued",
-                        "job_id": job_id,
-                        "message": "Waiting for provider quota to reset — your video is queued and will be processed automatically.",
-                        "progress": 0,
-                        "quota_queued": True,
-                    })
-
-                # ── Live PiAPI re-check for orphaned Seedance jobs ──
-                # If the backend polling thread died (deploy/crash) and the job
-                # has been stuck for >10 min, check PiAPI directly and finalize.
-                if job["status"] in ("provider_pending", "processing") and _is_stale_seedance_job(job, job_meta):
-                    live_result = _try_live_seedance_check(job_id, job_meta, identity_id)
-                    if live_result:
-                        return live_result
-
-                if job["status"] == "provider_pending":
-                    pending_secs = job_meta.get("pending_seconds", 0)
-                    prov = (meta.get("provider") or job_meta.get("provider") or "vertex").capitalize()
-                    if prov == "Vertex": prov = "Veo"
-                    if pending_secs < 60:
-                        msg = f"Queued with {prov}"
-                    elif pending_secs < 300:
-                        msg = f"{prov} queue busy — your video is still waiting"
-                    else:
-                        msg = f"{prov} queue is slow — still waiting ({pending_secs // 60}m elapsed)"
-                    return jsonify({
-                        "ok": True,
-                        "status": "provider_pending",
-                        "job_id": job_id,
-                        "message": msg,
-                        "progress": 0,
-                        "pending_seconds": pending_secs,
-                        "provider_status": job_meta.get("provider_status", "pending"),
-                    })
-
-                if job["status"] in ("processing", "provider_processing"):
-                    real_progress = meta.get("progress") or job_meta.get("progress") or 0
-                    provider_hint = meta.get("provider") or job_meta.get("provider") or "vertex"
-                    from backend.services.video_limits import get_estimated_render_time
-                    rtime = get_estimated_render_time(provider_hint)
-
-                    # Estimate progress from elapsed time if provider gives 0
-                    progress = real_progress
-                    if progress == 0:
-                        progress = _estimate_video_progress(job, job_meta, rtime["estimated_duration_seconds"])
-
-                    # Format time estimate as minutes if > 90s
-                    lo, hi = rtime['estimated_min_seconds'], rtime['estimated_max_seconds']
-                    if lo >= 90:
-                        time_hint = f"{lo // 60}–{hi // 60} min"
-                    else:
-                        time_hint = f"{lo}–{hi}s"
-
-                    prov_label = (provider_hint or "vertex").capitalize()
-                    if prov_label == "Vertex": prov_label = "Veo"
-                    return jsonify({
-                        "ok": True,
-                        "status": "processing",
-                        "job_id": job_id,
-                        "message": f"{prov_label} rendering (estimated {time_hint})",
-                        "progress": progress,
-                        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-                    })
-
-                if job["status"] in ("failed", "provider_stalled"):
-                    error_msg = job.get("error_message", "Video generation failed")
-                    error_code = job_meta.get("error_code") or "video_failed"
-
-                    # Fallback: parse error code from "code: message" format
-                    if error_code == "video_failed" and error_msg and ":" in error_msg:
-                        parts = error_msg.split(":", 1)
-                        candidate = parts[0].strip()
-                        if candidate and " " not in candidate:
-                            error_code = candidate
-                            error_msg = parts[1].strip()
-
-                    # Use structured failure_reason from meta if available
-                    failure_reason = job_meta.get("failure_reason") or error_msg
-
-                    # Surface user-friendly message for filtered errors
-                    user_message = job_meta.get("user_message") if error_code == "provider_filtered_third_party" else None
-
-                    resp = {
-                        "ok": False,
-                        "status": "failed",
-                        "job_id": job_id,
-                        "error": error_code,
-                        "message": user_message or failure_reason,
-                    }
-                    if user_message:
-                        resp["user_message"] = user_message
-                    if job["status"] == "provider_stalled":
-                        resp["provider_stalled"] = True
-                    return jsonify(resp)
-
-                if job["status"] == "ready":
-                    video_url = meta.get("video_url") or job_meta.get("video_url")
-                    thumbnail_url = meta.get("thumbnail_url") or job_meta.get("thumbnail_url")
-                    # Include new_balance so frontend can update credits display
-                    new_balance = meta.get("new_balance") or job_meta.get("new_balance")
-
-                    response_data = {
-                        "ok": True,
-                        "status": "done",
-                        "job_id": job_id,
-                        "video_id": job_id,
-                        "video_uuid": job_meta.get("video_uuid") or job_id,
-                        "video_url": video_url,
-                        "thumbnail_url": thumbnail_url,
-                        "duration_seconds": meta.get("duration_seconds") or job_meta.get("duration_seconds"),
-                        "resolution": meta.get("resolution") or job_meta.get("resolution"),
-                        "provider": meta.get("provider") or job_meta.get("provider") or "google",
-                    }
-                    # Only include new_balance if present (backwards compatible)
-                    if new_balance is not None:
-                        response_data["new_balance"] = new_balance
-                    return jsonify(response_data)
-
-        except Exception as e:
-            print(f"[VIDEO STATUS] Error checking job {job_id}: {e}")
-
-    # Fallback to job store
-    if meta.get("status") == "done":
-        response_data = {
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "video_id": job_id,
-            "video_url": meta.get("video_url"),
-            "thumbnail_url": meta.get("thumbnail_url"),
-            "duration_seconds": meta.get("duration_seconds"),
-            "resolution": meta.get("resolution"),
-            "provider": meta.get("provider", "google"),
-        }
-        # Include new_balance if present (for frontend credit display)
-        new_balance = meta.get("new_balance")
-        if new_balance is not None:
-            response_data["new_balance"] = new_balance
-        return jsonify(response_data)
-
-    if meta.get("status") in ("failed", "provider_stalled"):
-        error_msg = meta.get("error", "Video generation failed")
-        error_code = meta.get("error_code", "gemini_video_failed")
-        resp = {
-            "ok": False,
-            "status": "failed",
-            "job_id": job_id,
-            "error": error_code,
-            "message": error_msg,
-        }
-        if error_code == "provider_filtered_third_party":
-            resp["user_message"] = error_msg
-        if meta.get("status") == "provider_stalled":
-            resp["provider_stalled"] = True
-        return jsonify(resp)
-
-    if meta.get("status") == "quota_queued":
-        return jsonify({
-            "ok": True,
-            "status": "queued",
-            "job_id": job_id,
-            "progress": 0,
-            "message": "Waiting for provider quota to reset — your video is queued and will be processed automatically.",
-            "quota_queued": True,
-        })
-
-    if meta.get("status") == "provider_pending":
-        pending_secs = meta.get("pending_seconds", 0)
-        msg = "Queued with provider" if pending_secs < 120 else "Provider queue busy — your video is still queued"
-        return jsonify({
-            "ok": True,
-            "status": "provider_pending",
-            "job_id": job_id,
-            "message": msg,
-            "progress": 0,
-            "pending_seconds": pending_secs,
-            "provider_status": meta.get("provider_status", "pending"),
-        })
-
-    if meta.get("status") in ("queued", "processing"):
-        provider_hint = meta.get("provider", "vertex")
-        from backend.services.video_limits import get_estimated_render_time
-        rtime = get_estimated_render_time(provider_hint)
-        real_progress = meta.get("progress", 0)
-        # Estimate progress from elapsed time for store-based fallback
-        progress = real_progress
-        if progress == 0 and meta.get("status") == "processing":
-            import math, time as _time
-            from datetime import datetime, timezone
-            started = meta.get("processing_started_at") or meta.get("dispatched_at") or meta.get("started_at")
-            if started and isinstance(started, (int, float)):
-                elapsed = _time.time() - started
-                est = rtime["estimated_duration_seconds"]
-                if elapsed > 0 and est > 0:
-                    progress = max(1, min(int(95 * (1 - math.exp(-2 * elapsed / est))), 95))
-        return jsonify({
-            "ok": True,
-            "status": meta.get("status"),
-            "job_id": job_id,
-            "progress": progress,
-            "message": "Generating video...",
-            "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-        })
-
-    # Store has an entry but with an unexpected status — treat as in-flight
-    if meta:
-        return jsonify({
-            "ok": True,
-            "status": "processing",
-            "job_id": job_id,
-            "progress": meta.get("progress", 0),
-            "message": "Generating video...",
-        })
-
-    # Last resort: check DB without identity constraint (handles edge cases)
-    if USE_DB:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT id, status, error_message, meta
-                        FROM {Tables.JOBS}
-                        WHERE id::text = %s
-                        LIMIT 1
-                        """,
-                        (job_id,),
-                    )
-                    job = cur.fetchone()
-            if job:
-                status = job["status"]
-                if status == "ready":
-                    jm = job.get("meta") or {}
-                    if isinstance(jm, str):
-                        try:
-                            jm = __import__('json').loads(jm)
-                        except Exception:
-                            jm = {}
-                    response_data = {
-                        "ok": True,
-                        "status": "done",
-                        "job_id": job_id,
-                        "video_id": job_id,
-                        "video_url": jm.get("video_url"),
-                        "thumbnail_url": jm.get("thumbnail_url"),
-                    }
-                    # Include new_balance if present
-                    new_balance = jm.get("new_balance")
-                    if new_balance is not None:
-                        response_data["new_balance"] = new_balance
-                    return jsonify(response_data)
-                if status == "failed":
-                    return jsonify({
-                        "ok": False,
-                        "status": "failed",
-                        "job_id": job_id,
-                        "error": "video_failed",
-                        "message": job.get("error_message") or "Video generation failed",
-                    })
-                # queued / processing / other — return in-flight
-                return jsonify({
-                    "ok": True,
-                    "status": status if status in ("queued", "processing") else "processing",
-                    "job_id": job_id,
-                    "progress": 0,
-                    "message": "Generating video...",
-                })
-        except Exception as e:
-            print(f"[VIDEO STATUS] Fallback DB check error for {job_id}: {e}")
-
-    return jsonify({
-        "error": "job_not_found",
-        "message": f"No video job found with ID: {job_id}"
-    }), 404
-
-
-# ── POST /video/admin/process-queue — Admin: trigger queued jobs ──
-@bp.route("/video/admin/process-queue", methods=["POST", "OPTIONS"])
-@with_session
-def video_admin_process_queue():
-    """
-    Admin trigger: immediately attempt to process quota-queued video jobs.
-
-    Returns:
-    {
-        "ok": true,
-        "dispatched": 3,
-        "queue_remaining": 1
+    return;
+  }
+
+  // Priority 1: Check cross-page wallet cache (fresher, from hub after purchase)
+  const walletCache = readWalletCache();
+  let displayValue = '—';
+  let cacheSource = null;
+
+  if (walletCache && typeof walletCache.available_credits === 'number') {
+    displayValue = walletCache.available_credits.toLocaleString();
+    // Pre-populate state so hasCreditsFor() works with cached value
+    creditsState.wallet.available = walletCache.available_credits;
+    creditsState.wallet.balance = walletCache.available_credits;
+    creditsState.identityId = walletCache.identity_id || null;
+    cacheSource = 'cross-page';
+    log('[Credits] Early render from cross-page cache:', walletCache.available_credits);
+  } else {
+    // Priority 2: Fall back to local credits cache
+    const cached = localStorage.getItem(CREDITS_CACHE_KEY);
+    if (cached !== null) {
+      const cachedBalance = parseInt(cached, 10);
+      if (Number.isFinite(cachedBalance) && cachedBalance >= 0) {
+        displayValue = cachedBalance.toLocaleString();
+        // Pre-populate state so hasCreditsFor() works with cached value
+        creditsState.wallet.available = cachedBalance;
+        creditsState.wallet.balance = cachedBalance;
+        cacheSource = 'local';
+        log('[Credits] Early render from local cache:', cachedBalance);
+      }
     }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
+  }
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    from backend.services.video_queue import video_queue
-
-    dispatched = video_queue.process_queue_now()
-
-    return jsonify({
-        "ok": True,
-        "dispatched": dispatched,
-        "queue_remaining": video_queue.size,
-    })
-
-
-# ── GET /video/admin/provider-info — Show current video provider config ──
-@bp.route("/video/admin/provider-info", methods=["GET", "OPTIONS"])
-@with_session
-def video_admin_provider_info():
-    """
-    Admin endpoint: Show current video provider configuration.
-
-    Returns:
-    {
-        "ok": true,
-        "video_provider": "vertex",
-        "video_quality": "fast",
-        "vertex_model": "veo-3.1-fast-generate-001",
-        "providers": [
-            {"name": "vertex", "configured": true, "primary": true},
-            {"name": "google", "configured": true, "primary": false}
-        ]
+  // Also restore cached video credits (separate pool)
+  const cachedVideo = localStorage.getItem(VIDEO_CREDITS_CACHE_KEY);
+  if (cachedVideo !== null) {
+    const cachedVideoBalance = parseInt(cachedVideo, 10);
+    if (Number.isFinite(cachedVideoBalance) && cachedVideoBalance >= 0) {
+      creditsState.wallet.videoAvailable = cachedVideoBalance;
+      creditsState.wallet.videoBalance = cachedVideoBalance;
     }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
+  }
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
+  if (!cacheSource) {
+    log('[Credits] No cached balance, showing syncing placeholder');
+  }
 
-    from backend.config import config
+  // Render immediately
+  creditsValue.textContent = displayValue;
 
-    providers_info = []
-    available = video_router.get_available_providers()
-    available_names = [p.name for p in available]
+  // Add syncing indicator
+  if (creditsGroup) {
+    creditsGroup.classList.add('syncing');
+  }
+  if (creditsPill) {
+    creditsPill.classList.add('syncing');
+    creditsPill.setAttribute('title', 'Syncing credits...');
+  }
+}
 
-    for idx, provider in enumerate(video_router.providers):
-        configured, err = provider.is_configured()
-        providers_info.append({
-            "name": provider.name,
-            "configured": configured,
-            "primary": idx == 0,
-            "error": err if not configured else None,
-        })
+/**
+ * Save credits balance to localStorage for next page load
+ */
+function cacheCreditsBalance(balance, videoBalance) {
+  if (typeof balance === 'number' && Number.isFinite(balance) && balance >= 0) {
+    localStorage.setItem(CREDITS_CACHE_KEY, balance.toString());
+    log('[Credits] Cached balance to localStorage:', balance);
+  }
+  if (typeof videoBalance === 'number' && Number.isFinite(videoBalance) && videoBalance >= 0) {
+    localStorage.setItem(VIDEO_CREDITS_CACHE_KEY, videoBalance.toString());
+  }
+}
 
-    return jsonify({
-        "ok": True,
-        "video_provider": getattr(config, 'VIDEO_PROVIDER', 'vertex'),
-        "video_quality": getattr(config, 'VIDEO_QUALITY', 'fast'),
-        "vertex_model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown'),
-        "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
-        "active_providers": available_names,
-        "providers": providers_info,
-    })
+// ============================================================================
+// API FETCHING
+// ============================================================================
 
+/**
+ * Fetch wallet balance from /api/me
+ * Single-flight: returns existing promise if already in flight
+ * Response format:
+ * {
+ *   ok: true,
+ *   identity_id: "uuid",
+ *   balance_credits: 100,
+ *   reserved_credits: 0,
+ *   available_credits: 100,
+ *   ...
+ * }
+ */
+export async function fetchWallet() {
+  // Single-flight guard: return existing promise if already fetching
+  if (walletFetchInFlight) {
+    log('[Credits] fetchWallet already in flight, returning existing promise');
+    return walletFetchInFlight;
+  }
 
-# ── GET /video/admin/diagnostics — Lightweight operator dashboard ──
-@bp.route("/video/admin/diagnostics", methods=["GET", "OPTIONS"])
-@with_session
-def video_admin_diagnostics():
-    """
-    Lightweight operator diagnostics for the video pipeline.
+  const url = `${BACKEND}/api/me`;
+  log('[Credits] Fetching wallet from:', url);
 
-    Returns job counts by status, provider health, and recent failures.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
+  // Create the fetch promise with single-flight tracking
+  walletFetchInFlight = (async () => {
+    try {
+      const result = await apiFetch('/api/me', {
+        cache: 'no-store',
+        keepalive: true,
+      });
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
+      if (!result.ok) {
+        // Not authenticated or error - log details
+        log('[Credits] Wallet fetch failed:', result.status, result.error);
+        creditsState.wallet = { balance: 0, reserved: 0, available: 0, videoBalance: 0, videoReserved: 0, videoAvailable: 0 };
+        pendingRetry = true; // Schedule retry on window.focus
+        return creditsState.wallet;
+      }
 
-    from backend.db import query_all
-    from backend.config import config
+      const data = result.data;
+      log('[Credits] /api/me response:', {
+        ok: data.ok,
+        identity_id: data.identity_id,
+        balance_credits: data.balance_credits,
+        reserved_credits: data.reserved_credits,
+        available_credits: data.available_credits,
+      });
 
-    # Job counts by status (last 24h)
-    status_counts = query_all(f"""
-        SELECT status, COUNT(*) AS cnt
-        FROM {Tables.JOBS}
-        WHERE stage = 'video'
-          AND created_at > NOW() - INTERVAL '24 hours'
-        GROUP BY status
-        ORDER BY cnt DESC
-    """)
+      if (data.ok) {
+        // Read credits from top-level fields (new format) with fallback to nested wallet object
+        const balance = data.balance_credits ?? data.wallet?.balance ?? 0;
+        const reserved = data.reserved_credits ?? data.wallet?.reserved ?? 0;
+        const available = data.available_credits ?? data.wallet?.available ?? Math.max(0, balance - reserved);
+        const serverIdentityId = data.identity_id || null;
 
-    # Job counts by provider (last 24h)
-    provider_counts = query_all(f"""
-        SELECT provider, status, COUNT(*) AS cnt
-        FROM {Tables.JOBS}
-        WHERE stage = 'video'
-          AND created_at > NOW() - INTERVAL '24 hours'
-        GROUP BY provider, status
-        ORDER BY provider, cnt DESC
-    """)
+        // Video credits (separate pool)
+        const videoBalance = data.video_credits_balance ?? data.video_balance_credits ?? 0;
+        const videoReserved = data.video_reserved_credits ?? 0;
+        const videoAvailable = data.video_available_credits ?? Math.max(0, videoBalance - videoReserved);
 
-    # Recent failures (last 10)
-    recent_failures = query_all(f"""
-        SELECT id, provider, error_code, error_message, created_at, updated_at
-        FROM {Tables.JOBS}
-        WHERE stage = 'video' AND status = 'failed'
-        ORDER BY updated_at DESC
-        LIMIT 10
-    """)
-
-    # In-flight jobs (not terminal)
-    in_flight = query_all(f"""
-        SELECT id, provider, status, created_at, updated_at
-        FROM {Tables.JOBS}
-        WHERE stage = 'video'
-          AND status NOT IN ('ready', 'failed', 'refunded', 'succeeded',
-                             'abandoned_legacy', 'recovery_blocked', 'ready_unbilled')
-        ORDER BY created_at DESC
-        LIMIT 20
-    """)
-
-    # Provider configuration
-    available = video_router.get_available_providers()
-    providers = []
-    for idx, provider in enumerate(video_router.providers):
-        configured, err = provider.is_configured()
-        providers.append({
-            "name": provider.name,
-            "configured": configured,
-            "primary": idx == 0,
-            "error": err if not configured else None,
-        })
-
-    # Serialise datetimes
-    def _ser(rows):
-        out = []
-        for r in rows:
-            row = dict(r)
-            for k, v in row.items():
-                if hasattr(v, 'isoformat'):
-                    row[k] = v.isoformat()
-            out.append(row)
-        return out
-
-    return jsonify({
-        "ok": True,
-        "status_counts_24h": {r["status"]: r["cnt"] for r in status_counts},
-        "provider_breakdown_24h": _ser(provider_counts),
-        "in_flight_jobs": _ser(in_flight),
-        "recent_failures": _ser(recent_failures),
-        "providers": providers,
-        "config": {
-            "video_provider": getattr(config, 'VIDEO_PROVIDER', 'vertex'),
-            "vertex_model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown'),
-            "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
-        },
-    })
-
-
-# ── POST /video/admin/smoke-test — Quick Veo test (no credits) ──
-@bp.route("/video/admin/smoke-test", methods=["POST", "OPTIONS"])
-@with_session
-def video_admin_smoke_test():
-    """
-    Admin smoke test: Start a fast Veo job and return operation name.
-
-    This is for testing the Vertex AI integration without going through
-    the full credit reservation flow. Only available to admins.
-
-    Request body (optional):
-    {
-        "provider": "vertex",           # "vertex" or "aistudio"
-        "prompt": "A cat on a beach"    # Optional, uses default if not provided
-    }
-
-    Returns:
-    {
-        "ok": true,
-        "provider": "vertex",
-        "operation_name": "projects/.../operations/...",
-        "model": "veo-3.1-fast-generate-001"
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    # Check admin access (optional - remove if you want any authenticated user)
-    from backend.config import config
-    # For now, allow any authenticated user to run smoke test
-
-    body = request.get_json(silent=True) or {}
-    provider_name = (body.get("provider") or "vertex").lower()
-    prompt = body.get("prompt") or "A serene mountain lake at sunrise, calm water reflections, cinematic"
-
-    # Get the requested provider
-    provider = video_router.get_provider(provider_name)
-    if not provider:
-        return jsonify({
-            "ok": False,
-            "error": "invalid_provider",
-            "message": f"Unknown provider: {provider_name}",
-            "available": [p.name for p in video_router.providers],
-        }), 400
-
-    configured, config_err = provider.is_configured()
-    if not configured:
-        return jsonify({
-            "ok": False,
-            "error": "provider_not_configured",
-            "message": f"Provider {provider_name} is not configured: {config_err}",
-        }), 400
-
-    try:
-        # Start a short, low-cost video job for testing
-        result = provider.start_text_to_video(
-            prompt=prompt,
-            aspect_ratio="16:9",
-            resolution="720p",
-            duration_seconds=4,  # Shortest duration for quick test
-        )
-
-        operation_name = result.get("operation_name")
-
-        return jsonify({
-            "ok": True,
-            "provider": provider_name,
-            "operation_name": operation_name,
-            "model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown') if provider_name == "vertex" else "veo-3.1-generate-preview",
-            "prompt": prompt,
-            "hint": f"Poll status with: GET /api/_mod/video/admin/smoke-test/status?op={operation_name[:50]}...",
-        })
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "smoke_test_failed",
-            "message": str(e),
-            "provider": provider_name,
-        }), 500
-
-
-# ── GET /video/admin/smoke-test/status — Poll smoke test operation ──
-@bp.route("/video/admin/smoke-test/status", methods=["GET", "OPTIONS"])
-@with_session
-def video_admin_smoke_test_status():
-    """
-    Poll a smoke test operation for status.
-
-    Query params:
-    - op: Operation name from smoke test
-    - provider: "vertex" or "aistudio" (default: vertex)
-
-    Returns:
-    {
-        "ok": true,
-        "status": "processing" | "done" | "failed",
-        "progress": 45,
-        "video_url": "..." (if done)
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    operation_name = request.args.get("op")
-    if not operation_name:
-        return jsonify({
-            "ok": False,
-            "error": "missing_param",
-            "message": "Query param 'op' (operation name) is required",
-        }), 400
-
-    provider_name = request.args.get("provider", "vertex").lower()
-    provider = video_router.get_provider(provider_name)
-    if not provider:
-        return jsonify({
-            "ok": False,
-            "error": "invalid_provider",
-            "message": f"Unknown provider: {provider_name}",
-        }), 400
-
-    try:
-        result = provider.check_status(operation_name)
-
-        response = {
-            "ok": True,
-            "provider": provider_name,
-            "status": result.get("status"),
-            "progress": result.get("progress", 0),
+        // Check if identity differs from cross-page cache - if so, discard cache
+        const walletCache = readWalletCache();
+        if (walletCache && walletCache.identity_id && serverIdentityId && walletCache.identity_id !== serverIdentityId) {
+          log('[Credits] Identity mismatch - clearing cross-page cache');
+          log('[Credits]   Cached:', walletCache.identity_id?.slice(0, 8) + '...');
+          log('[Credits]   Server:', serverIdentityId?.slice(0, 8) + '...');
+          clearWalletCache();
         }
 
-        if result.get("video_url"):
-            response["video_url"] = result["video_url"]
+        creditsState.wallet = {
+          balance,
+          reserved,
+          available,
+          // Video credits
+          videoBalance,
+          videoReserved,
+          videoAvailable,
+        };
+        creditsState.identityId = serverIdentityId;
+        creditsState.email = data.email || null;
+        creditsState.emailVerified = data.email_verified || false;
 
-        if result.get("error"):
-            response["error"] = result.get("error")
-            response["message"] = result.get("message")
+        // Server's available already accounts for backend reservations.
+        // Clear client-side reservations to avoid double-counting.
+        creditsState.reservations.clear();
+        creditsState.totalReserved = 0;
 
-        return jsonify(response)
+        // Update email beacon visibility
+        updateEmailBeaconUI();
 
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "status_check_failed",
-            "message": str(e),
-        }), 500
+        // Cache balance for next page load (perceived performance)
+        cacheCreditsBalance(available, videoAvailable);
+
+        // Also write to cross-page wallet cache
+        if (serverIdentityId) {
+          writeWalletCache(serverIdentityId, available);
+        }
+
+        pendingRetry = false; // Clear retry flag on success
+        lastRefreshTime = Date.now(); // Track for visibility throttling
+
+        log('[Credits] Wallet loaded:', creditsState.wallet);
+
+        // Update global session info for debugging
+        updateSessionInfo(data, 'workspace');
+      } else {
+        log('[Credits] /api/me returned ok:false');
+        creditsState.wallet = { balance: 0, reserved: 0, available: 0, videoBalance: 0, videoReserved: 0, videoAvailable: 0 };
+        pendingRetry = true;
+      }
+
+      return creditsState.wallet;
+    } catch (err) {
+      log('[Credits] Wallet fetch error:', err.message);
+      // Keep cached balance on timeout, schedule retry
+      pendingRetry = true;
+      creditsState.error = err.message;
+      return creditsState.wallet;
+    } finally {
+      walletFetchInFlight = null; // Clear single-flight guard
+    }
+  })();
+
+  return walletFetchInFlight;
+}
+
+/**
+ * Fetch action costs from /api/billing/action-costs
+ * Response format: { ok: true, action_costs: [{ action_key: "...", credits: N }, ...] }
+ */
+export async function fetchActionCosts() {
+  try {
+    const result = await apiFetch('/api/billing/action-costs');
+
+    if (!result.ok) {
+      log('[Credits] Action costs fetch failed:', result.status);
+      creditsState.actionCosts = getDefaultActionCosts();
+      return creditsState.actionCosts;
+    }
+
+    const data = result.data;
+
+    // Handle array format from backend: { action_costs: [{ action_key, credits }, ...] }
+    if (data.ok && Array.isArray(data.action_costs)) {
+      const costsMap = {};
+      data.action_costs.forEach(item => {
+        if (item.action_key && typeof item.credits === 'number') {
+          costsMap[item.action_key] = item.credits;
+        }
+      });
+
+      // Add legacy aliases for backward compatibility
+      // Backend now returns canonical keys; we add aliases for any code still using old keys
+      // Canonical -> Legacy aliases
+      if (costsMap['text_to_3d_generate']) {
+        costsMap['text-to-3d'] = costsMap['text_to_3d_generate'];
+        costsMap['preview'] = costsMap['text_to_3d_generate'];
+      }
+      if (costsMap['image_to_3d_generate']) {
+        costsMap['image-to-3d'] = costsMap['image_to_3d_generate'];
+      }
+      if (costsMap['image_generate']) {
+        costsMap['text-to-image'] = costsMap['image_generate'];
+        costsMap['image_studio_generate'] = costsMap['image_generate'];
+      }
+      if (costsMap['refine']) {
+        costsMap['upscale'] = costsMap['refine'];
+      }
+      if (costsMap['retexture']) {
+        costsMap['texture'] = costsMap['retexture'];
+      }
+      if (costsMap['video_generate']) {
+        costsMap['video'] = costsMap['video_generate'];
+      }
+      if (costsMap['video_text_generate']) {
+        costsMap['text2video'] = costsMap['video_text_generate'];
+      }
+      if (costsMap['video_image_animate']) {
+        costsMap['image2video'] = costsMap['video_image_animate'];
+      }
+
+      // If no costs were parsed, use defaults
+      if (Object.keys(costsMap).length === 0) {
+        log('[Credits] API returned empty action_costs array, using defaults');
+        creditsState.actionCosts = getDefaultActionCosts();
+      } else {
+        // Merge: defaults as fallback, backend values take priority
+        creditsState.actionCosts = { ...getDefaultActionCosts(), ...costsMap };
+        log('[Credits] Action costs loaded:', Object.keys(costsMap).length, 'keys from backend +', Object.keys(creditsState.actionCosts).length, 'total with defaults');
+      }
+    } else if (data.costs && Object.keys(data.costs).length > 0) {
+      // Handle old object format (backward compatibility)
+      creditsState.actionCosts = data.costs;
+      log('[Credits] Action costs from legacy format:', Object.keys(data.costs).length, 'keys');
+    } else {
+      // Fallback to defaults if API returns empty or unexpected format
+      creditsState.actionCosts = getDefaultActionCosts();
+      log('[Credits] Using default action costs (API returned empty or unexpected format)');
+      log('[Credits] API response was:', data);
+    }
+
+    return creditsState.actionCosts;
+  } catch (err) {
+    log('[Credits] Action costs fetch error:', err);
+    creditsState.actionCosts = getDefaultActionCosts();
+    creditsState.error = err.message;
+    return creditsState.actionCosts;
+  }
+}
+
+/**
+ * Default action costs (fallback if API unavailable)
+ *
+ * CANONICAL ACTION KEYS (use these in new code):
+ * - image_generate       (10c) - Standard AI image
+ * - image_generate_2k    (15c) - 2K resolution AI image
+ * - image_generate_4k    (20c) - 4K resolution AI image
+ * - text_to_3d_generate  (20c) - Text to 3D preview generation
+ * - image_to_3d_generate (30c) - Image to 3D conversion
+ * - refine               (10c) - Refine/upscale 3D model
+ * - remesh               (10c) - Remesh 3D model (same cost as refine)
+ * - retexture            (15c) - Apply new texture to 3D model
+ * - video_generate       (75c) - Generic video generation (minimum, varies by duration/resolution)
+ * - video_text_generate  (75c) - Text-to-video generation (minimum)
+ * - video_image_animate  (110c) - Image-to-video animation (minimum)
+ *
+ * VIDEO PRICING (DB-driven via video_credit_rules):
+ * - 720p:  4s=75, 6s=100, 8s=125
+ * - 1080p: 8s=150 (requires 8s duration)
+ * - 4K:    8s=200 (requires 8s duration)
+ */
+function getDefaultActionCosts() {
+  return {
+    // === CANONICAL ACTION KEYS ===
+    'image_generate': 10,         // Standard AI image
+    'image_generate_2k': 15,      // 2K resolution
+    'image_generate_4k': 20,      // 4K resolution
+    'text_to_3d_generate': 20,    // Text to 3D preview
+    'image_to_3d_generate': 30,   // Image to 3D
+    'refine': 10,                 // Refine 3D model
+    'remesh': 10,                 // Remesh 3D model
+    'retexture': 15,              // Retexture 3D model
+    'video_generate': 75,         // Video generation (minimum - actual cost from video_credit_rules)
+    'video_text_generate': 75,    // Text to video (minimum)
+    'video_image_animate': 110,   // Image to video (minimum)
+
+    // === LEGACY ALIASES (backwards compatibility) ===
+    // Hyphenated variants
+    'text-to-3d': 20,
+    'image-to-3d': 30,
+    'text-to-image': 10,
+
+    // Old naming
+    'preview': 20,                // -> text_to_3d_generate
+    'texture': 15,                // -> retexture
+    'upscale': 10,                // -> refine
+    'video': 75,                  // -> video_generate (minimum)
+    'image_studio_generate': 10,  // -> image_generate
+
+    // Backend DB action codes (for direct lookups)
+    'MESHY_TEXT_TO_3D': 20,
+    'MESHY_IMAGE_TO_3D': 30,
+    'MESHY_RETEXTURE': 15,
+    'MESHY_REFINE': 10,
+    'OPENAI_IMAGE': 10,
+    'OPENAI_IMAGE_2K': 15,
+    'OPENAI_IMAGE_4K': 20,
+    'GEMINI_IMAGE': 10,
+    'GEMINI_IMAGE_2K': 15,
+    'GEMINI_IMAGE_4K': 20,
+    'VIDEO_GENERATE': 75,         // Minimum video cost
+    'VIDEO_TEXT_GENERATE': 75,
+    'VIDEO_IMAGE_ANIMATE': 110,
+  };
+}
+
+/**
+ * Initialize credits - fetch wallet and action costs
+ * Idempotent: safe to call multiple times, will only run once
+ */
+export async function initCredits() {
+  // Guard: already initialized
+  if (creditsState.loaded) {
+    log('[Credits] Already initialized, skipping...');
+    return;
+  }
+
+  // Guard: currently loading (prevent concurrent calls)
+  if (creditsState.loading) {
+    log('[Credits] Already loading, skipping...');
+    return;
+  }
+
+  creditsState.loading = true;
+  creditsState.error = null;
+
+  try {
+    // Fetch both in parallel
+    await Promise.all([
+      fetchWallet(),
+      fetchActionCosts(),
+    ]);
+
+    creditsState.loaded = true;
+    log('[Credits] Initialization complete');
+
+    // Update any UI elements
+    updateCreditsUI();
+
+    // Setup batch count listeners for dynamic cost updates
+    setupBatchCountListeners();
+
+  } catch (err) {
+    log('[Credits] Initialization error:', err);
+    creditsState.error = err.message;
+  } finally {
+    creditsState.loading = false;
+  }
+}
+
+// ============================================================================
+// CREDIT CHECKS
+// ============================================================================
+
+// Track which actions we've already warned about (avoid log spam)
+const _warnedActions = new Set();
+
+/**
+ * Resolve cost for an action key, trying multiple aliases.
+ * Returns null if action is not found (distinct from 0 which means free).
+ *
+ * @param {string} action - The action key (e.g., 'text-to-3d', 'refine')
+ * @returns {number|null} - Cost in credits, or null if unknown
+ */
+export function resolveCost(action) {
+  if (!action) return null;
+
+  // Direct lookup
+  if (action in creditsState.actionCosts) {
+    return creditsState.actionCosts[action];
+  }
+
+  // Try common aliases (hyphen <-> underscore)
+  const underscore = action.replace(/-/g, '_');
+  const hyphen = action.replace(/_/g, '-');
+
+  if (underscore !== action && underscore in creditsState.actionCosts) {
+    return creditsState.actionCosts[underscore];
+  }
+  if (hyphen !== action && hyphen in creditsState.actionCosts) {
+    return creditsState.actionCosts[hyphen];
+  }
+
+  // Try with common suffixes
+  const withGenerate = `${action}_generate`;
+  if (withGenerate in creditsState.actionCosts) {
+    return creditsState.actionCosts[withGenerate];
+  }
+
+  // Not found - log warning once per action key
+  if (!_warnedActions.has(action) && creditsState.loaded) {
+    _warnedActions.add(action);
+    console.warn(`[Credits] Unknown action: "${action}". Available keys:`, Object.keys(creditsState.actionCosts).join(', '));
+  }
+
+  return null;
+}
+
+/**
+ * Get cost for a specific action.
+ * Returns 0 for unknown actions (backward compatible) - use resolveCost() for nullable result.
+ *
+ * @param {string} action - The action key
+ * @returns {number} - Cost in credits (0 if unknown)
+ */
+export function getActionCost(action) {
+  const cost = resolveCost(action);
+  return cost !== null ? cost : 0;
+}
+
+/**
+ * Check if user has enough credits for an action
+ */
+export function hasCreditsFor(action) {
+  const cost = getActionCost(action);
+  return creditsState.wallet.available >= cost;
+}
+
+/**
+ * Get available credits
+ */
+export function getAvailableCredits() {
+  return creditsState.wallet.available;
+}
+
+/**
+ * Get wallet state (includes both general and video credits)
+ */
+export function getWallet() {
+  return { ...creditsState.wallet };
+}
+
+/**
+ * Get general credits wallet only (without video credits)
+ */
+export function getGeneralWallet() {
+  return {
+    balance: creditsState.wallet.balance,
+    reserved: creditsState.wallet.reserved,
+    available: creditsState.wallet.available,
+  };
+}
+
+/**
+ * Get all action costs
+ */
+export function getActionCosts() {
+  return { ...creditsState.actionCosts };
+}
+
+/**
+ * Check if credits system is loaded
+ */
+export function isLoaded() {
+  return creditsState.loaded;
+}
+
+// ============================================================================
+// VIDEO CREDITS - Separate pool for video generation
+// ============================================================================
+
+/**
+ * Get available video credits
+ */
+export function getVideoCredits() {
+  return creditsState.wallet.videoAvailable;
+}
+
+/**
+ * Get video wallet state
+ */
+export function getVideoWallet() {
+  return {
+    balance: creditsState.wallet.videoBalance,
+    reserved: creditsState.wallet.videoReserved,
+    available: creditsState.wallet.videoAvailable,
+  };
+}
+
+/**
+ * Check if user has enough video credits for a specific cost
+ * @param {number} cost - Required video credits
+ * @returns {boolean}
+ */
+export function hasVideoCredits(cost) {
+  return creditsState.wallet.videoAvailable >= cost;
+}
+
+/**
+ * Check if an action is a video action (uses video credits pool)
+ * @param {string} action - Action key
+ * @returns {boolean}
+ */
+export function isVideoAction(action) {
+  if (!action) return false;
+  const normalizedAction = action.toLowerCase().replace(/-/g, '_');
+  return normalizedAction.includes('video') ||
+         normalizedAction === 'text2video' ||
+         normalizedAction === 'image2video';
+}
+
+/**
+ * Build video action code from task, duration, and resolution.
+ * Format: VIDEO_TEXT_GENERATE_4S_720P or VIDEO_IMAGE_ANIMATE_8S_4K
+ * @param {string} task - "text2video" or "image2video"
+ * @param {number} durationSeconds - 4, 6, or 8
+ * @param {string} resolution - "720p", "1080p", or "4k"
+ * @returns {string} Action code
+ */
+export function getVideoActionCode(task, durationSeconds, resolution, provider) {
+  // Use lowercase snake_case as canonical format
+  const taskPart = task === 'text2video' ? 'text_generate' : 'image_animate';
+  const durationPart = `${durationSeconds}s`;
+
+  // fal Seedance: fal_seedance_{task}_{duration}s
+  if (provider === 'fal_seedance') {
+    return `fal_seedance_${taskPart}_${durationPart}`;
+  }
+
+  // PiAPI Seedance: handled by caller with tier prefix (seedance_{tier}_{task}_{dur}s)
+  // Vertex/Veo: video_{task}_{dur}s_{res}
+  const resPart = resolution.toLowerCase();
+  return `video_${taskPart}_${durationPart}_${resPart}`;
+}
+
+/**
+ * Get video credit cost by duration and resolution.
+ * Looks up from backend-fetched action costs, falls back to hardcoded defaults.
+ * @param {string} task - "text2video" or "image2video"
+ * @param {number} durationSeconds - 4, 6, or 8
+ * @param {string} resolution - "720p", "1080p", or "4k"
+ * @returns {number} Credit cost
+ */
+export function getVideoCreditCost(task, durationSeconds, resolution) {
+  // Build the action code
+  const actionCode = getVideoActionCode(task, durationSeconds, resolution);
+
+  // Try to find in action costs (both uppercase and lowercase)
+  const cost = resolveCost(actionCode) || resolveCost(actionCode.toLowerCase());
+
+  if (cost !== null && cost > 0) {
+    return cost;
+  }
+
+  // Fallback to hardcoded defaults (must match backend pricing_service.py)
+  const FALLBACK_TEXT = {
+    '720p': { 4: 75, 6: 100, 8: 125 },
+    '1080p': { 8: 150 },
+    '4k': { 8: 200 },
+  };
+  const FALLBACK_IMAGE = {
+    '720p': { 4: 110, 6: 140, 8: 170 },
+    '1080p': { 8: 200 },
+    '4k': { 8: 250 },
+  };
+
+  const isImageTask = task && task.toLowerCase() !== 'text2video';
+  const fallback = isImageTask ? FALLBACK_IMAGE : FALLBACK_TEXT;
+  const resLower = resolution.toLowerCase();
+  const dur = parseInt(durationSeconds, 10);
+
+  if (fallback[resLower] && fallback[resLower][dur] !== undefined) {
+    console.warn(`[Credits] Using fallback cost for ${actionCode}: ${fallback[resLower][dur]}`);
+    return fallback[resLower][dur];
+  }
+
+  // Ultimate fallback
+  console.warn(`[Credits] No cost found for ${actionCode}, defaulting to ${isImageTask ? 110 : 75}`);
+  return isImageTask ? 110 : 75;
+}
+
+/**
+ * Show insufficient video credits modal
+ * @param {number} required - Credits required
+ * @param {number} available - Credits available (optional, uses current state if not provided)
+ */
+export function showInsufficientVideoCreditsMessage(required, available = null) {
+  const actualAvailable = available !== null ? available : creditsState.wallet.videoAvailable;
+  const needed = Math.max(0, required - actualAvailable);
+
+  log('[Credits] Insufficient video credits:', { required, available: actualAvailable, needed });
+
+  // Create modal HTML
+  const modalId = 'insufficient-video-credits-modal';
+
+  // Remove existing modal if any
+  const existingModal = document.getElementById(modalId);
+  if (existingModal) {
+    existingModal.remove();
+  }
+
+  const modal = document.createElement('div');
+  modal.id = modalId;
+  modal.className = 'modal show';
+  modal.style.cssText = 'position:fixed;inset:0;z-index:999999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);opacity:1;visibility:visible;';
+
+  modal.innerHTML = `
+    <div class="modal-backdrop" style="position:absolute;inset:0;cursor:pointer;"></div>
+    <div class="modal-dialog" style="position:relative;z-index:1;background:var(--surface-elevated, #1e1e2e);border-radius:12px;padding:24px;max-width:400px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+      <div class="modal-header" style="margin-bottom:16px;">
+        <h3 style="margin:0;color:var(--text-primary, #fff);font-size:1.25rem;display:flex;align-items:center;gap:8px;">
+          <i class="fa-solid fa-video" style="color:var(--accent-warning, #f59e0b);"></i>
+          Video Credits Required
+        </h3>
+      </div>
+      <div class="modal-body" style="color:var(--text-secondary, #a0a0b0);margin-bottom:20px;">
+        <p style="margin:0 0 12px 0;">
+          Video generation uses <strong style="color:var(--accent-warning, #f59e0b);">video credits</strong>,
+          which are separate from your general credits.
+        </p>
+        <div style="background:var(--surface-base, #14141f);border-radius:8px;padding:12px;margin:12px 0;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+            <span>Required:</span>
+            <span style="color:var(--text-primary, #fff);font-weight:600;">${required} video credits</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+            <span>Available:</span>
+            <span style="color:var(--text-primary, #fff);">${actualAvailable} video credits</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;border-top:1px solid var(--border-subtle, #2a2a3a);padding-top:8px;margin-top:8px;">
+            <span>Need:</span>
+            <span style="color:var(--accent-error, #ef4444);font-weight:600;">${needed} more</span>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer" style="display:flex;gap:12px;justify-content:flex-end;">
+        <button class="btn btn-secondary" id="video-credits-modal-cancel" style="padding:10px 20px;border-radius:8px;border:1px solid var(--border-default, #3a3a4a);background:transparent;color:var(--text-primary, #fff);cursor:pointer;">
+          Cancel
+        </button>
+        <button class="btn btn-primary" id="video-credits-modal-buy" style="padding:10px 20px;border-radius:8px;border:none;background:linear-gradient(135deg, #8b5cf6, #6366f1);color:#fff;cursor:pointer;font-weight:600;">
+          <i class="fa-solid fa-coins" style="margin-right:6px;"></i>
+          Buy Video Credits
+        </button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  // Event handlers
+  const closeModal = () => modal.remove();
+
+  modal.querySelector('.modal-backdrop').addEventListener('click', closeModal);
+  modal.querySelector('#video-credits-modal-cancel').addEventListener('click', closeModal);
+  modal.querySelector('#video-credits-modal-buy').addEventListener('click', () => {
+    closeModal();
+    // Navigate to hub pricing section for video credits
+    window.location.href = 'hub.html#pricing';
+  });
+
+  // Close on Escape key
+  const handleEscape = (e) => {
+    if (e.key === 'Escape') {
+      closeModal();
+      document.removeEventListener('keydown', handleEscape);
+    }
+  };
+  document.addEventListener('keydown', handleEscape);
+}
+
+// ============================================================================
+// OPTIMISTIC UPDATES
+// ============================================================================
+
+/**
+ * Generate unique ID for tracking pending deductions
+ */
+function generateDeductionId() {
+  return `deduct_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+}
+
+/**
+ * Deduct credits optimistically (immediately update UI before API call)
+ *
+ * @param {string} action - The action key (e.g., 'image_to_3d', 'text_to_3d')
+ * @param {number} count - Number of items (default 1, for batch operations)
+ * @returns {object} - { id, amount } to use for reconcile/rollback
+ */
+export function deductOptimistic(action, count = 1) {
+  const costPerItem = getActionCost(action);
+  const totalCost = costPerItem * count;
+
+  if (totalCost === 0) {
+    log('[Credits] Optimistic deduct: action has no cost', action);
+    return { id: null, amount: 0 };
+  }
+
+  const deductionId = generateDeductionId();
+  const deduction = {
+    id: deductionId,
+    amount: totalCost,
+    action,
+    count,
+    timestamp: Date.now(),
+  };
+
+  // Track this pending deduction
+  creditsState.pendingDeductions.push(deduction);
+
+  // Store current balance as "last server balance" if not already set
+  if (creditsState.lastServerBalance === null) {
+    creditsState.lastServerBalance = creditsState.wallet.available;
+  }
+
+  // Optimistically reduce available credits
+  creditsState.wallet.available = Math.max(0, creditsState.wallet.available - totalCost);
+  creditsState.wallet.balance = Math.max(0, creditsState.wallet.balance - totalCost);
+
+  log('[Credits] Optimistic deduct:', {
+    id: deductionId,
+    action,
+    cost: totalCost,
+    newAvailable: creditsState.wallet.available,
+  });
+
+  // Update UI immediately
+  updateCreditsUI();
+
+  return { id: deductionId, amount: totalCost };
+}
+
+/**
+ * Reconcile local state with server balance (call after API response)
+ *
+ * @param {number} serverBalance - The actual balance from server response
+ * @param {string} deductionId - Optional: specific deduction to clear
+ */
+export function reconcile(serverBalance, deductionId = null) {
+  log('[Credits] Reconciling with server balance:', serverBalance);
+
+  // Clear specific deduction or all pending deductions
+  if (deductionId) {
+    creditsState.pendingDeductions = creditsState.pendingDeductions.filter(
+      d => d.id !== deductionId
+    );
+  } else {
+    // Clear all pending deductions on full reconcile
+    creditsState.pendingDeductions = [];
+  }
+
+  // Update to server truth
+  creditsState.wallet.available = serverBalance;
+  creditsState.wallet.balance = serverBalance;
+  creditsState.lastServerBalance = serverBalance;
+
+  // Cache for next page load
+  cacheCreditsBalance(serverBalance);
+
+  log('[Credits] Reconciled:', {
+    balance: serverBalance,
+    pendingCount: creditsState.pendingDeductions.length,
+  });
+
+  // Update UI with server truth
+  updateCreditsUI();
+}
+
+/**
+ * Rollback a pending deduction (call if API call fails)
+ *
+ * @param {string} deductionId - The deduction ID from deductOptimistic
+ */
+export function rollback(deductionId) {
+  const deductionIndex = creditsState.pendingDeductions.findIndex(
+    d => d.id === deductionId
+  );
+
+  if (deductionIndex === -1) {
+    log('[Credits] Rollback: deduction not found', deductionId);
+    return;
+  }
+
+  const deduction = creditsState.pendingDeductions[deductionIndex];
+
+  // Remove from pending
+  creditsState.pendingDeductions.splice(deductionIndex, 1);
+
+  // Restore credits
+  creditsState.wallet.available += deduction.amount;
+  creditsState.wallet.balance += deduction.amount;
+
+  log('[Credits] Rolled back:', {
+    id: deductionId,
+    amount: deduction.amount,
+    newAvailable: creditsState.wallet.available,
+  });
+
+  // Update UI
+  updateCreditsUI();
+}
+
+/**
+ * Clear all pending deductions (useful on page refresh or error recovery)
+ */
+export function clearPending() {
+  creditsState.pendingDeductions = [];
+  log('[Credits] Cleared all pending deductions');
+}
+
+/**
+ * Get total pending deductions amount
+ */
+export function getPendingAmount() {
+  return creditsState.pendingDeductions.reduce((sum, d) => sum + d.amount, 0);
+}
+
+// ============================================================================
+// CREDIT RESERVATIONS (hold credits during generation)
+// ============================================================================
+
+/**
+ * Reserve credits for a pending operation.
+ * Shows "Reserving credits..." state and immediately reduces available.
+ *
+ * @param {string} action - The action key (e.g., 'text-to-3d', 'image-to-3d')
+ * @param {number} count - Number of items (default 1, for batch operations)
+ * @returns {{ reservationId: string, amount: number }} Reservation info
+ */
+export function reserveCredits(action, count = 1) {
+  const costPerItem = getActionCost(action);
+  const totalCost = costPerItem * count;
+
+  if (totalCost === 0) {
+    log('[Credits] Reserve: action has no cost', action);
+    log('[Credits] Available action costs:', Object.keys(creditsState.actionCosts).join(', ') || '(empty)');
+    log('[Credits] Action costs state:', creditsState.actionCosts);
+    return { reservationId: null, amount: 0 };
+  }
+
+  // Check if enough credits available (accounting for existing reservations)
+  const available = Number(creditsState.wallet.available) || 0;
+  const reserved = Number(creditsState.totalReserved) || 0;
+  const effectiveAvailable = available - reserved;
+  const missing = Math.max(0, totalCost - effectiveAvailable);
+  const shouldBlock = missing > 0;
+
+  // Detailed logging for debugging credit issues
+  console.log(`[CREDITS] ========================================`);
+  console.log(`[CREDITS] RESERVE CREDITS CHECK (action-based)`);
+  console.log(`[CREDITS] action=${action}`);
+  console.log(`[CREDITS] costPerItem=${costPerItem}, count=${count}, totalCost=${totalCost}`);
+  console.log(`[CREDITS] available=${available}`);
+  console.log(`[CREDITS] reserved=${reserved}`);
+  console.log(`[CREDITS] effectiveAvailable=${effectiveAvailable}`);
+  console.log(`[CREDITS] missing=${missing}`);
+  console.log(`[CREDITS] shouldBlock=${shouldBlock}`);
+  console.log(`[CREDITS] ========================================`);
+
+  if (shouldBlock) {
+    log('[Credits] Reserve failed: insufficient credits', {
+      action,
+      cost: totalCost,
+      available,
+      reserved,
+      effectiveAvailable,
+      missing,
+    });
+    return { reservationId: null, amount: 0, insufficient: true, required: totalCost, available: effectiveAvailable, missing };
+  }
+
+  const reservationId = `res_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const reservation = {
+    amount: totalCost,
+    action,
+    count,
+    timestamp: Date.now(),
+  };
+
+  // Track reservation
+  creditsState.reservations.set(reservationId, reservation);
+  creditsState.totalReserved += totalCost;
+
+  log('[Credits] Reserved:', {
+    reservationId,
+    action,
+    amount: totalCost,
+    totalReserved: creditsState.totalReserved,
+    effectiveAvailable: creditsState.wallet.available - creditsState.totalReserved,
+  });
+
+  // Update UI to show reservation
+  updateCreditsUI();
+
+  return { reservationId, amount: totalCost };
+}
+
+/**
+ * Reserve an EXACT amount of credits (use for pre-computed costs like video)
+ * Unlike reserveCredits(action, count), this does NOT multiply by action cost.
+ *
+ * @param {object} params
+ * @param {string} params.action - The action type (for logging/tracking)
+ * @param {number} params.amount - Exact credits amount to reserve
+ * @param {object} params.meta - Optional metadata
+ * @returns {{ reservationId: string, amount: number, insufficient?: boolean }}
+ */
+export function reserveAmount({ action, amount, meta = {} }) {
+  const numAmount = Number(amount) || 0;
+
+  if (numAmount <= 0) {
+    log('[Credits] reserveAmount: invalid amount', { action, amount });
+    return { reservationId: null, amount: 0 };
+  }
+
+  // Check if enough credits available (accounting for existing reservations)
+  const available = Number(creditsState.wallet.available) || 0;
+  const reserved = Number(creditsState.totalReserved) || 0;
+  const effectiveAvailable = available - reserved;
+  const missing = Math.max(0, numAmount - effectiveAvailable);
+  const shouldBlock = missing > 0;
+
+  // Detailed logging for debugging credit issues
+  console.log(`[CREDITS] ========================================`);
+  console.log(`[CREDITS] RESERVE AMOUNT CHECK`);
+  console.log(`[CREDITS] action=${action}`);
+  console.log(`[CREDITS] cost=${numAmount}`);
+  console.log(`[CREDITS] available=${available}`);
+  console.log(`[CREDITS] reserved=${reserved}`);
+  console.log(`[CREDITS] effectiveAvailable=${effectiveAvailable}`);
+  console.log(`[CREDITS] missing=${missing}`);
+  console.log(`[CREDITS] shouldBlock=${shouldBlock}`);
+  console.log(`[CREDITS] ========================================`);
+
+  if (shouldBlock) {
+    log('[Credits] reserveAmount failed: insufficient credits', {
+      action,
+      cost: numAmount,
+      available,
+      reserved,
+      effectiveAvailable,
+      missing,
+    });
+    return { reservationId: null, amount: 0, insufficient: true, required: numAmount, available: effectiveAvailable, missing };
+  }
+
+  const reservationId = `res_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const reservation = {
+    amount: numAmount,
+    action,
+    meta,
+    timestamp: Date.now(),
+  };
+
+  // Track reservation
+  creditsState.reservations.set(reservationId, reservation);
+  creditsState.totalReserved += numAmount;
+
+  log('[Credits] reserveAmount succeeded:', {
+    reservationId,
+    action,
+    amount: numAmount,
+    totalReserved: creditsState.totalReserved,
+    effectiveAvailable: available - creditsState.totalReserved,
+  });
+
+  // Update UI to show reservation
+  updateCreditsUI();
+
+  return { reservationId, amount: numAmount };
+}
+
+/**
+ * Confirm a reservation (job started successfully).
+ * Converts reservation to actual deduction.
+ *
+ * @param {string} reservationId - The reservation ID from reserveCredits
+ * @param {string} jobId - The actual job ID from backend
+ */
+export function confirmReservation(reservationId, jobId) {
+  const reservation = creditsState.reservations.get(reservationId);
+  if (!reservation) {
+    log('[Credits] confirmReservation: not found', reservationId);
+    return;
+  }
+
+  // Remove from reservations
+  creditsState.reservations.delete(reservationId);
+  creditsState.totalReserved -= reservation.amount;
+
+  // Apply actual deduction
+  applyDelta(-reservation.amount, reservation.action, jobId);
+
+  log('[Credits] Reservation confirmed:', {
+    reservationId,
+    jobId,
+    amount: reservation.amount,
+    newBalance: creditsState.wallet.available,
+  });
+}
+
+/**
+ * Release a reservation (job failed to start or was cancelled).
+ * Returns credits to available.
+ *
+ * @param {string} reservationId - The reservation ID from reserveCredits
+ */
+export function releaseReservation(reservationId) {
+  const reservation = creditsState.reservations.get(reservationId);
+  if (!reservation) {
+    log('[Credits] releaseReservation: not found', reservationId);
+    return;
+  }
+
+  // Remove from reservations
+  creditsState.reservations.delete(reservationId);
+  creditsState.totalReserved -= reservation.amount;
+
+  log('[Credits] Reservation released:', {
+    reservationId,
+    amount: reservation.amount,
+    totalReserved: creditsState.totalReserved,
+  });
+
+  // Update UI
+  updateCreditsUI();
+}
+
+/**
+ * Get total currently reserved credits
+ */
+export function getTotalReserved() {
+  return creditsState.totalReserved;
+}
+
+/**
+ * Get effective available credits (available minus reserved)
+ */
+export function getEffectiveAvailable() {
+  return Math.max(0, creditsState.wallet.available - creditsState.totalReserved);
+}
+
+/**
+ * Check if enough credits for action (accounting for reservations)
+ */
+export function hasEffectiveCreditsFor(action, count = 1) {
+  const cost = getActionCost(action) * count;
+  return getEffectiveAvailable() >= cost;
+}
+
+// ============================================================================
+// WALLET STATE MANAGEMENT
+// ============================================================================
+
+/**
+ * Update wallet after a successful operation (e.g., after job completion)
+ */
+export function updateWallet(wallet) {
+  if (wallet) {
+    const available = wallet.available ?? Math.max(0, (wallet.balance || 0) - (wallet.reserved || 0));
+    creditsState.wallet = {
+      balance: wallet.balance || 0,
+      reserved: wallet.reserved || 0,
+      available,
+    };
+    // Cache for next page load
+    cacheCreditsBalance(available);
+    updateCreditsUI();
+    log('[Credits] Wallet updated:', creditsState.wallet);
+  }
+}
+
+// ============================================================================
+// EMAIL BEACON - Navbar beacon prompt to add email
+// ============================================================================
+
+/**
+ * Update email beacon visibility based on email state
+ * Shows beacon if: no email attached
+ */
+function updateEmailBeaconUI() {
+  const emailBeacon = document.getElementById('emailBeacon');
+  if (!emailBeacon) return;
+
+  const shouldShow = !creditsState.email;
+
+  if (shouldShow) {
+    emailBeacon.classList.remove('hidden');
+    log('[Credits] Email beacon shown - no email attached');
+  } else {
+    emailBeacon.classList.add('hidden');
+    log('[Credits] Email beacon hidden - email attached');
+  }
+}
+
+/**
+ * Handle beacon click - navigate to hub secure credits section
+ */
+function handleBeaconClick() {
+  window.location.href = 'hub.html#secure-credits';
+}
+
+// Setup email beacon event listeners on DOM ready
+function setupEmailBeaconListeners() {
+  const emailBeacon = document.getElementById('emailBeacon');
+  emailBeacon?.addEventListener('click', handleBeaconClick);
+}
+
+// Run setup when DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', setupEmailBeaconListeners);
+} else {
+  setupEmailBeaconListeners();
+}
+
+// ============================================================================
+// UI UPDATES
+// ============================================================================
+
+/**
+ * Update credits display in the workspace UI
+ */
+export function updateCreditsUI() {
+  // Update credits pill if it exists
+  const creditsPill = document.getElementById('workspaceCredits');
+  const creditsValue = document.getElementById('workspaceCreditsValue');
+  const creditsGroup = document.getElementById('workspaceCreditsGroup');
+  const reservedIndicator = document.getElementById('workspaceCreditsReserved');
+
+  // Calculate effective available (balance - reserved)
+  const effectiveAvailable = getEffectiveAvailable();
+  const hasReservations = creditsState.totalReserved > 0;
+
+  if (creditsValue) {
+    creditsValue.textContent = effectiveAvailable.toLocaleString();
+  }
+
+  // Update hover tooltip with pool breakdown
+  const tooltipGeneral = document.getElementById('tooltipGeneral');
+  const tooltipVideo = document.getElementById('tooltipVideo');
+  if (tooltipGeneral) {
+    tooltipGeneral.textContent = effectiveAvailable.toLocaleString();
+  }
+  if (tooltipVideo) {
+    tooltipVideo.textContent = creditsState.wallet.videoAvailable.toLocaleString();
+  }
+
+  // Show/hide reserved indicator
+  if (reservedIndicator) {
+    if (hasReservations) {
+      reservedIndicator.textContent = `(${creditsState.totalReserved} reserved)`;
+      reservedIndicator.classList.remove('hidden');
+    } else {
+      reservedIndicator.classList.add('hidden');
+    }
+  }
+
+  if (creditsPill) {
+    creditsPill.classList.toggle('low', effectiveAvailable < 30 && effectiveAvailable > 0);
+    creditsPill.classList.toggle('empty', effectiveAvailable === 0);
+    creditsPill.classList.toggle('has-credits', effectiveAvailable > 0);
+    creditsPill.classList.toggle('has-reservations', hasReservations);
+
+    // Make credits pill clickable to show buy options
+    if (!creditsPill.dataset.clickWired) {
+      creditsPill.dataset.clickWired = 'true';
+      creditsPill.style.cursor = 'pointer';
+      creditsPill.addEventListener('click', () => {
+        // Redirect to pricing section
+        window.location.href = 'hub.html#pricing';
+      });
+    }
+
+    // Native title removed — hover tooltip shows pool breakdown instead
+    creditsPill.removeAttribute('title');
+  }
+
+  // Toggle syncing class on group and pill
+  const isSyncing = creditsState.loading && !creditsState.loaded;
+  const wasSyncing = creditsPill?.classList.contains('syncing');
+
+  if (creditsGroup) {
+    creditsGroup.classList.toggle('syncing', isSyncing);
+  }
+  if (creditsPill) {
+    creditsPill.classList.toggle('syncing', isSyncing);
+
+    // Brief "just-synced" flash when syncing completes
+    if (wasSyncing && !isSyncing && creditsState.loaded) {
+      creditsPill.classList.add('just-synced');
+      setTimeout(() => creditsPill.classList.remove('just-synced'), 1200);
+    }
+  }
+
+  // Update generate buttons with cost indicators
+  updateGenerateButtonCosts();
+}
+
+/**
+ * Button to action mapping with associated batch count inputs.
+ *
+ * CANONICAL ACTION KEYS (use these):
+ * - image_generate       (10c) - All 2D image providers
+ * - text_to_3d_generate  (20c) - Text to 3D preview
+ * - image_to_3d_generate (30c) - Image to 3D
+ * - refine               (10c) - Refine 3D model
+ * - remesh               (10c) - Remesh 3D model
+ * - retexture            (15c) - Retexture 3D model
+ * - video_generate       (75-250c) - Video generation (varies by duration/resolution)
+ * - video_text_generate  (75-200c) - Text to video
+ * - video_image_animate  (110-250c) - Image to video
+ */
+const BUTTON_CONFIG = {
+  // Core generation buttons (canonical keys)
+  'generateModelBtn': { action: 'text_to_3d_generate', batchInput: 'modelBatchCount' },
+  'generateImageBtn': { action: 'image_generate', batchInput: null },
+  'imageTo3dBtn': { action: 'image_to_3d_generate', batchInput: null },
+  // Post-processing buttons (canonical keys)
+  'generateTextureBtn': { action: 'retexture', batchInput: null },
+  'applyRemeshBtn': { action: 'remesh', batchInput: null },
+  'applyRefineBtn': { action: 'refine', batchInput: null },
+  'applyUpscaleBtn': { action: 'refine', batchInput: null },  // Upscale uses refine cost
+  'generateVideoBtn': { action: 'video_generate', batchInput: null },
+};
+
+/**
+ * Get batch count for a button (from associated input or default 1)
+ */
+function getBatchCountForButton(btnId) {
+  const config = BUTTON_CONFIG[btnId];
+  if (!config?.batchInput) return 1;
+
+  const input = document.getElementById(config.batchInput);
+  if (!input) return 1;
+
+  const val = parseInt(input.value, 10);
+  return Number.isFinite(val) && val > 0 ? Math.min(val, 4) : 1;
+}
+
+/**
+ * Update generate buttons to show credit costs
+ * Maps button IDs to action keys for cost lookup
+ * Uses resolveCost() to show "—" for unknown costs instead of "0"
+ */
+function updateGenerateButtonCosts() {
+  // Use effective available (accounting for reservations)
+  const effectiveAvailable = getEffectiveAvailable();
+
+  Object.entries(BUTTON_CONFIG).forEach(([btnId, config]) => {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+
+    // Check for dynamic action override (e.g., when switching between text-to-3d and image-to-3d tabs)
+    const action = btn.dataset.currentAction || config.action;
+    const batchCount = getBatchCountForButton(btnId);
+
+    // Check for dynamic cost override from UI (e.g., video panel with duration/resolution/audio options)
+    // The data-base-credits attribute is set by panel-specific JS when options change
+    const dynamicCost = btn.dataset.baseCredits ? parseInt(btn.dataset.baseCredits, 10) : null;
+
+    // Use dynamic cost if available, otherwise fall back to static action cost
+    const costPerItem = dynamicCost !== null && !isNaN(dynamicCost) ? dynamicCost : resolveCost(action);
+    const isUnknown = costPerItem === null;
+    const totalCost = isUnknown ? 0 : costPerItem * batchCount;
+    const hasCreds = isUnknown ? false : effectiveAvailable >= totalCost;
+
+    // Find the .gen-credits span in the same footer card
+    const footerCard = btn.closest('.gen-footer-card');
+    if (footerCard) {
+      const creditsSpan = footerCard.querySelector('.gen-credits');
+      if (creditsSpan) {
+        // Show "—" for unknown costs, otherwise show the cost
+        if (isUnknown) {
+          creditsSpan.textContent = '—';
+          creditsSpan.title = `Cost unknown for action: ${action}`;
+        } else {
+          // Show batch multiplier if > 1
+          const costText = batchCount > 1
+            ? `${costPerItem} × ${batchCount} = ${totalCost}`
+            : `${totalCost}`;
+          creditsSpan.innerHTML = `<i class="fa-solid fa-coins"></i> ${costText}`;
+          creditsSpan.classList.toggle('insufficient', !hasCreds);
+        }
+      }
+    }
+
+    // Add/update insufficient state on button
+    btn.classList.toggle('insufficient-credits', !hasCreds);
+
+    // Disable button when insufficient credits
+    // Only manage the disabled state for credits - don't override other reasons
+    const currentlyDisabledForCredits = btn.getAttribute('data-disabled-reason') === 'insufficient-credits';
+    const hasOtherDisabledReason = btn.disabled && !currentlyDisabledForCredits;
+
+    if (!hasCreds) {
+      btn.setAttribute('data-disabled-reason', 'insufficient-credits');
+      btn.disabled = true;
+    } else if (currentlyDisabledForCredits) {
+      // Only re-enable if we were the ones who disabled it
+      btn.removeAttribute('data-disabled-reason');
+      if (!hasOtherDisabledReason) {
+        btn.disabled = false;
+      }
+    }
+
+    // Update tooltip with clear message about required credits
+    btn.setAttribute('data-credits', isUnknown ? '' : totalCost);
+    if (isUnknown) {
+      btn.setAttribute('title', `Cost unknown for action: ${action}`);
+    } else if (!hasCreds) {
+      // Ensure missing is never negative
+      const missing = Math.max(0, totalCost - effectiveAvailable);
+      btn.setAttribute('title', `You need ${totalCost} credits to generate this. (${missing} more needed)`);
+    } else {
+      btn.setAttribute('title', `${totalCost} credits`);
+    }
+
+    // Add cost badge to button (show "—" for unknown, cost for known)
+    let costBadge = btn.querySelector('.btn-cost-badge');
+    if (isUnknown || totalCost > 0) {
+      if (!costBadge) {
+        costBadge = document.createElement('span');
+        costBadge.className = 'btn-cost-badge';
+        btn.appendChild(costBadge);
+      }
+      if (isUnknown) {
+        costBadge.textContent = '—';
+        costBadge.classList.add('unknown');
+        costBadge.classList.remove('insufficient', 'has-batch');
+      } else {
+        // Show batch multiplier in badge if > 1
+        costBadge.textContent = batchCount > 1 ? `${totalCost}` : totalCost;
+        costBadge.classList.toggle('insufficient', !hasCreds);
+        costBadge.classList.toggle('has-batch', batchCount > 1);
+        costBadge.classList.remove('unknown');
+      }
+    } else if (costBadge) {
+      costBadge.remove();
+    }
+  });
+}
+
+/**
+ * Setup batch count input listeners to update costs dynamically
+ */
+function setupBatchCountListeners() {
+  // Find all batch count inputs
+  const batchInputIds = [...new Set(
+    Object.values(BUTTON_CONFIG)
+      .map(c => c.batchInput)
+      .filter(Boolean)
+  )];
+
+  batchInputIds.forEach(inputId => {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+
+    // Update costs when value changes
+    const updateHandler = () => {
+      log('[Credits] Batch count changed:', inputId, input.value);
+      updateGenerateButtonCosts();
+    };
+
+    input.addEventListener('input', updateHandler);
+    input.addEventListener('change', updateHandler);
+
+    // Note: Stepper buttons are handled by 3dprint-app.js which dispatches
+    // change events that we listen to above. No duplicate handlers needed.
+  });
+
+  log('[Credits] Batch count listeners setup for:', batchInputIds);
+}
+
+/**
+ * Show insufficient credits message and redirect to pricing
+ */
+export function showInsufficientCreditsMessage(action) {
+  const cost = getActionCost(action);
+  const available = creditsState.wallet.available;
+  const needed = Math.max(0, cost - available);
+
+  log('[Credits] Insufficient credits:', { action, cost, available, needed });
+
+  // Check if we're on hub.html with the buy modal
+  const hubBuyModal = document.getElementById('buyCreditsModal');
+  if (hubBuyModal && window.TimrXCredits?.openModal) {
+    window.TimrXCredits.openModal();
+    return;
+  }
+
+  // Simple confirm dialog and redirect to pricing
+  const msg = `Insufficient credits.\n\nYou need ${cost} credits for this action but only have ${available} available.\nYou need ${needed} more credits.`;
+  if (confirm(msg + '\n\nWould you like to buy more credits?')) {
+    window.location.href = 'hub.html#pricing';
+  }
+}
+
+// ============================================================================
+// SIMPLE CLIENT API (credits-client interface)
+// ============================================================================
+
+/**
+ * Initialize credits UI - loads current credits from backend and renders
+ * Alias for initCredits() with a clearer name
+ */
+export async function initCreditsUI() {
+  return initCredits();
+}
+
+/**
+ * Get current cached numeric balance
+ * @returns {number} Current available credits
+ */
+export function getCredits() {
+  return creditsState.wallet.available;
+}
+
+/**
+ * Set credits balance directly and update UI
+ * @param {number} n - New balance to set
+ */
+export function setCredits(n) {
+  const balance = Math.max(0, Math.floor(n));
+  creditsState.wallet.available = balance;
+  creditsState.wallet.balance = balance;
+  creditsState.lastServerBalance = balance;
+  // Cache for next page load
+  cacheCreditsBalance(balance);
+  log('[Credits] setCredits:', balance);
+  updateCreditsUI();
+}
+
+/**
+ * Apply a delta (positive or negative) to credits with tracking
+ * Used for optimistic updates with reason/job tracking
+ *
+ * @param {number} delta - Amount to add (positive) or subtract (negative)
+ * @param {string} reason - Reason for the change (e.g., 'text_to_3d', 'purchase')
+ * @param {string} jobId - Optional job ID for idempotency tracking
+ * @returns {{ id: string, previousBalance: number, newBalance: number }}
+ */
+export function applyDelta(delta, reason = 'unknown', jobId = null) {
+  // Idempotency: skip if this jobId was already charged (prevents double-click/retry duplicates)
+  if (jobId && delta < 0 && chargedJobs.has(jobId)) {
+    log('[Credits] applyDelta: skipping duplicate charge for jobId:', jobId);
+    return {
+      id: jobId,
+      previousBalance: creditsState.wallet.available,
+      newBalance: creditsState.wallet.available,
+      skipped: true,
+    };
+  }
+
+  const previousBalance = creditsState.wallet.available;
+  const deductionId = jobId || `delta_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+
+  // Track this change
+  const change = {
+    id: deductionId,
+    amount: Math.abs(delta),
+    delta,
+    reason,
+    jobId,
+    timestamp: Date.now(),
+  };
+
+  if (delta < 0) {
+    // Deduction - track as pending
+    creditsState.pendingDeductions.push(change);
+    // Mark this jobId as charged for idempotency
+    if (jobId) {
+      chargedJobs.add(jobId);
+    }
+  }
+
+  // Store last server balance if not set
+  if (creditsState.lastServerBalance === null) {
+    creditsState.lastServerBalance = previousBalance;
+  }
+
+  // Apply delta
+  const newBalance = Math.max(0, previousBalance + delta);
+  creditsState.wallet.available = newBalance;
+  creditsState.wallet.balance = newBalance;
+
+  log('[Credits] applyDelta:', {
+    id: deductionId,
+    delta,
+    reason,
+    jobId,
+    balance: `${previousBalance} → ${newBalance}`,
+  });
+
+  // Update UI immediately
+  updateCreditsUI();
+
+  return {
+    id: deductionId,
+    previousBalance,
+    newBalance,
+  };
+}
+
+/**
+ * Refresh credits from server - calls GET /api/credits/wallet
+ * Single-flight: returns existing promise if already in flight
+ * Sets exact server balance, clearing any optimistic state
+ * @returns {Promise<number>} The server balance
+ */
+export async function refreshCredits() {
+  // Single-flight guard: return existing promise if already refreshing
+  if (refreshInFlight) {
+    log('[Credits] refreshCredits already in flight, returning existing promise');
+    return refreshInFlight;
+  }
+
+  const url = `${BACKEND}/api/credits/wallet`;
+  log('[Credits] Refreshing from:', url);
+
+  // Show syncing indicator
+  creditsState.loading = true;
+  updateCreditsUI();
+
+  refreshInFlight = (async () => {
+    try {
+      const result = await apiFetch('/api/credits/wallet', {
+        cache: 'no-store',
+        keepalive: true,
+      });
+
+      if (!result.ok) {
+        log('[Credits] refreshCredits failed:', result.status, result.error);
+        pendingRetry = true;
+        // Fall back to /api/me
+        return fetchWallet().then(() => creditsState.wallet.available);
+      }
+
+      const data = result.data;
+      log('[Credits] /api/credits/wallet response:', data);
+
+      if (data.ok && typeof data.credits_balance === 'number') {
+        const serverBalance = data.credits_balance;
+        const serverReserved = data.reserved_credits || 0;
+        const serverAvailable = typeof data.available_credits === 'number'
+          ? data.available_credits
+          : Math.max(0, serverBalance - serverReserved);
+
+        // Video credits (separate pool)
+        const videoBalance = data.video_credits_balance ?? 0;
+        const videoReserved = data.video_reserved_credits ?? 0;
+        const videoAvailable = typeof data.video_available_credits === 'number'
+          ? data.video_available_credits
+          : Math.max(0, videoBalance - videoReserved);
+
+        // Server is truth - use server's available (accounts for backend reservations)
+        creditsState.pendingDeductions = [];
+        creditsState.wallet.balance = serverBalance;
+        creditsState.wallet.reserved = serverReserved;
+        creditsState.wallet.available = serverAvailable;
+        creditsState.wallet.videoBalance = videoBalance;
+        creditsState.wallet.videoReserved = videoReserved;
+        creditsState.wallet.videoAvailable = videoAvailable;
+        creditsState.lastServerBalance = serverBalance;
+
+        // Server's available_credits already accounts for all backend reservations.
+        // Clear client-side reservations to avoid double-counting.
+        creditsState.reservations.clear();
+        creditsState.totalReserved = 0;
+
+        if (data.identity_id) {
+          creditsState.identityId = data.identity_id;
+        }
+
+        log('[Credits] Video credits: balance=%d, reserved=%d, available=%d',
+            videoBalance, videoReserved, videoAvailable);
+
+        // Cache available for next page load (not raw balance)
+        cacheCreditsBalance(serverAvailable, videoAvailable);
+
+        // Also write to cross-page wallet cache
+        if (data.identity_id) {
+          writeWalletCache(data.identity_id, serverAvailable);
+        }
+
+        pendingRetry = false; // Clear retry flag on success
+        lastRefreshTime = Date.now(); // Track for visibility throttling
+
+        // Update global session info
+        updateSessionInfo({ ok: true, identity_id: data.identity_id, available_credits: serverAvailable }, 'workspace');
+
+        log('[Credits] Refreshed from server: balance=%d, reserved=%d, available=%d',
+            serverBalance, serverReserved, serverAvailable);
+        updateCreditsUI();
+        return serverAvailable;
+      }
+
+      // Fallback to /api/me if response format unexpected
+      return fetchWallet().then(() => creditsState.wallet.available);
+    } catch (err) {
+      log('[Credits] refreshCredits error:', err.message);
+      // Keep cached balance on timeout, schedule retry on focus
+      pendingRetry = true;
+      return creditsState.wallet.available;
+    } finally {
+      // Hide syncing indicator and clear single-flight guard
+      creditsState.loading = false;
+      refreshInFlight = null;
+      updateCreditsUI();
+    }
+  })();
+
+  return refreshInFlight;
+}
+
+// ============================================================================
+// BACKEND SYNC HELPERS
+// ============================================================================
+
+/**
+ * Force sync with backend - ALWAYS trusts backend over local state.
+ * Use this after job completion (success or failure) to ensure UI matches DB.
+ *
+ * If backend returns a different balance than local, backend wins.
+ * This prevents "snap back" issues where optimistic updates diverge from reality.
+ *
+ * @returns {Promise<number>} The authoritative server balance
+ */
+export async function syncWithBackend() {
+  log('[Credits] syncWithBackend: Forcing reconciliation with backend (backend is truth)');
+
+  // Clear any pending deductions - we're about to get authoritative balance
+  creditsState.pendingDeductions = [];
+
+  // Refresh from server - refreshCredits already treats server as truth
+  const serverBalance = await refreshCredits();
+
+  log('[Credits] syncWithBackend: Authoritative balance from backend:', serverBalance);
+  return serverBalance;
+}
+
+/**
+ * Apply backend balance immediately if returned in API response.
+ * Call this whenever an API response includes new_balance.
+ *
+ * @param {number} newBalance - The new_balance from backend response
+ * @param {string} source - Where this balance came from (for logging)
+ */
+export function applyBackendBalance(newBalance, source = 'api_response') {
+  if (typeof newBalance !== 'number' || isNaN(newBalance)) {
+    log('[Credits] applyBackendBalance: Invalid balance, ignoring:', newBalance);
+    return;
+  }
+
+  const previousBalance = creditsState.wallet.available;
+  const balance = Math.max(0, Math.floor(newBalance));
+
+  // Clear pending deductions and client-side reservations - backend balance is authoritative
+  creditsState.pendingDeductions = [];
+  creditsState.reservations.clear();
+  creditsState.totalReserved = 0;
+
+  // Apply backend balance
+  creditsState.wallet.available = balance;
+  creditsState.wallet.balance = balance;
+  creditsState.lastServerBalance = balance;
+
+  // Cache for next page load
+  cacheCreditsBalance(balance);
+
+  log(`[Credits] applyBackendBalance (${source}): ${previousBalance} → ${balance} (backend is truth)`);
+  updateCreditsUI();
+}
+
+// ============================================================================
+// IDEMPOTENCY HELPERS
+// ============================================================================
+
+/**
+ * Clear charged jobs set (useful for testing or session reset)
+ */
+export function clearChargedJobs() {
+  chargedJobs.clear();
+  log('[Credits] Cleared chargedJobs set');
+}
+
+/**
+ * Check if a job ID has already been charged
+ */
+export function isJobCharged(jobId) {
+  return chargedJobs.has(jobId);
+}
+
+// ============================================================================
+// EXPORTS FOR GLOBAL ACCESS
+// ============================================================================
+
+/**
+ * Get the current identity ID (for debugging)
+ */
+export function getIdentityId() {
+  return creditsState.identityId;
+}
+
+/**
+ * Check if the current user can download assets.
+ * Requires: wallet loaded AND (general credits > 0 OR video credits > 0).
+ * Unauthenticated/zero-credit users are blocked.
+ */
+export function canDownloadAssets() {
+  if (!creditsState.loaded) return false;
+  const totalAvailable = (creditsState.wallet.available || 0)
+    + (creditsState.wallet.videoAvailable || 0);
+  return totalAvailable > 0;
+}
+
+// Expose globally for backward compatibility and cross-module access
+window.WorkspaceCredits = {
+  // Original API
+  init: initCredits,
+  refresh: fetchWallet,
+  getWallet,
+  getAvailableCredits,
+  getActionCost,
+  resolveCost,  // New: returns null for unknown actions (vs 0)
+  getActionCosts,
+  hasCreditsFor,
+  updateWallet,
+  updateUI: updateCreditsUI,
+  updateButtonCosts: updateGenerateButtonCosts,
+  setupBatchListeners: setupBatchCountListeners,
+  showInsufficientCreditsMessage,
+  isLoaded,
+  getIdentityId,
+  canDownloadAssets,
+  // Video credits API (separate pool)
+  getVideoCredits,
+  getVideoWallet,
+  hasVideoCredits,
+  isVideoAction,
+  showInsufficientVideoCreditsMessage,
+  // Video variant costs (backend-driven)
+  getVideoActionCode,
+  getVideoCreditCost,
+  // Optimistic update functions
+  deductOptimistic,
+  reconcile,
+  rollback,
+  clearPending,
+  getPendingAmount,
+  // Reservation functions (hold credits during generation)
+  reserveCredits,
+  reserveAmount,
+  confirmReservation,
+  releaseReservation,
+  getTotalReserved,
+  getEffectiveAvailable,
+  hasEffectiveCreditsFor,
+  // Simple client API (credits-client interface)
+  initCreditsUI,
+  getCredits,
+  setCredits,
+  applyDelta,
+  refreshCredits,
+  // Backend sync (force reconciliation - backend is truth)
+  syncWithBackend,
+  applyBackendBalance,
+  // Idempotency helpers
+  clearChargedJobs,
+  isJobCharged,
+  // Early render (for external use if needed)
+  renderCachedCreditsEarly,
+};
+
+// Standardized ready flag for diagnostics (workspace page)
+window.__TIMRX_CREDITS_READY__ = true;
+window.__TIMRX_CREDITS_PAGE__ = 'workspace';
+console.log('[Credits] Workspace credits module ready');
+
+// ============================================================================
+// IMMEDIATE EXECUTION: Render cached credits ASAP
+// ============================================================================
+
+// Run early render immediately when module loads - don't wait for initCredits()
+// This provides instant visual feedback using the last known balance
+renderCachedCreditsEarly();
+
+// ============================================================================
+// VISIBILITY & FOCUS: Refresh credits when tab becomes visible/focused
+// ============================================================================
+
+/**
+ * Refresh credits if enough time has passed since last refresh
+ * Used for focus/visibility events to catch up after payments or generation
+ */
+function maybeRefreshOnVisibility() {
+  const now = Date.now();
+  const timeSinceLastRefresh = now - lastRefreshTime;
+
+  // Skip if already refreshing or too soon
+  if (refreshInFlight || walletFetchInFlight) {
+    log('[Credits] Skipping visibility refresh - already in flight');
+    return;
+  }
+
+  // Refresh if pending retry OR enough time has passed (to catch payments in other tabs)
+  if (pendingRetry || timeSinceLastRefresh > MIN_REFRESH_INTERVAL_MS) {
+    log('[Credits] Visibility/focus refresh triggered');
+    pendingRetry = false;
+    lastRefreshTime = now;
+    refreshCredits().catch(err => {
+      log('[Credits] Visibility refresh failed:', err.message);
+      pendingRetry = true;
+    });
+  }
+}
+
+// Refresh on window focus
+window.addEventListener('focus', maybeRefreshOnVisibility);
+
+// Refresh on visibility change (tab becomes visible)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    maybeRefreshOnVisibility();
+  }
+});
+
+// ============================================================================
+// CROSS-TAB SYNC: Detect wallet cache changes from hub purchases
+// ============================================================================
+
+/**
+ * Listen for localStorage changes from other tabs.
+ * When hub completes a purchase and writes to timrx_last_wallet,
+ * this tab will detect it and refresh credits immediately.
+ */
+window.addEventListener('storage', (event) => {
+  // Only react to wallet cache changes
+  if (event.key !== 'timrx_last_wallet') return;
+
+  log('[Credits] Cross-tab storage event detected');
+
+  // Parse the new value
+  if (event.newValue) {
+    try {
+      const newCache = JSON.parse(event.newValue);
+      if (newCache && typeof newCache.available_credits === 'number') {
+        const newCredits = newCache.available_credits;
+        const currentCredits = creditsState.wallet.available;
+
+        log('[Credits] Cross-tab wallet update:', currentCredits, '→', newCredits);
+
+        // If credits increased (purchase in another tab), update immediately
+        if (newCredits > currentCredits) {
+          creditsState.wallet.available = newCredits;
+          creditsState.wallet.balance = newCredits;
+
+          // Update identity if provided
+          if (newCache.identity_id) {
+            creditsState.identityId = newCache.identity_id;
+          }
+
+          // Cache locally
+          cacheCreditsBalance(newCredits);
+
+          // Update UI immediately
+          updateCreditsUI();
+
+          log('[Credits] Cross-tab sync complete: credits now', newCredits);
+
+          // Also verify with server in background (non-blocking)
+          refreshCredits().catch(err => {
+            log('[Credits] Background refresh after cross-tab sync failed:', err.message);
+          });
+        }
+      }
+    } catch (e) {
+      log('[Credits] Failed to parse cross-tab storage value:', e.message);
+    }
+  }
+});
