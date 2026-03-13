@@ -107,6 +107,11 @@ _PROVIDER_ERROR_MAP = {
     # Generation failures
     "generation_failed": ErrorCategory.INTERNAL,
     "seedance_generation_failed": ErrorCategory.INTERNAL,
+    # Vertex AI
+    "vertex_video_failed": ErrorCategory.INTERNAL,
+    "vertex_auth_failed": ErrorCategory.AUTH,
+    "provider_filtered_content": ErrorCategory.VALIDATION,
+    "deadline exceeded": ErrorCategory.PROCESSING_TIMEOUT,
     # fal.ai Seedance
     "fal_seedance_auth_error": ErrorCategory.AUTH,
     "fal_seedance_network_error": ErrorCategory.NETWORK,
@@ -150,9 +155,13 @@ def is_quota_error(error_msg: str) -> bool:
 
 
 # ── Error codes that warrant credit release ──────────────────
-# Confirmed terminal failures where the provider will NOT complete the job.
-# Timeouts and poll errors do NOT release credits -- the provider may
-# still complete, and the rescue service can recover later.
+# IMPORTANT: _fail_job() transitions jobs to "failed" status, which is a
+# terminal state that rescue/recovery will NEVER reclaim. Therefore ANY
+# error code passed to _fail_job MUST release credits — otherwise they
+# are held forever.
+#
+# This set must include ALL error codes that _fail_job or _handle_job_error
+# can produce. If you add a new error code path, add it here too.
 
 TERMINAL_ERROR_CODES = frozenset({
     # Normalized categories
@@ -161,13 +170,27 @@ TERMINAL_ERROR_CODES = frozenset({
     ErrorCategory.DISPATCH_FAILED,
     ErrorCategory.MAX_RETRIES,
     ErrorCategory.VALIDATION,
-    # Legacy codes (backward compat with existing DB rows)
+    ErrorCategory.INTERNAL,
+    ErrorCategory.PENDING_TIMEOUT,
+    ErrorCategory.PROCESSING_TIMEOUT,
+    # Vertex — upstream terminal failures (provider returned done+error)
+    "vertex_video_failed",          # Vertex operation done+error (e.g. "Deadline exceeded")
+    "vertex_auth_failed",           # Vertex 401/403
+    "vertex_no_result_url",         # Vertex done but no video
+    "vertex_pending_timeout",       # Our timeout: Vertex never started
+    "vertex_processing_timeout",    # Our timeout: Vertex started but didn't finish
+    "vertex_poll_error",            # Max consecutive poll errors for Vertex
+    "provider_filtered_content",    # Content safety filter rejection
+    # Seedance — legacy codes (backward compat with existing DB rows)
     "generation_failed",
     "no_result_url",
     "auth_error",
     "seedance_generation_failed",
     "seedance_no_video_url",
     "seedance_auth_error",
+    "seedance_pending_timeout",
+    "seedance_processing_timeout",
+    "seedance_poll_error",
     "max_attempts_exceeded",
     "dispatch_failed",
     "no_upstream_id",
@@ -177,6 +200,9 @@ TERMINAL_ERROR_CODES = frozenset({
     "fal_seedance_auth_error",
     "fal_seedance_no_request_id",
     "fal_seedance_api_error",
+    "fal_seedance_pending_timeout",
+    "fal_seedance_processing_timeout",
+    "fal_seedance_poll_error",
 })
 
 
@@ -209,10 +235,16 @@ FAILURE_MESSAGES = {
     "seedance_no_video_url": "Seedance completed but no video was returned",
     "seedance_auth_error": "Seedance authentication failed",
     # Vertex-specific
+    "vertex_video_failed": "Veo generation failed -- provider returned an error",
     "vertex_no_result_url": "Veo completed but no video was returned",
     "vertex_timeout": "Veo generation timed out",
+    "vertex_auth_failed": "Veo authentication failed",
     "vertex_auth_error": "Veo authentication failed",
     "vertex_quota": "Veo quota reached -- try again later",
+    "vertex_pending_timeout": "Veo queue timed out -- job was not started in time",
+    "vertex_processing_timeout": "Veo render timed out -- started but did not finish",
+    "vertex_poll_error": "Lost connection to Veo during generation",
+    "provider_filtered_content": "Content blocked by safety filters",
     # fal.ai Seedance-specific
     "fal_seedance_auth_error": "fal Seedance authentication failed",
     "fal_seedance_network_error": "Lost connection to fal Seedance during generation",

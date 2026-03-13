@@ -1214,34 +1214,58 @@ def _fail_job(
     provider_name: str = "unknown",
 ):
     """
-    Mark job as failed. Only releases credits for terminal error codes.
+    Mark job as permanently failed and release held credits.
 
-    Temporary errors (timeouts, poll errors) keep the reservation held
-    so the rescue service can recover the job later if the provider
-    eventually completes.
+    IMPORTANT: This function transitions the job to "failed" status, which is
+    a TERMINAL state — no rescue or recovery service will ever reclaim it.
+    Therefore credits MUST be released here. Holding credits on a failed job
+    means they are stuck forever.
+
+    If you need a recoverable error state, use _handle_job_error (-> stalled)
+    instead of this function.
     """
-    print(f"[JOB] FAIL job={job_id} code={error_code} provider={provider_name} msg={error_msg}")
-
-    # Determine if this error code is terminal (warrants credit release).
-    # Check both the exact code and the generic suffix (e.g. "seedance_generation_failed" -> "generation_failed")
+    # ── Structured failure log ──────────────────────────────────
+    resolution = meta.get("resolution", "unknown")
+    task = meta.get("task", "unknown")
+    duration = meta.get("duration_seconds", "?")
+    action_code = meta.get("action_code") or meta.get("requested_action_key", "unknown")
+    upstream_id = meta.get("upstream_id", "none")
     reservation_id = meta.get("reservation_id")
-    suffix = error_code.split("_", 1)[-1] if "_" in error_code else error_code
-    is_terminal = error_code in _TERMINAL_ERROR_CODES or suffix in _TERMINAL_ERROR_CODES
 
-    if reservation_id and is_terminal:
+    # Classify as terminal or recoverable (for logging — release always happens)
+    suffix = error_code.split("_", 1)[-1] if "_" in error_code else error_code
+    is_known_terminal = error_code in _TERMINAL_ERROR_CODES or suffix in _TERMINAL_ERROR_CODES
+
+    print(
+        f"[JOB:FAIL] job={job_id} provider={provider_name} task={task} "
+        f"duration={duration}s resolution={resolution} action_code={action_code} "
+        f"upstream={upstream_id[:40] if upstream_id else 'none'} "
+        f"error_code={error_code} terminal={is_known_terminal} "
+        f"msg={error_msg[:200]}"
+    )
+
+    # ── Always release credits — job is being permanently failed ──
+    credits_action = "N/A"
+    if reservation_id:
         from backend.services.credits_helper import release_job_credits
         try:
             release_job_credits(reservation_id, error_code, job_id)
-            print(f"[JOB] credits RELEASED job={job_id} reason={error_code} provider={provider_name}")
+            credits_action = "released"
+            print(f"[JOB:FAIL] credits RELEASED job={job_id} reason={error_code} provider={provider_name}")
         except Exception as e:
-            print(f"[JOB] WARNING: credit release failed job={job_id}: {e}")
-    elif reservation_id:
-        print(
-            f"[JOB] credits HELD job={job_id} reason=non_terminal_error "
-            f"code={error_code} provider={provider_name} (rescue may recover)"
-        )
+            credits_action = "release_failed"
+            print(f"[JOB:FAIL] WARNING: credit release failed job={job_id}: {e}")
     else:
-        print(f"[JOB] credits N/A job={job_id} no_reservation provider={provider_name}")
+        credits_action = "no_reservation"
+
+    # Structured audit log
+    print(
+        f"[JOB:FAIL:AUDIT] provider={provider_name} task={task} duration={duration}s "
+        f"resolution={resolution} action_code={action_code} "
+        f"upstream_op={upstream_id[:40] if upstream_id else 'none'} "
+        f"error_code={error_code} error_msg={error_msg[:150]} "
+        f"credits={credits_action} terminal_classified={is_known_terminal}"
+    )
 
     # Resolve user-facing message from shared error taxonomy
     user_message = get_failure_message(error_code)
@@ -1249,11 +1273,25 @@ def _fail_job(
         # No specific message for this code — try the generic suffix
         user_message = get_failure_message(suffix) if suffix != error_code else error_msg
 
+    # Build richer user-facing message with resolution context
+    if resolution and resolution != "unknown" and resolution != "720p":
+        # Add resolution context for non-standard resolutions so user knows why it failed
+        if "deadline" in error_msg.lower() or "timeout" in error_code.lower():
+            user_message = f"{resolution} generation timed out — try a lower resolution"
+        elif "filtered" in error_code:
+            pass  # Don't append resolution to content filter messages
+        else:
+            user_message = f"{user_message} ({resolution})"
+
     fail_meta = {
         "error_code": error_code,
         "error_message": error_msg,
         "failure_reason": user_message,
         "failure_provider": provider_name,
+        "failure_resolution": resolution,
+        "failure_task": task,
+        "failure_duration": duration,
+        "credits_action": credits_action,
     }
     # Carry through any upstream provider error details the caller enriched
     if meta.get("provider_error_code"):
@@ -1275,12 +1313,16 @@ def _fail_job(
             update_video_record(
                 video_uuid,
                 status="failed",
-                error_message=error_msg[:500],
-                meta_patch={"error_code": error_code, "failure_provider": provider_name},
+                error_message=user_message[:500],
+                meta_patch={
+                    "error_code": error_code,
+                    "failure_provider": provider_name,
+                    "failure_resolution": resolution,
+                },
             )
-            print(f"[JOB] videos row updated: video_uuid={video_uuid} status=failed")
+            print(f"[JOB:FAIL] videos row updated: video_uuid={video_uuid} status=failed")
         except Exception as e:
-            print(f"[JOB] WARNING: failed to update videos row {video_uuid}: {e}")
+            print(f"[JOB:FAIL] WARNING: failed to update videos row {video_uuid}: {e}")
 
         # Write history_items row so failed video appears in user history
         try:
@@ -1291,14 +1333,14 @@ def _fail_job(
                 identity_id=identity_id,
                 video_uuid=video_uuid,
                 prompt=meta.get("prompt", ""),
-                error_message=error_msg[:500],
+                error_message=user_message[:500],
                 provider=provider_name,
                 duration_seconds=meta.get("duration_seconds"),
                 aspect_ratio=meta.get("aspect_ratio"),
                 resolution=meta.get("resolution"),
             )
         except Exception as e:
-            print(f"[JOB] WARNING: failed to write failed history for job {job_id}: {e}")
+            print(f"[JOB:FAIL] WARNING: failed to write failed history for job {job_id}: {e}")
 
     # Update in-memory store for frontend
     from backend.services.job_service import load_store, save_store
