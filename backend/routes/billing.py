@@ -233,6 +233,12 @@ def get_action_costs():
                 {"action_key": "video_image_animate_8s_720p", "credits": 170},
                 {"action_key": "video_image_animate_8s_1080p", "credits": 200},
                 {"action_key": "video_image_animate_8s_4k", "credits": 250},
+                # Veo Image Transition (same pricing as image animate)
+                {"action_key": "video_image_transition_4s_720p", "credits": 110},
+                {"action_key": "video_image_transition_6s_720p", "credits": 140},
+                {"action_key": "video_image_transition_8s_720p", "credits": 170},
+                {"action_key": "video_image_transition_8s_1080p", "credits": 200},
+                {"action_key": "video_image_transition_8s_4k", "credits": 250},
             ],
         })
 
