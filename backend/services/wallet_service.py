@@ -95,6 +95,11 @@ VIDEO_ACTION_CODES = {
     "seedance_preview_image_animate_5s",    # 120 credits
     "seedance_preview_image_animate_10s",   # 240 credits
     "seedance_preview_image_animate_15s",   # 360 credits
+    # fal Seedance 1.5 Pro (14 cps)
+    "fal_seedance_text_generate_5s",        # 70 credits
+    "fal_seedance_text_generate_10s",       # 140 credits
+    "fal_seedance_image_animate_5s",        # 70 credits
+    "fal_seedance_image_animate_10s",       # 140 credits
 }
 
 # Action codes that use GENERAL credits (3D + images)
@@ -176,8 +181,10 @@ def get_credit_type_for_action(action_code: str) -> str:
         return CreditType.GENERAL
 
     # Dynamic recognition: Seedance variant codes follow a known pattern
-    from backend.services.pricing_service import _is_seedance_variant_code
+    from backend.services.pricing_service import _is_seedance_variant_code, _is_fal_seedance_variant_code
     if _is_seedance_variant_code(action_code):
+        return CreditType.VIDEO
+    if _is_fal_seedance_variant_code(action_code):
         return CreditType.VIDEO
 
     raise ValueError(
