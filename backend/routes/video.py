@@ -235,7 +235,7 @@ def _dispatch_video_job(
 
     # Credit calculation — server is sole authority on action code
     action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
-    expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
+    expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier, task=task)
 
     print(
         f"[VIDEO] resolved provider={provider} task={task} duration={duration_seconds}s "

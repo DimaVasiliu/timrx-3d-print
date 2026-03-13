@@ -216,6 +216,7 @@ def _is_fal_seedance_variant_code(action_key: str) -> bool:
     valid_prefixes = (
         "fal_seedance_text_generate_",
         "fal_seedance_image_animate_",
+        "fal_seedance_image_transition_",
     )
     for prefix in valid_prefixes:
         if action_key.startswith(prefix):
@@ -256,12 +257,12 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_text_generate_8s_720p", "cost_credits": 110, "provider": "vertex"},
     {"action_code": "video_text_generate_8s_1080p", "cost_credits": 130, "provider": "vertex"},
     {"action_code": "video_text_generate_8s_4k", "cost_credits": 160, "provider": "vertex"},
-    # Image-to-Video (animate) variants
-    {"action_code": "video_image_animate_4s_720p", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "video_image_animate_6s_720p", "cost_credits": 90, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_720p", "cost_credits": 110, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 130, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_4k", "cost_credits": 160, "provider": "vertex"},
+    # Image-to-Video (animate) variants — +50% premium over text-to-video
+    {"action_code": "video_image_animate_4s_720p", "cost_credits": 105, "provider": "vertex"},
+    {"action_code": "video_image_animate_6s_720p", "cost_credits": 135, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_720p", "cost_credits": 165, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 195, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_4k", "cost_credits": 240, "provider": "vertex"},
     # ── Seedance 2.0 — Text-to-Video (Fast: 14 cps, Preview: 24 cps) ──
     {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 70, "provider": "seedance"},
     {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 140, "provider": "seedance"},
@@ -282,6 +283,9 @@ DEFAULT_ACTION_COSTS = [
     # ── fal Seedance 1.5 Pro — Image-to-Video (14 cps) ──
     {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 70, "provider": "fal_seedance"},
     {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 140, "provider": "fal_seedance"},
+    # ── fal Seedance 1.5 Pro — Image Transition (14 cps) ──
+    {"action_code": "fal_seedance_image_transition_5s", "cost_credits": 70, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_transition_10s", "cost_credits": 140, "provider": "fal_seedance"},
     # Legacy fallback codes (backward compat — provider label kept generic)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "vertex"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "vertex"},
@@ -303,6 +307,12 @@ DEFAULT_ACTION_COSTS = [
 VIDEO_CREDIT_COSTS = {
     "720p": {4: 70, 6: 90, 8: 110},
     "1080p": {8: 130},
+}
+
+# Image-to-Video costs (+50% premium over text-to-video)
+VIDEO_IMAGE_CREDIT_COSTS = {
+    "720p": {4: 105, 6: 135, 8: 165},
+    "1080p": {8: 195},
 }
 
 # Seedance credit costs: tier * duration
@@ -336,7 +346,7 @@ def get_video_action_code(
     Build the video action code for a specific variant.
 
     Args:
-        task: "text2video" or "image2video"
+        task: "text2video", "image2video", or "image_transition"
         duration_seconds: Duration in seconds
         resolution: "720p" or "1080p"
         provider: "vertex" or "seedance"
@@ -345,7 +355,12 @@ def get_video_action_code(
     Returns:
         Action code like "video_text_generate_4s_720p" or "seedance_fast_text_generate_5s"
     """
-    task_part = "text_generate" if task.lower() in ("text2video", "text_to_video", "text") else "image_animate"
+    if task.lower() in ("text2video", "text_to_video", "text"):
+        task_part = "text_generate"
+    elif task.lower() in ("image_transition",):
+        task_part = "image_transition"
+    else:
+        task_part = "image_animate"
 
     if provider == "fal_seedance":
         return f"fal_seedance_{task_part}_{duration_seconds}s"
@@ -364,6 +379,7 @@ def get_video_credit_cost(
     resolution: str,
     provider: str = "vertex",
     seedance_tier: str = "fast",
+    task: str = "text2video",
 ) -> int:
     """
     Get the credit cost for a video variant.
@@ -373,6 +389,7 @@ def get_video_credit_cost(
         resolution: "720p" or "1080p"
         provider: "vertex" or "seedance"
         seedance_tier: "fast" or "preview" (only for seedance)
+        task: "text2video", "image2video", or "image_transition"
 
     Returns:
         Credit cost
@@ -387,8 +404,10 @@ def get_video_credit_cost(
 
     resolution = resolution.lower()
     duration = int(duration_seconds)
-    resolution_costs = VIDEO_CREDIT_COSTS.get(resolution, {})
-    return resolution_costs.get(duration, 70)
+    is_image_task = task.lower() not in ("text2video", "text_to_video", "text")
+    cost_table = VIDEO_IMAGE_CREDIT_COSTS if is_image_task else VIDEO_CREDIT_COSTS
+    resolution_costs = cost_table.get(resolution, {})
+    return resolution_costs.get(duration, 105 if is_image_task else 70)
 
 
 DEFAULT_PLANS = [
