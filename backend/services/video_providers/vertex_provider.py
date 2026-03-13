@@ -13,8 +13,10 @@ Supported options:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional, Tuple
 
+from backend.config import VERTEX_SAFE_DEFAULTS
 from backend.services.vertex_video_service import (
     VertexAuthError,
     VertexConfigError,
@@ -30,16 +32,22 @@ from backend.services.vertex_video_service import (
 from backend.services.gemini_video_service import extract_video_thumbnail
 from backend.services.video_errors import is_quota_error as _is_quota_error
 
+logger = logging.getLogger(__name__)
+
 
 # ── Vertex constraints ──────────────────────────────────────────
 SUPPORTED_DURATIONS = frozenset({4, 6, 8})
 SUPPORTED_ASPECTS = frozenset({"16:9", "9:16"})
 SUPPORTED_RESOLUTIONS = frozenset({"720p", "1080p", "4k"})
 HIGH_RES_REQUIRES_8S = frozenset({"1080p", "4k"})
+# Resolutions considered higher-risk for timeouts
+HIGH_RISK_RESOLUTIONS = frozenset({"1080p", "4k"})
 
-DEFAULT_DURATION = 6
+DEFAULT_DURATION = 4          # shortest = lightest payload
 DEFAULT_ASPECT = "16:9"
 DEFAULT_RESOLUTION = "720p"
+SAFE_RESOLUTION = "720p"
+SAFE_SAMPLE_COUNT = 1
 
 # Duration mapping: snap UI values to nearest valid Vertex duration.
 _DURATION_SNAP = {
@@ -56,10 +64,13 @@ def normalize_vertex_params(
     Normalize and validate Vertex-specific parameters.
 
     Returns a clean dict with:
-      duration_seconds (int), aspect_ratio (str), resolution (str)
+      duration_seconds (int), aspect_ratio (str), resolution (str),
+      sampleCount (int), risk_profile (str)
 
     Falls back to safe defaults for invalid values.
     Enforces the 1080p/4k → duration=8 constraint.
+    When VERTEX_SAFE_DEFAULTS=true, forces resolution to 720p
+    unless user explicitly requested a higher (allowed) resolution.
     """
     # Duration
     try:
@@ -75,6 +86,13 @@ def normalize_vertex_params(
     if res not in SUPPORTED_RESOLUTIONS:
         res = DEFAULT_RESOLUTION
 
+    # Safe defaults: clamp to 720p unless user explicitly picked higher
+    safe_clamped = False
+    if VERTEX_SAFE_DEFAULTS and res in HIGH_RISK_RESOLUTIONS:
+        logger.info("[Vertex] VERTEX_SAFE_DEFAULTS active: clamping %s → 720p", res)
+        res = SAFE_RESOLUTION
+        safe_clamped = True
+
     # Enforce: high-res requires 8s
     if res in HIGH_RES_REQUIRES_8S and dur != 8:
         dur = 8
@@ -84,11 +102,38 @@ def normalize_vertex_params(
     if ar not in SUPPORTED_ASPECTS:
         ar = DEFAULT_ASPECT
 
+    # Classify risk profile for logging
+    if res in HIGH_RISK_RESOLUTIONS:
+        risk = "high"
+    elif dur >= 8:
+        risk = "medium"
+    else:
+        risk = "safe"
+
     return {
         "duration_seconds": dur,
         "aspect_ratio": ar,
         "resolution": res,
+        "sampleCount": SAFE_SAMPLE_COUNT,
+        "risk_profile": risk,
+        "_safe_clamped": safe_clamped,
     }
+
+
+def _log_vertex_request(job_id: str | None, mode: str, clean: Dict[str, Any]):
+    """Structured log for every Vertex dispatch — makes risk visible."""
+    logger.info(
+        "[Vertex] dispatch job_id=%s provider=vertex mode=%s duration=%ss "
+        "resolution=%s sampleCount=%s aspect=%s risk=%s safe_clamped=%s",
+        job_id or "unknown",
+        mode,
+        clean["duration_seconds"],
+        clean["resolution"],
+        clean["sampleCount"],
+        clean["aspect_ratio"],
+        clean["risk_profile"],
+        clean.get("_safe_clamped", False),
+    )
 
 
 class VertexVeoProvider:
@@ -112,6 +157,7 @@ class VertexVeoProvider:
             aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
             resolution=params.get("resolution", DEFAULT_RESOLUTION),
         )
+        _log_vertex_request(params.get("job_id"), "text-to-video", clean)
         try:
             return vertex_text_to_video(
                 prompt=prompt,
@@ -120,6 +166,7 @@ class VertexVeoProvider:
                 duration_seconds=clean["duration_seconds"],
                 negative_prompt=params.get("negative_prompt"),
                 seed=params.get("seed"),
+                sample_count=clean["sampleCount"],
             )
         except VertexQuotaError as e:
             from backend.services.video_router import QuotaExhaustedError
@@ -137,6 +184,7 @@ class VertexVeoProvider:
             aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
             resolution=params.get("resolution", DEFAULT_RESOLUTION),
         )
+        _log_vertex_request(params.get("job_id"), "image-to-video", clean)
         try:
             return vertex_image_to_video(
                 image_data=image_data,
@@ -146,6 +194,7 @@ class VertexVeoProvider:
                 duration_seconds=clean["duration_seconds"],
                 negative_prompt=params.get("negative_prompt"),
                 seed=params.get("seed"),
+                sample_count=clean["sampleCount"],
             )
         except VertexQuotaError as e:
             from backend.services.video_router import QuotaExhaustedError
@@ -163,6 +212,13 @@ class VertexVeoProvider:
             aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
             resolution=params.get("resolution", DEFAULT_RESOLUTION),
         )
+        # Image transitions are heavier — extra warning for high-res
+        if clean["resolution"] in HIGH_RISK_RESOLUTIONS:
+            logger.warning(
+                "[Vertex] HIGH-RISK: image-transition at %s — elevated timeout risk",
+                clean["resolution"],
+            )
+        _log_vertex_request(params.get("job_id"), "image-transition", clean)
         try:
             return vertex_image_transition(
                 start_image=start_image,
@@ -173,6 +229,7 @@ class VertexVeoProvider:
                 duration_seconds=clean["duration_seconds"],
                 negative_prompt=params.get("negative_prompt"),
                 seed=params.get("seed"),
+                sample_count=clean["sampleCount"],
             )
         except VertexQuotaError as e:
             from backend.services.video_router import QuotaExhaustedError
@@ -194,7 +251,6 @@ class VertexVeoProvider:
     def extract_thumbnail(self, video_bytes: bytes, timestamp_sec: float = 1.0) -> Optional[bytes]:
         """Extract thumbnail from video (uses shared ffmpeg implementation)."""
         return extract_video_thumbnail(video_bytes, timestamp_sec)
-
 
 
 # _is_quota_error imported from backend.services.video_errors

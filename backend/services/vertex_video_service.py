@@ -357,6 +357,7 @@ def vertex_text_to_video(
     negative_prompt: Optional[str] = None,
     seed: Optional[int] = None,
     model: Optional[str] = None,
+    sample_count: int = 1,
 ) -> Dict[str, Any]:
     """
     Start a video generation from a text prompt using Vertex AI Veo.
@@ -369,6 +370,7 @@ def vertex_text_to_video(
         negative_prompt: Things to avoid (optional)
         seed: Random seed for reproducibility (optional)
         model: Override model (optional, uses VIDEO_QUALITY setting otherwise)
+        sample_count: Number of video samples to generate (default 1)
 
     Returns:
         Dict with operation_name for polling
@@ -398,6 +400,7 @@ def vertex_text_to_video(
             "aspectRatio": aspect_ratio,
             "resolution": resolution,
             "durationSeconds": duration_int,
+            "sampleCount": max(1, int(sample_count)),
         }
     }
 
@@ -407,7 +410,7 @@ def vertex_text_to_video(
         payload["parameters"]["seed"] = int(seed)
 
     print(f"[Vertex Veo] text-to-video: model={model_id}, duration={duration_int}s, "
-          f"aspect={aspect_ratio}, resolution={resolution}")
+          f"aspect={aspect_ratio}, resolution={resolution}, sampleCount={sample_count}")
 
     return _execute_video_start_request(url, payload, "text-to-video")
 
@@ -421,6 +424,7 @@ def vertex_image_to_video(
     negative_prompt: Optional[str] = None,
     seed: Optional[int] = None,
     model: Optional[str] = None,
+    sample_count: int = 1,
 ) -> Dict[str, Any]:
     """
     Start a video generation from an image using Vertex AI Veo.
@@ -434,6 +438,7 @@ def vertex_image_to_video(
         negative_prompt: Things to avoid (optional)
         seed: Random seed (optional)
         model: Override model (optional)
+        sample_count: Number of video samples to generate (default 1)
 
     Returns:
         Dict with operation_name for polling
@@ -474,6 +479,7 @@ def vertex_image_to_video(
             "aspectRatio": aspect_ratio,
             "resolution": resolution,
             "durationSeconds": duration_int,
+            "sampleCount": max(1, int(sample_count)),
         }
     }
 
@@ -483,7 +489,7 @@ def vertex_image_to_video(
         payload["parameters"]["seed"] = int(seed)
 
     print(f"[Vertex Veo] image-to-video: model={model_id}, duration={duration_int}s, "
-          f"aspect={aspect_ratio}, resolution={resolution}")
+          f"aspect={aspect_ratio}, resolution={resolution}, sampleCount={sample_count}")
 
     return _execute_video_start_request(url, payload, "image-to-video")
 
@@ -498,6 +504,7 @@ def vertex_image_transition(
     negative_prompt: Optional[str] = None,
     seed: Optional[int] = None,
     model: Optional[str] = None,
+    sample_count: int = 1,
 ) -> Dict[str, Any]:
     """
     Start a video generation transitioning between two images using Vertex AI Veo 3.1.
@@ -515,6 +522,7 @@ def vertex_image_transition(
         negative_prompt: Things to avoid (optional)
         seed: Random seed (optional)
         model: Override model (optional)
+        sample_count: Number of video samples to generate (default 1)
 
     Returns:
         Dict with operation_name for polling
@@ -559,6 +567,7 @@ def vertex_image_transition(
             "aspectRatio": aspect_ratio,
             "resolution": resolution,
             "durationSeconds": duration_int,
+            "sampleCount": max(1, int(sample_count)),
         }
     }
 
@@ -568,7 +577,7 @@ def vertex_image_transition(
         payload["parameters"]["seed"] = int(seed)
 
     print(f"[Vertex Veo] image-transition: model={model_id}, duration={duration_int}s, "
-          f"aspect={aspect_ratio}, resolution={resolution}")
+          f"aspect={aspect_ratio}, resolution={resolution}, sampleCount={sample_count}")
 
     return _execute_video_start_request(url, payload, "image-transition")
 

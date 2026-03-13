@@ -489,6 +489,12 @@ class Config:
     # Video quality: "fast" or "hq" (determines which Veo model to use)
     VIDEO_QUALITY: str = field(default_factory=lambda: _get_env("VIDEO_QUALITY", "fast").lower())
 
+    # Safe defaults: force 720p + sampleCount=1 to reduce Veo timeouts.
+    # Set VERTEX_SAFE_DEFAULTS=false to allow user-selected resolutions.
+    VERTEX_SAFE_DEFAULTS: bool = field(
+        default_factory=lambda: _get_env("VERTEX_SAFE_DEFAULTS", "true").lower() in ("true", "1", "yes")
+    )
+
     @property
     def USE_VERTEX_VIDEO(self) -> bool:
         """True if Vertex AI should be used for video generation."""
@@ -802,6 +808,7 @@ ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS
 ALLOWED_ORIGINS = config._ALLOWED_ORIGINS_RAW  # Raw string for existing code
 DISCORD_WEBHOOK_URL = config.DISCORD_WEBHOOK_URL
+VERTEX_SAFE_DEFAULTS = config.VERTEX_SAFE_DEFAULTS
 
 
 def log_config():
