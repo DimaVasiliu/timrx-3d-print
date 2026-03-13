@@ -8,17 +8,17 @@ Responsibilities:
 - Normalize action keys to canonical form
 
 CANONICAL ACTION KEYS (use these in new code):
-- image_generate       (5c)  - Standard AI image generation
-- image_generate_2k    (7c)  - 2K resolution AI image
-- image_generate_4k    (10c) - 4K resolution AI image
-- text_to_3d_generate  (18c) - Text to 3D preview generation
-- image_to_3d_generate (25c) - Image to 3D conversion
-- refine               (8c)  - Refine/upscale 3D model
-- remesh               (8c)  - Remesh 3D model (same cost as refine)
-- retexture            (12c) - Apply new texture to 3D model
-- video_generate       (70c) - Generic video generation
-- video_text_generate  (70c) - Text-to-video generation
-- video_image_animate  (70c) - Image-to-video animation
+- image_generate       (10c) - Standard AI image generation
+- image_generate_2k    (15c) - 2K resolution AI image
+- image_generate_4k    (20c) - 4K resolution AI image
+- text_to_3d_generate  (20c) - Text to 3D preview generation
+- image_to_3d_generate (30c) - Image to 3D conversion
+- refine               (10c) - Refine/upscale 3D model
+- remesh               (10c) - Remesh 3D model (same cost as refine)
+- retexture            (15c) - Apply new texture to 3D model
+- video_generate       (75c) - Generic video generation
+- video_text_generate  (75c) - Text-to-video generation
+- video_image_animate  (110c) - Image-to-video animation
 
 LEGACY ALIASES (backwards compatibility only):
 - preview, text-to-3d, text-to-3d-preview -> text_to_3d_generate
@@ -44,9 +44,9 @@ from backend.db import query_one, query_all, execute, Tables
 class CanonicalActions:
     """Canonical action key constants."""
     # Image generation (tiered by resolution)
-    IMAGE_GENERATE = "image_generate"           # Standard (5c)
-    IMAGE_GENERATE_2K = "image_generate_2k"     # 2K resolution (7c)
-    IMAGE_GENERATE_4K = "image_generate_4k"     # 4K resolution (10c)
+    IMAGE_GENERATE = "image_generate"           # Standard (10c)
+    IMAGE_GENERATE_2K = "image_generate_2k"     # 2K resolution (15c)
+    IMAGE_GENERATE_4K = "image_generate_4k"     # 4K resolution (20c)
     # 3D generation
     TEXT_TO_3D_GENERATE = "text_to_3d_generate"
     IMAGE_TO_3D_GENERATE = "image_to_3d_generate"
@@ -63,9 +63,9 @@ class CanonicalActions:
 # Canonical key -> DB action code mapping
 CANONICAL_TO_DB = {
     # Image generation (tiered)
-    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",           # Standard 5c
-    CanonicalActions.IMAGE_GENERATE_2K: "OPENAI_IMAGE_2K",     # 2K 7c
-    CanonicalActions.IMAGE_GENERATE_4K: "OPENAI_IMAGE_4K",     # 4K 10c
+    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",           # Standard 10c
+    CanonicalActions.IMAGE_GENERATE_2K: "OPENAI_IMAGE_2K",     # 2K 15c
+    CanonicalActions.IMAGE_GENERATE_4K: "OPENAI_IMAGE_4K",     # 4K 20c
     # 3D generation
     CanonicalActions.TEXT_TO_3D_GENERATE: "MESHY_TEXT_TO_3D",
     CanonicalActions.IMAGE_TO_3D_GENERATE: "MESHY_IMAGE_TO_3D",
@@ -244,57 +244,63 @@ DEFAULT_ACTION_COSTS = [
     # 3D Generation
     {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
     {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
-    {"action_code": "MESHY_REFINE", "cost_credits": 8, "provider": "meshy"},
-    {"action_code": "MESHY_RETEXTURE", "cost_credits": 12, "provider": "meshy"},
-    # Image Generation (tiered by resolution)
-    {"action_code": "OPENAI_IMAGE", "cost_credits": 5, "provider": "openai"},       # Standard
-    {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 7, "provider": "openai"},    # 2K
-    {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 10, "provider": "openai"},   # 4K
+    {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
+    {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
+    # Image Generation — OpenAI (tiered by resolution)
+    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},       # Standard
+    {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 15, "provider": "openai"},    # 2K
+    {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 20, "provider": "openai"},    # 4K
+    # Image Generation — Google Imagen (same tiers, same prices as OpenAI)
+    # These are separate DB entries for future provider-specific routing.
+    # Currently all images route via canonical image_generate → OPENAI_IMAGE.
+    {"action_code": "GEMINI_IMAGE", "cost_credits": 10, "provider": "google"},       # Standard
+    {"action_code": "GEMINI_IMAGE_2K", "cost_credits": 15, "provider": "google"},    # 2K
+    {"action_code": "GEMINI_IMAGE_4K", "cost_credits": 20, "provider": "google"},    # 4K
     # Video Generation - Vertex (Veo) variant costs by duration/resolution
     # Text-to-Video variants
-    {"action_code": "video_text_generate_4s_720p", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "video_text_generate_6s_720p", "cost_credits": 90, "provider": "vertex"},
-    {"action_code": "video_text_generate_8s_720p", "cost_credits": 110, "provider": "vertex"},
-    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 130, "provider": "vertex"},
-    {"action_code": "video_text_generate_8s_4k", "cost_credits": 160, "provider": "vertex"},
-    # Image-to-Video (animate) variants — +50% premium over text-to-video
-    {"action_code": "video_image_animate_4s_720p", "cost_credits": 105, "provider": "vertex"},
-    {"action_code": "video_image_animate_6s_720p", "cost_credits": 135, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_720p", "cost_credits": 165, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 195, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_4k", "cost_credits": 240, "provider": "vertex"},
-    # ── Seedance 2.0 — Text-to-Video (Fast: 14 cps, Preview: 24 cps) ──
-    {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 70, "provider": "seedance"},
-    {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 140, "provider": "seedance"},
-    {"action_code": "seedance_fast_text_generate_15s", "cost_credits": 210, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_5s", "cost_credits": 120, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_10s", "cost_credits": 240, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_15s", "cost_credits": 360, "provider": "seedance"},
-    # ── Seedance 2.0 — Image-to-Video (same CPS tiers) ──
-    {"action_code": "seedance_fast_image_animate_5s", "cost_credits": 70, "provider": "seedance"},
-    {"action_code": "seedance_fast_image_animate_10s", "cost_credits": 140, "provider": "seedance"},
-    {"action_code": "seedance_fast_image_animate_15s", "cost_credits": 210, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 120, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 240, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 360, "provider": "seedance"},
-    # ── fal Seedance 1.5 Pro — Text-to-Video (14 cps) ──
-    {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 70, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 140, "provider": "fal_seedance"},
-    # ── fal Seedance 1.5 Pro — Image-to-Video (14 cps) ──
-    {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 70, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 140, "provider": "fal_seedance"},
-    # ── fal Seedance 1.5 Pro — Image Transition (14 cps) ──
-    {"action_code": "fal_seedance_image_transition_5s", "cost_credits": 70, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_image_transition_10s", "cost_credits": 140, "provider": "fal_seedance"},
+    {"action_code": "video_text_generate_4s_720p", "cost_credits": 75, "provider": "vertex"},
+    {"action_code": "video_text_generate_6s_720p", "cost_credits": 100, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_720p", "cost_credits": 125, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 150, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_4k", "cost_credits": 200, "provider": "vertex"},
+    # Image-to-Video (animate) variants — premium over text-to-video
+    {"action_code": "video_image_animate_4s_720p", "cost_credits": 110, "provider": "vertex"},
+    {"action_code": "video_image_animate_6s_720p", "cost_credits": 140, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_720p", "cost_credits": 170, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 200, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_4k", "cost_credits": 250, "provider": "vertex"},
+    # ── Seedance 2.0 — Text-to-Video (Fast / Preview) ──
+    {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 80, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 150, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_15s", "cost_credits": 225, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_5s", "cost_credits": 125, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_10s", "cost_credits": 250, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_15s", "cost_credits": 375, "provider": "seedance"},
+    # ── Seedance 2.0 — Image-to-Video (same prices as text-to-video per tier) ──
+    {"action_code": "seedance_fast_image_animate_5s", "cost_credits": 80, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_10s", "cost_credits": 150, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_15s", "cost_credits": 225, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 125, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 250, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 375, "provider": "seedance"},
+    # ── fal Seedance 1.5 Pro — Text-to-Video ──
+    {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 80, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 150, "provider": "fal_seedance"},
+    # ── fal Seedance 1.5 Pro — Image-to-Video ──
+    {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 80, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 150, "provider": "fal_seedance"},
+    # ── fal Seedance 1.5 Pro — Image Transition ──
+    {"action_code": "fal_seedance_image_transition_5s", "cost_credits": 80, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_transition_10s", "cost_credits": 150, "provider": "fal_seedance"},
     # Legacy fallback codes (backward compat — provider label kept generic)
-    {"action_code": "VIDEO_GENERATE", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "vertex"},
+    {"action_code": "VIDEO_GENERATE", "cost_credits": 75, "provider": "vertex"},
+    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 75, "provider": "vertex"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 110, "provider": "vertex"},
+    {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "vertex"},  # Legacy — retained for DB compat only
     # Lowercase legacy codes
-    {"action_code": "video_generate", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "video_text_generate", "cost_credits": 70, "provider": "vertex"},
-    {"action_code": "video_image_animate", "cost_credits": 70, "provider": "vertex"},
+    {"action_code": "video_generate", "cost_credits": 75, "provider": "vertex"},
+    {"action_code": "video_text_generate", "cost_credits": 75, "provider": "vertex"},
+    {"action_code": "video_image_animate", "cost_credits": 110, "provider": "vertex"},
 ]
 
 
@@ -305,27 +311,32 @@ DEFAULT_ACTION_COSTS = [
 # Video credit costs by resolution and duration (must match frontend)
 # Note: 4K removed from UI - not available to users (requires GCP allowlisting)
 VIDEO_CREDIT_COSTS = {
-    "720p": {4: 70, 6: 90, 8: 110},
-    "1080p": {8: 130},
+    "720p": {4: 75, 6: 100, 8: 125},
+    "1080p": {8: 150},
 }
 
-# Image-to-Video costs (+50% premium over text-to-video)
+# Image-to-Video costs (premium over text-to-video)
 VIDEO_IMAGE_CREDIT_COSTS = {
-    "720p": {4: 105, 6: 135, 8: 165},
-    "1080p": {8: 195},
+    "720p": {4: 110, 6: 140, 8: 170},
+    "1080p": {8: 200},
 }
 
-# Seedance credit costs: tier * duration
-# seedance-2-fast-preview: 14 credits/sec
-# seedance-2-preview:      24 credits/sec
+# Seedance 2.0 credit costs by tier and duration (explicit lookup, DB is authoritative)
+SEEDANCE_CREDIT_COSTS = {
+    "fast": {5: 80, 10: 150, 15: 225},
+    "preview": {5: 125, 10: 250, 15: 375},
+}
+# Approximate CPS for fallback only (DB values are authoritative)
 SEEDANCE_CREDITS_PER_SEC = {
-    "fast": 14,
-    "preview": 24,
+    "fast": 16,
+    "preview": 25,
 }
 SEEDANCE_VALID_DURATIONS = [5, 10, 15]
 
-# fal Seedance 1.5 Pro credit costs: flat 14 credits/sec (single tier)
-FAL_SEEDANCE_CREDITS_PER_SEC = 14
+# fal Seedance 1.5 Pro credit costs by duration (explicit lookup, DB is authoritative)
+FAL_SEEDANCE_CREDIT_COSTS = {5: 80, 10: 150}
+# Approximate CPS for fallback only (DB values are authoritative)
+FAL_SEEDANCE_CREDITS_PER_SEC = 16
 FAL_SEEDANCE_VALID_DURATIONS = [5, 10]
 
 # Valid durations per resolution (Vertex/Veo constraints)
@@ -395,19 +406,28 @@ def get_video_credit_cost(
         Credit cost
     """
     if provider == "fal_seedance":
-        return FAL_SEEDANCE_CREDITS_PER_SEC * int(duration_seconds)
+        duration = int(duration_seconds)
+        # Prefer explicit lookup; fall back to CPS approximation
+        if duration in FAL_SEEDANCE_CREDIT_COSTS:
+            return FAL_SEEDANCE_CREDIT_COSTS[duration]
+        return FAL_SEEDANCE_CREDITS_PER_SEC * duration
 
     if provider == "seedance":
         tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
-        cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 14)
-        return cps * int(duration_seconds)
+        duration = int(duration_seconds)
+        # Prefer explicit lookup; fall back to CPS approximation
+        tier_costs = SEEDANCE_CREDIT_COSTS.get(tier, {})
+        if duration in tier_costs:
+            return tier_costs[duration]
+        cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 16)
+        return cps * duration
 
     resolution = resolution.lower()
     duration = int(duration_seconds)
     is_image_task = task.lower() not in ("text2video", "text_to_video", "text")
     cost_table = VIDEO_IMAGE_CREDIT_COSTS if is_image_task else VIDEO_CREDIT_COSTS
     resolution_costs = cost_table.get(resolution, {})
-    return resolution_costs.get(duration, 105 if is_image_task else 70)
+    return resolution_costs.get(duration, 110 if is_image_task else 75)
 
 
 DEFAULT_PLANS = [
@@ -678,9 +698,9 @@ class PricingService:
             "refine": 10,
             "remesh": 10,
             "retexture": 15,
-            "video_generate": 70,
-            "video_text_generate": 70,
-            "video_image_animate": 70
+            "video_generate": 75,
+            "video_text_generate": 75,
+            "video_image_animate": 110
         }
         """
         # Use cache if available
@@ -775,7 +795,7 @@ class PricingService:
         if canonical_from_db and canonical_from_db in costs:
             return costs[canonical_from_db]
 
-        # fal Seedance variant fallback: compute from CPS if not yet in DB cache
+        # fal Seedance variant fallback: use explicit lookup, then CPS approximation
         # Pattern: fal_seedance_{text_generate|image_animate}_{duration}s
         if _is_fal_seedance_variant_code(canonical):
             suffix = canonical.rsplit("_", 1)[-1]  # e.g. "10s"
@@ -783,23 +803,29 @@ class PricingService:
                 duration = int(suffix.rstrip("s"))
             except ValueError:
                 duration = 5
-            computed = FAL_SEEDANCE_CREDITS_PER_SEC * duration
-            print(f"[PRICING] fal Seedance fallback cost: {canonical} -> {computed} credits ({FAL_SEEDANCE_CREDITS_PER_SEC} x {duration}s)")
+            if duration in FAL_SEEDANCE_CREDIT_COSTS:
+                computed = FAL_SEEDANCE_CREDIT_COSTS[duration]
+            else:
+                computed = FAL_SEEDANCE_CREDITS_PER_SEC * duration
+            print(f"[PRICING] fal Seedance fallback cost: {canonical} -> {computed} credits")
             return computed
 
-        # Seedance variant fallback: compute from CPS if not yet in DB cache
+        # Seedance variant fallback: use explicit lookup, then CPS approximation
         # Pattern: seedance_{fast|preview}_{text_generate|image_animate}_{duration}s
         if _is_seedance_variant_code(canonical):
             tier = "preview" if canonical.startswith("seedance_preview_") else "fast"
-            # Extract duration from trailing "Ns"
             suffix = canonical.rsplit("_", 1)[-1]  # e.g. "15s"
             try:
                 duration = int(suffix.rstrip("s"))
             except ValueError:
                 duration = 5
-            cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 14)
-            computed = cps * duration
-            print(f"[PRICING] Seedance fallback cost: {canonical} -> {computed} credits (CPS {cps} x {duration}s)")
+            tier_costs = SEEDANCE_CREDIT_COSTS.get(tier, {})
+            if duration in tier_costs:
+                computed = tier_costs[duration]
+            else:
+                cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 16)
+                computed = cps * duration
+            print(f"[PRICING] Seedance fallback cost: {canonical} -> {computed} credits")
             return computed
 
         print(f"[PRICING] Warning: Unknown action key '{action_key}', returning 0 cost")
@@ -848,7 +874,7 @@ class PricingService:
         Useful for logging both requested and canonical action codes.
 
         Example:
-            normalize_and_get_cost('openai-image') -> ('image_generate', 'OPENAI_IMAGE', 10)
+            normalize_and_get_cost('openai-image') -> ('image_generate', 'OPENAI_IMAGE', 10)  # cost from DB
         """
         canonical = normalize_action_key(action_key)
         db_code = CANONICAL_TO_DB.get(canonical, "UNKNOWN")

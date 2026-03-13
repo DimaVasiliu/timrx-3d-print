@@ -70,39 +70,39 @@ VIDEO_ACTION_CODES = {
     "video_image_animate",
     "gemini_video",
     # Text-to-Video variants (duration_resolution)
-    "video_text_generate_4s_720p",   # 70 credits
-    "video_text_generate_6s_720p",   # 90 credits
-    "video_text_generate_8s_720p",   # 110 credits
-    "video_text_generate_8s_1080p",  # 130 credits
-    "video_text_generate_8s_4k",     # 160 credits
+    "video_text_generate_4s_720p",   # 75 credits
+    "video_text_generate_6s_720p",   # 100 credits
+    "video_text_generate_8s_720p",   # 125 credits
+    "video_text_generate_8s_1080p",  # 150 credits
+    "video_text_generate_8s_4k",     # 200 credits
     # Image-to-Video variants (duration_resolution)
-    "video_image_animate_4s_720p",   # 70 credits
-    "video_image_animate_6s_720p",   # 90 credits
-    "video_image_animate_8s_720p",   # 110 credits
-    "video_image_animate_8s_1080p",  # 130 credits
-    "video_image_animate_8s_4k",     # 160 credits
-    # Seedance 2.0 — Text-to-Video (Fast: 14 cps, Preview: 24 cps)
-    "seedance_fast_text_generate_5s",       # 70 credits
-    "seedance_fast_text_generate_10s",      # 140 credits
-    "seedance_fast_text_generate_15s",      # 210 credits
-    "seedance_preview_text_generate_5s",    # 120 credits
-    "seedance_preview_text_generate_10s",   # 240 credits
-    "seedance_preview_text_generate_15s",   # 360 credits
-    # Seedance 2.0 — Image-to-Video (same CPS tiers)
-    "seedance_fast_image_animate_5s",       # 70 credits
-    "seedance_fast_image_animate_10s",      # 140 credits
-    "seedance_fast_image_animate_15s",      # 210 credits
-    "seedance_preview_image_animate_5s",    # 120 credits
-    "seedance_preview_image_animate_10s",   # 240 credits
-    "seedance_preview_image_animate_15s",   # 360 credits
-    # fal Seedance 1.5 Pro (14 cps)
-    "fal_seedance_text_generate_5s",        # 70 credits
-    "fal_seedance_text_generate_10s",       # 140 credits
-    "fal_seedance_image_animate_5s",        # 70 credits
-    "fal_seedance_image_animate_10s",       # 140 credits
-    # fal Seedance 1.5 Pro — Image Transition (14 cps)
-    "fal_seedance_image_transition_5s",     # 70 credits
-    "fal_seedance_image_transition_10s",    # 140 credits
+    "video_image_animate_4s_720p",   # 110 credits
+    "video_image_animate_6s_720p",   # 140 credits
+    "video_image_animate_8s_720p",   # 170 credits
+    "video_image_animate_8s_1080p",  # 200 credits
+    "video_image_animate_8s_4k",     # 250 credits
+    # Seedance 2.0 — Text-to-Video (Fast / Preview)
+    "seedance_fast_text_generate_5s",       # 80 credits
+    "seedance_fast_text_generate_10s",      # 150 credits
+    "seedance_fast_text_generate_15s",      # 225 credits
+    "seedance_preview_text_generate_5s",    # 125 credits
+    "seedance_preview_text_generate_10s",   # 250 credits
+    "seedance_preview_text_generate_15s",   # 375 credits
+    # Seedance 2.0 — Image-to-Video (same prices as text per tier)
+    "seedance_fast_image_animate_5s",       # 80 credits
+    "seedance_fast_image_animate_10s",      # 150 credits
+    "seedance_fast_image_animate_15s",      # 225 credits
+    "seedance_preview_image_animate_5s",    # 125 credits
+    "seedance_preview_image_animate_10s",   # 250 credits
+    "seedance_preview_image_animate_15s",   # 375 credits
+    # fal Seedance 1.5 Pro
+    "fal_seedance_text_generate_5s",        # 80 credits
+    "fal_seedance_text_generate_10s",       # 150 credits
+    "fal_seedance_image_animate_5s",        # 80 credits
+    "fal_seedance_image_animate_10s",       # 150 credits
+    # fal Seedance 1.5 Pro — Image Transition
+    "fal_seedance_image_transition_5s",     # 80 credits
+    "fal_seedance_image_transition_10s",    # 150 credits
 }
 
 # Action codes that use GENERAL credits (3D + images)
@@ -114,6 +114,10 @@ GENERAL_ACTION_CODES = {
     "OPENAI_IMAGE",
     "OPENAI_IMAGE_2K",
     "OPENAI_IMAGE_4K",
+    # Google Imagen (same prices as OpenAI tiers)
+    "GEMINI_IMAGE",
+    "GEMINI_IMAGE_2K",
+    "GEMINI_IMAGE_4K",
 }
 
 # All known action codes (union of video + general)

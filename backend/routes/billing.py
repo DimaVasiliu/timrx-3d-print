@@ -182,9 +182,8 @@ def get_action_costs():
             {"action_key": "image_to_3d_generate", "credits": 30},
             {"action_key": "refine", "credits": 10},
             {"action_key": "remesh", "credits": 10},
-            {"action_key": "texture", "credits": 10},
-            {"action_key": "rig", "credits": 10},
-            {"action_key": "image_studio_generate", "credits": 12}
+            {"action_key": "retexture", "credits": 15},
+            {"action_key": "image_generate", "credits": 10}
         ]
     }
     """
@@ -211,28 +210,29 @@ def get_action_costs():
                 # 3D generation
                 {"action_key": "text_to_3d_generate", "credits": 20},
                 {"action_key": "image_to_3d_generate", "credits": 30},
-                {"action_key": "refine", "credits": 8},
-                {"action_key": "remesh", "credits": 8},
-                {"action_key": "retexture", "credits": 12},
+                {"action_key": "refine", "credits": 10},
+                {"action_key": "remesh", "credits": 10},
+                {"action_key": "retexture", "credits": 15},
                 # Image generation
-                {"action_key": "image_generate", "credits": 5},
-                {"action_key": "image_generate_2k", "credits": 7},
-                {"action_key": "image_generate_4k", "credits": 10},
+                {"action_key": "image_generate", "credits": 10},
+                {"action_key": "image_generate_2k", "credits": 15},
+                {"action_key": "image_generate_4k", "credits": 20},
                 # Video generation - base costs (minimum)
-                {"action_key": "video_generate", "credits": 70},
-                {"action_key": "video_text_generate", "credits": 70},
-                {"action_key": "video_image_animate", "credits": 70},
-                # Video variant costs (duration x resolution)
-                {"action_key": "video_text_generate_4s_720p", "credits": 70},
-                {"action_key": "video_text_generate_6s_720p", "credits": 90},
-                {"action_key": "video_text_generate_8s_720p", "credits": 110},
-                {"action_key": "video_text_generate_8s_1080p", "credits": 130},
-                {"action_key": "video_text_generate_8s_4k", "credits": 160},
-                {"action_key": "video_image_animate_4s_720p", "credits": 70},
-                {"action_key": "video_image_animate_6s_720p", "credits": 90},
-                {"action_key": "video_image_animate_8s_720p", "credits": 110},
-                {"action_key": "video_image_animate_8s_1080p", "credits": 130},
-                {"action_key": "video_image_animate_8s_4k", "credits": 160},
+                {"action_key": "video_generate", "credits": 75},
+                {"action_key": "video_text_generate", "credits": 75},
+                {"action_key": "video_image_animate", "credits": 110},
+                # Veo Text-to-Video variant costs (duration x resolution)
+                {"action_key": "video_text_generate_4s_720p", "credits": 75},
+                {"action_key": "video_text_generate_6s_720p", "credits": 100},
+                {"action_key": "video_text_generate_8s_720p", "credits": 125},
+                {"action_key": "video_text_generate_8s_1080p", "credits": 150},
+                {"action_key": "video_text_generate_8s_4k", "credits": 200},
+                # Veo Image-to-Video variant costs (premium over text-to-video)
+                {"action_key": "video_image_animate_4s_720p", "credits": 110},
+                {"action_key": "video_image_animate_6s_720p", "credits": 140},
+                {"action_key": "video_image_animate_8s_720p", "credits": 170},
+                {"action_key": "video_image_animate_8s_1080p", "credits": 200},
+                {"action_key": "video_image_animate_8s_4k", "credits": 250},
             ],
         })
 

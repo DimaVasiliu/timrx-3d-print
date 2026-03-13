@@ -6,17 +6,17 @@ incrementally without changing the credit/identity pipeline semantics.
 
 CANONICAL ACTION KEYS:
 Use these canonical keys when calling start_paid_job():
-- image_generate       (5c)  - Standard AI image
-- image_generate_2k    (7c)  - 2K AI image
-- image_generate_4k    (10c) - 4K AI image
+- image_generate       (10c) - Standard AI image
+- image_generate_2k    (15c) - 2K AI image
+- image_generate_4k    (20c) - 4K AI image
 - text_to_3d_generate  (20c) - Text to 3D preview
 - image_to_3d_generate (30c) - Image to 3D
 - refine               (10c) - Refine 3D model
 - remesh               (10c) - Remesh 3D model
 - retexture            (15c) - Retexture 3D model
-- video_generate       (70c) - Video generation
-- video_text_generate  (70c) - Text to video
-- video_image_animate  (70c) - Image to video
+- video_generate       (75c) - Video generation
+- video_text_generate  (75c) - Text to video
+- video_image_animate  (110c) - Image to video
 
 Legacy aliases are supported for backwards compatibility but will be
 normalized to canonical keys internally.
