@@ -104,11 +104,14 @@ VIDEO_ACTION_CODES = {
     # fal Seedance 1.5 Pro
     "fal_seedance_text_generate_5s",        # 80 credits
     "fal_seedance_text_generate_10s",       # 150 credits
+    "fal_seedance_text_generate_12s",       # 180 credits
     "fal_seedance_image_animate_5s",        # 80 credits
     "fal_seedance_image_animate_10s",       # 150 credits
+    "fal_seedance_image_animate_12s",       # 180 credits
     # fal Seedance 1.5 Pro — Image Transition
     "fal_seedance_image_transition_5s",     # 80 credits
     "fal_seedance_image_transition_10s",    # 150 credits
+    "fal_seedance_image_transition_12s",    # 180 credits
 }
 
 # Action codes that use GENERAL credits (3D + images)

@@ -5,7 +5,7 @@ Wraps fal_seedance_service to provide a consistent interface
 for the VideoRouter.
 
 Supported options:
-- durations:     5, 10 seconds
+- durations:     5, 10, 12 seconds
 - aspect ratios: 16:9, 9:16, 1:1
 - resolution:    720p (launch scope)
 """
@@ -28,7 +28,7 @@ from backend.services.video_errors import is_quota_error as _is_quota_error
 
 
 # ── fal Seedance constraints ──────────────────────────────────
-SUPPORTED_DURATIONS = frozenset({5, 10})
+SUPPORTED_DURATIONS = frozenset({5, 10, 12})
 SUPPORTED_ASPECTS = frozenset({"16:9", "9:16", "1:1"})
 SUPPORTED_RESOLUTIONS = frozenset({"720p"})
 

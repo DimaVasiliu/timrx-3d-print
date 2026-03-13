@@ -95,7 +95,7 @@ def submit_fal_seedance_task(
 
     Args:
         prompt: Text prompt for video generation.
-        duration: Video duration in seconds (5 or 10).
+        duration: Video duration in seconds (5, 10, or 12).
         aspect_ratio: Output aspect ratio (16:9, 9:16, 1:1).
         image_url: Start/source image URL for image-to-video (must be publicly accessible).
         end_image_url: End image URL for image transition (must be publicly accessible).

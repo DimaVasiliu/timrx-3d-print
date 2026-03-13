@@ -239,6 +239,16 @@ def get_action_costs():
                 {"action_key": "video_image_transition_8s_720p", "credits": 170},
                 {"action_key": "video_image_transition_8s_1080p", "credits": 200},
                 {"action_key": "video_image_transition_8s_4k", "credits": 250},
+                # fal Seedance 1.5 Pro
+                {"action_key": "fal_seedance_text_generate_5s", "credits": 80},
+                {"action_key": "fal_seedance_text_generate_10s", "credits": 150},
+                {"action_key": "fal_seedance_text_generate_12s", "credits": 180},
+                {"action_key": "fal_seedance_image_animate_5s", "credits": 80},
+                {"action_key": "fal_seedance_image_animate_10s", "credits": 150},
+                {"action_key": "fal_seedance_image_animate_12s", "credits": 180},
+                {"action_key": "fal_seedance_image_transition_5s", "credits": 80},
+                {"action_key": "fal_seedance_image_transition_10s", "credits": 150},
+                {"action_key": "fal_seedance_image_transition_12s", "credits": 180},
             ],
         })
 

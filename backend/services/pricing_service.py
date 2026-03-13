@@ -221,7 +221,7 @@ def _is_fal_seedance_variant_code(action_key: str) -> bool:
     for prefix in valid_prefixes:
         if action_key.startswith(prefix):
             suffix = action_key[len(prefix):]
-            return suffix in {"5s", "10s"}
+            return suffix in {"5s", "10s", "12s"}
 
     return False
 
@@ -292,12 +292,15 @@ DEFAULT_ACTION_COSTS = [
     # ── fal Seedance 1.5 Pro — Text-to-Video ──
     {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 80, "provider": "fal_seedance"},
     {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 150, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_text_generate_12s", "cost_credits": 180, "provider": "fal_seedance"},
     # ── fal Seedance 1.5 Pro — Image-to-Video ──
     {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 80, "provider": "fal_seedance"},
     {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 150, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_animate_12s", "cost_credits": 180, "provider": "fal_seedance"},
     # ── fal Seedance 1.5 Pro — Image Transition ──
     {"action_code": "fal_seedance_image_transition_5s", "cost_credits": 80, "provider": "fal_seedance"},
     {"action_code": "fal_seedance_image_transition_10s", "cost_credits": 150, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_transition_12s", "cost_credits": 180, "provider": "fal_seedance"},
     # Legacy fallback codes (backward compat — provider label kept generic)
     {"action_code": "VIDEO_GENERATE", "cost_credits": 75, "provider": "vertex"},
     {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 75, "provider": "vertex"},
@@ -342,10 +345,10 @@ SEEDANCE_CREDITS_PER_SEC = {
 SEEDANCE_VALID_DURATIONS = [5, 10, 15]
 
 # fal Seedance 1.5 Pro credit costs by duration (explicit lookup, DB is authoritative)
-FAL_SEEDANCE_CREDIT_COSTS = {5: 80, 10: 150}
+FAL_SEEDANCE_CREDIT_COSTS = {5: 80, 10: 150, 12: 180}
 # Approximate CPS for fallback only (DB values are authoritative)
 FAL_SEEDANCE_CREDITS_PER_SEC = 16
-FAL_SEEDANCE_VALID_DURATIONS = [5, 10]
+FAL_SEEDANCE_VALID_DURATIONS = [5, 10, 12]
 
 # Valid durations per resolution (Vertex/Veo constraints)
 VIDEO_VALID_DURATIONS = {
