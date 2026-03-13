@@ -51,6 +51,7 @@ from backend.services.video_providers.vertex_provider import (
 from backend.services.video_prompts import (
     normalize_text_prompt,
     normalize_motion_prompt,
+    sanitize_prompt,
     get_style_presets,
     get_motion_presets,
 )
@@ -501,6 +502,9 @@ def video_text():
         resolution = vc["resolution"]
         prompt = normalize_text_prompt(raw_prompt, style_preset, duration_seconds)
 
+    # Safety filter: soften content that triggers provider filters
+    prompt = sanitize_prompt(prompt, provider=provider)
+
     return _dispatch_video_job(
         identity_id=identity_id or "",
         task="text2video",
@@ -633,6 +637,9 @@ def video_animate():
             prompt = raw_user_prompt or "Smooth cinematic transition between these two images"
         else:
             prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
+
+    # Safety filter: soften content that triggers provider filters
+    prompt = sanitize_prompt(prompt, provider=provider)
 
     return _dispatch_video_job(
         identity_id=identity_id or "",

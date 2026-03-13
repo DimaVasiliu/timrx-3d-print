@@ -279,3 +279,84 @@ def get_camera_motion_prompt(motion_key: Optional[str]) -> str:
         return ""
     key = motion_key.lower().replace(" ", "_").replace("-", "_")
     return CAMERA_MOTION_PROMPTS.get(key, "")
+
+
+# ── Prompt Safety Filter ────────────────────────────────────────
+# Softens or removes content that triggers provider safety filters,
+# especially Vertex Veo which has strict content policies.
+
+import re
+
+# Patterns → safe replacements (case-insensitive substring match)
+_SAFETY_REPLACEMENTS = [
+    # Violence / destruction
+    (r"\bmassive explosion\b", "a burst of glowing energy"),
+    (r"\bhuge explosion\b", "a powerful shockwave of light"),
+    (r"\bnuclear explosion\b", "an immense wave of radiant energy"),
+    (r"\bexplosion\b", "a burst of energy"),
+    (r"\bexplode[sd]?\b", "erupts with energy"),
+    (r"\bexploding\b", "erupting with energy"),
+    (r"\bblood\s*splatter\b", "scattered crimson particles"),
+    (r"\bblood\s*spray\b", "mist of red particles"),
+    (r"\bblood\b", "crimson light"),
+    (r"\bgore\b", "dramatic impact"),
+    (r"\bdecapitat\w+\b", "dramatic defeat"),
+    (r"\bdismember\w+\b", "dramatic impact"),
+    (r"\bmurder\w*\b", "dramatic confrontation"),
+    (r"\bkill(?:s|ed|ing)?\b", "defeats"),
+    (r"\bgunshot\b", "energy blast"),
+    (r"\bgunfire\b", "energy bursts"),
+    (r"\bgun\b", "weapon"),
+    (r"\bshooting\b", "blasting energy"),
+    # Real people
+    (r"\bTrump\b", "a powerful leader figure"),
+    (r"\bBiden\b", "a distinguished leader figure"),
+    (r"\bObama\b", "a charismatic leader figure"),
+    (r"\bElon\s*Musk\b", "a tech visionary figure"),
+    (r"\bTaylor\s*Swift\b", "a pop music performer"),
+    # Explicit content
+    (r"\bnude\b", "elegantly draped"),
+    (r"\bnaked\b", "minimally clothed"),
+    (r"\bsex(?:ual)?\b", "intimate"),
+    (r"\bpornograph\w+\b", "artistic"),
+    # Audio/text instructions (Veo ignores these, causes confusion)
+    (r"\bwith\s+dialogue\b", "with expressive gestures"),
+    (r"\bspeaking\b", "gesturing expressively"),
+    (r"\btalking\b", "gesturing"),
+    (r"\bnarrat(?:ion|or|ed|ing)\b", "visual storytelling"),
+    (r"\bsubtitles?\b", ""),
+    (r"\btext\s+overlay\b", ""),
+    (r"\bvoice\s*over\b", ""),
+]
+
+# Compiled patterns for performance
+_COMPILED_SAFETY = [(re.compile(pat, re.IGNORECASE), repl) for pat, repl in _SAFETY_REPLACEMENTS]
+
+
+def sanitize_prompt(prompt: str, provider: str = "vertex") -> str:
+    """
+    Apply safety filter to a video prompt before sending to provider.
+
+    Softens violent/explicit/problematic content and removes
+    unsupported instructions (dialogue, text overlays, voiceover).
+
+    Args:
+        prompt: Raw prompt text
+        provider: Provider name (safety rules are strictest for Vertex)
+
+    Returns:
+        Sanitized prompt text
+    """
+    if not prompt:
+        return prompt
+
+    result = prompt
+    for pattern, replacement in _COMPILED_SAFETY:
+        result = pattern.sub(replacement, result)
+
+    # Clean up artifacts: double spaces, trailing punctuation issues
+    result = re.sub(r"  +", " ", result).strip()
+    result = re.sub(r"\s+\.", ".", result)
+    result = re.sub(r"\s+,", ",", result)
+
+    return result

@@ -52,6 +52,7 @@ def prompt_enhance():
 
     raw_prompt = (body.get("prompt") or "").strip()
     mode = (body.get("mode") or "").strip().lower()
+    provider = (body.get("provider") or "vertex").strip().lower()
 
     # Validate mode
     if mode not in VALID_MODES:
@@ -74,7 +75,7 @@ def prompt_enhance():
         }), 400
 
     try:
-        enhanced = enhance_prompt(raw_prompt, mode)
+        enhanced = enhance_prompt(raw_prompt, mode, provider=provider)
         return jsonify({
             "ok": True,
             "original_prompt": raw_prompt,
