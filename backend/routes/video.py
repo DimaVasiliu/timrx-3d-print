@@ -102,7 +102,7 @@ def generate_video():
         }), 400
 
     # Raw parameters from request
-    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or 6
+    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or (5 if provider in ("seedance", "fal_seedance") else 6)
     aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
     resolution = body.get("resolution") or "720p"
     motion = (body.get("motion") or "").strip()
@@ -442,7 +442,7 @@ def video_text():
         return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
 
     provider = normalize_provider_name(body.get("provider"))
-    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider == "seedance" else 6)
+    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
     resolution = body.get("resolution") or "720p"
     negative_prompt = (body.get("negative_prompt") or "").strip()
@@ -537,7 +537,7 @@ def video_animate():
 
     provider = normalize_provider_name(body.get("provider"))
     raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
-    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider == "seedance" else 6)
+    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
     resolution = body.get("resolution") or "720p"
     negative_prompt = (body.get("negative_prompt") or "").strip()

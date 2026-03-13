@@ -806,9 +806,14 @@ def _poll_provider_once(
 
     try:
         if provider_obj:
-            # fal_seedance needs model_id from meta for model-scoped status endpoints
-            if provider_name == "fal_seedance" and meta.get("fal_model_id"):
-                status_resp = provider_obj.check_status(upstream_id, model_id=meta["fal_model_id"])
+            # fal_seedance: pass stored URLs + model_id from meta for direct polling
+            if provider_name == "fal_seedance":
+                status_resp = provider_obj.check_status(
+                    upstream_id,
+                    model_id=meta.get("fal_model_id"),
+                    status_url=meta.get("fal_status_url"),
+                    response_url=meta.get("fal_response_url"),
+                )
             else:
                 status_resp = provider_obj.check_status(upstream_id)
         else:

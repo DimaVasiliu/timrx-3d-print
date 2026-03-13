@@ -609,6 +609,10 @@ def _mark_job_for_worker(job_id: str, upstream_id: str, provider_name: str, stor
             "provider": provider_name,
             "dispatched_via": "async_dispatch",
         }
+        # Persist fal metadata so reclaimed jobs can still poll correctly
+        for fal_key in ("fal_model_id", "fal_status_url", "fal_response_url", "fal_cancel_url"):
+            if store_meta.get(fal_key):
+                meta_patch[fal_key] = store_meta[fal_key]
         with get_conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -972,9 +976,15 @@ def dispatch_gemini_video_async(
             store_meta["operation_name"] = upstream_id  # backward compat
             store_meta["upstream_id"] = upstream_id
             store_meta["status"] = "processing"
-            # Preserve fal model_id for status polling (model-scoped endpoints)
+            # Preserve fal metadata for status polling
             if resp.get("fal_model_id"):
                 store_meta["fal_model_id"] = resp["fal_model_id"]
+            if resp.get("fal_status_url"):
+                store_meta["fal_status_url"] = resp["fal_status_url"]
+            if resp.get("fal_response_url"):
+                store_meta["fal_response_url"] = resp["fal_response_url"]
+            if resp.get("fal_cancel_url"):
+                store_meta["fal_cancel_url"] = resp["fal_cancel_url"]
             store[internal_job_id] = store_meta
             save_store(store)
 

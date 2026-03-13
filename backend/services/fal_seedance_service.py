@@ -163,17 +163,27 @@ def submit_fal_seedance_task(
 
     data = resp.json()
 
-    # fal queue returns {"request_id": "..."}
+    # fal queue returns {"request_id": "...", "status_url": "...", "response_url": "...", "cancel_url": "..."}
     request_id = data.get("request_id")
     if not request_id:
         raise RuntimeError(f"fal_seedance_no_request_id: {data}")
 
-    print(f"[FAL_SEEDANCE] Task submitted: request_id={request_id}")
+    status_url = data.get("status_url", "")
+    response_url = data.get("response_url", "")
+    cancel_url = data.get("cancel_url", "")
+
+    print(
+        f"[FAL_SEEDANCE] Task submitted: request_id={request_id} "
+        f"status_url={status_url[:80] or 'NONE'} response_url={response_url[:80] or 'NONE'}"
+    )
 
     return {
         "request_id": request_id,
         "status": "processing",
         "fal_model_id": model_id,
+        "fal_status_url": status_url,
+        "fal_response_url": response_url,
+        "fal_cancel_url": cancel_url,
     }
 
 
@@ -187,13 +197,20 @@ _FAL_STATUS_MAP = {
 }
 
 
-def check_fal_seedance_status(request_id: str, model_id: str | None = None) -> Dict[str, Any]:
+def check_fal_seedance_status(
+    request_id: str,
+    model_id: str | None = None,
+    status_url: str | None = None,
+    response_url: str | None = None,
+) -> Dict[str, Any]:
     """
     Check the status of a fal.ai Seedance task.
 
     Args:
         request_id: The fal request ID.
         model_id: The fal model ID used for submission. If None, defaults to t2v model.
+        status_url: Exact status URL returned by fal on submit (preferred over reconstruction).
+        response_url: Exact result URL returned by fal on submit (preferred over reconstruction).
 
     Returns a rich dict:
         status:          done | processing | pending | failed | error
@@ -205,20 +222,32 @@ def check_fal_seedance_status(request_id: str, model_id: str | None = None) -> D
     if not model_id:
         model_id = _get_model_id("text2video")
 
+    # Prefer exact URL from fal submit response; fall back to reconstruction
+    poll_url = status_url or f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}/status"
+
+    print(f"[FAL_SEEDANCE] polling url={poll_url}")
+
     try:
-        resp = requests.get(
-            f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}/status",
-            headers=headers,
-            timeout=FAL_TIMEOUT,
-        )
+        resp = requests.get(poll_url, headers=headers, timeout=FAL_TIMEOUT)
     except requests.RequestException as e:
-        return {"status": "error", "message": f"Network error: {e}"}
+        print(f"[FAL_SEEDANCE] POLL NETWORK ERROR url={poll_url} error={e}")
+        return {"status": "error", "provider_status": "network_error", "message": f"Network error polling fal: {e}"}
 
     if resp.status_code in (401, 403):
-        return {"status": "failed", "error": "auth", "message": "fal.ai auth failed"}
+        print(f"[FAL_SEEDANCE] POLL AUTH ERROR url={poll_url} status={resp.status_code} body={resp.text[:300]}")
+        return {"status": "failed", "provider_status": "auth_error", "error": "auth", "message": f"fal.ai auth failed: {resp.status_code}"}
 
     if resp.status_code >= 400:
-        return {"status": "error", "error": "network", "message": f"fal.ai error: {resp.status_code}"}
+        print(
+            f"[FAL_SEEDANCE] POLL HTTP ERROR url={poll_url} status={resp.status_code} "
+            f"body={resp.text[:500]}"
+        )
+        return {
+            "status": "error",
+            "provider_status": f"http_{resp.status_code}",
+            "error": "network",
+            "message": f"fal.ai poll error: {resp.status_code} {resp.text[:200]}",
+        }
 
     data = resp.json()
     fal_status = data.get("status", "UNKNOWN")
@@ -226,7 +255,7 @@ def check_fal_seedance_status(request_id: str, model_id: str | None = None) -> D
 
     print(
         f"[FAL_SEEDANCE] status check request={request_id[:12]}... "
-        f"raw_status={fal_status!r} -> {internal_status}"
+        f"raw_status={fal_status!r} -> {internal_status} keys={list(data.keys())[:8]}"
     )
 
     result: Dict[str, Any] = {
@@ -236,7 +265,8 @@ def check_fal_seedance_status(request_id: str, model_id: str | None = None) -> D
 
     if internal_status == "done":
         # Fetch the full result to get the video URL
-        video_result = _get_fal_result(request_id, headers, model_id)
+        result_url = response_url or f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}"
+        video_result = _get_fal_result_from_url(result_url, headers)
         if video_result.get("video_url"):
             result["video_url"] = video_result["video_url"]
         else:
@@ -246,25 +276,26 @@ def check_fal_seedance_status(request_id: str, model_id: str | None = None) -> D
 
     elif internal_status == "failed":
         result["error"] = "internal"
-        result["message"] = data.get("error", "fal Seedance generation failed")
+        err_data = data.get("error", "fal Seedance generation failed")
+        if isinstance(err_data, dict):
+            result["message"] = err_data.get("message", "") or str(err_data)
+        else:
+            result["message"] = str(err_data)
 
     return result
 
 
-def _get_fal_result(request_id: str, headers: Dict[str, str], model_id: str) -> Dict[str, Any]:
-    """Fetch the full result of a completed fal task."""
+def _get_fal_result_from_url(result_url: str, headers: Dict[str, str]) -> Dict[str, Any]:
+    """Fetch the full result of a completed fal task using the exact result URL."""
+    print(f"[FAL_SEEDANCE] fetching result url={result_url}")
     try:
-        resp = requests.get(
-            f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}",
-            headers=headers,
-            timeout=FAL_TIMEOUT,
-        )
+        resp = requests.get(result_url, headers=headers, timeout=FAL_TIMEOUT)
     except requests.RequestException as e:
-        print(f"[FAL_SEEDANCE] ERROR fetching result: {e}")
+        print(f"[FAL_SEEDANCE] ERROR fetching result url={result_url} error={e}")
         return {}
 
     if resp.status_code >= 400:
-        print(f"[FAL_SEEDANCE] ERROR fetching result: {resp.status_code}")
+        print(f"[FAL_SEEDANCE] ERROR fetching result url={result_url} status={resp.status_code} body={resp.text[:500]}")
         return {}
 
     data = resp.json()
@@ -282,6 +313,7 @@ def _get_fal_result(request_id: str, headers: Dict[str, str], model_id: str) -> 
     if not video_url:
         video_url = data.get("video_url") or data.get("output", {}).get("video_url")
 
+    print(f"[FAL_SEEDANCE] result parsed: video_url={'YES' if video_url else 'NONE'} keys={list(data.keys())[:10]}")
     return {"video_url": video_url}
 
 
