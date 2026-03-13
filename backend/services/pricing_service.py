@@ -166,12 +166,12 @@ def _is_video_variant_code(action_key: str) -> bool:
     """
     Check if an action key is a Veo video variant code.
 
-    Pattern: video_{text_generate|image_animate}_{duration}s_{resolution}
+    Pattern: video_{text_generate|image_animate|image_transition}_{duration}s_{resolution}
     """
     if not action_key.startswith("video_"):
         return False
 
-    valid_prefixes = ("video_text_generate_", "video_image_animate_")
+    valid_prefixes = ("video_text_generate_", "video_image_animate_", "video_image_transition_")
     for prefix in valid_prefixes:
         if action_key.startswith(prefix):
             suffix = action_key[len(prefix):]
