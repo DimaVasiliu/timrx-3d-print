@@ -23,6 +23,9 @@ Endpoints:
 - GET  /api/admin/alerts             - List admin alerts (filterable)
 - POST /api/admin/alerts/<id>/resolve - Mark an alert as resolved
 - GET  /api/admin/refunds/review     - Refund decision-support (failure candidates, suspicious purchases)
+- GET  /api/admin/provider-ledger    - List provider ledger entries (filterable)
+- POST /api/admin/provider-ledger    - Create a provider ledger entry
+- GET  /api/admin/provider-spend/monthly - Monthly provider spend report
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -2328,6 +2331,92 @@ def refunds_review():
 
     except Exception as e:
         print(f"[ADMIN] Refund review error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider ledger + monthly spend
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/provider-ledger", methods=["GET"])
+@require_admin
+def provider_ledger_list():
+    """List provider ledger entries with optional filters."""
+    try:
+        from backend.services.provider_ledger_service import list_ledger_entries
+
+        result = list_ledger_entries(
+            provider=request.args.get("provider"),
+            entry_type=request.args.get("entry_type"),
+            month=request.args.get("month"),
+            limit=min(int(request.args.get("limit", 50)), 200),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider ledger list error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-ledger", methods=["POST"])
+@require_admin
+def provider_ledger_create():
+    """Create a manual provider ledger entry."""
+    try:
+        from backend.services.provider_ledger_service import create_ledger_entry
+
+        data = request.get_json(silent=True) or {}
+
+        # Get admin identity for recorded_by
+        recorded_by = None
+        if hasattr(g, "admin_email"):
+            recorded_by = g.admin_email
+        elif hasattr(g, "identity"):
+            recorded_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        entry = create_ledger_entry(
+            provider=data.get("provider", ""),
+            entry_type=data.get("entry_type", ""),
+            amount_gbp=data.get("amount_gbp"),
+            currency=data.get("currency", "GBP"),
+            balance_snapshot_gbp=data.get("balance_snapshot_gbp"),
+            description=data.get("description"),
+            reference=data.get("reference"),
+            period_month=data.get("period_month"),
+            metadata=data.get("metadata"),
+            recorded_by=recorded_by or data.get("recorded_by"),
+        )
+        return jsonify({"ok": True, "entry": entry}), 201
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Provider ledger create error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-spend/monthly", methods=["GET"])
+@require_admin
+def provider_spend_monthly():
+    """Monthly provider spend report: estimated usage + manual ledger entries."""
+    try:
+        from backend.services.provider_ledger_service import get_monthly_spend_report
+
+        result = get_monthly_spend_report(
+            months=min(int(request.args.get("months", 3)), 24),
+            provider=request.args.get("provider"),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider spend monthly error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
