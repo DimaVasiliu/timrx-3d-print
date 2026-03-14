@@ -25,10 +25,13 @@ def _iso(val) -> Optional[str]:
 
 
 def _row_to_dict(r) -> Dict[str, Any]:
+    # Email may come from joined identities table or from metadata
+    email = r.get("_email") or (r.get("metadata") or {}).get("email")
     return {
         "id": str(r["id"]),
         "purchase_id": str(r["purchase_id"]) if r["purchase_id"] else None,
         "identity_id": str(r["identity_id"]) if r["identity_id"] else None,
+        "email": email,
         "payment_provider": r["payment_provider"],
         "payment_reference": r["payment_reference"],
         "dispute_status": r["dispute_status"],
@@ -51,34 +54,55 @@ def list_disputes(
     *,
     status: Optional[str] = None,
     purchase_id: Optional[str] = None,
+    email: Optional[str] = None,
+    identity_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
     """List disputes with optional filters."""
     conditions: list = []
     params: list = []
+    joins = ""
 
     if status:
-        conditions.append("dispute_status = %s")
+        conditions.append("d.dispute_status = %s")
         params.append(status)
     if purchase_id:
-        conditions.append("purchase_id = %s::uuid")
+        conditions.append("d.purchase_id = %s::uuid")
         params.append(purchase_id)
+    if identity_id:
+        conditions.append("d.identity_id = %s::uuid")
+        params.append(identity_id)
+    if date_from:
+        conditions.append("d.created_at >= %s::date")
+        params.append(date_from)
+    if date_to:
+        conditions.append("d.created_at < (%s::date + INTERVAL '1 day')")
+        params.append(date_to)
+    if email:
+        joins = f"LEFT JOIN {Tables.IDENTITIES} i ON i.id = d.identity_id"
+        conditions.append("i.email ILIKE %s")
+        params.append(f"%{email}%")
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     count_row = query_one(
-        f"SELECT COUNT(*) AS total FROM {_TABLE} {where}",
+        f"SELECT COUNT(*) AS total FROM {_TABLE} d {joins} {where}",
         tuple(params),
     )
     total = count_row["total"] if count_row else 0
 
     params.extend([limit, offset])
+    # Always join identities to include email in results
     rows = query_all(
         f"""
-        SELECT * FROM {_TABLE}
+        SELECT d.*, i.email AS _email
+        FROM {_TABLE} d
+        LEFT JOIN {Tables.IDENTITIES} i ON i.id = d.identity_id
         {where}
-        ORDER BY created_at DESC
+        ORDER BY d.created_at DESC
         LIMIT %s OFFSET %s
         """,
         tuple(params),

@@ -218,6 +218,10 @@ def disputes_list():
         result = list_disputes(
             status=request.args.get("status"),
             purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            identity_id=request.args.get("identity_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
             limit=min(int(request.args.get("limit", 50)), 100),
             offset=max(int(request.args.get("offset", 0)), 0),
         )
