@@ -957,11 +957,14 @@ def _build_timeline(purchase, wallet_effects, refunds, jobs, disputes):
 
     # Disputes
     for d in disputes:
+        detail_parts = [d.get("dispute_reason") or ""]
+        if d.get("evidence_summary"):
+            detail_parts.append("(has evidence)")
         events.append({
             "type": "dispute",
             "event": f"Dispute {d['dispute_status']}",
             "timestamp": d["created_at"],
-            "detail": d.get("dispute_reason") or "",
+            "detail": " ".join(p for p in detail_parts if p),
         })
 
     # Sort by timestamp descending (newest first)

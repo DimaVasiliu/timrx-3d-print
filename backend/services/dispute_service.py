@@ -27,6 +27,7 @@ def _iso(val) -> Optional[str]:
 def _row_to_dict(r) -> Dict[str, Any]:
     # Email may come from joined identities table or from metadata
     email = r.get("_email") or (r.get("metadata") or {}).get("email")
+    meta = r["metadata"] or {}
     return {
         "id": str(r["id"]),
         "purchase_id": str(r["purchase_id"]) if r["purchase_id"] else None,
@@ -40,7 +41,9 @@ def _row_to_dict(r) -> Dict[str, Any]:
         "currency": r["currency"],
         "admin_note": r["admin_note"],
         "evidence_summary": r["evidence_summary"],
-        "metadata": r["metadata"],
+        "evidence_links": meta.get("evidence_links", []),
+        "evidence_flags": meta.get("evidence_flags", {}),
+        "metadata": meta,
         "created_at": _iso(r["created_at"]),
         "updated_at": _iso(r["updated_at"]),
     }
@@ -213,13 +216,34 @@ def update_dispute_status(
     dispute_id: str,
     new_status: str,
     admin_note: Optional[str] = None,
+    evidence_summary: Optional[str] = None,
+    evidence_links: Optional[List[str]] = None,
+    evidence_flags: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
-    """Update a dispute's status."""
+    """Update a dispute's status and optionally its evidence fields."""
     if new_status not in _VALID_STATUSES:
         return {"ok": False, "error": f"Invalid status. Must be one of: {', '.join(sorted(_VALID_STATUSES))}"}
 
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # If evidence fields provided, merge into metadata
+            if evidence_links is not None or evidence_flags is not None:
+                existing = query_one(
+                    f"SELECT metadata FROM {_TABLE} WHERE id = %s::uuid",
+                    (dispute_id,),
+                )
+                if not existing:
+                    return {"ok": False, "error": "Dispute not found"}
+                meta = existing["metadata"] or {}
+                if evidence_links is not None:
+                    meta["evidence_links"] = evidence_links
+                if evidence_flags is not None:
+                    meta["evidence_flags"] = evidence_flags
+                cur.execute(
+                    f"UPDATE {_TABLE} SET metadata = %s::jsonb WHERE id = %s::uuid",
+                    (json.dumps(meta, default=str), dispute_id),
+                )
+
             cur.execute(
                 f"""
                 UPDATE {_TABLE}
@@ -227,11 +251,15 @@ def update_dispute_status(
                     admin_note = CASE WHEN %s::text IS NOT NULL
                         THEN COALESCE(admin_note || ' | ', '') || %s::text
                         ELSE admin_note END,
+                    evidence_summary = CASE WHEN %s::text IS NOT NULL
+                        THEN %s::text
+                        ELSE evidence_summary END,
                     updated_at = NOW()
                 WHERE id = %s::uuid
                 RETURNING id
                 """,
-                (new_status, admin_note, admin_note, dispute_id),
+                (new_status, admin_note, admin_note,
+                 evidence_summary, evidence_summary, dispute_id),
             )
             row = cur.fetchone()
         conn.commit()
@@ -239,7 +267,8 @@ def update_dispute_status(
     if not row:
         return {"ok": False, "error": "Dispute not found"}
 
-    print(f"[ADMIN_DISPUTE] updated dispute_id={dispute_id} status={new_status}")
+    print(f"[ADMIN_DISPUTE] updated dispute_id={dispute_id} status={new_status}"
+          f"{' +evidence' if evidence_summary or evidence_links or evidence_flags else ''}")
     return {"ok": True, "dispute_id": dispute_id, "dispute_status": new_status}
 
 

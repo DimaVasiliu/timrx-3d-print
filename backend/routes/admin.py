@@ -31,6 +31,7 @@ Endpoints:
 - POST /api/admin/provider-ledger    - Create a provider ledger entry
 - GET  /api/admin/provider-spend/monthly - Monthly provider spend report
 - GET  /api/admin/refunds/export.csv              - CSV export of refund history
+- GET  /api/admin/disputes/export.csv             - CSV export of disputes
 - GET  /api/admin/provider-ledger/export.csv      - CSV export of provider ledger
 - GET  /api/admin/provider-spend/monthly/export.csv - CSV export of monthly spend
 - POST /api/admin/refunds/<id>/send-review-email - Send refund-under-review email
@@ -274,10 +275,27 @@ def disputes_update(dispute_id):
         if not data.get("status"):
             return jsonify({"ok": False, "error": "status is required"}), 400
 
+        # Evidence links: accept list of strings, cap at 20 items
+        evidence_links = data.get("evidence_links")
+        if evidence_links is not None:
+            if not isinstance(evidence_links, list):
+                return jsonify({"ok": False, "error": "evidence_links must be a list"}), 400
+            evidence_links = [str(l)[:2000] for l in evidence_links[:20]]
+
+        # Evidence flags: accept dict of booleans
+        evidence_flags = data.get("evidence_flags")
+        if evidence_flags is not None:
+            if not isinstance(evidence_flags, dict):
+                return jsonify({"ok": False, "error": "evidence_flags must be an object"}), 400
+            evidence_flags = {str(k)[:100]: bool(v) for k, v in evidence_flags.items()}
+
         result = update_dispute_status(
             dispute_id=dispute_id,
             new_status=data["status"],
             admin_note=data.get("admin_note"),
+            evidence_summary=data.get("evidence_summary"),
+            evidence_links=evidence_links,
+            evidence_flags=evidence_flags,
         )
 
         status_code = 200 if result.get("ok") else 400
@@ -2963,6 +2981,74 @@ def refunds_export_csv():
 
     except Exception as e:
         print(f"[ADMIN] Refunds CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/disputes/export.csv", methods=["GET"])
+@require_admin
+def disputes_export_csv():
+    """Export disputes as CSV with same filters as list endpoint."""
+    try:
+        from backend.services.dispute_service import list_disputes
+
+        result = list_disputes(
+            status=request.args.get("status"),
+            purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            identity_id=request.args.get("identity_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+        )
+
+        _evd_flag_cols = [
+            "flag_purchase_paid", "flag_credits_granted", "flag_credits_used",
+            "flag_refund_offered", "flag_refund_executed", "flag_account_access_confirmed",
+        ]
+
+        fieldnames = [
+            "dispute_id", "created_at", "updated_at", "dispute_status",
+            "email", "identity_id", "purchase_id",
+            "payment_provider", "payment_reference",
+            "amount_gbp", "currency",
+            "dispute_reason", "admin_note", "evidence_summary",
+        ] + _evd_flag_cols + ["evidence_links"]
+
+        rows = []
+        for d in result.get("disputes", []):
+            flags = d.get("evidence_flags") or {}
+            links = d.get("evidence_links") or []
+            rows.append({
+                "dispute_id": d.get("id", ""),
+                "created_at": d.get("created_at", ""),
+                "updated_at": d.get("updated_at", ""),
+                "dispute_status": d.get("dispute_status", ""),
+                "email": d.get("email", ""),
+                "identity_id": d.get("identity_id", ""),
+                "purchase_id": d.get("purchase_id", ""),
+                "payment_provider": d.get("payment_provider", ""),
+                "payment_reference": d.get("payment_reference", ""),
+                "amount_gbp": d.get("amount_gbp", ""),
+                "currency": d.get("currency", ""),
+                "dispute_reason": d.get("dispute_reason", ""),
+                "admin_note": d.get("admin_note", ""),
+                "evidence_summary": d.get("evidence_summary", ""),
+                "flag_purchase_paid": flags.get("purchase_paid", ""),
+                "flag_credits_granted": flags.get("credits_granted", ""),
+                "flag_credits_used": flags.get("credits_used", ""),
+                "flag_refund_offered": flags.get("refund_offered", ""),
+                "flag_refund_executed": flags.get("refund_executed", ""),
+                "flag_account_access_confirmed": flags.get("account_access_confirmed", ""),
+                "evidence_links": " | ".join(links) if links else "",
+            })
+
+        return _csv_response(rows, fieldnames, "disputes.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Disputes CSV export error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
