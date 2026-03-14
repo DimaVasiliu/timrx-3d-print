@@ -19,6 +19,10 @@ Endpoints:
 - GET  /api/admin/health             - Admin health check
 - GET  /api/admin/debug/user         - Internal debug: user summary (masked email, wallet, history)
 - POST /api/admin/jobs/rescue        - Rescue late-completed Seedance jobs
+- GET  /api/admin/provider-health    - Aggregated provider health (success rates, spend, alerts)
+- GET  /api/admin/alerts             - List admin alerts (filterable)
+- POST /api/admin/alerts/<id>/resolve - Mark an alert as resolved
+- GET  /api/admin/refunds/review     - Refund decision-support (failure candidates, suspicious purchases)
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -2240,6 +2244,90 @@ def rescue_jobs():
 
     except Exception as e:
         print(f"[ADMIN] Job rescue error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider health, alerts, refund review
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/provider-health", methods=["GET"])
+@require_admin
+def provider_health():
+    """Aggregated provider health: success rates, spend, active alerts."""
+    try:
+        from backend.services.admin_ops_service import get_provider_health
+
+        result = get_provider_health()
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider health error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/alerts", methods=["GET"])
+@require_admin
+def alerts_list():
+    """List admin alerts with optional filters."""
+    try:
+        from backend.services.admin_ops_service import list_alerts
+
+        result = list_alerts(
+            active_only=request.args.get("active_only", "true").lower() == "true",
+            provider=request.args.get("provider"),
+            alert_type=request.args.get("alert_type"),
+            severity=request.args.get("severity"),
+            limit=min(int(request.args.get("limit", 50)), 200),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Alerts list error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/alerts/<alert_id>/resolve", methods=["POST"])
+@require_admin
+def alert_resolve(alert_id):
+    """Mark an alert as resolved (is_active = false)."""
+    try:
+        from backend.services.admin_ops_service import resolve_alert
+
+        resolved = resolve_alert(alert_id)
+        if resolved:
+            return jsonify({"ok": True, "resolved": True, "alert_id": alert_id})
+        else:
+            return jsonify({"ok": False, "error": "Alert not found or already resolved"}), 404
+
+    except Exception as e:
+        print(f"[ADMIN] Alert resolve error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds/review", methods=["GET"])
+@require_admin
+def refunds_review():
+    """Refund decision-support: failure candidates, suspicious purchases, recent refunds."""
+    try:
+        from backend.services.admin_ops_service import get_refund_review
+
+        days = min(int(request.args.get("days", 30)), 90)
+        limit = min(int(request.args.get("limit", 20)), 100)
+        result = get_refund_review(days=days, limit=limit)
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Refund review error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
