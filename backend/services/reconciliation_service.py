@@ -156,8 +156,8 @@ class ReconciliationService:
         # Find purchases with status='paid' or 'complete' missing ledger entry
         missing = query_all(
             f"""
-            SELECT p.id, p.identity_id, p.credits_granted, p.amount, p.currency,
-                   p.plan_code, p.plan_name, p.status, p.purchased_at
+            SELECT p.id, p.identity_id, p.credits_granted, p.amount_gbp, p.currency,
+                   p.status, p.created_at
             FROM {Tables.PURCHASES} p
             WHERE p.status IN ('paid', 'complete', 'completed')
               AND p.credits_granted > 0
@@ -167,7 +167,7 @@ class ReconciliationService:
                     AND le.ref_id = p.id::text
                     AND le.entry_type = %s
               )
-            ORDER BY p.purchased_at ASC
+            ORDER BY p.created_at ASC
             LIMIT %s
             """,
             (LedgerEntryType.PURCHASE_CREDIT, ReconciliationService.MAX_FIXES_PER_RUN),
@@ -539,9 +539,83 @@ class ReconciliationService:
             (ReconciliationService.MAX_FIXES_PER_RUN // 3,),
         )
 
+        # ── Direct orphan detection (not dependent on jobs table) ──
+        # Catches assets where: no job exists, job was deleted, job has
+        # non-success status, or upstream_job_id is NULL.
+        # Only picks up assets with a usable URL (ready to display).
+        direct_orphan_models = query_all(
+            f"""
+            SELECT
+                m.id as model_id,
+                m.identity_id,
+                m.title as model_title,
+                m.prompt,
+                m.glb_url,
+                m.thumbnail_url,
+                m.status as model_status,
+                m.upstream_job_id,
+                m.created_at
+            FROM {Tables.MODELS} m
+            WHERE m.identity_id IS NOT NULL
+              AND m.glb_url IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.HISTORY_ITEMS} h
+                  WHERE h.model_id = m.id
+              )
+            LIMIT %s
+            """,
+            (ReconciliationService.MAX_FIXES_PER_RUN // 3,),
+        )
+
+        direct_orphan_images = query_all(
+            f"""
+            SELECT
+                i.id as image_id,
+                i.identity_id,
+                i.title as image_title,
+                i.prompt,
+                i.image_url,
+                i.thumbnail_url,
+                i.upstream_id,
+                i.created_at
+            FROM {Tables.IMAGES} i
+            WHERE i.identity_id IS NOT NULL
+              AND i.image_url IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.HISTORY_ITEMS} h
+                  WHERE h.image_id = i.id
+              )
+            LIMIT %s
+            """,
+            (ReconciliationService.MAX_FIXES_PER_RUN // 3,),
+        )
+
+        direct_orphan_videos = query_all(
+            f"""
+            SELECT
+                v.id as video_id,
+                v.identity_id,
+                v.title as video_title,
+                v.prompt,
+                v.video_url,
+                v.thumbnail_url,
+                v.upstream_id,
+                v.created_at
+            FROM {Tables.VIDEOS} v
+            WHERE v.identity_id IS NOT NULL
+              AND v.video_url IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.HISTORY_ITEMS} h
+                  WHERE h.video_id = v.id
+              )
+            LIMIT %s
+            """,
+            (ReconciliationService.MAX_FIXES_PER_RUN // 3,),
+        )
+
         fixes = []
 
-        # Process models
+        # Process job-based orphans (existing detection via jobs table)
         for row in missing_model_history:
             fix = ReconciliationService._create_missing_history_item(
                 row, "model", dry_run
@@ -549,7 +623,6 @@ class ReconciliationService:
             if fix:
                 fixes.append(fix)
 
-        # Process images
         for row in missing_image_history:
             fix = ReconciliationService._create_missing_history_item(
                 row, "image", dry_run
@@ -557,9 +630,30 @@ class ReconciliationService:
             if fix:
                 fixes.append(fix)
 
-        # Process videos
         for row in missing_video_history:
             fix = ReconciliationService._create_missing_history_item(
+                row, "video", dry_run
+            )
+            if fix:
+                fixes.append(fix)
+
+        # Process direct orphans (assets with no history_item, regardless of job)
+        for row in direct_orphan_models:
+            fix = ReconciliationService._create_direct_orphan_history(
+                row, "model", dry_run
+            )
+            if fix:
+                fixes.append(fix)
+
+        for row in direct_orphan_images:
+            fix = ReconciliationService._create_direct_orphan_history(
+                row, "image", dry_run
+            )
+            if fix:
+                fixes.append(fix)
+
+        for row in direct_orphan_videos:
+            fix = ReconciliationService._create_direct_orphan_history(
                 row, "video", dry_run
             )
             if fix:
@@ -649,7 +743,7 @@ class ReconciliationService:
                     (id, identity_id, item_type, status, title, prompt,
                      thumbnail_url, glb_url, image_url, video_url,
                      model_id, image_id, video_id, payload, created_at, updated_at)
-                    VALUES (%s, %s, %s, 'succeeded', %s, %s,
+                    VALUES (%s, %s, %s, 'finished', %s, %s,
                             %s, %s, %s, %s,
                             %s, %s, %s, %s, NOW(), NOW())
                     ON CONFLICT DO NOTHING
@@ -691,6 +785,134 @@ class ReconciliationService:
             print(f"[RECONCILE] ERROR creating history for {item_type} job {job_id[:8]}: {e}")
             return {
                 "job_id": job_id,
+                "identity_id": identity_id,
+                "item_type": item_type,
+                "asset_id": asset_id,
+                "action": "error",
+                "error": str(e),
+            }
+
+    @staticmethod
+    def _create_direct_orphan_history(
+        row: Dict[str, Any],
+        item_type: str,
+        dry_run: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a missing history item for an orphan asset found without using the jobs table."""
+        from backend.utils import derive_display_title
+
+        identity_id = str(row["identity_id"])
+        prompt = row.get("prompt")
+        created_at = row.get("created_at")
+
+        if item_type == "model":
+            asset_id = str(row["model_id"])
+            title = row.get("model_title") or derive_display_title(prompt, None)
+            thumbnail_url = row.get("thumbnail_url")
+            glb_url = row.get("glb_url")
+            image_url = None
+            video_url = None
+            model_id = asset_id
+            image_id = None
+            video_id = None
+        elif item_type == "image":
+            asset_id = str(row["image_id"])
+            title = row.get("image_title") or derive_display_title(prompt, None)
+            thumbnail_url = row.get("thumbnail_url")
+            glb_url = None
+            image_url = row.get("image_url")
+            video_url = None
+            model_id = None
+            image_id = asset_id
+            video_id = None
+        else:  # video
+            asset_id = str(row["video_id"])
+            title = row.get("video_title") or derive_display_title(prompt, None)
+            thumbnail_url = row.get("thumbnail_url")
+            glb_url = None
+            image_url = None
+            video_url = row.get("video_url")
+            model_id = None
+            image_id = None
+            video_id = asset_id
+
+        upstream_job_id = row.get("upstream_job_id") or row.get("upstream_id")
+
+        print(
+            f"[RECONCILE] Found direct orphan {item_type} {asset_id[:8]}...: "
+            f"identity={identity_id[:8]}..., title={title[:20] if title else 'None'}..., "
+            f"upstream_job_id={'set' if upstream_job_id else 'NULL'}"
+        )
+
+        if dry_run:
+            return {
+                "identity_id": identity_id,
+                "item_type": item_type,
+                "asset_id": asset_id,
+                "action": "would_create_history_direct",
+            }
+
+        try:
+            import uuid
+
+            history_id = str(uuid.uuid4())
+            payload = {
+                "reconciliation": True,
+                "reconciliation_type": "direct_orphan",
+            }
+            if upstream_job_id:
+                payload["original_job_id"] = str(upstream_job_id)
+
+            with transaction() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.HISTORY_ITEMS}
+                    (id, identity_id, item_type, status, title, prompt,
+                     thumbnail_url, glb_url, image_url, video_url,
+                     model_id, image_id, video_id, payload,
+                     created_at, updated_at)
+                    VALUES (%s, %s, %s, 'finished', %s, %s,
+                            %s, %s, %s, %s,
+                            %s, %s, %s, %s,
+                            COALESCE(%s, NOW()), NOW())
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        history_id,
+                        identity_id,
+                        item_type,
+                        title,
+                        prompt,
+                        thumbnail_url,
+                        glb_url,
+                        image_url,
+                        video_url,
+                        model_id,
+                        image_id,
+                        video_id,
+                        json.dumps(payload),
+                        created_at,
+                    ),
+                )
+                result = fetch_one(cur)
+
+            if result:
+                print(f"[RECONCILE] Created direct orphan history {history_id[:8]} for {item_type} {asset_id[:8]}")
+                return {
+                    "identity_id": identity_id,
+                    "item_type": item_type,
+                    "asset_id": asset_id,
+                    "history_id": history_id,
+                    "action": "created_history_direct",
+                }
+            else:
+                print(f"[RECONCILE] History already exists for {item_type} {asset_id[:8]}")
+                return None
+
+        except Exception as e:
+            print(f"[RECONCILE] ERROR creating direct orphan history for {item_type} {asset_id[:8]}: {e}")
+            return {
                 "identity_id": identity_id,
                 "item_type": item_type,
                 "asset_id": asset_id,
