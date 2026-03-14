@@ -1193,7 +1193,7 @@ class IdentityInspectionService:
         # Counts for all owned tables
         counts = {}
         for label, sql in [
-            ("history_items", f"SELECT COUNT(*) as c FROM timrx_billing.history_items WHERE identity_id = %s"),
+            ("history_items", f"SELECT COUNT(*) as c FROM {Tables.HISTORY_ITEMS} WHERE identity_id = %s"),
             ("jobs", f"SELECT COUNT(*) as c FROM {Tables.JOBS} WHERE identity_id = %s"),
             ("models", f"SELECT COUNT(*) as c FROM timrx_app.models WHERE identity_id = %s"),
             ("images", f"SELECT COUNT(*) as c FROM timrx_app.images WHERE identity_id = %s"),
@@ -1309,7 +1309,7 @@ class IdentityInspectionService:
                     f"""
                     SELECT i.id, i.email, i.email_verified, i.created_at, i.last_seen_at,
                            COALESCE(w.balance_credits, 0) as balance,
-                           (SELECT COUNT(*) FROM timrx_billing.history_items WHERE identity_id = i.id) as history_count,
+                           (SELECT COUNT(*) FROM {Tables.HISTORY_ITEMS} WHERE identity_id = i.id) as history_count,
                            (SELECT COUNT(*) FROM {Tables.JOBS} WHERE identity_id = i.id) as job_count
                     FROM {Tables.IDENTITIES} i
                     LEFT JOIN {Tables.WALLETS} w ON w.identity_id = i.id

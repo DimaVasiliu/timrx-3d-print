@@ -80,7 +80,7 @@ class MagicCodeService:
                 f"""
                 SELECT
                     COALESCE(w.balance_credits, 0) as balance,
-                    (SELECT COUNT(*) FROM timrx_billing.history_items WHERE identity_id = %s) as history_count,
+                    (SELECT COUNT(*) FROM {Tables.HISTORY_ITEMS} WHERE identity_id = %s) as history_count,
                     (SELECT COUNT(*) FROM {Tables.JOBS} WHERE identity_id = %s) as job_count
                 FROM {Tables.WALLETS} w
                 WHERE w.identity_id = %s
