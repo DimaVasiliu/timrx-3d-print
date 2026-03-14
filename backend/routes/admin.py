@@ -35,6 +35,7 @@ Endpoints:
 - POST /api/admin/refunds/<id>/send-review-email - Send refund-under-review email
 - POST /api/admin/refunds/<id>/resolve           - Resolve a manual-review refund (approve/deny/close)
 - POST /api/admin/refunds/<id>/execute-approved  - Execute an already-approved refund (credit reversal + payment)
+- POST /api/admin/purchases/<id>/start-refund    - Create refund record from purchase (enters review workflow)
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -159,25 +160,28 @@ def get_identity_detail(identity_id):
 @require_admin
 def list_purchases():
     """
-    List purchases with filtering.
+    List purchases with filtering + refund eligibility enrichment.
 
     Query params:
         - status: Filter by status (pending, completed, failed, refunded)
         - identity_id: Filter by identity
+        - email: Partial email match
+        - purchase_id: Partial purchase ID match
+        - date_from: YYYY-MM-DD
+        - date_to: YYYY-MM-DD
         - limit: Max results (default 50)
         - offset: Pagination offset
     """
     try:
-        status = request.args.get("status")
-        identity_id = request.args.get("identity_id")
-        limit = request.args.get("limit", 50, type=int)
-        offset = request.args.get("offset", 0, type=int)
-
         result = AdminService.list_purchases(
-            status=status,
-            identity_id=identity_id,
-            limit=limit,
-            offset=offset
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            email=request.args.get("email"),
+            purchase_id=request.args.get("purchase_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=request.args.get("limit", 50, type=int),
+            offset=request.args.get("offset", 0, type=int),
         )
         return jsonify({"ok": True, **result})
     except DatabaseError as e:
@@ -2669,6 +2673,38 @@ def refunds_execute_approved(refund_id):
 
     except Exception as e:
         print(f"[ADMIN] Execute approved refund error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/purchases/<purchase_id>/start-refund", methods=["POST"])
+@require_admin
+def purchases_start_refund(purchase_id):
+    """Create a refund record from a purchase — enters refund review workflow."""
+    try:
+        from backend.services.refund_service import start_refund_from_purchase
+
+        data = request.get_json(silent=True) or {}
+
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = start_refund_from_purchase(
+            purchase_id=purchase_id,
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            executed_by=executed_by,
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+
+    except Exception as e:
+        print(f"[ADMIN] Start refund error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500

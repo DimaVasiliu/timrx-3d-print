@@ -449,92 +449,204 @@ class AdminService:
     def list_purchases(
         status: Optional[str] = None,
         identity_id: Optional[str] = None,
+        email: Optional[str] = None,
+        purchase_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
         limit: int = 50,
-        offset: int = 0
+        offset: int = 0,
     ) -> Dict[str, Any]:
         """
-        List purchases with filtering.
+        List purchases with filtering, enriched with refund + credit usage data.
 
-        Args:
-            status: Filter by status ('pending', 'completed', 'failed', 'refunded')
-            identity_id: Filter by identity
-            limit: Max results
-            offset: Pagination offset
+        Filters: status, identity_id, email (partial match), purchase_id,
+                 date_from, date_to, pagination.
         """
+        from datetime import date as d_date
+
         limit = min(max(1, limit), 100)
         offset = max(0, offset)
 
         conditions = []
-        params = []
+        params: list = []
 
         if status:
             conditions.append("p.status = %s")
             params.append(status)
-
         if identity_id:
-            conditions.append("p.identity_id = %s")
+            conditions.append("p.identity_id = %s::uuid")
             params.append(identity_id)
+        if email:
+            conditions.append("i.email ILIKE %s")
+            params.append(f"%{email.strip()}%")
+        if purchase_id:
+            conditions.append("p.id::text ILIKE %s")
+            params.append(f"%{purchase_id.strip()}%")
+        if date_from:
+            try:
+                df = d_date.fromisoformat(date_from.strip())
+                conditions.append("p.created_at >= %s")
+                params.append(df)
+            except ValueError:
+                pass
+        if date_to:
+            try:
+                dt = d_date.fromisoformat(date_to.strip())
+                conditions.append("p.created_at < %s + INTERVAL '1 day'")
+                params.append(dt)
+            except ValueError:
+                pass
 
         where_clause = ""
         if conditions:
             where_clause = "WHERE " + " AND ".join(conditions)
 
-        # Get total
-        count_sql = f"""
-            SELECT COUNT(*) as count
-            FROM {Tables.PURCHASES} p
-            {where_clause}
-        """
-        total = query_one(count_sql, params)
+        # Count
+        count_params = list(params)
+        total_row = query_one(
+            f"SELECT COUNT(*) AS count FROM {Tables.PURCHASES} p "
+            f"LEFT JOIN {Tables.IDENTITIES} i ON i.id = p.identity_id "
+            f"{where_clause}",
+            count_params,
+        )
+        total = total_row["count"] if total_row else 0
 
-        # Get purchases with identity and plan info
-        list_sql = f"""
+        # Main query
+        params.extend([limit, offset])
+        rows = query_all(
+            f"""
             SELECT
                 p.id,
                 p.identity_id,
                 p.plan_id,
                 p.provider,
                 p.provider_payment_id,
+                p.payment_id,
                 p.amount_gbp,
                 p.currency,
                 p.credits_granted,
                 p.status,
+                p.meta,
                 p.created_at,
                 p.paid_at,
                 i.email,
-                pl.code as plan_code,
-                pl.name as plan_name
+                pl.code AS plan_code,
+                pl.name AS plan_name
             FROM {Tables.PURCHASES} p
             LEFT JOIN {Tables.IDENTITIES} i ON i.id = p.identity_id
             LEFT JOIN {Tables.PLANS} pl ON pl.id = p.plan_id
             {where_clause}
             ORDER BY p.created_at DESC
             LIMIT %s OFFSET %s
-        """
-        params.extend([limit, offset])
-        rows = query_all(list_sql, params)
+            """,
+            params,
+        )
 
+        if not rows:
+            return {"purchases": [], "total": total, "limit": limit, "offset": offset}
+
+        # Batch-fetch refund info for these purchases
+        purchase_ids = [str(r["id"]) for r in rows]
+        placeholders = ",".join(["%s"] * len(purchase_ids))
+        refund_rows = query_all(
+            f"""
+            SELECT purchase_id, id AS refund_id, refund_status, refund_type,
+                   amount_gbp AS refund_amount_gbp, credits_reversed, created_at
+            FROM {Tables.REFUNDS}
+            WHERE purchase_id::text IN ({placeholders})
+            ORDER BY created_at DESC
+            """,
+            tuple(purchase_ids),
+        )
+        # Group by purchase_id — keep latest refund per purchase
+        refund_map: Dict[str, Dict] = {}
+        for rr in refund_rows:
+            pid = str(rr["purchase_id"])
+            if pid not in refund_map:
+                refund_map[pid] = {
+                    "refund_id": str(rr["refund_id"]),
+                    "refund_status": rr["refund_status"],
+                    "refund_type": rr["refund_type"],
+                    "refund_amount_gbp": float(rr["refund_amount_gbp"]) if rr["refund_amount_gbp"] else 0,
+                    "credits_reversed": rr["credits_reversed"] or 0,
+                    "refund_created_at": rr["created_at"].isoformat() if rr["created_at"] else None,
+                }
+
+        # Batch-fetch wallet balances for unique identities
+        identity_ids = list({str(r["identity_id"]) for r in rows})
+        wallet_map: Dict[str, Dict] = {}
+        try:
+            from backend.services.wallet_service import WalletService
+            for iid in identity_ids:
+                bal = WalletService.get_all_balances(iid)
+                wallet_map[iid] = bal
+        except Exception:
+            pass
+
+        # Build enriched purchase list
         purchases = []
         for row in rows:
+            pid = str(row["id"])
+            iid = str(row["identity_id"])
+            credits_granted = row["credits_granted"] or 0
+            wallet = wallet_map.get(iid, {"general": 0, "video": 0})
+            credits_remaining = wallet.get("general", 0) + wallet.get("video", 0)
+
+            # Determine credit_type from meta if available
+            meta = row["meta"] or {}
+            credit_type = meta.get("credit_type", "general")
+
+            # Is this a subscription purchase?
+            is_subscription = bool(row["plan_id"])
+
+            # Refund info
+            refund_info = refund_map.get(pid)
+            refund_exists = refund_info is not None
+            latest_refund_status = refund_info["refund_status"] if refund_info else None
+
+            # Compute refund_action_state
+            purchase_status = row["status"]
+            if purchase_status == "refunded":
+                action_state = "already_refunded"
+            elif purchase_status not in ("completed",):
+                action_state = "not_refundable"
+            elif refund_info and latest_refund_status == "executed":
+                action_state = "already_refunded"
+            elif refund_info and latest_refund_status in ("pending", "manual_review_required", "approved"):
+                action_state = "already_in_refund_flow"
+            elif refund_info and latest_refund_status in ("denied", "closed", "failed"):
+                # Previous refund was denied/closed/failed — can start a new one
+                action_state = "eligible"
+            else:
+                action_state = "eligible"
+
             purchases.append({
-                "id": str(row["id"]),
-                "identity_id": str(row["identity_id"]),
-                "identity_email": row["email"],
+                "id": pid,
+                "identity_id": iid,
+                "email": row["email"],
                 "plan_code": row["plan_code"],
                 "plan_name": row["plan_name"],
                 "provider": row["provider"],
-                "provider_payment_id": row["provider_payment_id"],
+                "payment_reference": row["provider_payment_id"],
+                "payment_id": row["payment_id"],
                 "amount_gbp": float(row["amount_gbp"]) if row["amount_gbp"] else 0,
                 "currency": row["currency"],
-                "credits_granted": row["credits_granted"],
-                "status": row["status"],
+                "credits_granted": credits_granted,
+                "credit_type": credit_type,
+                "status": purchase_status,
+                "is_subscription_purchase": is_subscription,
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 "paid_at": row["paid_at"].isoformat() if row["paid_at"] else None,
+                "credits_remaining": credits_remaining,
+                "refund_exists": refund_exists,
+                "latest_refund_status": latest_refund_status,
+                "latest_refund_id": refund_info["refund_id"] if refund_info else None,
+                "refund_action_state": action_state,
             })
 
         return {
             "purchases": purchases,
-            "total": total["count"] if total else 0,
+            "total": total,
             "limit": limit,
             "offset": offset,
         }

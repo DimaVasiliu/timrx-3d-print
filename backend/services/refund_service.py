@@ -1389,3 +1389,126 @@ def _blocked_response(
             "credits_remaining": credits_remaining,
         },
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# START REFUND FROM PURCHASE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def start_refund_from_purchase(
+    *,
+    purchase_id: str,
+    reason: Optional[str] = None,
+    admin_note: Optional[str] = None,
+    executed_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create a refund record in manual_review_required state for a purchase.
+
+    This is the intake step — no credits are reversed, no payment refunded.
+    The refund enters the existing resolve → approve → execute workflow.
+
+    Returns existing refund info if one is already in progress.
+    Blocks if purchase is already fully refunded.
+    """
+    # 1. Fetch purchase
+    purchase = query_one(
+        f"""
+        SELECT p.id, p.identity_id, p.amount_gbp, p.credits_granted,
+               p.status, p.provider, p.provider_payment_id, p.meta,
+               i.email
+        FROM {Tables.PURCHASES} p
+        LEFT JOIN {Tables.IDENTITIES} i ON i.id = p.identity_id
+        WHERE p.id = %s::uuid
+        """,
+        (purchase_id,),
+    )
+    if not purchase:
+        return {"ok": False, "error": "Purchase not found"}
+
+    purchase_status = purchase["status"]
+    if purchase_status not in ("completed", "refunded"):
+        return {"ok": False, "error": f"Purchase status is '{purchase_status}' — not refundable"}
+
+    # 2. Check existing refund records for this purchase
+    existing = query_all(
+        f"""
+        SELECT id, refund_status, refund_type, amount_gbp, created_at
+        FROM {_TABLE}
+        WHERE purchase_id = %s::uuid
+        ORDER BY created_at DESC
+        """,
+        (purchase_id,),
+    )
+
+    if existing:
+        latest = existing[0]
+        ls = latest["refund_status"]
+
+        # If an active refund exists (not terminal), return it instead of duplicating
+        if ls in ("pending", "manual_review_required", "approved"):
+            return {
+                "ok": True,
+                "already_exists": True,
+                "message": f"Refund already exists with status '{ls}'.",
+                "refund": {
+                    "id": str(latest["id"]),
+                    "refund_status": ls,
+                    "purchase_id": purchase_id,
+                    "amount_gbp": float(latest["amount_gbp"]),
+                },
+            }
+
+        # If already executed, block
+        if ls == "executed" or purchase_status == "refunded":
+            return {
+                "ok": False,
+                "error": "Purchase already has an executed refund",
+                "refund": {
+                    "id": str(latest["id"]),
+                    "refund_status": ls,
+                    "purchase_id": purchase_id,
+                    "amount_gbp": float(latest["amount_gbp"]),
+                },
+            }
+
+        # If denied/closed/failed — allow creating a new refund record
+
+    # 3. Create refund record in manual_review_required state
+    amount = float(purchase["amount_gbp"]) if purchase["amount_gbp"] else 0
+    identity_id = str(purchase["identity_id"])
+    payment_provider = purchase["provider"] or "unknown"
+    payment_ref = purchase["provider_payment_id"]
+
+    refund_record = _record_refund(
+        purchase_id=purchase_id,
+        identity_id=identity_id,
+        payment_provider=payment_provider,
+        payment_reference=payment_ref,
+        refund_type="full_purchase_refund",
+        refund_status="manual_review_required",
+        amount_gbp=amount,
+        credits_reversed=0,
+        reason=reason,
+        admin_note=admin_note or "Refund initiated from purchase view",
+        executed_by=executed_by,
+        metadata={
+            "source": "purchase_view",
+            "credits_granted": purchase["credits_granted"] or 0,
+            "email": purchase["email"],
+        },
+    )
+
+    print(f"[ADMIN_REFUND_START] purchase_id={purchase_id} refund_id={refund_record.get('id')}")
+
+    return {
+        "ok": True,
+        "already_exists": False,
+        "message": "Refund record created and added to refund workflow.",
+        "refund": {
+            "id": refund_record.get("id"),
+            "refund_status": "manual_review_required",
+            "purchase_id": purchase_id,
+            "amount_gbp": amount,
+        },
+    }
