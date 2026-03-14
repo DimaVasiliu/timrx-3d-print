@@ -224,8 +224,8 @@ def update_dispute_status(
                 f"""
                 UPDATE {_TABLE}
                 SET dispute_status = %s,
-                    admin_note = CASE WHEN %s IS NOT NULL
-                        THEN COALESCE(admin_note || ' | ', '') || %s
+                    admin_note = CASE WHEN %s::text IS NOT NULL
+                        THEN COALESCE(admin_note || ' | ', '') || %s::text
                         ELSE admin_note END,
                     updated_at = NOW()
                 WHERE id = %s::uuid
