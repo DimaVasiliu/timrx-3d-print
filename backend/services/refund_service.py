@@ -19,7 +19,7 @@ Design principles:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from backend.db import (
@@ -490,6 +490,8 @@ def list_refunds(
     identity_id: Optional[str] = None,
     purchase_id: Optional[str] = None,
     email: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -512,6 +514,22 @@ def list_refunds(
     if purchase_id:
         conditions.append("r.purchase_id = %s::uuid")
         params.append(purchase_id)
+
+    # Date range filters on r.created_at (inclusive end date)
+    if date_from:
+        try:
+            d = date.fromisoformat(date_from.strip())
+            conditions.append("r.created_at >= %s")
+            params.append(d)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            d = date.fromisoformat(date_to.strip())
+            conditions.append("r.created_at < %s + INTERVAL '1 day'")
+            params.append(d)
+        except ValueError:
+            pass
 
     # Email substring filter (case-insensitive) — requires JOIN
     needs_email_join = False

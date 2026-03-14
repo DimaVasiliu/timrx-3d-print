@@ -8,7 +8,7 @@ Read-only queries; does not modify business data.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from backend.db import USE_DB, query_all, query_one, Tables
@@ -289,6 +289,8 @@ def list_alerts(
     severity: Optional[str] = None,
     provider: Optional[str] = None,
     alert_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -307,6 +309,22 @@ def list_alerts(
     if alert_type:
         conditions.append("alert_type = %s")
         params.append(alert_type)
+
+    # Date range filters on first_seen_at
+    if date_from:
+        try:
+            d = date.fromisoformat(date_from.strip())
+            conditions.append("first_seen_at >= %s")
+            params.append(d)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            d = date.fromisoformat(date_to.strip())
+            conditions.append("first_seen_at < %s + INTERVAL '1 day'")
+            params.append(d)
+        except ValueError:
+            pass
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 

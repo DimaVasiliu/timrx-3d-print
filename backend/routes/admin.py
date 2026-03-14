@@ -2290,6 +2290,8 @@ def alerts_list():
             provider=request.args.get("provider"),
             alert_type=request.args.get("alert_type"),
             severity=request.args.get("severity"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
             limit=min(int(request.args.get("limit", 50)), 200),
             offset=int(request.args.get("offset", 0)),
         )
@@ -2356,6 +2358,8 @@ def provider_ledger_list():
             provider=request.args.get("provider"),
             entry_type=request.args.get("entry_type"),
             month=request.args.get("month"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
             limit=min(int(request.args.get("limit", 50)), 200),
             offset=int(request.args.get("offset", 0)),
         )
@@ -2488,6 +2492,8 @@ def refunds_list():
             identity_id=request.args.get("identity_id"),
             purchase_id=request.args.get("purchase_id"),
             email=request.args.get("email"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
             limit=min(int(request.args.get("limit", 50)), 200),
             offset=int(request.args.get("offset", 0)),
         )
@@ -2531,6 +2537,8 @@ def refunds_export_csv():
             identity_id=request.args.get("identity_id"),
             purchase_id=request.args.get("purchase_id"),
             email=request.args.get("email"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
             limit=min(int(request.args.get("limit", 5000)), 5000),
             offset=0,
         )
@@ -2594,6 +2602,8 @@ def provider_ledger_export_csv():
             provider=request.args.get("provider"),
             entry_type=request.args.get("entry_type"),
             month=request.args.get("month"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
             limit=min(int(request.args.get("limit", 5000)), 5000),
             offset=0,
         )

@@ -41,6 +41,8 @@ def list_ledger_entries(
     provider: Optional[str] = None,
     entry_type: Optional[str] = None,
     month: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -63,6 +65,22 @@ def list_ledger_entries(
             params.append(m_date)
         except (ValueError, IndexError):
             pass  # ignore bad month format
+
+    # Date range filters on created_at (inclusive end date)
+    if date_from:
+        try:
+            d = date.fromisoformat(date_from.strip())
+            conditions.append("created_at >= %s")
+            params.append(d)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            d = date.fromisoformat(date_to.strip())
+            conditions.append("created_at < %s + INTERVAL '1 day'")
+            params.append(d)
+        except ValueError:
+            pass
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
