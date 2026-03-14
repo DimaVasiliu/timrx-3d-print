@@ -415,6 +415,9 @@ def execute_refund(
             "credits_used": credits_used,
             "credits_remaining_before": credits_remaining,
             "plan_code": plan_code,
+            "external_refund_attempted": execute_external_refund,
+            "external_refund_executed": external_refund_executed,
+            "external_refund_error": external_refund_error,
         },
     )
 
@@ -472,24 +475,30 @@ def list_refunds(
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    """List refund records with optional filters."""
+    """
+    List refund records with enriched context.
+
+    Joins identities for email. Derives external_refund state from
+    stored metadata + external_refund_id. Adds display_summary for
+    human-readable status.
+    """
     conditions: list = []
     params: list = []
 
     if status:
-        conditions.append("refund_status = %s")
+        conditions.append("r.refund_status = %s")
         params.append(status)
     if identity_id:
-        conditions.append("identity_id = %s::uuid")
+        conditions.append("r.identity_id = %s::uuid")
         params.append(identity_id)
     if purchase_id:
-        conditions.append("purchase_id = %s::uuid")
+        conditions.append("r.purchase_id = %s::uuid")
         params.append(purchase_id)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     count_row = query_one(
-        f"SELECT COUNT(*) AS total FROM {_TABLE} {where}",
+        f"SELECT COUNT(*) AS total FROM {_TABLE} r {where}",
         tuple(params),
     )
     total = count_row["total"] if count_row else 0
@@ -497,14 +506,16 @@ def list_refunds(
     params.extend([limit, offset])
     rows = query_all(
         f"""
-        SELECT id, purchase_id, subscription_id, identity_id,
-               payment_provider, payment_reference, refund_type, refund_status,
-               amount_gbp, currency, credits_reversed, credit_type,
-               reason, admin_note, executed_by, external_refund_id,
-               metadata, created_at, executed_at
-        FROM {_TABLE}
+        SELECT r.id, r.purchase_id, r.subscription_id, r.identity_id,
+               r.payment_provider, r.payment_reference, r.refund_type, r.refund_status,
+               r.amount_gbp, r.currency, r.credits_reversed, r.credit_type,
+               r.reason, r.admin_note, r.executed_by, r.external_refund_id,
+               r.metadata, r.created_at, r.executed_at,
+               i.email AS identity_email
+        FROM {_TABLE} r
+        LEFT JOIN {Tables.IDENTITIES} i ON i.id = r.identity_id
         {where}
-        ORDER BY created_at DESC
+        ORDER BY r.created_at DESC
         LIMIT %s OFFSET %s
         """,
         tuple(params),
@@ -512,11 +523,32 @@ def list_refunds(
 
     refunds = []
     for r in rows:
+        meta = r["metadata"] or {}
+        ext_id = r["external_refund_id"]
+
+        # Build structured external_refund from stored metadata
+        external_refund = {
+            "provider": r["payment_provider"],
+            "attempted": bool(meta.get("external_refund_attempted", False)),
+            "executed": bool(meta.get("external_refund_executed", False)) or bool(ext_id),
+            "external_refund_id": ext_id,
+            "error": meta.get("external_refund_error"),
+        }
+
+        # Determine purchase_type
+        purchase_type = "unknown"
+        if r["purchase_id"] and not r["subscription_id"]:
+            purchase_type = "one_time"
+        elif r["subscription_id"]:
+            purchase_type = "subscription"
+
         refunds.append({
             "id": str(r["id"]),
             "purchase_id": str(r["purchase_id"]) if r["purchase_id"] else None,
             "subscription_id": str(r["subscription_id"]) if r["subscription_id"] else None,
             "identity_id": str(r["identity_id"]) if r["identity_id"] else None,
+            "email": r["identity_email"],
+            "purchase_type": purchase_type,
             "payment_provider": r["payment_provider"],
             "payment_reference": r["payment_reference"],
             "refund_type": r["refund_type"],
@@ -525,11 +557,14 @@ def list_refunds(
             "currency": r["currency"],
             "credits_reversed": r["credits_reversed"],
             "credit_type": r["credit_type"],
+            "credits_granted": meta.get("credits_granted"),
+            "credits_used": meta.get("credits_used"),
             "reason": r["reason"],
             "admin_note": r["admin_note"],
             "executed_by": r["executed_by"],
-            "external_refund_id": r["external_refund_id"],
-            "metadata": r["metadata"],
+            "external_refund_id": ext_id,
+            "external_refund": external_refund,
+            "display_summary": _build_display_summary(r, external_refund),
             "created_at": _iso(r["created_at"]),
             "executed_at": _iso(r["executed_at"]),
         })
@@ -540,6 +575,38 @@ def list_refunds(
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _build_display_summary(row: Dict, external_refund: Dict) -> str:
+    """Build a short human-readable summary of the refund state."""
+    refund_st = row["refund_status"]
+    credits = row["credits_reversed"] or 0
+    meta = row["metadata"] or {}
+
+    _REVIEW_REASONS = {
+        "credits_already_used": "Manual review required: credits already used",
+        "balance_mismatch": "Manual review required: balance does not match granted credits",
+        "duplicate_refund": "Blocked: duplicate refund",
+        "purchase_already_refunded": "Blocked: purchase already refunded",
+    }
+
+    if refund_st == "executed":
+        ext_part = "Mollie refund sent" if external_refund.get("executed") else (
+            "Mollie refund failed" if external_refund.get("attempted") else "external refund not attempted"
+        )
+        return f"Refund executed ({credits} credits reversed), {ext_part}"
+
+    if refund_st == "manual_review_required":
+        reason = meta.get("blocked_reason") or row.get("reason") or ""
+        return _REVIEW_REASONS.get(reason, f"Manual review required: {reason}" if reason else "Manual review required")
+
+    if refund_st == "failed":
+        return "Refund execution failed"
+
+    if refund_st == "pending":
+        return "Refund pending"
+
+    return refund_st
+
 
 def _attempt_mollie_refund(
     *,
