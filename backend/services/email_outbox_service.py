@@ -492,9 +492,8 @@ class EmailOutboxService:
 
     @staticmethod
     def _alert_admin_email_failure(email_job: Dict[str, Any], error: str, attempts: int):
-        """Send admin alert when an email permanently fails."""
+        """Send admin alert when an email permanently fails (deduplicated)."""
         try:
-            from backend.emailer import notify_admin
             from backend.config import config
 
             if not config.ADMIN_EMAIL:
@@ -506,17 +505,23 @@ class EmailOutboxService:
                 print("[EMAIL_OUTBOX] Skipping failure alert for admin email")
                 return
 
-            notify_admin(
+            template = email_job.get("template", "unknown")
+            from backend.services.alert_service import send_admin_alert_once
+            send_admin_alert_once(
+                alert_key=f"email_delivery_failed:{template}",
+                alert_type="email_delivery_failed",
                 subject="Email Delivery Failed",
                 message=f"An email failed to send after {attempts} attempts and has been marked as failed.",
-                data={
+                severity="warning",
+                metadata={
                     "Outbox ID": str(email_job.get("id", ""))[:8] + "...",
-                    "Template": email_job.get("template"),
+                    "Template": template,
                     "Recipient": email_job.get("to_email"),
                     "Purchase ID": str(email_job.get("purchase_id", ""))[:8] + "..." if email_job.get("purchase_id") else "N/A",
                     "Attempts": attempts,
                     "Last Error": error[:200] if error else "Unknown",
                 },
+                cooldown_minutes=30,
             )
         except Exception as e:
             # Log but don't fail - we've already recorded the failure in the DB

@@ -195,10 +195,12 @@ def sanitize_job_error_message(raw_error: Optional[str]) -> Optional[str]:
 
 
 def _send_wallet_alert(provider: str, error_str: str, job_id: Optional[str]) -> None:
-    """Send admin alert about provider wallet depletion."""
+    """Send admin alert about provider wallet depletion (deduplicated)."""
     try:
-        from backend.emailer import notify_admin
-        notify_admin(
+        from backend.services.alert_service import send_admin_alert_once
+        send_admin_alert_once(
+            alert_key=f"provider_wallet_depleted:{provider}",
+            alert_type="wallet_depleted",
             subject=f"Provider wallet depleted — {provider}",
             message=(
                 f"Provider wallet/quota exhaustion detected.\n\n"
@@ -207,12 +209,14 @@ def _send_wallet_alert(provider: str, error_str: str, job_id: Optional[str]) -> 
                 f"Error: {error_str[:300]}\n\n"
                 f"Refill provider wallet immediately."
             ),
-            data={
-                "provider": provider,
-                "job_id": job_id,
+            severity="critical",
+            provider=provider,
+            related_job_id=job_id,
+            metadata={
                 "error": error_str[:500],
                 "alert_type": "wallet_depleted",
             },
+            cooldown_minutes=15,
         )
     except Exception as e:
         print(f"[PROVIDER_ERROR] Failed to send wallet alert: {e}")

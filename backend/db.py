@@ -420,6 +420,7 @@ class Tables:
     INVOICE_ITEMS = f"{_BILLING_SCHEMA}.invoice_items"
     RECEIPTS = f"{_BILLING_SCHEMA}.receipts"
     EMAIL_OUTBOX = f"{_BILLING_SCHEMA}.email_outbox"
+    PROVIDER_ALERTS = f"{_BILLING_SCHEMA}.provider_alerts"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"

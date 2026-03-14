@@ -1233,8 +1233,10 @@ class SubscriptionService:
                                     "identity_id": identity_id,
                                 })
 
-                                from backend.emailer import notify_admin
-                                notify_admin(
+                                from backend.services.alert_service import send_admin_alert_once
+                                send_admin_alert_once(
+                                    alert_key=f"stale_subscription_credit_date:{sub_id}",
+                                    alert_type="stale_credit_date",
                                     subject=f"Stale subscription credit date — {stale_days} days overdue",
                                     message=(
                                         f"Subscription {sub_id} (plan: {plan_code}) has a "
@@ -1245,7 +1247,9 @@ class SubscriptionService:
                                         f"Action required: Check Mollie dashboard for subscription "
                                         f"payments and manually reconcile if needed."
                                     ),
-                                    data={
+                                    severity="warning",
+                                    related_subscription_id=sub_id,
+                                    metadata={
                                         "subscription_id": sub_id,
                                         "identity_id": identity_id,
                                         "plan_code": plan_code,
@@ -1253,6 +1257,7 @@ class SubscriptionService:
                                         "stale_days": stale_days,
                                         "customer_email": sub.get("customer_email"),
                                     },
+                                    cooldown_minutes=1440,  # 24 hours
                                 )
 
                                 result["details"].append({

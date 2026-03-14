@@ -773,7 +773,7 @@ Need help? Reply to this email or contact support@timrx.live
     return send_email(to_email, subject, html_body, text_body)
 
 
-def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None) -> bool:
+def notify_admin(subject: str, message: str, data: Optional[Dict[str, Any]] = None, _skip_history: bool = False) -> bool:
     """Send a notification to the admin email."""
     admin_email = config.ADMIN_EMAIL
     if not admin_email:
@@ -845,7 +845,25 @@ TimrX Admin Notification
         except Exception as e:
             print(f"[EMAIL] notify_admin send_raw error: {e}, falling back to simple send")
 
-    return send_email(admin_email, f"[TimrX Admin] {subject}", html_body, text_body)
+    sent = send_email(admin_email, f"[TimrX Admin] {subject}", html_body, text_body)
+
+    # Record to alert history (best-effort, never crashes caller)
+    # Skipped when called from send_admin_alert_once() which manages its own recording.
+    if not _skip_history:
+        try:
+            from backend.services.alert_service import record_admin_alert
+            record_admin_alert(
+                alert_key=f"notify_admin:{subject[:80]}",
+                alert_type="admin_notification",
+                subject=subject,
+                message=message[:500] if message else "",
+                severity="info",
+                metadata=data,
+            )
+        except Exception:
+            pass  # Alert history is optional
+
+    return sent
 
 
 def notify_new_identity(identity_id: str, email: Optional[str] = None) -> bool:
