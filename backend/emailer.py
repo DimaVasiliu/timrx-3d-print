@@ -1706,3 +1706,208 @@ def _send_with_logo(
             print(f"[EMAIL] send_raw error: {e}, falling back to simple send")
 
     return send_email(to_email, subject, html_body, text_body)
+
+
+# ─────────────────────────────────────────────────────────────
+# Refund Confirmation Email
+# ─────────────────────────────────────────────────────────────
+REFUND_COLOR = "#b45309"  # Warm amber for refund status
+
+
+def send_refund_confirmation(
+    to_email: str,
+    refund_id: str,
+    amount_gbp: float,
+    currency: str = "GBP",
+    credits_reversed: int = 0,
+    credits_granted: int = 0,
+    refund_type: str = "full_purchase_refund",
+    payment_provider: str = "mollie",
+    external_refund_executed: bool = False,
+    external_refund_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    executed_at: Optional[str] = None,
+) -> bool:
+    """
+    Send a styled refund confirmation / credit note email.
+
+    Only called for actually executed refunds. Never exposes
+    admin notes, internal errors, or provider error details.
+    """
+    from datetime import datetime, timezone
+
+    logo_bytes = _load_logo()
+    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+
+    # Determine headline and status based on external refund state
+    if external_refund_executed:
+        headline = "Refund Processed"
+        status_text = "Refunded"
+        status_color = SUCCESS_COLOR
+        intro = "Your refund has been processed. Here are the details."
+        next_steps = (
+            "Your payment refund has been submitted to your payment provider. "
+            "Depending on your bank, it may take 5\u201310 business days to appear on your statement."
+        )
+    else:
+        headline = "Refund Recorded"
+        status_text = "Refund recorded"
+        status_color = REFUND_COLOR
+        intro = "Your refund has been recorded. Here are the details."
+        next_steps = (
+            "Your refund has been recorded in our system. "
+            "The payment refund is being processed and may take 5\u201310 business days "
+            "to appear on your statement."
+        )
+
+    # Format date
+    if executed_at:
+        try:
+            dt = datetime.fromisoformat(executed_at.replace("Z", "+00:00"))
+            refund_date = dt.strftime("%B %d, %Y")
+        except (ValueError, AttributeError):
+            refund_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    else:
+        refund_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Refund type label
+    type_labels = {
+        "full_purchase_refund": "Full refund",
+        "partial_purchase_refund": "Partial refund",
+        "subscription_refund": "Subscription refund",
+        "manual_adjustment_refund": "Adjustment",
+    }
+    type_label = type_labels.get(refund_type, "Refund")
+
+    # Amount display (refund-styled)
+    amount_display = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund amount</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0;font-size:14px;font-weight:600;color:{status_color};font-family:Arial,Helvetica,sans-serif;">{status_text} &bull; {refund_date}</p>
+                </td>
+            </tr>
+        </table>'''
+
+    # Summary card rows
+    summary_rows = [
+        ("Refund reference", refund_id[:8].upper() if refund_id else "\u2014"),
+        ("Type", type_label),
+        ("Amount refunded", f"&pound;{amount_gbp:.2f}"),
+        ("Date", refund_date),
+    ]
+
+    if credits_reversed > 0:
+        summary_rows.append(("Credits reversed", f"{credits_reversed:,}"))
+    elif credits_granted > 0:
+        summary_rows.append(("Credits impact", "No credits reversed"))
+
+    provider_labels = {"mollie": "Mollie", "stripe": "Stripe"}
+    summary_rows.append(("Payment method", provider_labels.get(payment_provider, payment_provider.title())))
+
+    summary_card = render_detail_card(summary_rows, header="Refund Summary")
+
+    # Credits info section (if relevant)
+    credits_section = ""
+    if credits_reversed > 0:
+        credits_section = f'''
+            <tr>
+                <td style="padding-top:20px;">
+                    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:{BG_LIGHT};border:1px solid {BORDER_COLOR};border-radius:6px;">
+                        <tr>
+                            <td style="padding:16px;">
+                                <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">Credits adjustment</p>
+                                <p style="margin:0;font-size:13px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                                    {credits_reversed:,} credits have been removed from your account as part of this refund.
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>'''
+
+    # Reason section (user-facing, only if provided)
+    reason_section = ""
+    if reason:
+        reason_section = f'''
+            <tr>
+                <td style="padding-top:16px;">
+                    <p style="margin:0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Reason:</strong> {reason}
+                    </p>
+                </td>
+            </tr>'''
+
+    # Next steps
+    next_steps_section = f'''
+        <tr>
+            <td style="padding-top:20px;">
+                <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">What happens next</p>
+                <p style="margin:0;font-size:13px;line-height:1.5;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                    {next_steps}
+                </p>
+            </td>
+        </tr>'''
+
+    body_html = f'''
+        {amount_display}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr><td>{summary_card}</td></tr>
+            {credits_section}
+            {reason_section}
+            {next_steps_section}
+        </table>
+    '''
+
+    subject = f"TimrX Refund Confirmation - {symbol}{amount_gbp:.2f}"
+
+    html_body = render_email_html(
+        title=headline,
+        intro=intro,
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+        footer_extra=f"Refund reference: {refund_id[:8].upper() if refund_id else '\u2014'}",
+    )
+
+    # Plain text fallback
+    credits_text = f"\nCredits reversed: {credits_reversed:,}" if credits_reversed > 0 else ""
+    reason_text = f"\nReason: {reason}" if reason else ""
+    text_body = f"""{headline}
+
+Amount refunded: {symbol}{amount_gbp:.2f}
+Date: {refund_date}
+Type: {type_label}
+Refund reference: {refund_id[:8].upper() if refund_id else '\u2014'}
+Payment method: {provider_labels.get(payment_provider, payment_provider.title())}{credits_text}{reason_text}
+
+{next_steps}
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    # Send with inline logo if available
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_refund_confirmation send_raw failed: {result.message}, falling back")
+        except Exception as e:
+            print(f"[EMAIL] send_refund_confirmation send_raw error: {e}, falling back")
+
+    return send_email(to_email, subject, html_body, text_body)

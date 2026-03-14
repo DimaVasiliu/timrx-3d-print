@@ -45,6 +45,7 @@ class EmailTemplate:
     INVOICE_WITH_PDF = "invoice_with_pdf"        # Full invoice + receipt PDFs
     PAYMENT_RECEIVED = "payment_received"        # Fallback HTML-only confirmation
     ADMIN_ALERT = "admin_alert"                  # Admin notification
+    REFUND_CONFIRMATION = "refund_confirmation"  # Refund credit note / confirmation
 
 
 # Default max attempts before marking as failed
@@ -406,6 +407,9 @@ class EmailOutboxService:
             elif template == EmailTemplate.ADMIN_ALERT:
                 return EmailOutboxService._send_admin_alert(to_email, payload)
 
+            elif template == EmailTemplate.REFUND_CONFIRMATION:
+                return EmailOutboxService._send_refund_confirmation(to_email, payload)
+
             else:
                 return False, f"Unknown template: {template}"
 
@@ -489,6 +493,30 @@ class EmailOutboxService:
         if success:
             return True, None
         return False, "notify_admin returned False"
+
+    @staticmethod
+    def _send_refund_confirmation(to_email: str, payload: Dict[str, Any]) -> tuple:
+        """Send refund confirmation / credit note email."""
+        from backend.emailer import send_refund_confirmation
+
+        success = send_refund_confirmation(
+            to_email=to_email,
+            refund_id=payload.get("refund_id", ""),
+            amount_gbp=payload.get("amount_gbp", 0),
+            currency=payload.get("currency", "GBP"),
+            credits_reversed=payload.get("credits_reversed", 0),
+            credits_granted=payload.get("credits_granted", 0),
+            refund_type=payload.get("refund_type", "full_purchase_refund"),
+            payment_provider=payload.get("payment_provider", "mollie"),
+            external_refund_executed=payload.get("external_refund_executed", False),
+            external_refund_id=payload.get("external_refund_id"),
+            reason=payload.get("reason"),
+            executed_at=payload.get("executed_at"),
+        )
+
+        if success:
+            return True, None
+        return False, "send_refund_confirmation returned False"
 
     @staticmethod
     def _alert_admin_email_failure(email_job: Dict[str, Any], error: str, attempts: int):

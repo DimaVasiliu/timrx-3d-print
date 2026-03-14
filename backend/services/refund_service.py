@@ -421,6 +421,23 @@ def execute_refund(
         },
     )
 
+    # ── 9. Queue refund confirmation email (executed refunds only) ──
+    if refund_status == "executed" and refund_record.get("id"):
+        _queue_refund_email(
+            identity_id=identity_id,
+            refund_id=refund_record["id"],
+            purchase_id=purchase_id,
+            amount_gbp=amount_gbp,
+            credits_reversed=credits_to_reverse,
+            credits_granted=credits_granted,
+            refund_type=refund_type,
+            payment_provider=payment_provider,
+            external_refund_executed=external_refund_executed,
+            external_refund_id=external_refund_id,
+            reason=reason,
+            executed_at=now,
+        )
+
     # Build external refund summary
     external_refund_summary = {
         "attempted": execute_external_refund,
@@ -606,6 +623,93 @@ def _build_display_summary(row: Dict, external_refund: Dict) -> str:
         return "Refund pending"
 
     return refund_st
+
+
+def _queue_refund_email(
+    *,
+    identity_id: str,
+    refund_id: str,
+    purchase_id: str,
+    amount_gbp: float,
+    credits_reversed: int,
+    credits_granted: int,
+    refund_type: str,
+    payment_provider: str,
+    external_refund_executed: bool,
+    external_refund_id: Optional[str],
+    reason: Optional[str],
+    executed_at: Optional[datetime],
+) -> None:
+    """
+    Queue a refund confirmation email via the email outbox.
+
+    Best-effort: never crashes the caller. Looks up email from identity,
+    skips silently if not found or if email already queued for this refund.
+    """
+    try:
+        # Look up user email
+        email_row = query_one(
+            f"SELECT email FROM {Tables.IDENTITIES} WHERE id = %s",
+            (identity_id,),
+        )
+        if not email_row or not email_row.get("email"):
+            print(f"[ADMIN_REFUND_EMAIL] Skipped — no email for identity {identity_id}")
+            return
+
+        user_email = email_row["email"]
+
+        # Check for duplicate: don't re-queue if already sent/pending for this refund
+        existing = query_one(
+            f"""
+            SELECT id FROM {Tables.EMAIL_OUTBOX}
+            WHERE template = 'refund_confirmation'
+              AND payload->>'refund_id' = %s
+              AND status IN ('pending', 'sent')
+            LIMIT 1
+            """,
+            (refund_id,),
+        )
+        if existing:
+            print(f"[ADMIN_REFUND_EMAIL] Skipped — already queued/sent for refund {refund_id[:8]}")
+            return
+
+        from backend.services.email_outbox_service import EmailOutboxService, EmailTemplate
+
+        payload = {
+            "refund_id": refund_id,
+            "amount_gbp": amount_gbp,
+            "currency": "GBP",
+            "credits_reversed": credits_reversed,
+            "credits_granted": credits_granted,
+            "refund_type": refund_type,
+            "payment_provider": payment_provider,
+            "external_refund_executed": external_refund_executed,
+            "external_refund_id": external_refund_id,
+            "reason": reason,
+            "executed_at": _iso(executed_at),
+        }
+
+        with transaction() as cur:
+            EmailOutboxService.queue_email(
+                cur,
+                to_email=user_email,
+                template=EmailTemplate.REFUND_CONFIRMATION,
+                payload=payload,
+                subject=f"TimrX Refund Confirmation - \u00a3{amount_gbp:.2f}",
+                identity_id=identity_id,
+                purchase_id=purchase_id,
+            )
+
+        # Best-effort immediate send
+        try:
+            EmailOutboxService.send_pending_emails(limit=1)
+        except Exception:
+            pass  # Will be picked up by cron retry
+
+        print(f"[ADMIN_REFUND_EMAIL] Queued for {user_email} refund={refund_id[:8]}")
+
+    except Exception as e:
+        print(f"[ADMIN_REFUND_EMAIL] Failed to queue (non-fatal): {e}")
 
 
 def _attempt_mollie_refund(
