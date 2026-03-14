@@ -54,6 +54,7 @@ def execute_refund(
     admin_note: Optional[str] = None,
     allow_credit_reversal: bool = True,
     manual_record_only: bool = False,
+    execute_external_refund: bool = False,
     executed_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -79,6 +80,7 @@ def execute_refund(
         admin_note:             Optional admin context
         allow_credit_reversal:  If True, reverse granted credits when safe
         manual_record_only:     If True, only record the decision (no credit/status changes)
+        execute_external_refund: If True, attempt Mollie payment refund (only for safe full refunds via Mollie)
         executed_by:            Admin email or identifier
 
     Returns:
@@ -206,10 +208,32 @@ def execute_refund(
             admin_note=admin_note,
         )
     elif credits_remaining < credits_granted:
-        # Balance is lower than granted (possible if subscription added credits too)
-        # Be conservative — only reverse what's available
-        credits_to_reverse = credits_remaining
-        refund_status = "executed"
+        # Balance is lower than granted — ambiguous situation.
+        # Could be partial usage, subscription top-ups spent, etc.
+        # Block automatic execution: a partial reversal masquerading as
+        # a full refund creates accounting discrepancies.
+        print(
+            f"[ADMIN_REFUND_BLOCKED] purchase_id={purchase_id} "
+            f"reason=balance_mismatch granted={credits_granted} "
+            f"remaining={credits_remaining}"
+        )
+        return _blocked_response(
+            purchase_id=purchase_id,
+            identity_id=identity_id,
+            reason="balance_mismatch",
+            message=(
+                f"User has {credits_remaining} credits but purchase granted {credits_granted}. "
+                f"Automatic reversal would only remove {credits_remaining}, creating an accounting "
+                f"discrepancy. Use manual_record_only=true to record the decision, then adjust "
+                f"credits manually if needed."
+            ),
+            amount_gbp=amount_gbp,
+            credits_granted=credits_granted,
+            credits_used=credits_used,
+            credits_remaining=credits_remaining,
+            executed_by=executed_by,
+            admin_note=admin_note,
+        )
     else:
         # Full safe reversal
         credits_to_reverse = credits_granted
@@ -331,6 +355,45 @@ def execute_refund(
             print(f"[ADMIN_REFUND_FAILED] purchase_id={purchase_id} error={e}")
             raise
 
+    # ── 7b. Optional external Mollie refund ──
+    external_refund_error = None
+    payment_reference = purchase.get("provider_payment_id")
+
+    if (
+        execute_external_refund
+        and refund_status == "executed"
+        and payment_provider == "mollie"
+        and payment_reference
+        and refund_type == "full_purchase_refund"
+        and not manual_record_only
+    ):
+        external_refund_id, external_refund_executed, external_refund_error = (
+            _attempt_mollie_refund(
+                payment_id=payment_reference,
+                amount_gbp=amount_gbp,
+                reason=reason or "Admin refund",
+                purchase_id=purchase_id,
+            )
+        )
+    elif execute_external_refund:
+        # Requested but not eligible — record why
+        if payment_provider != "mollie":
+            external_refund_error = f"External refund not supported for provider '{payment_provider}'"
+        elif not payment_reference:
+            external_refund_error = "No payment reference found on purchase"
+        elif refund_type != "full_purchase_refund":
+            external_refund_error = f"External refund only supported for full_purchase_refund, got '{refund_type}'"
+        elif manual_record_only:
+            external_refund_error = "External refund skipped because manual_record_only=true"
+        elif refund_status != "executed":
+            external_refund_error = f"External refund skipped — internal refund status is '{refund_status}'"
+        else:
+            external_refund_error = "External refund not eligible"
+        print(
+            f"[ADMIN_REFUND_EXTERNAL_SKIP] purchase_id={purchase_id} "
+            f"reason={external_refund_error}"
+        )
+
     # ── 8. Record in refunds table ──
     refund_record = _record_refund(
         purchase_id=purchase_id,
@@ -355,6 +418,30 @@ def execute_refund(
         },
     )
 
+    # Build external refund summary
+    external_refund_summary = {
+        "attempted": execute_external_refund,
+        "provider": payment_provider if execute_external_refund else None,
+        "executed": external_refund_executed,
+        "external_refund_id": external_refund_id,
+        "error": external_refund_error,
+    }
+
+    if not execute_external_refund:
+        external_note = (
+            "External payment refund (Mollie/Stripe) was NOT automatically executed. "
+            "Process the payment refund manually in your payment provider dashboard."
+        )
+    elif external_refund_executed:
+        external_note = (
+            f"Mollie refund executed successfully (refund_id={external_refund_id})."
+        )
+    else:
+        external_note = (
+            f"Mollie refund failed: {external_refund_error or 'unknown error'}. "
+            "Process the payment refund manually in your Mollie dashboard."
+        )
+
     return {
         "ok": True,
         "refund": refund_record,
@@ -367,12 +454,9 @@ def execute_refund(
             "credits_remaining_before": credits_remaining,
             "credits_reversed": credits_to_reverse,
             "credit_type": credit_type,
-            "external_refund_executed": external_refund_executed,
-            "external_refund_note": (
-                "External payment refund (Mollie/Stripe) was NOT automatically executed. "
-                "Process the payment refund manually in your payment provider dashboard."
-            ),
+            "external_refund_note": external_note,
         },
+        "external_refund": external_refund_summary,
     }
 
 
@@ -456,6 +540,67 @@ def list_refunds(
 # ─────────────────────────────────────────────────────────────────────────────
 # INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _attempt_mollie_refund(
+    *,
+    payment_id: str,
+    amount_gbp: float,
+    reason: str,
+    purchase_id: str,
+) -> tuple:
+    """
+    Attempt a Mollie payment refund via their API.
+
+    Returns:
+        (external_refund_id, success, error_message)
+    """
+    import requests
+    from backend.config import config
+
+    if not getattr(config, "MOLLIE_CONFIGURED", False):
+        return (None, False, "Mollie is not configured")
+
+    try:
+        resp = requests.post(
+            f"https://api.mollie.com/v2/payments/{payment_id}/refunds",
+            headers={
+                "Authorization": f"Bearer {config.MOLLIE_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "amount": {
+                    "currency": "GBP",
+                    "value": f"{amount_gbp:.2f}",
+                },
+                "description": f"Admin refund for purchase {purchase_id}: {reason}",
+            },
+            timeout=15,
+        )
+
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            refund_id = data.get("id")
+            print(
+                f"[ADMIN_REFUND_MOLLIE_OK] purchase_id={purchase_id} "
+                f"payment_id={payment_id} mollie_refund_id={refund_id}"
+            )
+            return (refund_id, True, None)
+        else:
+            error_detail = resp.text[:500]
+            print(
+                f"[ADMIN_REFUND_MOLLIE_FAIL] purchase_id={purchase_id} "
+                f"payment_id={payment_id} status={resp.status_code} "
+                f"body={error_detail}"
+            )
+            return (None, False, f"Mollie API returned {resp.status_code}: {error_detail}")
+
+    except requests.Timeout:
+        print(f"[ADMIN_REFUND_MOLLIE_TIMEOUT] purchase_id={purchase_id} payment_id={payment_id}")
+        return (None, False, "Mollie API request timed out")
+    except Exception as e:
+        print(f"[ADMIN_REFUND_MOLLIE_ERROR] purchase_id={purchase_id} error={e}")
+        return (None, False, str(e))
+
 
 def _record_refund(
     *,

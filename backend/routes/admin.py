@@ -2454,6 +2454,7 @@ def refunds_execute():
             admin_note=data.get("admin_note"),
             allow_credit_reversal=data.get("allow_credit_reversal", True),
             manual_record_only=data.get("manual_record_only", False),
+            execute_external_refund=bool(data.get("execute_external_refund", False)),
             executed_by=executed_by or data.get("executed_by"),
         )
 
