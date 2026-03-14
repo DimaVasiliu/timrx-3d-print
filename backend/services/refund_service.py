@@ -489,6 +489,7 @@ def list_refunds(
     status: Optional[str] = None,
     identity_id: Optional[str] = None,
     purchase_id: Optional[str] = None,
+    email: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -512,10 +513,18 @@ def list_refunds(
         conditions.append("r.purchase_id = %s::uuid")
         params.append(purchase_id)
 
+    # Email substring filter (case-insensitive) — requires JOIN
+    needs_email_join = False
+    if email and email.strip():
+        conditions.append("i.email ILIKE %s")
+        params.append(f"%{email.strip()}%")
+        needs_email_join = True
+
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    email_join = f"LEFT JOIN {Tables.IDENTITIES} i ON i.id = r.identity_id" if needs_email_join else ""
 
     count_row = query_one(
-        f"SELECT COUNT(*) AS total FROM {_TABLE} r {where}",
+        f"SELECT COUNT(*) AS total FROM {_TABLE} r {email_join} {where}",
         tuple(params),
     )
     total = count_row["total"] if count_row else 0

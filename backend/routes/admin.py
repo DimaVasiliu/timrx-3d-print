@@ -2484,6 +2484,7 @@ def refunds_list():
             status=request.args.get("status"),
             identity_id=request.args.get("identity_id"),
             purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
             limit=min(int(request.args.get("limit", 50)), 200),
             offset=int(request.args.get("offset", 0)),
         )
