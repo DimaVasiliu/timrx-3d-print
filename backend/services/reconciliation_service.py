@@ -604,6 +604,7 @@ class ReconciliationService:
             FROM {Tables.VIDEOS} v
             WHERE v.identity_id IS NOT NULL
               AND v.video_url IS NOT NULL
+              AND v.status NOT IN ('queued', 'failed', 'error', 'cancelled')
               AND NOT EXISTS (
                   SELECT 1 FROM {Tables.HISTORY_ITEMS} h
                   WHERE h.video_id = v.id
