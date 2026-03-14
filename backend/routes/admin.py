@@ -28,13 +28,16 @@ Endpoints:
 - GET  /api/admin/provider-ledger    - List provider ledger entries (filterable)
 - POST /api/admin/provider-ledger    - Create a provider ledger entry
 - GET  /api/admin/provider-spend/monthly - Monthly provider spend report
+- GET  /api/admin/refunds/export.csv              - CSV export of refund history
+- GET  /api/admin/provider-ledger/export.csv      - CSV export of provider ledger
+- GET  /api/admin/provider-spend/monthly/export.csv - CSV export of monthly spend
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
   ADMIN_EMAILS=admin@example.com     # Comma-separated list for email-based auth
 """
 
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify, g, Response
 
 from backend.middleware import require_admin
 from backend.services.admin_service import AdminService
@@ -2492,6 +2495,181 @@ def refunds_list():
 
     except Exception as e:
         print(f"[ADMIN] Refunds list error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV EXPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _csv_response(rows, fieldnames, filename):
+    """Build a CSV Response from a list of dicts."""
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@bp.route("/refunds/export.csv", methods=["GET"])
+@require_admin
+def refunds_export_csv():
+    """Export refund history as CSV with same filters as list endpoint."""
+    try:
+        from backend.services.refund_service import list_refunds
+
+        result = list_refunds(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+        )
+
+        fieldnames = [
+            "refund_id", "created_at", "executed_at", "refund_status", "refund_type",
+            "email", "identity_id", "purchase_id", "subscription_id", "purchase_type",
+            "amount_gbp", "currency", "credits_reversed", "credits_granted", "credits_used",
+            "credit_type", "payment_provider",
+            "external_refund_attempted", "external_refund_executed", "external_refund_id",
+            "executed_by", "reason", "admin_note", "display_summary",
+        ]
+
+        rows = []
+        for rf in result.get("refunds", []):
+            ext = rf.get("external_refund") or {}
+            rows.append({
+                "refund_id": rf.get("id", ""),
+                "created_at": rf.get("created_at", ""),
+                "executed_at": rf.get("executed_at", ""),
+                "refund_status": rf.get("refund_status", ""),
+                "refund_type": rf.get("refund_type", ""),
+                "email": rf.get("email", ""),
+                "identity_id": rf.get("identity_id", ""),
+                "purchase_id": rf.get("purchase_id", ""),
+                "subscription_id": rf.get("subscription_id", ""),
+                "purchase_type": rf.get("purchase_type", ""),
+                "amount_gbp": rf.get("amount_gbp", ""),
+                "currency": rf.get("currency", ""),
+                "credits_reversed": rf.get("credits_reversed", ""),
+                "credits_granted": rf.get("credits_granted", ""),
+                "credits_used": rf.get("credits_used", ""),
+                "credit_type": rf.get("credit_type", ""),
+                "payment_provider": rf.get("payment_provider", ""),
+                "external_refund_attempted": ext.get("attempted", ""),
+                "external_refund_executed": ext.get("executed", ""),
+                "external_refund_id": ext.get("external_refund_id", ""),
+                "executed_by": rf.get("executed_by", ""),
+                "reason": rf.get("reason", ""),
+                "admin_note": rf.get("admin_note", ""),
+                "display_summary": rf.get("display_summary", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "refund_history.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Refunds CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-ledger/export.csv", methods=["GET"])
+@require_admin
+def provider_ledger_export_csv():
+    """Export provider ledger entries as CSV."""
+    try:
+        from backend.services.provider_ledger_service import list_ledger_entries
+
+        result = list_ledger_entries(
+            provider=request.args.get("provider"),
+            entry_type=request.args.get("entry_type"),
+            month=request.args.get("month"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+        )
+
+        fieldnames = [
+            "id", "created_at", "provider", "entry_type", "amount_gbp", "currency",
+            "balance_snapshot_gbp", "description", "reference", "period_month", "recorded_by",
+        ]
+
+        rows = []
+        for e in result.get("entries", []):
+            rows.append({
+                "id": e.get("id", ""),
+                "created_at": e.get("created_at", ""),
+                "provider": e.get("provider", ""),
+                "entry_type": e.get("entry_type", ""),
+                "amount_gbp": e.get("amount_gbp", ""),
+                "currency": e.get("currency", ""),
+                "balance_snapshot_gbp": e.get("balance_snapshot_gbp", ""),
+                "description": e.get("description", ""),
+                "reference": e.get("reference", ""),
+                "period_month": e.get("period_month", ""),
+                "recorded_by": e.get("recorded_by", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "provider_ledger.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Provider ledger CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-spend/monthly/export.csv", methods=["GET"])
+@require_admin
+def provider_spend_monthly_export_csv():
+    """Export monthly provider spend report as CSV."""
+    try:
+        from backend.services.provider_ledger_service import get_monthly_spend_report
+
+        result = get_monthly_spend_report(
+            months=min(int(request.args.get("months", 6)), 24),
+        )
+
+        fieldnames = [
+            "month", "provider", "estimated_usage_gbp", "job_count",
+            "topups_gbp", "topup_count", "invoices_gbp", "invoice_count",
+            "adjustments_gbp", "adjustment_count",
+            "latest_balance_snapshot_gbp", "latest_balance_snapshot_recorded_at",
+        ]
+
+        snapshots = result.get("latest_snapshots", {})
+        rows = []
+        for row in result.get("report", []):
+            provider = row.get("provider", "")
+            snap = snapshots.get(provider, {})
+            rows.append({
+                "month": row.get("month", ""),
+                "provider": provider,
+                "estimated_usage_gbp": row.get("estimated_usage_gbp", ""),
+                "job_count": row.get("job_count", ""),
+                "topups_gbp": row.get("topups_gbp", ""),
+                "topup_count": row.get("topup_count", ""),
+                "invoices_gbp": row.get("invoices_gbp", ""),
+                "invoice_count": row.get("invoice_count", ""),
+                "adjustments_gbp": row.get("adjustments_gbp", ""),
+                "adjustment_count": row.get("adjustment_count", ""),
+                "latest_balance_snapshot_gbp": snap.get("balance_gbp", ""),
+                "latest_balance_snapshot_recorded_at": snap.get("recorded_at", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "monthly_provider_spend.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Monthly spend CSV export error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
