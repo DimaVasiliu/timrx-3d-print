@@ -1149,3 +1149,263 @@ class _AdminServiceExtra:
 for _name in dir(_AdminServiceExtra):
     if not _name.startswith('_'):
         setattr(AdminService, _name, getattr(_AdminServiceExtra, _name))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identity Fragmentation Inspection (Phase 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IdentityInspectionService:
+    """
+    Read-only inspection tools for identity fragmentation diagnosis.
+    No mutations — safe for production use.
+    """
+
+    @staticmethod
+    def _ts(val) -> Optional[str]:
+        """Format a timestamp for JSON output."""
+        if val and hasattr(val, "isoformat"):
+            return val.isoformat()
+        return None
+
+    @staticmethod
+    def inspect_identity(identity_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Deep inspection of a single identity: wallet, history, jobs, models,
+        images, videos, purchases, subscriptions, active sessions.
+        Returns counts and summaries — not full record dumps.
+        """
+        identity = query_one(
+            f"""
+            SELECT i.*, COALESCE(w.balance_credits, 0) as balance,
+                   COALESCE(w.reserved_credits, 0) as reserved
+            FROM {Tables.IDENTITIES} i
+            LEFT JOIN {Tables.WALLETS} w ON w.identity_id = i.id
+            WHERE i.id = %s
+            """,
+            (identity_id,),
+        )
+        if not identity:
+            return None
+
+        ts = IdentityInspectionService._ts
+
+        # Counts for all owned tables
+        counts = {}
+        for label, sql in [
+            ("history_items", f"SELECT COUNT(*) as c FROM timrx_billing.history_items WHERE identity_id = %s"),
+            ("jobs", f"SELECT COUNT(*) as c FROM {Tables.JOBS} WHERE identity_id = %s"),
+            ("models", f"SELECT COUNT(*) as c FROM timrx_app.models WHERE identity_id = %s"),
+            ("images", f"SELECT COUNT(*) as c FROM timrx_app.images WHERE identity_id = %s"),
+            ("videos", f"SELECT COUNT(*) as c FROM timrx_app.videos WHERE identity_id = %s"),
+            ("purchases", f"SELECT COUNT(*) as c FROM {Tables.PURCHASES} WHERE identity_id = %s"),
+            ("ledger_entries", f"SELECT COUNT(*) as c FROM {Tables.LEDGER_ENTRIES} WHERE identity_id = %s"),
+        ]:
+            try:
+                row = query_one(sql, (identity_id,))
+                counts[label] = int(row["c"]) if row else 0
+            except Exception:
+                counts[label] = -1  # Table may not exist
+
+        # Subscriptions (with status)
+        subs = query_all(
+            f"""
+            SELECT id, status, plan_id, created_at, current_period_end
+            FROM {Tables.SUBSCRIPTIONS}
+            WHERE identity_id = %s
+            ORDER BY created_at DESC
+            """,
+            (identity_id,),
+        ) or []
+
+        # Active sessions
+        sessions = query_all(
+            f"""
+            SELECT id, created_at, expires_at, ip_hash, user_agent_hash
+            FROM {Tables.SESSIONS}
+            WHERE identity_id = %s AND revoked_at IS NULL AND expires_at > NOW()
+            ORDER BY created_at DESC
+            """,
+            (identity_id,),
+        ) or []
+
+        balance = int(identity["balance"])
+        reserved = int(identity["reserved"])
+
+        return {
+            "identity_id": str(identity["id"]),
+            "email": identity.get("email"),
+            "email_verified": identity.get("email_verified", False),
+            "created_at": ts(identity.get("created_at")),
+            "last_seen_at": ts(identity.get("last_seen_at")),
+            "wallet": {
+                "balance": balance,
+                "reserved": reserved,
+                "available": max(0, balance - reserved),
+            },
+            "counts": counts,
+            "subscriptions": [
+                {
+                    "id": str(s["id"]),
+                    "status": s["status"],
+                    "plan_id": s.get("plan_id"),
+                    "created_at": ts(s.get("created_at")),
+                    "current_period_end": ts(s.get("current_period_end")),
+                }
+                for s in subs
+            ],
+            "active_sessions": [
+                {
+                    "id": str(s["id"]),
+                    "created_at": ts(s.get("created_at")),
+                    "expires_at": ts(s.get("expires_at")),
+                    "ip_hash": s.get("ip_hash", "")[:16] + "..." if s.get("ip_hash") else None,
+                    "ua_hash": s.get("user_agent_hash", "")[:16] + "..." if s.get("user_agent_hash") else None,
+                }
+                for s in sessions
+            ],
+        }
+
+    @staticmethod
+    def find_fragmented_identities(limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Find identities that likely belong to the same real user.
+        Uses session IP+UA fingerprint overlap as the primary signal.
+        Returns groups of identities sharing the same fingerprint,
+        where at least one has data (history/jobs/credits).
+        """
+        ts = IdentityInspectionService._ts
+
+        # Find IP+UA pairs that appear across multiple identities
+        rows = query_all(
+            f"""
+            WITH fingerprints AS (
+                SELECT DISTINCT s.ip_hash, s.user_agent_hash, s.identity_id
+                FROM {Tables.SESSIONS} s
+                WHERE s.ip_hash IS NOT NULL
+                  AND s.user_agent_hash IS NOT NULL
+            ),
+            shared AS (
+                SELECT f.ip_hash, f.user_agent_hash,
+                       array_agg(DISTINCT f.identity_id) as identity_ids
+                FROM fingerprints f
+                GROUP BY f.ip_hash, f.user_agent_hash
+                HAVING COUNT(DISTINCT f.identity_id) > 1
+            )
+            SELECT s.ip_hash, s.user_agent_hash, s.identity_ids
+            FROM shared s
+            ORDER BY array_length(s.identity_ids, 1) DESC
+            LIMIT %s
+            """,
+            (limit,),
+        ) or []
+
+        results = []
+        for row in rows:
+            identity_ids = [str(uid) for uid in row["identity_ids"]]
+            group_details = []
+            for iid in identity_ids:
+                detail = query_one(
+                    f"""
+                    SELECT i.id, i.email, i.email_verified, i.created_at, i.last_seen_at,
+                           COALESCE(w.balance_credits, 0) as balance,
+                           (SELECT COUNT(*) FROM timrx_billing.history_items WHERE identity_id = i.id) as history_count,
+                           (SELECT COUNT(*) FROM {Tables.JOBS} WHERE identity_id = i.id) as job_count
+                    FROM {Tables.IDENTITIES} i
+                    LEFT JOIN {Tables.WALLETS} w ON w.identity_id = i.id
+                    WHERE i.id = %s
+                    """,
+                    (iid,),
+                )
+                if detail:
+                    group_details.append({
+                        "identity_id": str(detail["id"]),
+                        "email": detail.get("email"),
+                        "email_verified": detail.get("email_verified", False),
+                        "created_at": ts(detail.get("created_at")),
+                        "last_seen_at": ts(detail.get("last_seen_at")),
+                        "balance": int(detail["balance"]),
+                        "history_count": int(detail["history_count"]),
+                        "job_count": int(detail["job_count"]),
+                    })
+
+            # Only include groups where at least one identity has meaningful data
+            has_data = any(d["history_count"] > 0 or d["balance"] > 0 for d in group_details)
+            if has_data:
+                results.append({
+                    "fingerprint_ip_hash": row["ip_hash"][:16] + "...",
+                    "identity_count": len(group_details),
+                    "identities": group_details,
+                })
+
+        return results
+
+    @staticmethod
+    def dry_run_merge(source_id: str, target_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Simulate a merge of source into target WITHOUT making any changes.
+        Returns a report of what WOULD happen.
+        """
+        source = IdentityInspectionService.inspect_identity(source_id)
+        target = IdentityInspectionService.inspect_identity(target_id)
+
+        if not source or not target:
+            return None
+
+        # Check for conflicts
+        conflicts = []
+
+        # Both have verified emails?
+        if (source["email"] and source["email_verified"]
+                and target["email"] and target["email_verified"]
+                and source["email"] != target["email"]):
+            conflicts.append({
+                "type": "DIFFERENT_VERIFIED_EMAILS",
+                "severity": "BLOCKER",
+                "detail": f"Source has verified {source['email']}, target has verified {target['email']}. "
+                          f"Cannot auto-merge — different real users.",
+            })
+
+        # Both have active subscriptions?
+        source_active_subs = [s for s in source["subscriptions"] if s["status"] == "active"]
+        target_active_subs = [s for s in target["subscriptions"] if s["status"] == "active"]
+        if source_active_subs and target_active_subs:
+            conflicts.append({
+                "type": "DUAL_ACTIVE_SUBSCRIPTIONS",
+                "severity": "WARNING",
+                "detail": f"Source has {len(source_active_subs)} active sub(s), "
+                          f"target has {len(target_active_subs)}. Needs manual review.",
+            })
+
+        s_counts = source["counts"]
+        t_counts = target["counts"]
+
+        return {
+            "source": {
+                "identity_id": source["identity_id"],
+                "email": source["email"],
+                "email_verified": source["email_verified"],
+            },
+            "target": {
+                "identity_id": target["identity_id"],
+                "email": target["email"],
+                "email_verified": target["email_verified"],
+            },
+            "would_transfer": {
+                "history_items": s_counts.get("history_items", 0),
+                "jobs": s_counts.get("jobs", 0),
+                "models": s_counts.get("models", 0),
+                "images": s_counts.get("images", 0),
+                "videos": s_counts.get("videos", 0),
+                "purchases": s_counts.get("purchases", 0),
+                "ledger_entries": s_counts.get("ledger_entries", 0),
+                "credit_balance": source["wallet"]["balance"],
+            },
+            "target_after_merge": {
+                "history_items": t_counts.get("history_items", 0) + s_counts.get("history_items", 0),
+                "jobs": t_counts.get("jobs", 0) + s_counts.get("jobs", 0),
+                "credit_balance": target["wallet"]["balance"] + source["wallet"]["balance"],
+            },
+            "conflicts": conflicts,
+            "safe_to_merge": len([c for c in conflicts if c["severity"] == "BLOCKER"]) == 0,
+        }

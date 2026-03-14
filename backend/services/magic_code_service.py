@@ -56,6 +56,58 @@ class MagicCodeService:
         return hashlib.sha256(code.encode()).hexdigest()
 
     # ─────────────────────────────────────────────────────────────
+    # Restore Diagnostics
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _log_restore_diagnostic(session_id: str, target_identity_id: str) -> None:
+        """
+        Log whether the identity being abandoned during restore has meaningful data.
+        Non-blocking — failures here never affect the restore flow.
+        """
+        try:
+            current_session = query_one(
+                f"SELECT identity_id FROM {Tables.SESSIONS} WHERE id = %s",
+                (session_id,),
+            )
+            if not current_session:
+                return
+            source_id = str(current_session["identity_id"])
+            if source_id == target_identity_id:
+                return
+
+            source_stats = query_one(
+                f"""
+                SELECT
+                    COALESCE(w.balance_credits, 0) as balance,
+                    (SELECT COUNT(*) FROM timrx_billing.history_items WHERE identity_id = %s) as history_count,
+                    (SELECT COUNT(*) FROM {Tables.JOBS} WHERE identity_id = %s) as job_count
+                FROM {Tables.WALLETS} w
+                WHERE w.identity_id = %s
+                """,
+                (source_id, source_id, source_id),
+            )
+            if not source_stats:
+                return
+
+            h = int(source_stats["history_count"])
+            j = int(source_stats["job_count"])
+            b = int(source_stats["balance"])
+            if h > 0 or j > 0 or b > 0:
+                print(
+                    f"[RESTORE] DATA AT RISK: session switching from identity "
+                    f"{source_id[:8]}... to {target_identity_id[:8]}... — "
+                    f"source has history={h}, jobs={j}, balance={b}"
+                )
+            else:
+                print(
+                    f"[RESTORE] Identity switch {source_id[:8]}... -> "
+                    f"{target_identity_id[:8]}... (source has no data, safe)"
+                )
+        except Exception as diag_err:
+            print(f"[RESTORE] Diagnostic check failed (non-blocking): {diag_err}")
+
+    # ─────────────────────────────────────────────────────────────
     # Request Code (Step 1)
     # ─────────────────────────────────────────────────────────────
 
@@ -232,6 +284,9 @@ class MagicCodeService:
             return (False, None, "Too many failed attempts. Please request a new code")
 
         code_id = str(code_record["id"])
+
+        # Log diagnostic info about the identity switch (non-blocking)
+        MagicCodeService._log_restore_diagnostic(session_id, identity_id)
 
         # Mark code as consumed and link session to identity
         with transaction() as cur:

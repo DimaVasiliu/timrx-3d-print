@@ -598,18 +598,55 @@ class IdentityService:
         return session
 
     @staticmethod
+    def _maybe_renew_session(session_id: str, session_created_at) -> bool:
+        """
+        Sliding-window session renewal.
+        Extends expires_at when more than half the TTL has elapsed since creation.
+        Returns True if renewal happened.
+
+        This avoids a DB write on every request while ensuring active users
+        never hit the 30-day expiry cliff (AUTH-1 fix).
+        """
+        if not session_created_at:
+            return False
+        ttl_days = config.SESSION_TTL_DAYS
+        half_life = timedelta(days=ttl_days) / 2
+        session_age = now_utc() - session_created_at
+        if session_age <= half_life:
+            return False
+
+        new_expiry = now_utc() + timedelta(days=ttl_days)
+        execute(
+            f"UPDATE {Tables.SESSIONS} SET expires_at = %s WHERE id = %s",
+            (new_expiry, session_id),
+        )
+        if SESSION_DEBUG:
+            print(
+                f"[SESSION] Renewed session {session_id[:8]}... "
+                f"(age={session_age.days}d, new_expiry={new_expiry.isoformat()})"
+            )
+        return True
+
+    @staticmethod
     def validate_session(session_id: str) -> Optional[Dict[str, Any]]:
         """
         Validate a session ID and return the associated identity.
         Returns None if session is invalid, expired, or revoked.
         Also updates identity's last_seen_at.
+
+        Session renewal (sliding window):
+        - If >50% of SESSION_TTL_DAYS has elapsed since session creation,
+          extends expires_at by another full TTL from now.
+        - Sets result["_session_renewed"] = True when renewal happens,
+          so callers (middleware) can re-set the cookie with fresh Max-Age.
         """
         if not session_id:
             return None
 
         result = query_one(
             f"""
-            SELECT i.*, s.id as session_id, s.expires_at as session_expires_at
+            SELECT i.*, s.id as session_id, s.expires_at as session_expires_at,
+                   s.created_at as session_created_at
             FROM {Tables.SESSIONS} s
             JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
             WHERE s.id = %s
@@ -619,12 +656,24 @@ class IdentityService:
             (session_id,),
         )
 
-        if result:
-            # Touch identity in background (don't fail if this fails)
-            try:
-                IdentityService.touch_identity(str(result["id"]))
-            except Exception:
-                pass
+        if not result:
+            return None
+
+        # Touch identity in background (don't fail if this fails)
+        try:
+            IdentityService.touch_identity(str(result["id"]))
+        except Exception:
+            pass
+
+        # Attempt sliding-window renewal (non-critical)
+        try:
+            result["_session_renewed"] = IdentityService._maybe_renew_session(
+                session_id, result.get("session_created_at")
+            )
+        except Exception as e:
+            result["_session_renewed"] = False
+            if SESSION_DEBUG:
+                print(f"[SESSION] Renewal failed for {session_id[:8]}...: {e}")
 
         return result
 
@@ -752,6 +801,30 @@ class IdentityService:
 
         if SESSION_DEBUG:
             print(f"[SESSION] Created anonymous session {session_id[:8]}... for new identity {identity_id[:8]}...")
+
+        # ── Fragmentation detection log ──
+        # If this IP+UA already has other identities, log a warning.
+        # This doesn't block anything — it's visibility into potential fragmentation.
+        if ip_hash:
+            try:
+                existing = query_one(
+                    f"""
+                    SELECT COUNT(DISTINCT s.identity_id) as identity_count
+                    FROM {Tables.SESSIONS} s
+                    WHERE s.ip_hash = %s
+                      AND s.identity_id != %s
+                    """,
+                    (ip_hash, identity_id),
+                )
+                count = int(existing["identity_count"]) if existing else 0
+                if count > 0:
+                    print(
+                        f"[IDENTITY] FRAGMENTATION WARNING: new identity {identity_id[:8]}... "
+                        f"created for IP that already has {count} other identity(ies)"
+                    )
+            except Exception:
+                pass  # Non-critical diagnostic
+
         return session_id, identity_id, identity
 
     @staticmethod
@@ -899,3 +972,4 @@ def require_identity() -> tuple[str | None, Response | None]:
         }),
         401,
     )
+

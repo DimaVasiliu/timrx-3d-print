@@ -3146,3 +3146,84 @@ def provider_spend_monthly_export_csv():
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identity Fragmentation Inspection (Phase 2 — read-only, no mutations)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/identity/inspect/<identity_id>", methods=["GET"])
+@require_admin
+def inspect_identity(identity_id):
+    """
+    Deep inspection of a single identity: wallet, history counts, jobs,
+    models, images, videos, purchases, subscriptions, active sessions.
+    """
+    from backend.services.admin_service import IdentityInspectionService
+
+    try:
+        result = IdentityInspectionService.inspect_identity(identity_id)
+        if not result:
+            return jsonify({"ok": False, "error": "Identity not found"}), 404
+        return jsonify({"ok": True, "identity": result})
+    except Exception as e:
+        print(f"[ADMIN] Identity inspect error: {e}")
+        return jsonify({"ok": False, "error": "Inspection failed"}), 500
+
+
+@bp.route("/identity/fragments", methods=["GET"])
+@require_admin
+def find_fragments():
+    """
+    Find identities that likely belong to the same real user (shared IP+UA
+    fingerprint across multiple identities). Only returns groups where at
+    least one identity has meaningful data (history or credits).
+
+    Query params:
+        - limit: Max groups to return (default 50)
+    """
+    from backend.services.admin_service import IdentityInspectionService
+
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        results = IdentityInspectionService.find_fragmented_identities(limit=limit)
+        return jsonify({
+            "ok": True,
+            "fragment_groups": results,
+            "total_groups": len(results),
+        })
+    except Exception as e:
+        print(f"[ADMIN] Fragment detection error: {e}")
+        return jsonify({"ok": False, "error": "Fragment detection failed"}), 500
+
+
+@bp.route("/identity/merge-preview", methods=["POST"])
+@require_admin
+def merge_preview():
+    """
+    Dry-run merge simulation. Shows what WOULD happen if source identity
+    were merged into target identity. No data is changed.
+
+    Request body:
+        { "source_id": "uuid", "target_id": "uuid" }
+    """
+    from backend.services.admin_service import IdentityInspectionService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        source_id = data.get("source_id", "").strip()
+        target_id = data.get("target_id", "").strip()
+
+        if not source_id or not target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id required"}), 400
+        if source_id == target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id must be different"}), 400
+
+        result = IdentityInspectionService.dry_run_merge(source_id, target_id)
+        if not result:
+            return jsonify({"ok": False, "error": "One or both identities not found"}), 404
+
+        return jsonify({"ok": True, "merge_preview": result})
+    except Exception as e:
+        print(f"[ADMIN] Merge preview error: {e}")
+        return jsonify({"ok": False, "error": "Merge preview failed"}), 500

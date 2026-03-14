@@ -156,6 +156,21 @@ def no_cache(f):
     return decorated
 
 
+def _ensure_response(result):
+    """Convert a route return value (Response, tuple, dict, str) to a Response object."""
+    if hasattr(result, 'headers'):
+        return result
+    if isinstance(result, tuple):
+        return make_response(result[0], result[1] if len(result) > 1 else 200)
+    return make_response(result)
+
+
+def _copy_cookies(source_response, target_response):
+    """Copy Set-Cookie headers from source to target response."""
+    for cookie in source_response.headers.getlist('Set-Cookie'):
+        target_response.headers.add('Set-Cookie', cookie)
+
+
 def with_session(f):
     """
     Decorator that ensures a session exists.
@@ -167,58 +182,46 @@ def with_session(f):
         - g.identity: The full identity dict (with wallet balance)
 
     The session cookie is automatically set on new sessions.
+    If an existing session was renewed (sliding window), the cookie
+    Max-Age is refreshed so the browser stays in sync.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Lazy imports to avoid circular import at module load time
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
-        # DEBUG: Log session diagnostics
         _log_session_debug("with_session")
 
-        # Create response wrapper to set cookies
         try:
-            # Check for existing valid session first
             identity = IdentityService.get_current_identity(request)
 
             if identity:
-                # Existing valid session
                 g.session_id = IdentityService.get_session_id_from_request(request)
                 g.identity_id = str(identity["id"])
                 g.identity = identity
-                return f(*args, **kwargs)
 
-            # No valid session - need to create one
-            # We need to wrap the response to set the cookie
-            response = make_response()
+                result = f(*args, **kwargs)
 
-            session_id, identity_id = IdentityService.get_or_create_session(request, response)
+                # If session was renewed (sliding window), refresh cookie Max-Age
+                if identity.get("_session_renewed") and g.session_id:
+                    resp = _ensure_response(result)
+                    IdentityService.set_session_cookie(resp, g.session_id)
+                    return resp
+
+                return result
+
+            # No valid session — create anonymous identity + session
+            cookie_response = make_response()
+            session_id, identity_id = IdentityService.get_or_create_session(request, cookie_response)
 
             g.session_id = session_id
             g.identity_id = identity_id
             g.identity = IdentityService.get_identity_with_wallet(identity_id)
 
-            # Call the actual route function
             result = f(*args, **kwargs)
-
-            # If result is a Response, copy cookies to it
-            if hasattr(result, 'headers'):
-                # Copy the session cookie from our temp response
-                for cookie in response.headers.getlist('Set-Cookie'):
-                    result.headers.add('Set-Cookie', cookie)
-                return result
-            else:
-                # Result is not a response (e.g., tuple or dict)
-                # Convert to response and add cookies
-                if isinstance(result, tuple):
-                    actual_response = make_response(result[0], result[1] if len(result) > 1 else 200)
-                else:
-                    actual_response = make_response(result)
-
-                for cookie in response.headers.getlist('Set-Cookie'):
-                    actual_response.headers.add('Set-Cookie', cookie)
-                return actual_response
+            resp = _ensure_response(result)
+            _copy_cookies(cookie_response, resp)
+            return resp
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in with_session: {e}")
@@ -284,7 +287,15 @@ def require_session(f):
             g.identity_id = str(identity["id"])
             g.identity = identity
 
-            return f(*args, **kwargs)
+            result = f(*args, **kwargs)
+
+            # If session was renewed (sliding window), refresh cookie Max-Age
+            if identity.get("_session_renewed") and session_id:
+                resp = _ensure_response(result)
+                IdentityService.set_session_cookie(resp, session_id)
+                return resp
+
+            return result
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in require_session: {e}")
