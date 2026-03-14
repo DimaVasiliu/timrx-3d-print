@@ -23,6 +23,8 @@ Endpoints:
 - GET  /api/admin/alerts             - List admin alerts (filterable)
 - POST /api/admin/alerts/<id>/resolve - Mark an alert as resolved
 - GET  /api/admin/refunds/review     - Refund decision-support (failure candidates, suspicious purchases)
+- POST /api/admin/refunds/execute    - Execute an admin refund (credit reversal + audit)
+- GET  /api/admin/refunds            - List refund history
 - GET  /api/admin/provider-ledger    - List provider ledger entries (filterable)
 - POST /api/admin/provider-ledger    - Create a provider ledger entry
 - GET  /api/admin/provider-spend/monthly - Monthly provider spend report
@@ -2417,6 +2419,77 @@ def provider_spend_monthly():
 
     except Exception as e:
         print(f"[ADMIN] Provider spend monthly error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refund execution + history
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/refunds/execute", methods=["POST"])
+@require_admin
+def refunds_execute():
+    """Execute an admin refund with credit reversal and audit trail."""
+    try:
+        from backend.services.refund_service import execute_refund
+
+        data = request.get_json(silent=True) or {}
+
+        if not data.get("purchase_id"):
+            return jsonify({"ok": False, "error": "purchase_id is required"}), 400
+
+        # Get admin identity for executed_by
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = execute_refund(
+            purchase_id=data["purchase_id"],
+            refund_type=data.get("refund_type", "full_purchase_refund"),
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            allow_credit_reversal=data.get("allow_credit_reversal", True),
+            manual_record_only=data.get("manual_record_only", False),
+            executed_by=executed_by or data.get("executed_by"),
+        )
+
+        # The service returns {"ok": True/False, ...} directly
+        if result.get("ok"):
+            return jsonify(result)
+        else:
+            return jsonify(result), 422
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Refund execute error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds", methods=["GET"])
+@require_admin
+def refunds_list():
+    """List refund history with optional filters."""
+    try:
+        from backend.services.refund_service import list_refunds
+
+        result = list_refunds(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            purchase_id=request.args.get("purchase_id"),
+            limit=min(int(request.args.get("limit", 50)), 200),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Refunds list error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500

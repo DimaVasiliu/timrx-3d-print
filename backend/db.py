@@ -422,6 +422,7 @@ class Tables:
     EMAIL_OUTBOX = f"{_BILLING_SCHEMA}.email_outbox"
     PROVIDER_ALERTS = f"{_BILLING_SCHEMA}.provider_alerts"
     PROVIDER_LEDGER = f"{_BILLING_SCHEMA}.provider_ledger"
+    REFUNDS = f"{_BILLING_SCHEMA}.refunds"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
