@@ -611,6 +611,10 @@ class PurchaseService:
     @staticmethod
     def _format_purchase(purchase: Dict[str, Any]) -> Dict[str, Any]:
         """Format purchase for API response."""
+        # amount column: schema uses amount_gbp, some code paths use amount
+        amount_val = purchase.get("amount_gbp") or purchase.get("amount") or 0
+        # date column: schema uses paid_at, some code paths use purchased_at
+        date_val = purchase.get("paid_at") or purchase.get("purchased_at")
         return {
             "id": str(purchase["id"]),
             "identity_id": str(purchase["identity_id"]),
@@ -618,9 +622,12 @@ class PurchaseService:
             "plan_code": purchase.get("plan_code"),
             "plan_name": purchase.get("plan_name"),
             "provider": purchase.get("provider"),
-            "amount": float(purchase.get("amount", 0)),
+            "provider_payment_id": purchase.get("provider_payment_id"),
+            "amount": float(amount_val),
+            "amount_gbp": float(amount_val),
             "currency": purchase.get("currency", "GBP"),
             "credits_granted": purchase.get("credits_granted", 0),
             "status": purchase.get("status"),
-            "purchased_at": purchase["purchased_at"].isoformat() if purchase.get("purchased_at") else None,
+            "meta": purchase.get("meta") or {},
+            "purchased_at": date_val.isoformat() if hasattr(date_val, "isoformat") else date_val,
         }
