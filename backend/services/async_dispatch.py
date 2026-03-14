@@ -595,6 +595,14 @@ def update_job_status_ready(
                     )
             conn.commit()
             # print(f"[JOB] Marked job {job_id} as ready (model_id={model_id}, image_id={image_id})")
+
+        # Stamp estimated provider cost (observability only)
+        try:
+            from backend.services.provider_costs import stamp_estimated_cost
+            stamp_estimated_cost(job_id)
+        except Exception:
+            pass  # Cost stamping is best-effort
+
     except Exception as e:
         print(f"[JOB] ERROR marking job {job_id} as ready: {e}")
 

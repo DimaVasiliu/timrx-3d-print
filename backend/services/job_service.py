@@ -1010,6 +1010,14 @@ class JobService:
 
         # print(f"[JOB] Completed job={job_id}, success={success}, reservation={reservation_id}")
 
+        # Stamp estimated provider cost (observability only, does not affect billing)
+        if success:
+            try:
+                from backend.services.provider_costs import stamp_estimated_cost
+                stamp_estimated_cost(job_id)
+            except Exception:
+                pass  # Cost stamping is best-effort
+
         # Post to Discord on success (3D model completions via Meshy callback)
         if success:
             try:
@@ -2025,6 +2033,14 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                         (meta_json, internal_job_id),
                     )
             conn.commit()
+
+        # Stamp estimated provider cost (observability only)
+        try:
+            from backend.services.provider_costs import stamp_estimated_cost
+            stamp_estimated_cost(internal_job_id)
+        except Exception:
+            pass  # Cost stamping is best-effort
+
     except Exception as e:
         logger.exception(
             "[JOB] Failed to mark job %s as ready", internal_job_id

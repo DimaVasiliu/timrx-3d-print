@@ -73,24 +73,8 @@ _VIDEO_PACK_TIER_MAP = {
 }
 
 # Estimated provider cost per video job in GBP (used for daily spend guardrails)
-# Keyed by (provider, duration_seconds). Approximate real API costs.
-PROVIDER_COST_GBP: Dict[Tuple[str, int], float] = {
-    # Vertex (Veo)
-    ("vertex", 4): 0.30,
-    ("vertex", 6): 0.45,
-    ("vertex", 8): 0.60,
-    # Seedance Fast (PiAPI)
-    ("seedance_fast", 5): 0.25,
-    ("seedance_fast", 10): 0.50,
-    ("seedance_fast", 15): 0.75,
-    # Seedance Preview (PiAPI)
-    ("seedance_preview", 5): 0.45,
-    ("seedance_preview", 10): 0.90,
-    ("seedance_preview", 15): 1.35,
-    # fal Seedance 1.5 Pro
-    ("fal_seedance", 5): 0.25,
-    ("fal_seedance", 10): 0.50,
-}
+# Canonical data now lives in provider_costs.py; re-exported here for compatibility.
+from backend.services.provider_costs import VIDEO_COST_GBP as PROVIDER_COST_GBP  # noqa: E402
 
 # Cooldown between video starts (seconds)
 VIDEO_COOLDOWN_SECONDS = 10
@@ -241,26 +225,10 @@ def estimate_video_provider_cost(provider: str, duration_seconds: int, seedance_
     Estimate the real GBP cost of a video job to the provider.
 
     Returns approximate cost in GBP.
+    Delegates to the canonical implementation in provider_costs.py.
     """
-    if provider == "fal_seedance":
-        key = ("fal_seedance", int(duration_seconds))
-    elif provider == "seedance":
-        key = (f"seedance_{seedance_tier}", int(duration_seconds))
-    else:
-        key = ("vertex", int(duration_seconds))
-
-    cost = PROVIDER_COST_GBP.get(key)
-    if cost is not None:
-        return cost
-
-    # Fallback: linear estimate based on closest known cost
-    if provider == "fal_seedance":
-        rate = 0.05
-    elif provider == "seedance":
-        rate = 0.05 if seedance_tier == "fast" else 0.09
-    else:
-        rate = 0.075
-    return round(rate * int(duration_seconds), 2)
+    from backend.services.provider_costs import estimate_video_cost
+    return estimate_video_cost(provider, duration_seconds, seedance_tier)
 
 
 def get_daily_user_video_provider_spend(identity_id: str) -> float:
