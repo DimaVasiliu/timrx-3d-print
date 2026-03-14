@@ -20,6 +20,7 @@ Endpoints:
 - GET  /api/admin/debug/user         - Internal debug: user summary (masked email, wallet, history)
 - POST /api/admin/jobs/rescue        - Rescue late-completed Seedance jobs
 - GET  /api/admin/provider-health    - Aggregated provider health (success rates, spend, alerts)
+- GET  /api/admin/provider-balances  - Provider balance summary (snapshots, spend since, wallet alerts)
 - GET  /api/admin/alerts             - List admin alerts (filterable)
 - POST /api/admin/alerts/<id>/resolve - Mark an alert as resolved
 - GET  /api/admin/refunds/review     - Refund decision-support (failure candidates, suspicious purchases)
@@ -2276,6 +2277,23 @@ def provider_health():
 
     except Exception as e:
         print(f"[ADMIN] Provider health error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-balances", methods=["GET"])
+@require_admin
+def provider_balances():
+    """Provider balance summary: snapshots, estimated spend, wallet alerts, status."""
+    try:
+        from backend.services.provider_ledger_service import get_provider_balances
+
+        result = get_provider_balances()
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider balances error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500

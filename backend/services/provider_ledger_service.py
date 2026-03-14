@@ -377,3 +377,153 @@ def _empty_month() -> Dict[str, Any]:
         "adjustments_gbp": 0.0,
         "adjustment_count": 0,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVIDER BALANCE SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Known providers — mirrors admin_ops_service._PROVIDER_FEATURES
+_KNOWN_PROVIDERS = {"meshy", "openai", "google", "vertex", "seedance", "fal_seedance"}
+
+# Thresholds
+_STALE_SNAPSHOT_DAYS = 7          # snapshot older than this → warning
+_ACTION_NEEDED_SNAPSHOT_DAYS = 14  # snapshot older than this → action_needed
+_LOW_BALANCE_GBP = 10.0           # balance below this → warning
+_CRITICAL_BALANCE_GBP = 3.0       # balance below this → action_needed
+
+
+def get_provider_balances() -> Dict[str, Any]:
+    """
+    Provider balance summary: latest snapshot, estimated spend since snapshot,
+    wallet alerts, and computed balance_status per provider.
+
+    Status logic:
+      action_needed — snapshot stale >14d, balance <£3, or active wallet_depleted alert
+      warning       — snapshot stale >7d, balance <£10
+      ok            — recent snapshot, balance looks fine
+      unknown       — no snapshot recorded
+    """
+    now = datetime.now(timezone.utc)
+
+    # 1. Latest balance snapshot per provider
+    snapshot_rows = query_all(f"""
+        SELECT DISTINCT ON (provider)
+            provider, balance_snapshot_gbp, created_at, description
+        FROM {_TABLE}
+        WHERE entry_type = 'balance_snapshot'
+          AND balance_snapshot_gbp IS NOT NULL
+        ORDER BY provider, created_at DESC
+    """)
+    snapshots = {}
+    for r in snapshot_rows:
+        snapshots[r["provider"]] = {
+            "balance_gbp": float(r["balance_snapshot_gbp"]),
+            "recorded_at": r["created_at"],
+            "description": r["description"],
+        }
+
+    # 2. Estimated spend per provider since their last snapshot
+    spend_since = {}
+    for prov, snap in snapshots.items():
+        row = query_one(
+            f"""
+            SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS spend,
+                   COUNT(*) AS job_count
+            FROM {Tables.JOBS}
+            WHERE provider = %s
+              AND status IN ('succeeded', 'ready')
+              AND created_at > %s
+            """,
+            (prov, snap["recorded_at"]),
+        )
+        if row:
+            spend_since[prov] = {
+                "estimated_spend_gbp": round(float(row["spend"]), 2),
+                "job_count": row["job_count"],
+            }
+
+    # 3. Active wallet_depleted alerts (last 7 days)
+    _ALERTS_TABLE = "timrx_billing.provider_alerts"
+    wallet_alerts = query_all(f"""
+        SELECT provider, COUNT(*) AS cnt,
+               MAX(last_seen_at) AS latest
+        FROM {_ALERTS_TABLE}
+        WHERE alert_type = 'wallet_depleted'
+          AND last_seen_at > NOW() - INTERVAL '7 days'
+          AND provider IS NOT NULL
+        GROUP BY provider
+    """)
+    wallet_alert_map = {
+        r["provider"]: {"count": r["cnt"], "latest": _iso(r["latest"])}
+        for r in wallet_alerts
+    }
+
+    # 4. Build per-provider result
+    all_providers = _KNOWN_PROVIDERS | set(snapshots.keys())
+    providers = []
+    action_needed_count = 0
+    warning_count = 0
+
+    for prov in sorted(all_providers):
+        snap = snapshots.get(prov)
+        spend = spend_since.get(prov, {"estimated_spend_gbp": 0.0, "job_count": 0})
+        wallet = wallet_alert_map.get(prov)
+
+        if snap is None:
+            status = "unknown"
+            days_since = None
+            balance = None
+            estimated_remaining = None
+        else:
+            days_since = (now - snap["recorded_at"].replace(tzinfo=timezone.utc
+                          if snap["recorded_at"].tzinfo is None else snap["recorded_at"].tzinfo)).days
+            balance = snap["balance_gbp"]
+            estimated_remaining = round(balance - spend["estimated_spend_gbp"], 2)
+
+            # Status determination
+            has_wallet_alert = wallet is not None
+            if (days_since >= _ACTION_NEEDED_SNAPSHOT_DAYS
+                    or estimated_remaining <= _CRITICAL_BALANCE_GBP
+                    or has_wallet_alert):
+                status = "action_needed"
+            elif (days_since >= _STALE_SNAPSHOT_DAYS
+                  or estimated_remaining <= _LOW_BALANCE_GBP):
+                status = "warning"
+            else:
+                status = "ok"
+
+        if status == "action_needed":
+            action_needed_count += 1
+        elif status == "warning":
+            warning_count += 1
+
+        entry = {
+            "provider": prov,
+            "balance_status": status,
+            "last_snapshot_gbp": balance,
+            "last_snapshot_at": _iso(snap["recorded_at"]) if snap else None,
+            "last_snapshot_description": snap["description"] if snap else None,
+            "days_since_snapshot": days_since,
+            "estimated_spend_since_gbp": spend["estimated_spend_gbp"],
+            "jobs_since_snapshot": spend["job_count"],
+            "estimated_remaining_gbp": estimated_remaining,
+            "wallet_alerts_7d": wallet["count"] if wallet else 0,
+            "wallet_alert_latest": wallet["latest"] if wallet else None,
+        }
+        providers.append(entry)
+
+    # Sort: action_needed first, then warning, then ok, then unknown
+    _STATUS_ORDER = {"action_needed": 0, "warning": 1, "ok": 2, "unknown": 3}
+    providers.sort(key=lambda p: (_STATUS_ORDER.get(p["balance_status"], 9), p["provider"]))
+
+    print(f"[ADMIN_PROVIDER_BALANCES] providers={len(providers)} action_needed={action_needed_count} warning={warning_count}")
+
+    return {
+        "providers": providers,
+        "summary": {
+            "provider_count": len(providers),
+            "action_needed_count": action_needed_count,
+            "warning_count": warning_count,
+        },
+    }
