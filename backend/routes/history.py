@@ -89,59 +89,53 @@ def history_mod():
                                     v.meta AS v_meta, v.prompt AS v_prompt
                                 FROM {Tables.HISTORY_ITEMS} h
                                 LEFT JOIN {Tables.MODELS} m ON (
-                                    m.identity_id = %s AND (
-                                        -- Direct model_id lookup
-                                        (h.model_id IS NOT NULL AND h.model_id = m.id)
-                                        OR
-                                        -- Fallback: upstream_job_id lookup when no model_id
-                                        (h.model_id IS NULL AND m.upstream_job_id = COALESCE(
-                                            h.payload->>'original_job_id',
-                                            h.payload->>'preview_task_id',
-                                            h.payload->>'source_task_id'
-                                        ) AND COALESCE(
-                                            h.payload->>'original_job_id',
-                                            h.payload->>'preview_task_id',
-                                            h.payload->>'source_task_id'
-                                        ) IS NOT NULL)
-                                    )
+                                    -- Direct model_id lookup
+                                    (h.model_id IS NOT NULL AND h.model_id = m.id)
+                                    OR
+                                    -- Fallback: upstream_job_id lookup when no model_id
+                                    (h.model_id IS NULL AND m.upstream_job_id = COALESCE(
+                                        h.payload->>'original_job_id',
+                                        h.payload->>'preview_task_id',
+                                        h.payload->>'source_task_id'
+                                    ) AND COALESCE(
+                                        h.payload->>'original_job_id',
+                                        h.payload->>'preview_task_id',
+                                        h.payload->>'source_task_id'
+                                    ) IS NOT NULL)
                                 )
                                 LEFT JOIN {Tables.IMAGES} i ON (
-                                    i.identity_id = %s AND (
-                                        -- Direct image_id lookup
-                                        (h.image_id IS NOT NULL AND h.image_id = i.id)
-                                        OR
-                                        -- Fallback: upstream_id lookup when no image_id
-                                        (h.image_id IS NULL AND i.upstream_id = COALESCE(
-                                            h.payload->>'original_job_id',
-                                            h.payload->>'preview_task_id',
-                                            h.payload->>'source_task_id'
-                                        ) AND COALESCE(
-                                            h.payload->>'original_job_id',
-                                            h.payload->>'preview_task_id',
-                                            h.payload->>'source_task_id'
-                                        ) IS NOT NULL)
-                                    )
+                                    -- Direct image_id lookup
+                                    (h.image_id IS NOT NULL AND h.image_id = i.id)
+                                    OR
+                                    -- Fallback: upstream_id lookup when no image_id
+                                    (h.image_id IS NULL AND i.upstream_id = COALESCE(
+                                        h.payload->>'original_job_id',
+                                        h.payload->>'preview_task_id',
+                                        h.payload->>'source_task_id'
+                                    ) AND COALESCE(
+                                        h.payload->>'original_job_id',
+                                        h.payload->>'preview_task_id',
+                                        h.payload->>'source_task_id'
+                                    ) IS NOT NULL)
                                 )
                                 LEFT JOIN {Tables.VIDEOS} v ON (
-                                    v.identity_id = %s AND (
-                                        -- Direct video_id lookup
-                                        (h.video_id IS NOT NULL AND h.video_id = v.id)
-                                        OR
-                                        -- Fallback: upstream_id lookup when no video_id
-                                        (h.video_id IS NULL AND v.upstream_id = COALESCE(
-                                            h.payload->>'original_id',
-                                            h.payload->>'original_job_id'
-                                        ) AND COALESCE(
-                                            h.payload->>'original_id',
-                                            h.payload->>'original_job_id'
-                                        ) IS NOT NULL)
-                                    )
+                                    -- Direct video_id lookup
+                                    (h.video_id IS NOT NULL AND h.video_id = v.id)
+                                    OR
+                                    -- Fallback: upstream_id lookup when no video_id
+                                    (h.video_id IS NULL AND v.upstream_id = COALESCE(
+                                        h.payload->>'original_id',
+                                        h.payload->>'original_job_id'
+                                    ) AND COALESCE(
+                                        h.payload->>'original_id',
+                                        h.payload->>'original_job_id'
+                                    ) IS NOT NULL)
                                 )
                                 WHERE h.identity_id = %s
                                 ORDER BY h.created_at DESC
                                 LIMIT %s OFFSET %s;
                                 """,
-                                (identity_id, identity_id, identity_id, identity_id, limit, offset),
+                                (identity_id, limit, offset),
                             )
                             rows = cur.fetchall()
                     query_time = time.time() - start_time

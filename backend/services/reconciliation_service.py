@@ -457,12 +457,15 @@ class ReconciliationService:
 
         Create missing history_items rows.
         """
-        # Find successful jobs with models but no history item
+        # Find successful jobs with models but no history item.
+        # Use m.identity_id (asset owner) for NOT EXISTS check instead of
+        # j.identity_id — after identity merges, the asset's identity_id is
+        # the canonical owner while the job may still reference the old source.
         missing_model_history = query_all(
             f"""
             SELECT
                 j.id as job_id,
-                j.identity_id,
+                m.identity_id as identity_id,
                 j.action_code,
                 j.prompt,
                 j.meta,
@@ -474,11 +477,10 @@ class ReconciliationService:
             FROM {Tables.JOBS} j
             INNER JOIN {Tables.MODELS} m ON m.upstream_job_id = j.id::text
             WHERE j.status IN ('succeeded', 'completed', 'complete')
-              AND j.identity_id IS NOT NULL
+              AND m.identity_id IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM {Tables.HISTORY_ITEMS} h
-                  WHERE h.identity_id = j.identity_id
-                    AND (h.model_id = m.id OR h.payload->>'original_job_id' = j.id::text)
+                  WHERE h.model_id = m.id
               )
             LIMIT %s
             """,
@@ -490,7 +492,7 @@ class ReconciliationService:
             f"""
             SELECT
                 j.id as job_id,
-                j.identity_id,
+                i.identity_id as identity_id,
                 j.action_code,
                 j.prompt,
                 j.meta,
@@ -501,11 +503,10 @@ class ReconciliationService:
             FROM {Tables.JOBS} j
             INNER JOIN {Tables.IMAGES} i ON i.upstream_id = j.id::text
             WHERE j.status IN ('succeeded', 'completed', 'complete')
-              AND j.identity_id IS NOT NULL
+              AND i.identity_id IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM {Tables.HISTORY_ITEMS} h
-                  WHERE h.identity_id = j.identity_id
-                    AND (h.image_id = i.id OR h.payload->>'original_job_id' = j.id::text)
+                  WHERE h.image_id = i.id
               )
             LIMIT %s
             """,
@@ -517,7 +518,7 @@ class ReconciliationService:
             f"""
             SELECT
                 j.id as job_id,
-                j.identity_id,
+                v.identity_id as identity_id,
                 j.action_code,
                 j.prompt,
                 j.meta,
@@ -528,11 +529,10 @@ class ReconciliationService:
             FROM {Tables.JOBS} j
             INNER JOIN {Tables.VIDEOS} v ON v.upstream_id = j.id::text
             WHERE j.status IN ('succeeded', 'completed', 'complete')
-              AND j.identity_id IS NOT NULL
+              AND v.identity_id IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1 FROM {Tables.HISTORY_ITEMS} h
-                  WHERE h.identity_id = j.identity_id
-                    AND (h.video_id = v.id OR h.payload->>'original_job_id' = j.id::text)
+                  WHERE h.video_id = v.id
               )
             LIMIT %s
             """,
