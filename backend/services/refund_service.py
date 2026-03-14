@@ -33,7 +33,7 @@ _VALID_REFUND_TYPES = {
     "subscription_refund",
     "manual_adjustment_refund",
 }
-_VALID_STATUSES = {"pending", "executed", "failed", "manual_review_required"}
+_VALID_STATUSES = {"pending", "executed", "failed", "manual_review_required", "approved", "denied", "closed"}
 
 
 def _iso(val) -> Optional[str]:
@@ -555,7 +555,13 @@ def list_refunds(
                r.amount_gbp, r.currency, r.credits_reversed, r.credit_type,
                r.reason, r.admin_note, r.executed_by, r.external_refund_id,
                r.metadata, r.created_at, r.executed_at,
-               i.email AS identity_email
+               i.email AS identity_email,
+               EXISTS(
+                   SELECT 1 FROM {Tables.EMAIL_OUTBOX} eo
+                   WHERE eo.template = 'refund_review'
+                     AND eo.payload->>'refund_id' = r.id::text
+                     AND eo.status IN ('pending', 'sent')
+               ) AS review_email_sent
         FROM {_TABLE} r
         LEFT JOIN {Tables.IDENTITIES} i ON i.id = r.identity_id
         {where}
@@ -609,11 +615,472 @@ def list_refunds(
             "external_refund_id": ext_id,
             "external_refund": external_refund,
             "display_summary": _build_display_summary(r, external_refund),
+            "review_email_sent": bool(r.get("review_email_sent", False)),
+            "resolved_by": meta.get("resolved_by"),
+            "resolved_at": meta.get("resolved_at"),
+            "resolution_reason": meta.get("resolution_reason"),
+            "follow_up_email_queued": bool(meta.get("follow_up_email_queued", False)),
             "created_at": _iso(r["created_at"]),
             "executed_at": _iso(r["executed_at"]),
         })
 
     return {"refunds": refunds, "total": total}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOLVE MANUAL-REVIEW REFUND
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VALID_RESOLUTIONS = {"approved", "denied", "closed"}
+_RESOLVABLE_STATUSES = {"manual_review_required", "failed"}
+
+
+def resolve_refund(
+    *,
+    refund_id: str,
+    resolution: str,
+    reason: Optional[str] = None,
+    admin_note: Optional[str] = None,
+    resolved_by: Optional[str] = None,
+    send_email: bool = False,
+) -> Dict[str, Any]:
+    """
+    Resolve a manual-review refund.
+
+    Updates refund_status to the resolution value (approved/denied/closed).
+    Stores resolution metadata for audit trail. Optionally queues a
+    follow-up email to the user.
+    """
+    if resolution not in _VALID_RESOLUTIONS:
+        return {"ok": False, "error": f"Invalid resolution: {resolution}. Must be one of: {', '.join(sorted(_VALID_RESOLUTIONS))}"}
+
+    # Fetch current refund
+    refund = query_one(
+        f"SELECT id, identity_id, purchase_id, refund_status, amount_gbp, currency, reason, metadata FROM {_TABLE} WHERE id = %s::uuid",
+        (refund_id,),
+    )
+    if not refund:
+        return {"ok": False, "error": "Refund not found"}
+
+    if refund["refund_status"] not in _RESOLVABLE_STATUSES:
+        return {"ok": False, "error": f"Cannot resolve: refund status is '{refund['refund_status']}', must be in {', '.join(sorted(_RESOLVABLE_STATUSES))}"}
+
+    now = datetime.now(timezone.utc)
+
+    # Merge resolution metadata into existing metadata
+    existing_meta = refund["metadata"] or {}
+    existing_meta["resolved_by"] = resolved_by
+    existing_meta["resolved_at"] = _iso(now)
+    existing_meta["resolution"] = resolution
+    existing_meta["resolution_reason"] = (reason or "")[:2000] if reason else None
+    existing_meta["resolution_admin_note"] = (admin_note or "")[:2000] if admin_note else None
+    existing_meta["follow_up_email_queued"] = False
+
+    meta_json = json.dumps(existing_meta, default=str)
+
+    # Update refund status and metadata
+    query_one(
+        f"""
+        UPDATE {_TABLE}
+        SET refund_status = %s,
+            reason = COALESCE(%s, reason),
+            admin_note = COALESCE(%s, admin_note),
+            metadata = %s::jsonb
+        WHERE id = %s::uuid
+        RETURNING id
+        """,
+        (
+            resolution,
+            (reason or "")[:2000] if reason else None,
+            (admin_note or "")[:2000] if admin_note else None,
+            meta_json,
+            refund_id,
+        ),
+    )
+
+    print(f"[ADMIN_REFUND] Resolved refund {refund_id[:8]} as '{resolution}' by {resolved_by}")
+
+    # Optionally queue follow-up email
+    email_result = None
+    if send_email and resolution in ("approved", "denied"):
+        email_result = _queue_resolution_email(
+            identity_id=str(refund["identity_id"]),
+            refund_id=str(refund["id"]),
+            purchase_id=str(refund["purchase_id"]) if refund["purchase_id"] else None,
+            amount_gbp=float(refund["amount_gbp"]) if refund["amount_gbp"] is not None else 0,
+            currency=refund["currency"] or "GBP",
+            resolution=resolution,
+            reason=reason,
+        )
+        if email_result and email_result.get("queued"):
+            # Update metadata to record email was queued
+            existing_meta["follow_up_email_queued"] = True
+            query_one(
+                f"UPDATE {_TABLE} SET metadata = %s::jsonb WHERE id = %s::uuid RETURNING id",
+                (json.dumps(existing_meta, default=str), refund_id),
+            )
+
+    return {
+        "ok": True,
+        "refund_id": str(refund["id"]),
+        "resolution": resolution,
+        "resolved_by": resolved_by,
+        "resolved_at": _iso(now),
+        "email": email_result,
+    }
+
+
+def _queue_resolution_email(
+    *,
+    identity_id: str,
+    refund_id: str,
+    purchase_id: Optional[str],
+    amount_gbp: float,
+    currency: str,
+    resolution: str,
+    reason: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Queue a refund resolution follow-up email. Best-effort, never crashes caller.
+    Returns dict with queued/already_sent status.
+    """
+    try:
+        email_row = query_one(
+            f"SELECT email FROM {Tables.IDENTITIES} WHERE id = %s",
+            (identity_id,),
+        )
+        if not email_row or not email_row.get("email"):
+            return {"queued": False, "reason": "no_email"}
+
+        user_email = email_row["email"]
+        template_name = f"refund_resolution_{resolution}"
+
+        # Duplicate check
+        existing = query_one(
+            f"""
+            SELECT id FROM {Tables.EMAIL_OUTBOX}
+            WHERE template = %s
+              AND payload->>'refund_id' = %s
+              AND status IN ('pending', 'sent')
+            LIMIT 1
+            """,
+            (template_name, refund_id),
+        )
+        if existing:
+            return {"queued": False, "already_sent": True, "reason": "duplicate"}
+
+        from backend.services.email_outbox_service import EmailOutboxService, EmailTemplate
+
+        payload = {
+            "refund_id": refund_id,
+            "amount_gbp": amount_gbp,
+            "currency": currency,
+            "purchase_id": purchase_id,
+            "resolution": resolution,
+            "reason": reason,
+        }
+
+        template = EmailTemplate.REFUND_RESOLUTION_APPROVED if resolution == "approved" else EmailTemplate.REFUND_RESOLUTION_DENIED
+
+        with transaction() as cur:
+            EmailOutboxService.queue_email(
+                cur,
+                to_email=user_email,
+                template=template,
+                payload=payload,
+            )
+
+        print(f"[ADMIN_REFUND_EMAIL] Queued {resolution} follow-up for refund {refund_id[:8]} to {user_email}")
+        return {"queued": True, "email": user_email}
+
+    except Exception as e:
+        print(f"[ADMIN_REFUND_EMAIL] Failed to queue resolution email: {e}")
+        return {"queued": False, "reason": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXECUTE APPROVED REFUND
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_approved_refund(
+    *,
+    refund_id: str,
+    execute_external_refund: bool = False,
+    reason: Optional[str] = None,
+    admin_note: Optional[str] = None,
+    executed_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Execute an already-approved refund.
+
+    Completes the second step of the two-step lifecycle:
+      manual_review_required → approved → executed
+
+    Performs credit reversal, wallet update, purchase status change,
+    and optional Mollie refund — using the same safe logic as
+    execute_refund() but operating on the existing refund record
+    rather than creating a new one.
+    """
+    from backend.services.purchase_service import PurchaseService
+    from backend.services.wallet_service import (
+        WalletService, CreditType, get_credit_type_for_plan,
+    )
+
+    # ── 1. Fetch and validate refund ──
+    refund = query_one(
+        f"SELECT * FROM {_TABLE} WHERE id = %s::uuid",
+        (refund_id,),
+    )
+    if not refund:
+        return {"ok": False, "error": "Refund not found"}
+
+    if refund["refund_status"] != "approved":
+        return {"ok": False, "error": f"Refund status is '{refund['refund_status']}', must be 'approved' to execute"}
+
+    purchase_id = str(refund["purchase_id"]) if refund["purchase_id"] else None
+    identity_id = str(refund["identity_id"])
+    payment_provider = refund["payment_provider"]
+    refund_type = refund["refund_type"]
+    amount_gbp = float(refund["amount_gbp"]) if refund["amount_gbp"] is not None else 0
+    existing_meta = refund["metadata"] or {}
+
+    if not purchase_id:
+        return {"ok": False, "error": "No purchase linked to this refund"}
+
+    # ── 2. Fetch purchase ──
+    purchase = PurchaseService.get_purchase(purchase_id)
+    if not purchase:
+        return {"ok": False, "error": f"Linked purchase not found: {purchase_id}"}
+
+    purchase_status = purchase.get("status", "")
+    plan_code = purchase.get("plan_code") or ""
+    credits_granted = purchase.get("credits_granted", 0) or 0
+
+    # Allow execution for completed OR already-refunded-check
+    if purchase_status == "refunded":
+        return {"ok": False, "error": "Purchase already marked as refunded"}
+    if purchase_status not in ("completed",):
+        return {"ok": False, "error": f"Purchase status is '{purchase_status}', not 'completed'"}
+
+    # ── 3. Check no executed refund already exists ──
+    existing_executed = query_one(
+        f"SELECT id FROM {_TABLE} WHERE purchase_id = %s AND refund_status = 'executed' LIMIT 1",
+        (purchase_id,),
+    )
+    if existing_executed:
+        return {"ok": False, "error": f"An executed refund already exists for this purchase (refund_id={existing_executed['id']})"}
+
+    # ── 4. Determine credit type and compute usage ──
+    try:
+        credit_type = get_credit_type_for_plan(plan_code) if plan_code else CreditType.GENERAL
+    except ValueError:
+        credit_type = CreditType.GENERAL
+    balance_column = "balance_video_credits" if credit_type == CreditType.VIDEO else "balance_credits"
+
+    balances = WalletService.get_all_balances(identity_id)
+    credits_remaining = balances.get("video" if credit_type == CreditType.VIDEO else "general", 0)
+    credits_used = max(0, credits_granted - credits_remaining) if credits_granted > 0 else 0
+
+    # For approved refunds, reverse what is available (up to granted)
+    # The admin already approved knowing the situation
+    credits_to_reverse = min(credits_remaining, credits_granted)
+
+    # ── 5. Execute credit reversal ──
+    now = datetime.now(timezone.utc)
+    external_refund_id = None
+    external_refund_executed = False
+    external_refund_error = None
+
+    if credits_to_reverse > 0:
+        try:
+            with transaction() as cur:
+                # Lock wallet
+                cur.execute(
+                    f"SELECT {balance_column} AS current_balance FROM {Tables.WALLETS} WHERE identity_id = %s FOR UPDATE",
+                    (identity_id,),
+                )
+                wallet = fetch_one(cur)
+                current_balance = wallet["current_balance"] if wallet else 0
+
+                # Create refund ledger entry
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.LEDGER_ENTRIES}
+                    (identity_id, entry_type, amount_credits, ref_type, ref_id,
+                     meta, credit_type, created_at)
+                    VALUES (%s, 'refund', %s, 'purchase', %s, %s, %s, NOW())
+                    ON CONFLICT (identity_id, ref_type, ref_id)
+                        WHERE entry_type IN ('refund', 'chargeback') AND ref_type = 'purchase'
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    (
+                        identity_id,
+                        -credits_to_reverse,
+                        purchase_id,
+                        json.dumps({
+                            "refund_type": refund_type,
+                            "reason": reason or refund["reason"],
+                            "executed_by": executed_by,
+                            "approved_refund_id": refund_id,
+                            "credits_granted": credits_granted,
+                            "credits_used": credits_used,
+                            "balance_before": current_balance,
+                        }),
+                        credit_type,
+                    ),
+                )
+                ledger_row = fetch_one(cur)
+
+                if not ledger_row:
+                    return {"ok": False, "error": "Refund ledger entry already exists for this purchase"}
+
+                # Update wallet
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.WALLETS}
+                    SET {balance_column} = GREATEST({balance_column} - %s, 0), updated_at = NOW()
+                    WHERE identity_id = %s
+                    RETURNING {balance_column} AS new_balance
+                    """,
+                    (credits_to_reverse, identity_id),
+                )
+                wallet_result = fetch_one(cur)
+                new_balance = wallet_result["new_balance"] if wallet_result else 0
+
+                # Mark purchase as refunded
+                cur.execute(
+                    f"UPDATE {Tables.PURCHASES} SET status = 'refunded' WHERE id = %s",
+                    (purchase_id,),
+                )
+
+            print(
+                f"[ADMIN_REFUND_EXECUTE_APPROVED] refund_id={refund_id[:8]} purchase_id={purchase_id[:8]} "
+                f"credits_reversed={credits_to_reverse} balance: {current_balance} -> {new_balance}"
+            )
+        except Exception as e:
+            # Update refund record to reflect failure
+            query_one(
+                f"UPDATE {_TABLE} SET refund_status = 'failed', admin_note = COALESCE(admin_note || ' | ', '') || %s WHERE id = %s::uuid RETURNING id",
+                (f"Execution failed: {e}", refund_id),
+            )
+            print(f"[ADMIN_REFUND_EXECUTE_APPROVED_FAILED] refund_id={refund_id[:8]} error={e}")
+            raise
+    else:
+        # No credits to reverse — just mark purchase as refunded
+        query_one(
+            f"UPDATE {Tables.PURCHASES} SET status = 'refunded' WHERE id = %s RETURNING id",
+            (purchase_id,),
+        )
+
+    # ── 6. Optional external Mollie refund ──
+    payment_reference = purchase.get("provider_payment_id")
+
+    if (
+        execute_external_refund
+        and payment_provider == "mollie"
+        and payment_reference
+        and refund_type == "full_purchase_refund"
+    ):
+        external_refund_id, external_refund_executed, external_refund_error = (
+            _attempt_mollie_refund(
+                payment_id=payment_reference,
+                amount_gbp=amount_gbp,
+                reason=reason or refund["reason"] or "Admin refund",
+                purchase_id=purchase_id,
+            )
+        )
+    elif execute_external_refund:
+        if payment_provider != "mollie":
+            external_refund_error = f"External refund not supported for provider '{payment_provider}'"
+        elif not payment_reference:
+            external_refund_error = "No payment reference found on purchase"
+        elif refund_type != "full_purchase_refund":
+            external_refund_error = f"External refund only supported for full_purchase_refund"
+
+    # ── 7. Update existing refund record to executed ──
+    existing_meta["executed_by"] = executed_by
+    existing_meta["executed_at"] = _iso(now)
+    existing_meta["execution_credits_reversed"] = credits_to_reverse
+    existing_meta["execution_credits_remaining_before"] = credits_remaining
+    existing_meta["execution_credits_used"] = credits_used
+    existing_meta["external_refund_attempted"] = execute_external_refund
+    existing_meta["external_refund_executed"] = external_refund_executed
+    existing_meta["external_refund_error"] = external_refund_error
+    if admin_note:
+        existing_meta["execution_admin_note"] = admin_note[:2000]
+
+    meta_json = json.dumps(existing_meta, default=str)
+
+    # CAS guard: only update if still 'approved' — prevents duplicate execution
+    updated = query_one(
+        f"""
+        UPDATE {_TABLE}
+        SET refund_status = 'executed',
+            credits_reversed = %s,
+            executed_by = %s,
+            executed_at = %s,
+            external_refund_id = %s,
+            admin_note = COALESCE(admin_note || ' | ', '') || COALESCE(%s, ''),
+            metadata = %s::jsonb
+        WHERE id = %s::uuid AND refund_status = 'approved'
+        RETURNING id
+        """,
+        (
+            credits_to_reverse,
+            executed_by,
+            now,
+            external_refund_id,
+            admin_note[:2000] if admin_note else None,
+            meta_json,
+            refund_id,
+        ),
+    )
+    if not updated:
+        return {"ok": False, "error": "Refund was already executed by another request"}
+
+    print(f"[ADMIN_REFUND_EXECUTE_APPROVED] Refund {refund_id[:8]} executed successfully")
+
+    # ── 8. Queue refund confirmation email ──
+    _queue_refund_email(
+        identity_id=identity_id,
+        refund_id=refund_id,
+        purchase_id=purchase_id,
+        amount_gbp=amount_gbp,
+        credits_reversed=credits_to_reverse,
+        credits_granted=credits_granted,
+        refund_type=refund_type,
+        payment_provider=payment_provider,
+        external_refund_executed=external_refund_executed,
+        external_refund_id=external_refund_id,
+        reason=reason or refund["reason"],
+        executed_at=now,
+    )
+
+    # ── 9. Build response ──
+    external_refund_summary = {
+        "attempted": execute_external_refund,
+        "provider": payment_provider if execute_external_refund else None,
+        "executed": external_refund_executed,
+        "external_refund_id": external_refund_id,
+        "error": external_refund_error,
+    }
+
+    return {
+        "ok": True,
+        "refund_id": refund_id,
+        "summary": {
+            "purchase_id": purchase_id,
+            "identity_id": identity_id,
+            "amount_gbp": amount_gbp,
+            "credits_granted": credits_granted,
+            "credits_used": credits_used,
+            "credits_remaining_before": credits_remaining,
+            "credits_reversed": credits_to_reverse,
+            "credit_type": credit_type,
+        },
+        "external_refund": external_refund_summary,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -634,10 +1101,15 @@ def _build_display_summary(row: Dict, external_refund: Dict) -> str:
     }
 
     if refund_st == "executed":
-        ext_part = "Mollie refund sent" if external_refund.get("executed") else (
-            "Mollie refund failed" if external_refund.get("attempted") else "external refund not attempted"
-        )
-        return f"Refund executed ({credits} credits reversed), {ext_part}"
+        if external_refund.get("executed"):
+            ext_part = "Mollie payment refund sent"
+        elif external_refund.get("attempted"):
+            ext_part = "Mollie payment refund FAILED — process manually"
+        elif external_refund.get("provider") == "mollie":
+            ext_part = "payment refund not yet processed — action required"
+        else:
+            ext_part = "no external payment refund"
+        return f"Credits reversed ({credits}), {ext_part}"
 
     if refund_st == "manual_review_required":
         reason = meta.get("blocked_reason") or row.get("reason") or ""
@@ -648,6 +1120,17 @@ def _build_display_summary(row: Dict, external_refund: Dict) -> str:
 
     if refund_st == "pending":
         return "Refund pending"
+
+    if refund_st == "approved":
+        resolved_by = meta.get("resolved_by", "admin")
+        return f"Refund approved by {resolved_by} — awaiting execution"
+
+    if refund_st == "denied":
+        resolution_reason = meta.get("resolution_reason") or ""
+        return f"Refund denied{': ' + resolution_reason if resolution_reason else ''}"
+
+    if refund_st == "closed":
+        return "Refund case closed"
 
     return refund_st
 

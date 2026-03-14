@@ -31,6 +31,9 @@ Endpoints:
 - GET  /api/admin/refunds/export.csv              - CSV export of refund history
 - GET  /api/admin/provider-ledger/export.csv      - CSV export of provider ledger
 - GET  /api/admin/provider-spend/monthly/export.csv - CSV export of monthly spend
+- POST /api/admin/refunds/<id>/send-review-email - Send refund-under-review email
+- POST /api/admin/refunds/<id>/resolve           - Resolve a manual-review refund (approve/deny/close)
+- POST /api/admin/refunds/<id>/execute-approved  - Execute an already-approved refund (credit reversal + payment)
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -2507,6 +2510,153 @@ def refunds_list():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Refund review email
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/refunds/<refund_id>/send-review-email", methods=["POST"])
+@require_admin
+def refunds_send_review_email(refund_id):
+    """Send a 'refund under review' email for a manual-review refund."""
+    try:
+        from backend.db import query_one, transaction, Tables
+        from backend.services.email_outbox_service import EmailOutboxService, EmailTemplate
+
+        # Fetch refund
+        refund = query_one(
+            f"SELECT id, identity_id, purchase_id, refund_status, amount_gbp, currency, reason FROM {Tables.REFUNDS} WHERE id = %s::uuid",
+            (refund_id,),
+        )
+        if not refund:
+            return jsonify({"ok": False, "error": "Refund not found"}), 404
+
+        if refund["refund_status"] != "manual_review_required":
+            return jsonify({"ok": False, "error": f"Refund status is '{refund['refund_status']}', not 'manual_review_required'"}), 400
+
+        # Resolve email
+        identity = query_one(
+            f"SELECT email FROM {Tables.IDENTITIES} WHERE id = %s",
+            (refund["identity_id"],),
+        )
+        if not identity or not identity.get("email"):
+            return jsonify({"ok": False, "error": "No email found for this user"}), 400
+
+        user_email = identity["email"]
+
+        # Duplicate check
+        existing = query_one(
+            f"""
+            SELECT id, status FROM {Tables.EMAIL_OUTBOX}
+            WHERE template = 'refund_review'
+              AND payload->>'refund_id' = %s
+              AND status IN ('pending', 'sent')
+            LIMIT 1
+            """,
+            (str(refund["id"]),),
+        )
+        if existing:
+            st = existing["status"]
+            return jsonify({"ok": True, "already_sent": True, "status": st, "message": f"Review email already {st} for this refund"})
+
+        # Queue email
+        payload = {
+            "refund_id": str(refund["id"]),
+            "amount_gbp": float(refund["amount_gbp"]) if refund["amount_gbp"] else 0,
+            "currency": refund["currency"] or "GBP",
+            "purchase_id": str(refund["purchase_id"]) if refund["purchase_id"] else None,
+            "reason": refund["reason"],
+        }
+
+        with transaction() as cur:
+            EmailOutboxService.queue_email(
+                cur,
+                to_email=user_email,
+                template=EmailTemplate.REFUND_REVIEW,
+                payload=payload,
+            )
+
+        print(f"[ADMIN] Queued refund review email for refund {refund_id[:8]} to {user_email}")
+        return jsonify({"ok": True, "queued": True, "email": user_email, "message": "Review email queued"})
+
+    except Exception as e:
+        print(f"[ADMIN] Send review email error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds/<refund_id>/resolve", methods=["POST"])
+@require_admin
+def refunds_resolve(refund_id):
+    """Resolve a manual-review refund (approve/deny/close)."""
+    try:
+        from backend.services.refund_service import resolve_refund
+
+        data = request.get_json(silent=True) or {}
+        resolution = data.get("resolution", "").strip()
+        if not resolution:
+            return jsonify({"ok": False, "error": "resolution is required"}), 400
+
+        # Get admin identity
+        resolved_by = None
+        if hasattr(g, "admin_email"):
+            resolved_by = g.admin_email
+        elif hasattr(g, "identity"):
+            resolved_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = resolve_refund(
+            refund_id=refund_id,
+            resolution=resolution,
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            resolved_by=resolved_by,
+            send_email=bool(data.get("send_email", False)),
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+
+    except Exception as e:
+        print(f"[ADMIN] Refund resolve error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds/<refund_id>/execute-approved", methods=["POST"])
+@require_admin
+def refunds_execute_approved(refund_id):
+    """Execute an already-approved refund (credit reversal + optional payment refund)."""
+    try:
+        from backend.services.refund_service import execute_approved_refund
+
+        data = request.get_json(silent=True) or {}
+
+        # Get admin identity
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = execute_approved_refund(
+            refund_id=refund_id,
+            execute_external_refund=bool(data.get("execute_external_refund", False)),
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            executed_by=executed_by,
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+
+    except Exception as e:
+        print(f"[ADMIN] Execute approved refund error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSV EXPORTS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2548,7 +2698,7 @@ def refunds_export_csv():
             "email", "identity_id", "purchase_id", "subscription_id", "purchase_type",
             "amount_gbp", "currency", "credits_reversed", "credits_granted", "credits_used",
             "credit_type", "payment_provider",
-            "external_refund_attempted", "external_refund_executed", "external_refund_id",
+            "external_refund_attempted", "external_refund_executed", "external_refund_id", "external_refund_error",
             "executed_by", "reason", "admin_note", "display_summary",
         ]
 
@@ -2576,6 +2726,7 @@ def refunds_export_csv():
                 "external_refund_attempted": ext.get("attempted", ""),
                 "external_refund_executed": ext.get("executed", ""),
                 "external_refund_id": ext.get("external_refund_id", ""),
+                "external_refund_error": ext.get("error", ""),
                 "executed_by": rf.get("executed_by", ""),
                 "reason": rf.get("reason", ""),
                 "admin_note": rf.get("admin_note", ""),

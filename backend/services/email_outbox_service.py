@@ -46,6 +46,9 @@ class EmailTemplate:
     PAYMENT_RECEIVED = "payment_received"        # Fallback HTML-only confirmation
     ADMIN_ALERT = "admin_alert"                  # Admin notification
     REFUND_CONFIRMATION = "refund_confirmation"  # Refund credit note / confirmation
+    REFUND_REVIEW = "refund_review"              # Refund under manual review notice
+    REFUND_RESOLUTION_APPROVED = "refund_resolution_approved"   # Refund approved follow-up
+    REFUND_RESOLUTION_DENIED = "refund_resolution_denied"       # Refund denied follow-up
 
 
 # Default max attempts before marking as failed
@@ -410,6 +413,15 @@ class EmailOutboxService:
             elif template == EmailTemplate.REFUND_CONFIRMATION:
                 return EmailOutboxService._send_refund_confirmation(to_email, payload)
 
+            elif template == EmailTemplate.REFUND_REVIEW:
+                return EmailOutboxService._send_refund_review(to_email, payload)
+
+            elif template == EmailTemplate.REFUND_RESOLUTION_APPROVED:
+                return EmailOutboxService._send_refund_resolution(to_email, payload, "approved")
+
+            elif template == EmailTemplate.REFUND_RESOLUTION_DENIED:
+                return EmailOutboxService._send_refund_resolution(to_email, payload, "denied")
+
             else:
                 return False, f"Unknown template: {template}"
 
@@ -517,6 +529,52 @@ class EmailOutboxService:
         if success:
             return True, None
         return False, "send_refund_confirmation returned False"
+
+    @staticmethod
+    def _send_refund_review(to_email: str, payload: Dict[str, Any]) -> tuple:
+        """Send refund under review notification email."""
+        from backend.emailer import send_refund_review_email
+
+        success = send_refund_review_email(
+            to_email=to_email,
+            refund_id=payload.get("refund_id", ""),
+            amount_gbp=payload.get("amount_gbp", 0),
+            currency=payload.get("currency", "GBP"),
+            purchase_id=payload.get("purchase_id"),
+            reason=payload.get("reason"),
+        )
+
+        if success:
+            return True, None
+        return False, "send_refund_review_email returned False"
+
+    @staticmethod
+    def _send_refund_resolution(to_email: str, payload: Dict[str, Any], resolution: str) -> tuple:
+        """Send refund resolution follow-up email (approved or denied)."""
+        if resolution == "approved":
+            from backend.emailer import send_refund_resolution_approved
+            success = send_refund_resolution_approved(
+                to_email=to_email,
+                refund_id=payload.get("refund_id", ""),
+                amount_gbp=payload.get("amount_gbp", 0),
+                currency=payload.get("currency", "GBP"),
+                purchase_id=payload.get("purchase_id"),
+                reason=payload.get("reason"),
+            )
+        else:
+            from backend.emailer import send_refund_resolution_denied
+            success = send_refund_resolution_denied(
+                to_email=to_email,
+                refund_id=payload.get("refund_id", ""),
+                amount_gbp=payload.get("amount_gbp", 0),
+                currency=payload.get("currency", "GBP"),
+                purchase_id=payload.get("purchase_id"),
+                reason=payload.get("reason"),
+            )
+
+        if success:
+            return True, None
+        return False, f"send_refund_resolution_{resolution} returned False"
 
     @staticmethod
     def _alert_admin_email_failure(email_job: Dict[str, Any], error: str, attempts: int):

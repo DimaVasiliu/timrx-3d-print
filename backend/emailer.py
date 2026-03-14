@@ -1750,15 +1750,22 @@ def send_refund_confirmation(
             "Depending on your bank, it may take 5\u201310 business days to appear on your statement."
         )
     else:
-        headline = "Refund Recorded"
-        status_text = "Refund recorded"
+        headline = "Refund Update"
+        status_text = "Credits refunded"
         status_color = REFUND_COLOR
-        intro = "Your refund has been recorded. Here are the details."
-        next_steps = (
-            "Your refund has been recorded in our system. "
-            "The payment refund is being processed and may take 5\u201310 business days "
-            "to appear on your statement."
-        )
+        intro = "Your refund has been processed. Here are the details."
+        if credits_reversed > 0:
+            next_steps = (
+                "Your credits have been adjusted in your account. "
+                "If a payment refund is also due, it will be processed separately and "
+                "may take 5\u201310 business days to appear on your statement."
+            )
+        else:
+            next_steps = (
+                "Your refund has been recorded in our system. "
+                "If a payment refund is due, it will be processed separately and "
+                "may take 5\u201310 business days to appear on your statement."
+            )
 
     # Format date
     if executed_at:
@@ -1909,5 +1916,423 @@ Need help? Reply to this email or contact support@timrx.live
             print(f"[EMAIL] send_refund_confirmation send_raw failed: {result.message}, falling back")
         except Exception as e:
             print(f"[EMAIL] send_refund_confirmation send_raw error: {e}, falling back")
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refund Under Review Email
+# ─────────────────────────────────────────────────────────────────────────────
+
+REVIEW_COLOR = "#d97706"  # Amber for review/pending status
+
+
+def send_refund_review_email(
+    to_email: str,
+    refund_id: str,
+    amount_gbp: float,
+    currency: str = "GBP",
+    purchase_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """
+    Send a styled 'refund under review' email.
+
+    Informs the user their refund request is being manually reviewed.
+    Does NOT claim the refund has been processed or approved.
+    Never exposes admin notes or internal details.
+    """
+    from datetime import datetime, timezone
+
+    logo_bytes = _load_logo()
+    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+
+    headline = "Refund Under Review"
+    intro = (
+        "We've received your refund request and it is currently being reviewed by our team."
+    )
+
+    request_date = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    # Amount display (review-styled)
+    amount_display = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund request</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0;font-size:14px;font-weight:600;color:{REVIEW_COLOR};font-family:Arial,Helvetica,sans-serif;">Under review &bull; {request_date}</p>
+                </td>
+            </tr>
+        </table>'''
+
+    # Summary card
+    summary_rows = [
+        ("Reference", refund_id[:8].upper() if refund_id else "\u2014"),
+        ("Amount", f"&pound;{amount_gbp:.2f}"),
+        ("Date submitted", request_date),
+        ("Status", "Under review"),
+    ]
+    if purchase_id:
+        summary_rows.insert(1, ("Purchase", purchase_id[:8].upper() + "..."))
+
+    summary_card = render_detail_card(summary_rows, header="Request Summary")
+
+    # Reason section (user-facing only)
+    reason_section = ""
+    if reason:
+        reason_section = f'''
+            <tr>
+                <td style="padding-top:16px;">
+                    <p style="margin:0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Reason provided:</strong> {reason}
+                    </p>
+                </td>
+            </tr>'''
+
+    # Next steps
+    next_steps_section = f'''
+        <tr>
+            <td style="padding-top:20px;">
+                <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">What happens next</p>
+                <p style="margin:0;font-size:13px;line-height:1.5;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                    We're reviewing your request and will follow up as soon as possible.
+                    If your refund is approved, you'll receive a confirmation email with full details.
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td style="padding-top:16px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:{BG_LIGHT};border:1px solid {BORDER_COLOR};border-radius:6px;">
+                    <tr>
+                        <td style="padding:16px;">
+                            <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">Need help?</p>
+                            <p style="margin:0;font-size:13px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                                If you have questions about your refund, reply to this email or contact us at
+                                <a href="mailto:support@timrx.live" style="color:{ACCENT_COLOR};text-decoration:underline;">support@timrx.live</a>.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>'''
+
+    body_html = f'''
+        {amount_display}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr><td>{summary_card}</td></tr>
+            {reason_section}
+            {next_steps_section}
+        </table>
+    '''
+
+    subject = f"TimrX Refund Request Under Review - {symbol}{amount_gbp:.2f}"
+
+    html_body = render_email_html(
+        title=headline,
+        intro=intro,
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+        footer_extra=f"Reference: {refund_id[:8].upper() if refund_id else '\u2014'}",
+    )
+
+    # Plain text fallback
+    reason_text = f"\nReason: {reason}" if reason else ""
+    purchase_text = f"\nPurchase: {purchase_id[:8].upper()}..." if purchase_id else ""
+    text_body = f"""{headline}
+
+We've received your refund request and it is currently being reviewed.
+
+Amount: {symbol}{amount_gbp:.2f}
+Reference: {refund_id[:8].upper() if refund_id else '\u2014'}{purchase_text}
+Date: {request_date}
+Status: Under review{reason_text}
+
+We're reviewing your request and will follow up as soon as possible.
+If your refund is approved, you'll receive a confirmation email with full details.
+
+Need help? Reply to this email or contact support@timrx.live
+
+---
+TimrX - 3D Print Hub
+"""
+
+    # Send with inline logo if available
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email,
+                subject=subject,
+                html=html_body,
+                text=text_body,
+                inline_images=[{
+                    "cid": "timrx_logo",
+                    "data": logo_bytes,
+                    "content_type": "image/png",
+                }],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_refund_review_email send_raw failed: {result.message}, falling back")
+        except Exception as e:
+            print(f"[EMAIL] send_refund_review_email send_raw error: {e}, falling back")
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refund Resolution Emails (Approved / Denied)
+# ─────────────────────────────────────────────────────────────────────────────
+
+APPROVED_COLOR = "#22863a"
+DENIED_COLOR = "#b91c1c"
+
+
+def send_refund_resolution_approved(
+    to_email: str,
+    refund_id: str,
+    amount_gbp: float,
+    currency: str = "GBP",
+    purchase_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """
+    Send a 'refund approved' follow-up email.
+
+    Does NOT claim payment has been refunded — only that the request
+    has been approved and is being processed.
+    """
+    from datetime import datetime, timezone
+
+    logo_bytes = _load_logo()
+    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    amount_display = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund amount</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0;font-size:14px;font-weight:600;color:{APPROVED_COLOR};font-family:Arial,Helvetica,sans-serif;">Approved &bull; {today}</p>
+                </td>
+            </tr>
+        </table>'''
+
+    summary_rows = [
+        ("Reference", refund_id[:8].upper() if refund_id else "\u2014"),
+        ("Amount", f"&pound;{amount_gbp:.2f}"),
+        ("Date approved", today),
+        ("Status", "Approved"),
+    ]
+    if purchase_id:
+        summary_rows.insert(1, ("Purchase", purchase_id[:8].upper() + "..."))
+
+    summary_card = render_detail_card(summary_rows, header="Refund Approved")
+
+    reason_section = ""
+    if reason:
+        reason_section = f'''
+            <tr>
+                <td style="padding-top:16px;">
+                    <p style="margin:0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Details:</strong> {reason}
+                    </p>
+                </td>
+            </tr>'''
+
+    next_steps = f'''
+        <tr>
+            <td style="padding-top:20px;">
+                <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">What happens next</p>
+                <p style="margin:0;font-size:13px;line-height:1.5;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                    Your refund request has been approved and is being processed.
+                    Depending on your payment method, it may take 5\u201310 business days
+                    to appear on your statement.
+                </p>
+            </td>
+        </tr>'''
+
+    body_html = f'''
+        {amount_display}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr><td>{summary_card}</td></tr>
+            {reason_section}
+            {next_steps}
+        </table>
+    '''
+
+    subject = f"TimrX Refund Approved - {symbol}{amount_gbp:.2f}"
+    html_body = render_email_html(
+        title="Refund Approved",
+        intro="Good news — your refund request has been approved.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+        footer_extra=f"Reference: {refund_id[:8].upper() if refund_id else '\u2014'}",
+    )
+
+    reason_text = f"\nDetails: {reason}" if reason else ""
+    purchase_text = f"\nPurchase: {purchase_id[:8].upper()}..." if purchase_id else ""
+    text_body = f"""Refund Approved
+
+Your refund request has been approved.
+
+Amount: {symbol}{amount_gbp:.2f}
+Reference: {refund_id[:8].upper() if refund_id else '\u2014'}{purchase_text}
+Date: {today}{reason_text}
+
+Your refund is being processed. Depending on your payment method,
+it may take 5-10 business days to appear on your statement.
+
+Need help? Reply to this email or contact support@timrx.live
+
+---
+TimrX - 3D Print Hub
+"""
+
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email, subject=subject, html=html_body, text=text_body,
+                inline_images=[{"cid": "timrx_logo", "data": logo_bytes, "content_type": "image/png"}],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_refund_resolution_approved send_raw failed: {result.message}, falling back")
+        except Exception as e:
+            print(f"[EMAIL] send_refund_resolution_approved send_raw error: {e}, falling back")
+
+    return send_email(to_email, subject, html_body, text_body)
+
+
+def send_refund_resolution_denied(
+    to_email: str,
+    refund_id: str,
+    amount_gbp: float,
+    currency: str = "GBP",
+    purchase_id: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """
+    Send a 'refund denied' follow-up email.
+
+    Professional and empathetic. Never hostile. Includes support guidance.
+    """
+    from datetime import datetime, timezone
+
+    logo_bytes = _load_logo()
+    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    amount_display = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
+                    <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund request</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0;font-size:14px;font-weight:600;color:{DENIED_COLOR};font-family:Arial,Helvetica,sans-serif;">Not approved &bull; {today}</p>
+                </td>
+            </tr>
+        </table>'''
+
+    summary_rows = [
+        ("Reference", refund_id[:8].upper() if refund_id else "\u2014"),
+        ("Amount", f"&pound;{amount_gbp:.2f}"),
+        ("Date reviewed", today),
+        ("Status", "Not approved"),
+    ]
+    if purchase_id:
+        summary_rows.insert(1, ("Purchase", purchase_id[:8].upper() + "..."))
+
+    summary_card = render_detail_card(summary_rows, header="Refund Request Reviewed")
+
+    reason_section = ""
+    if reason:
+        reason_section = f'''
+            <tr>
+                <td style="padding-top:16px;">
+                    <p style="margin:0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
+                        <strong>Details:</strong> {reason}
+                    </p>
+                </td>
+            </tr>'''
+
+    next_steps = f'''
+        <tr>
+            <td style="padding-top:20px;">
+                <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">Questions?</p>
+                <p style="margin:0;font-size:13px;line-height:1.5;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                    If you believe this decision was made in error or have additional information,
+                    please don't hesitate to reach out. We're happy to review further.
+                </p>
+            </td>
+        </tr>
+        <tr>
+            <td style="padding-top:16px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:{BG_LIGHT};border:1px solid {BORDER_COLOR};border-radius:6px;">
+                    <tr>
+                        <td style="padding:16px;">
+                            <p style="margin:0 0 4px 0;font-size:13px;font-weight:600;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;">Need help?</p>
+                            <p style="margin:0;font-size:13px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                                Reply to this email or contact us at
+                                <a href="mailto:support@timrx.live" style="color:{ACCENT_COLOR};text-decoration:underline;">support@timrx.live</a>.
+                            </p>
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>'''
+
+    body_html = f'''
+        {amount_display}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:24px;">
+            <tr><td>{summary_card}</td></tr>
+            {reason_section}
+            {next_steps}
+        </table>
+    '''
+
+    subject = f"TimrX Refund Request Reviewed - {symbol}{amount_gbp:.2f}"
+    html_body = render_email_html(
+        title="Refund Request Reviewed",
+        intro="After careful review, we're unable to approve this refund request at this time.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+        footer_extra=f"Reference: {refund_id[:8].upper() if refund_id else '\u2014'}",
+    )
+
+    reason_text = f"\nDetails: {reason}" if reason else ""
+    purchase_text = f"\nPurchase: {purchase_id[:8].upper()}..." if purchase_id else ""
+    text_body = f"""Refund Request Reviewed
+
+After careful review, we're unable to approve this refund request at this time.
+
+Amount: {symbol}{amount_gbp:.2f}
+Reference: {refund_id[:8].upper() if refund_id else '\u2014'}{purchase_text}
+Date: {today}{reason_text}
+
+If you believe this decision was made in error or have additional information,
+please don't hesitate to reach out. We're happy to review further.
+
+Need help? Reply to this email or contact support@timrx.live
+
+---
+TimrX - 3D Print Hub
+"""
+
+    if logo_bytes:
+        try:
+            from backend.services.email_service import EmailService
+            result = EmailService.send_raw(
+                to=to_email, subject=subject, html=html_body, text=text_body,
+                inline_images=[{"cid": "timrx_logo", "data": logo_bytes, "content_type": "image/png"}],
+            )
+            if result.success:
+                return True
+            print(f"[EMAIL] send_refund_resolution_denied send_raw failed: {result.message}, falling back")
+        except Exception as e:
+            print(f"[EMAIL] send_refund_resolution_denied send_raw error: {e}, falling back")
 
     return send_email(to_email, subject, html_body, text_body)
