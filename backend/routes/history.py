@@ -563,7 +563,8 @@ def history_mod():
                 }
             )
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            print(f"[INTERNAL_ERROR] context=history_sync error={e}")
+            return jsonify({"error": "SERVER_ERROR", "message": "Something went wrong. Please try again."}), 500
 
     return _inner()
 
@@ -814,7 +815,8 @@ def history_item_add_mod():
                 }
             )
         except Exception as e:
-            return jsonify({"error": str(e)}), 500
+            print(f"[INTERNAL_ERROR] context=history_item_add error={e}")
+            return jsonify({"error": "SERVER_ERROR", "message": "Something went wrong. Please try again."}), 500
 
     return _inner()
 
@@ -971,7 +973,7 @@ def history_item_update_mod(item_id: str):
                 return jsonify({"ok": True, "item": item})
             except Exception as e:
                 log_db_continue("history_item_get", e)
-                return jsonify({"ok": False, "error": str(e)}), 500
+                return jsonify({"ok": False, "error": "SERVER_ERROR", "message": "Something went wrong. Please try again."}), 500
 
         if request.method == "DELETE":
             db_ok = False
@@ -1228,7 +1230,8 @@ def history_item_update_mod(item_id: str):
                     }
                 )
             except Exception as e:
-                return jsonify({"error": str(e)}), 500
+                print(f"[INTERNAL_ERROR] context=history_item_update error={e}")
+                return jsonify({"error": "SERVER_ERROR", "message": "Something went wrong. Please try again."}), 500
 
         return jsonify({"error": "Method not allowed"}), 405
 

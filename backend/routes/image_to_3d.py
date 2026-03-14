@@ -217,7 +217,8 @@ def image_to_3d_status_mod(job_id: str):
         ms = mesh_get(f"/openapi/v1/image-to-3d/{meshy_job_id}")
         log_event("image-to-3d/status:meshy-resp[mod]", ms)
     except Exception as e:
-        return jsonify({"error": str(e)}), 404
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
+        return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
     out = normalize_meshy_task(ms, stage="image3d")
     log_status_summary("image-to-3d[mod]", meshy_job_id, out)
 

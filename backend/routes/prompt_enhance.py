@@ -83,9 +83,16 @@ def prompt_enhance():
             "mode": mode,
         })
     except PromptEnhanceError as e:
+        err_str = str(e)
+        # Only surface user-input validation errors; hide provider details
+        if any(kw in err_str for kw in ("empty", "exceeds", "Unsupported mode")):
+            safe_msg = err_str
+        else:
+            print(f"[PROVIDER_ERROR] provider=openai context=prompt_enhance error={err_str}")
+            safe_msg = "Prompt enhancement failed. Please try again."
         return jsonify({
             "ok": False,
-            "error": str(e),
+            "error": safe_msg,
         }), 400
     except Exception as e:
         print(f"[PromptEnhance] Unexpected error: {e}")

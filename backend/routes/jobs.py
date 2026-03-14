@@ -418,12 +418,13 @@ def get_job(job_id):
         if status == "ready":
             progress = 100
 
+        from backend.services.error_sanitizer import sanitize_job_error_message
         return jsonify({
             "ok": True,
             "job_id": job.get("id"),
             "status": status,
             "progress": progress,
-            "error_message": job.get("error_message"),
+            "error_message": sanitize_job_error_message(job.get("error_message")),
             "model_id": model_id,
             "image_id": image_id,
             "glb_url": glb_url,
@@ -869,7 +870,8 @@ def save_active_job():
         success = save_active_job_to_db(job_id, job_type, stage, metadata, identity_id)
         return jsonify({"success": success, "job_id": job_id})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[INTERNAL_ERROR] context=save_active_job error={e}")
+        return jsonify({"error": "SERVER_ERROR", "message": "Something went wrong. Please try again."}), 500
 
 
 @bp.route("/active", methods=["GET", "OPTIONS"])
@@ -962,4 +964,5 @@ def delete_active_job(job_id):
         delete_active_job_from_db(job_id, identity_id)
         return jsonify({"success": True, "job_id": job_id})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[INTERNAL_ERROR] context=delete_active_job error={e}")
+        return jsonify({"error": "SERVER_ERROR", "message": "Something went wrong. Please try again."}), 500

@@ -363,10 +363,15 @@ def text_to_3d_remesh_start_mod():
         meshy_task_id = resp.get("result")
         if not meshy_task_id:
             release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            return jsonify({"ok": False, "error": "No job id in response", "raw": resp}), 502
+            print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} error=no_task_id_in_response raw={resp}")
+            return jsonify({"ok": False, "error": "MODEL_GENERATION_FAILED", "message": "3D model generation failed. Please try again."}), 502
     except Exception as e:
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        return jsonify({"ok": False, "error": str(e)}), 502
+        from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+        return jsonify(sanitize_provider_error(
+            provider="meshy", error=e, job_id=internal_job_id,
+            code=MODEL_GENERATION_FAILED,
+        )), 502
 
     # Use internal_job_id (not meshy_task_id) for credit finalization tracking
     finalize_job_credits(reservation_id, internal_job_id, identity_id)
@@ -522,7 +527,8 @@ def text_to_3d_status_mod(job_id: str):
         ms = mesh_get(f"/openapi/v2/text-to-3d/{meshy_job_id}")
         log_event("text-to-3d/status:meshy-resp[mod]", ms)
     except Exception as e:
-        return jsonify({"error": str(e)}), 404
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
+        return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
 
     out = normalize_status(ms)
     log_status_summary("text-to-3d[mod]", job_id, out)

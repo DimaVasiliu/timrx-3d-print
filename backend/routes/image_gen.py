@@ -954,10 +954,12 @@ def proxy_image_mod():
     try:
         r = requests.get(url, stream=True, timeout=30)
     except Exception as e:
-        return jsonify({"error": f"Fetch failed: {e}"}), 502
+        print(f"[PROVIDER_ERROR] provider=image_proxy error={e}")
+        return jsonify({"error": "FETCH_FAILED", "message": "Failed to fetch the requested resource. Please try again."}), 502
 
     if not r.ok:
-        return jsonify({"error": f"Upstream {r.status_code}"}), r.status_code
+        print(f"[PROVIDER_ERROR] provider=image_proxy error=upstream_http_{r.status_code}")
+        return jsonify({"error": "FETCH_FAILED", "message": "Failed to fetch the requested resource. Please try again."}), 502
 
     content_type = r.headers.get("Content-Type", "application/octet-stream")
     return Response(r.content, status=200, mimetype=content_type)
@@ -988,7 +990,8 @@ def cache_image_mod():
         file_path = config.CACHE_DIR / f"{file_id}{ext}"
         file_path.write_bytes(base64.b64decode(b64data))
     except Exception as e:
-        return jsonify({"error": f"Failed to decode data URL: {e}"}), 400
+        print(f"[INTERNAL_ERROR] context=data_url_decode error={e}")
+        return jsonify({"error": "INPUT_VALIDATION_FAILED", "message": "Failed to decode image data. Please try again with a different image."}), 400
 
     return jsonify({"url": f"/api/cache-image/{file_path.name}", "mime": mime})
 

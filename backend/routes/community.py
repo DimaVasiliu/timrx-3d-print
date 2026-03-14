@@ -125,7 +125,7 @@ def community_feed_mod():
 
     except Exception as e:
         print(f"[COMMUNITY][mod] Error in feed: {e}")
-        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
 
 
 @bp.route("/community/share", methods=["POST", "OPTIONS"])
@@ -212,7 +212,7 @@ def community_share_mod():
 
         except Exception as e:
             print(f"[COMMUNITY][mod] Error in share: {e}")
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
 
     return _inner()
 
@@ -253,7 +253,7 @@ def community_delete_mod(post_id: str):
 
         except Exception as e:
             print(f"[COMMUNITY][mod] Error in delete: {e}")
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
 
     return _inner(post_id)
 

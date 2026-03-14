@@ -461,5 +461,5 @@ def asset_download_mod(asset_type: str, asset_id: str):
         })
 
     except Exception as e:
-        print(f"[DOWNLOAD][mod] Error: {e}")
-        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": str(e)}}), 500
+        print(f"[INTERNAL_ERROR] context=asset_download error={e}")
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500

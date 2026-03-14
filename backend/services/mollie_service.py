@@ -1254,9 +1254,9 @@ class MollieService:
 
         now = datetime.now(timezone.utc)
         if cadence == "yearly":
-            period_end = now + timedelta(days=365)
+            period_end = SubscriptionService.add_years(now, 1)
         else:
-            period_end = now + timedelta(days=30)
+            period_end = SubscriptionService.add_months(now, 1)
 
         # Create subscription
         sub = SubscriptionService.create_subscription(
@@ -1276,8 +1276,10 @@ class MollieService:
         sub_id = str(sub["id"])
 
         # Grant first period credits immediately
+        # For yearly plans, the first credit cycle is 1 month (not the full year)
+        first_cycle_end = period_end if cadence == "monthly" else SubscriptionService.add_months(now, 1)
         cycle_id = SubscriptionService.grant_subscription_credits(
-            sub_id, now, period_end if cadence == "monthly" else now + timedelta(days=30),
+            sub_id, now, first_cycle_end,
         )
 
         if cycle_id:
@@ -1445,7 +1447,7 @@ class MollieService:
         # Calculate period end and prepaid tracking for yearly plans
         is_yearly = cadence == "yearly"
         if is_yearly:
-            period_end = now + timedelta(days=365)
+            period_end = SubscriptionService.add_years(now, 1)
             credits_remaining_months = 12
             prepaid_until = period_end  # Yearly: prepaid for full year
         else:
@@ -1716,7 +1718,7 @@ class MollieService:
                                     updated_at = NOW()
                                 WHERE id = %s
                                 """,
-                                (paid_at + timedelta(days=365), sub_id),
+                                (SubscriptionService.add_years(paid_at, 1), sub_id),
                             )
                         conn.commit()
                 except Exception as e:
@@ -1746,6 +1748,9 @@ class MollieService:
             except Exception:
                 pass
 
+            # Compute next credit date once — used for both DB update and email
+            computed_next_credit = SubscriptionService.calculate_next_credit_date(period_start, billing_day)
+
             # Update subscription dates
             try:
                 with get_conn() as conn:
@@ -1764,7 +1769,7 @@ class MollieService:
                             (
                                 period_start,
                                 period_end,
-                                SubscriptionService.calculate_next_credit_date(period_start, billing_day),
+                                computed_next_credit,
                                 sub_id,
                             ),
                         )
@@ -1782,7 +1787,7 @@ class MollieService:
                     plan_code=plan_code,
                     credits_granted=plan.get("credits_per_month", 0),
                     is_first_grant=False,
-                    next_credit_date=period_end,
+                    next_credit_date=computed_next_credit,
                 )
 
             # Log event
@@ -2167,7 +2172,7 @@ class MollieService:
                 billing_day = now.day
 
                 if cadence == "yearly":
-                    period_end = now + timedelta(days=365)
+                    period_end = SubscriptionService.add_years(now, 1)
                     credits_remaining_months = 12
                 else:
                     period_end = SubscriptionService.calculate_next_credit_date(now, billing_day)

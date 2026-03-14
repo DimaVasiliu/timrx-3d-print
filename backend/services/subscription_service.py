@@ -317,9 +317,9 @@ class SubscriptionService:
         billing_day = now.day
         if period_end is None:
             if plan["cadence"] == "yearly":
-                period_end = now + timedelta(days=365)
+                period_end = SubscriptionService.add_years(now, 1)
             else:
-                period_end = now + timedelta(days=30)
+                period_end = SubscriptionService.add_months(now, 1)
 
         # Calculate next credit date for monthly allocation tracking
         next_credit_date = SubscriptionService.calculate_next_credit_date(now, billing_day)
@@ -645,6 +645,40 @@ class SubscriptionService:
             return None
 
     # ══════════════════════════════════════════════════════════════
+    # CALENDAR-AWARE DATE HELPERS
+    # ══════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def add_months(from_date: datetime, months: int) -> datetime:
+        """
+        Advance a datetime by N calendar months, clamping the day to the
+        last day of the target month when necessary (e.g. Jan 31 + 1 month
+        → Feb 28).  Preserves time and tzinfo.
+        """
+        import calendar
+        year = from_date.year
+        month = from_date.month + months
+        # Normalise month overflow
+        year += (month - 1) // 12
+        month = (month - 1) % 12 + 1
+        _, last_day = calendar.monthrange(year, month)
+        day = min(from_date.day, last_day)
+        return from_date.replace(year=year, month=month, day=day)
+
+    @staticmethod
+    def add_years(from_date: datetime, years: int) -> datetime:
+        """
+        Advance a datetime by N calendar years, clamping Feb 29 → Feb 28
+        on non-leap years.  Preserves time and tzinfo.
+        """
+        import calendar
+        year = from_date.year + years
+        month = from_date.month
+        _, last_day = calendar.monthrange(year, month)
+        day = min(from_date.day, last_day)
+        return from_date.replace(year=year, month=month, day=day)
+
+    # ══════════════════════════════════════════════════════════════
     # ENHANCED SUBSCRIPTION MANAGEMENT (Monthly Credit Allocation)
     # ══════════════════════════════════════════════════════════════
 
@@ -932,11 +966,11 @@ class SubscriptionService:
 
         # Calculate period end based on cadence
         if cadence == "yearly":
-            period_end = now + timedelta(days=365)
+            period_end = SubscriptionService.add_years(now, 1)
             credits_remaining_months = 12
             renewal_date = period_end
         else:
-            period_end = now + timedelta(days=30)
+            period_end = SubscriptionService.add_months(now, 1)
             credits_remaining_months = None
             renewal_date = None
 
@@ -1174,6 +1208,62 @@ class SubscriptionService:
                         "status": "skipped",
                         "reason": "monthly_recurring_awaiting_payment",
                     })
+
+                    # ── S4: Stale credit date safety monitor ──────────────────────
+                    # If next_credit_date is > 3 days in the past, the Mollie webhook
+                    # likely failed or payment is stuck.  Alert admin but do NOT
+                    # modify any subscription state — detection only.
+                    try:
+                        ncd = sub.get("next_credit_date")
+                        if ncd is not None:
+                            stale_days = (_now_utc() - ncd).days
+                            if stale_days > 3:
+                                stale_msg = (
+                                    f"[SUB] ⚠ STALE next_credit_date for monthly recurring "
+                                    f"{sub_id} (plan={plan_code}, identity={identity_id}): "
+                                    f"next_credit_date={ncd.isoformat()} is {stale_days} days "
+                                    f"in the past. Mollie webhook may have failed."
+                                )
+                                print(stale_msg)
+
+                                SubscriptionService._log_event(sub_id, "stale_credit_date_detected", {
+                                    "next_credit_date": ncd.isoformat(),
+                                    "stale_days": stale_days,
+                                    "plan_code": plan_code,
+                                    "identity_id": identity_id,
+                                })
+
+                                from backend.emailer import notify_admin
+                                notify_admin(
+                                    subject=f"Stale subscription credit date — {stale_days} days overdue",
+                                    message=(
+                                        f"Subscription {sub_id} (plan: {plan_code}) has a "
+                                        f"next_credit_date of {ncd.strftime('%Y-%m-%d')} which is "
+                                        f"{stale_days} days in the past.\n\n"
+                                        f"This likely means the Mollie payment webhook failed or "
+                                        f"a payment is stuck in pending/open state.\n\n"
+                                        f"Action required: Check Mollie dashboard for subscription "
+                                        f"payments and manually reconcile if needed."
+                                    ),
+                                    data={
+                                        "subscription_id": sub_id,
+                                        "identity_id": identity_id,
+                                        "plan_code": plan_code,
+                                        "next_credit_date": ncd.isoformat(),
+                                        "stale_days": stale_days,
+                                        "customer_email": sub.get("customer_email"),
+                                    },
+                                )
+
+                                result["details"].append({
+                                    "subscription_id": sub_id,
+                                    "status": "stale_alert",
+                                    "stale_days": stale_days,
+                                    "next_credit_date": ncd.isoformat(),
+                                })
+                    except Exception as e:
+                        print(f"[SUB] Error in stale credit date check for {sub_id}: {e}")
+
                     continue
 
                 # Check if yearly plan has exhausted credits
@@ -1209,9 +1299,10 @@ class SubscriptionService:
                                 """
                                 params = [next_credit]
 
-                                # Decrement remaining months for yearly plans
-                                if plan["cadence"] == "yearly":
-                                    update_sql += ", credits_remaining_months = GREATEST(0, credits_remaining_months - 1)"
+                                # NOTE: credits_remaining_months is already decremented
+                                # inside grant_subscription_credits() atomically with the
+                                # cycle insert and ledger credit.  Do NOT decrement again here.
+                                # We only read it back for the email template.
 
                                 update_sql += " WHERE id::text = %s RETURNING credits_remaining_months"
                                 params.append(sub_id)
@@ -1823,7 +1914,7 @@ class SubscriptionService:
                 with conn.cursor() as cur:
                     if cadence == "yearly":
                         # Yearly renewal: reset for another 12 months
-                        new_period_end = now + timedelta(days=365)
+                        new_period_end = SubscriptionService.add_years(now, 1)
                         cur.execute(
                             f"""
                             UPDATE {Tables.SUBSCRIPTIONS}
@@ -1840,8 +1931,8 @@ class SubscriptionService:
                             (now, new_period_end, new_period_end, subscription_id),
                         )
                     else:
-                        # Monthly renewal: extend period by 30 days
-                        new_period_end = now + timedelta(days=30)
+                        # Monthly renewal: extend by 1 calendar month
+                        new_period_end = SubscriptionService.add_months(now, 1)
                         cur.execute(
                             f"""
                             UPDATE {Tables.SUBSCRIPTIONS}

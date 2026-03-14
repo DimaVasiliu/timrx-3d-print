@@ -74,7 +74,7 @@ def dispatch_meshy_text_to_3d_async(
             print(f"[ASYNC] ERROR: No task_id from Meshy for job {internal_job_id}")
             if reservation_id:
                 release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
+            update_job_status_failed(internal_job_id, "3D model generation failed. Please try again.")
             return
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -97,10 +97,11 @@ def dispatch_meshy_text_to_3d_async(
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} duration_ms={duration_ms} error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        update_job_status_failed(internal_job_id, str(e))
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Generation failed. Please try again.")
 
 
 def dispatch_meshy_refine_async(
@@ -129,11 +130,10 @@ def dispatch_meshy_refine_async(
         # )
 
         if not meshy_task_id:
-            error_msg = "Meshy refine returned no task ID"
-            print(f"[ASYNC] ERROR: {error_msg} for job {internal_job_id}")
+            print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} error=refine_returned_no_task_id")
             if reservation_id:
                 release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            update_job_status_failed(internal_job_id, error_msg)
+            update_job_status_failed(internal_job_id, "3D model generation failed. Please try again.")
             return
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -161,12 +161,13 @@ def dispatch_meshy_refine_async(
         duration_ms = int((time.time() - start_time) * 1000)
         err_text = str(e)
         print(
-            f"[ASYNC] ERROR: Meshy refine failed for job {internal_job_id} "
-            f"after {duration_ms}ms: {err_text}"
+            f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} "
+            f"action=refine duration_ms={duration_ms} error={err_text}"
         )
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        update_job_status_failed(internal_job_id, err_text)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(err_text) or "Generation failed. Please try again.")
 
 
 def dispatch_meshy_image_to_3d_async(
@@ -219,7 +220,7 @@ def dispatch_meshy_image_to_3d_async(
             print(f"[ASYNC] ERROR: No task_id from Meshy image-to-3d for job {internal_job_id}")
             if reservation_id:
                 release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            update_job_status_failed(internal_job_id, "Meshy API returned no task ID")
+            update_job_status_failed(internal_job_id, "3D model generation failed. Please try again.")
             return
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -259,10 +260,11 @@ def dispatch_meshy_image_to_3d_async(
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Meshy image-to-3d failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} action=image-to-3d duration_ms={duration_ms} error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        update_job_status_failed(internal_job_id, str(e))
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Generation failed. Please try again.")
 
 
 def dispatch_openai_image_async(
@@ -301,10 +303,10 @@ def dispatch_openai_image_async(
                 urls.append(f"data:image/png;base64,{item['b64_json']}")
 
         if not urls:
-            print(f"[ASYNC] ERROR: No images from OpenAI for job {internal_job_id}")
+            print(f"[PROVIDER_ERROR] provider=openai job_id={internal_job_id} error=no_images_returned")
             if reservation_id:
                 release_job_credits(reservation_id, "openai_no_images", internal_job_id)
-            update_job_status_failed(internal_job_id, "OpenAI returned no images")
+            update_job_status_failed(internal_job_id, "Image generation failed. Please try again.")
             return
 
         save_image_to_normalized_db(
@@ -352,10 +354,11 @@ def dispatch_openai_image_async(
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: OpenAI failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[PROVIDER_ERROR] provider=openai job_id={internal_job_id} duration_ms={duration_ms} error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "openai_api_error", internal_job_id)
-        update_job_status_failed(internal_job_id, str(e))
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed. Please try again.")
         # Unregister active job on failure
         ExpenseGuard.unregister_active_job(internal_job_id)
 
@@ -399,10 +402,10 @@ def dispatch_gemini_image_async(
         image_base64 = result.get("image_base64")
 
         if not image_url and not image_urls:
-            print(f"[ASYNC] ERROR: No images from Gemini for job {internal_job_id}")
+            print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} error=no_images_returned")
             if reservation_id:
                 release_job_credits(reservation_id, "gemini_no_images", internal_job_id)
-            update_job_status_failed(internal_job_id, "Gemini returned no images")
+            update_job_status_failed(internal_job_id, "Image generation failed. Please try again.")
             return
 
         # Save to normalized DB (creates images row + history_items row)
@@ -453,34 +456,35 @@ def dispatch_gemini_image_async(
 
     except GeminiImageConfigError as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Gemini config error for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} type=config error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
-        update_job_status_failed(internal_job_id, f"gemini_config_error: {e}")
+        update_job_status_failed(internal_job_id, "Image generation temporarily unavailable. Please try again shortly.")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiImageValidationError as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Gemini validation error for job {internal_job_id} after {duration_ms}ms: {e.message}")
+        print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} type=validation error={e.message}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
-        update_job_status_failed(internal_job_id, f"gemini_validation_error: {e.message}")
+        update_job_status_failed(internal_job_id, "Image generation failed. Please try again.")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except GeminiImageAuthError as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Gemini auth error for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} type=auth error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
-        update_job_status_failed(internal_job_id, f"gemini_auth_error: {e}")
+        update_job_status_failed(internal_job_id, "Image generation temporarily unavailable. Please try again shortly.")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[ASYNC] ERROR: Gemini call failed for job {internal_job_id} after {duration_ms}ms: {e}")
+        print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "gemini_api_error", internal_job_id)
-        update_job_status_failed(internal_job_id, str(e))
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed. Please try again.")
         ExpenseGuard.unregister_active_job(internal_job_id)
 
 

@@ -1051,6 +1051,28 @@ def subscription_me():
         return jsonify({"ok": True, "subscription": None})
 
     plan_info = SubscriptionService.get_plan_info(sub["plan_code"]) or {}
+
+    # Compute display-safe credits_next_refill
+    from datetime import datetime, timezone as _tz
+    raw_next = sub.get("next_credit_date")
+    now_utc = datetime.now(_tz.utc)
+    display_next = None
+
+    if raw_next is not None:
+        if raw_next > now_utc:
+            display_next = raw_next
+        elif sub["status"] in ("active", "cancelled"):
+            billing_day = sub.get("billing_day") or (raw_next.day if raw_next else 1)
+            advanced = raw_next
+            for _ in range(13):
+                advanced = SubscriptionService.calculate_next_credit_date(advanced, billing_day)
+                if advanced > now_utc:
+                    break
+            display_next = advanced
+
+    credits_next_refill = display_next.strftime("%Y-%m-%d") if display_next else None
+    billing_next_charge = sub["current_period_end"].strftime("%Y-%m-%d") if sub.get("current_period_end") else None
+
     return jsonify({
         "ok": True,
         "subscription": {
@@ -1058,11 +1080,18 @@ def subscription_me():
             "plan_code": sub["plan_code"],
             "plan_name": plan_info.get("name", sub["plan_code"]),
             "credits_per_month": plan_info.get("credits_per_month", 0),
+            "credits_per_cycle": plan_info.get("credits_per_month", 0),
             "cadence": plan_info.get("cadence", "monthly"),
+            "billing_cadence": plan_info.get("cadence", "monthly"),
             "status": sub["status"],
+            # ── Explicit semantic fields ──
+            "credits_next_refill": credits_next_refill,
+            "billing_next_charge": billing_next_charge,
+            # ── Backward-compatible (deprecated) ──
             "current_period_start": sub["current_period_start"].isoformat() if sub.get("current_period_start") else None,
             "current_period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
             "cancelled_at": sub["cancelled_at"].isoformat() if sub.get("cancelled_at") else None,
+            "pause_reason": sub.get("pause_reason"),
         },
     })
 
@@ -1195,8 +1224,8 @@ def subscription_checkout():
         })
 
     except (MollieCreateError, ValueError) as e:
-        print(f"[BILLING] Subscription checkout error: {e}")
-        return jsonify({"error": "checkout_failed", "message": str(e)}), 500
+        print(f"[PROVIDER_ERROR] provider=mollie context=subscription_checkout error={e}")
+        return jsonify({"error": "checkout_failed", "message": "Failed to create checkout. Please try again."}), 500
     except Exception as e:
         print(f"[BILLING] Unexpected subscription checkout error: {e}")
         return jsonify({"error": "checkout_failed", "message": "Failed to create checkout"}), 500
@@ -1391,20 +1420,30 @@ def subscription_summary():
     This endpoint provides the essential subscription fields for UI display
     and decision-making. Use /subscriptions/status for full details.
 
+    Date semantics:
+      credits_next_refill  — when credits will next be added (YYYY-MM-DD, always future)
+      billing_next_charge  — when Mollie will next charge (YYYY-MM-DD, from current_period_end)
+      next_credit_date     — DEPRECATED alias for credits_next_refill (backward compat)
+
     Response (with subscription):
     {
         "ok": true,
         "has_subscription": true,
-        "status": "active",              // processing, active, past_due, cancelled, suspended, expired
+        "status": "active",
         "plan_code": "creator_monthly",
-        "interval": "monthly",           // monthly or yearly
-        "next_credit_date": "2026-03-01T00:00:00Z",
-        "ends_at": null,                 // Set when cancelled - when access truly ends
-        "prepaid_until": null,           // Yearly only - when prepaid period ends
-        "credits_remaining_months": null, // Yearly only - months of credits left
-        "last_payment_status": "paid",   // pending, paid, failed
+        "interval": "monthly",
+        "credits_next_refill": "2026-04-01",   // when credits are next granted
+        "billing_next_charge": "2026-04-01",   // when next Mollie charge occurs
+        "credits_per_cycle": 1300,             // credits granted each cycle
+        "billing_cadence": "monthly",          // monthly or yearly
+        "next_credit_date": "2026-04-01",      // DEPRECATED — same as credits_next_refill
+        "credit_refresh_state": "scheduled",   // scheduled, processing, none
+        "ends_at": "2026-05-01",               // set when cancelled
+        "prepaid_until": null,                 // yearly only
+        "credits_remaining_months": null,      // yearly only
+        "last_payment_status": "paid",
         "last_payment_at": "2026-02-01T12:00:00Z",
-        "suspend_reason": null           // Set if suspended (refunded, charged_back, fraud, manual)
+        "suspend_reason": null
     }
 
     Response (no subscription):
@@ -1413,6 +1452,8 @@ def subscription_summary():
         "has_subscription": false
     }
     """
+    from backend.services.subscription_service import SUBSCRIPTION_PLANS
+
     # Get any subscription (active, cancelled, pending_payment, suspended)
     sub = None
     try:
@@ -1464,15 +1505,110 @@ def subscription_summary():
     plan_code = sub.get("plan_code", "")
     interval = "yearly" if plan_code.endswith("_yearly") else "monthly"
 
+    # ─────────────────────────────────────────────────────────────────
+    # Compute safe display date for next_credit_date.
+    #
+    # The stored next_credit_date is an internal scheduling field used
+    # by cron/webhook to know when to grant credits.  For monthly
+    # recurring subscriptions the cron intentionally skips them (waits
+    # for Mollie webhook), so the stored date can sit in the past
+    # until the webhook advances it.  We must never surface a past
+    # date to the user as "next refill".
+    #
+    # Rules:
+    #   - null              → null / "none"
+    #   - future            → return as-is / "scheduled"
+    #   - past + active     → advance to next future cycle date / "processing"
+    #   - past + cancelled  → null (no future refresh) / "none"
+    #   - suspended/expired → null / "none"
+    # ─────────────────────────────────────────────────────────────────
+    from datetime import datetime, timezone as _tz
+
+    raw_next = sub.get("next_credit_date")
+    now_utc = datetime.now(_tz.utc)
+
+    display_next = None
+    credit_refresh_state = "none"
+
+    if raw_next is not None:
+        if raw_next > now_utc:
+            # Stored date is in the future — use it directly
+            display_next = raw_next
+            credit_refresh_state = "scheduled"
+        elif db_status in ("active",):
+            # Stored date is in the past for an active subscription.
+            # Compute the next future cycle-aligned date for display.
+            billing_day = sub.get("billing_day") or (raw_next.day if raw_next else 1)
+            advanced = raw_next
+            # Safety cap: at most 13 iterations (covers any real-world lag)
+            for _ in range(13):
+                advanced = SubscriptionService.calculate_next_credit_date(advanced, billing_day)
+                if advanced > now_utc:
+                    break
+            display_next = advanced
+            credit_refresh_state = "processing"
+        elif db_status == "cancelled":
+            # Cancelled — check if there are still future refreshes due
+            ends_at = sub.get("ends_at")
+            if ends_at and ends_at > now_utc and raw_next <= now_utc:
+                # Credits overdue but sub still active until ends_at
+                billing_day = sub.get("billing_day") or (raw_next.day if raw_next else 1)
+                advanced = raw_next
+                for _ in range(13):
+                    advanced = SubscriptionService.calculate_next_credit_date(advanced, billing_day)
+                    if advanced > now_utc:
+                        break
+                # Only show if the next date falls before the sub ends
+                if advanced <= ends_at:
+                    display_next = advanced
+                    credit_refresh_state = "processing"
+                # else: no more refreshes before sub ends
+            elif raw_next > now_utc:
+                display_next = raw_next
+                credit_refresh_state = "scheduled"
+            # else: no future refresh
+
+    # ─────────────────────────────────────────────────────────────────
+    # Build explicit date fields.
+    #
+    # credits_next_refill  — when credits will next be added (display-safe, always future)
+    # billing_next_charge  — when Mollie will next charge the user (current_period_end)
+    #
+    # These may coincide for most monthly subs but are conceptually distinct.
+    # ─────────────────────────────────────────────────────────────────
+    credits_next_refill = display_next.strftime("%Y-%m-%d") if display_next else None
+    billing_next_charge = sub["current_period_end"].strftime("%Y-%m-%d") if sub.get("current_period_end") else None
+
+    plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+    credits_per_cycle = plan_info.get("credits_per_month", 0)
+    billing_cadence = plan_info.get("cadence", interval)
+
+    print(
+        f"[SUB_API] subscription response "
+        f"identity_id={g.identity_id} "
+        f"credits_next_refill={credits_next_refill} "
+        f"billing_next_charge={billing_next_charge}"
+    )
+
     return jsonify({
         "ok": True,
         "has_subscription": True,
         "status": display_status,
         "plan_code": plan_code,
         "interval": interval,
-        "next_credit_date": sub["next_credit_date"].isoformat() if sub.get("next_credit_date") else None,
-        "ends_at": sub["ends_at"].isoformat() if sub.get("ends_at") else None,
-        "prepaid_until": sub["prepaid_until"].isoformat() if sub.get("prepaid_until") else None,
+
+        # ── Explicit semantic fields (preferred) ──
+        "credits_next_refill": credits_next_refill,
+        "billing_next_charge": billing_next_charge,
+        "credits_per_cycle": credits_per_cycle,
+        "billing_cadence": billing_cadence,
+
+        # ── Backward-compatible (deprecated — use credits_next_refill instead) ──
+        "next_credit_date": credits_next_refill,
+
+        "credit_refresh_state": credit_refresh_state,
+        "ends_at": sub["ends_at"].strftime("%Y-%m-%d") if sub.get("ends_at") else None,
+        "prepaid_until": sub["prepaid_until"].strftime("%Y-%m-%d") if sub.get("prepaid_until") else None,
         "credits_remaining_months": sub.get("credits_remaining_months"),
         "last_payment_status": sub.get("last_payment_status"),
         "last_payment_at": sub["last_payment_at"].isoformat() if sub.get("last_payment_at") else None,
