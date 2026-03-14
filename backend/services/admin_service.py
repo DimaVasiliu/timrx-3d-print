@@ -455,6 +455,7 @@ class AdminService:
         date_to: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        _max_limit: int = 100,
     ) -> Dict[str, Any]:
         """
         List purchases with filtering, enriched with refund + credit usage data.
@@ -464,7 +465,7 @@ class AdminService:
         """
         from datetime import date as d_date
 
-        limit = min(max(1, limit), 100)
+        limit = min(max(1, limit), _max_limit)
         offset = max(0, offset)
 
         conditions = []

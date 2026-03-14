@@ -11,6 +11,7 @@ Endpoints:
 - GET  /api/admin/identities         - List identities
 - GET  /api/admin/identities/<id>    - Get identity detail
 - GET  /api/admin/purchases          - List purchases
+- GET  /api/admin/purchases/export.csv - CSV export of purchases
 - POST /api/admin/credits/grant      - Grant/deduct credits (requires reason, audit trail)
 - POST /api/admin/wallet/adjust      - Adjust wallet (alias for credits/grant)
 - GET  /api/admin/reservations       - List credit reservations
@@ -2833,6 +2834,71 @@ def _csv_response(rows, fieldnames, filename):
         mimetype="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@bp.route("/purchases/export.csv", methods=["GET"])
+@require_admin
+def purchases_export_csv():
+    """Export purchases as CSV with same filters as list endpoint."""
+    try:
+        result = AdminService.list_purchases(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            email=request.args.get("email"),
+            purchase_id=request.args.get("purchase_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+            _max_limit=5000,
+        )
+
+        fieldnames = [
+            "purchase_id", "created_at", "paid_at", "status",
+            "email", "identity_id", "plan_code", "plan_name",
+            "provider", "payment_reference", "payment_id",
+            "amount_gbp", "currency", "credits_granted", "credits_remaining",
+            "credit_type", "is_subscription_purchase",
+            "refund_exists", "latest_refund_status", "latest_refund_id",
+            "refund_action_state", "refund_risk_level", "refund_risk_reason",
+        ]
+
+        rows = []
+        for p in result.get("purchases", []):
+            risk = p.get("refund_risk") or {}
+            rows.append({
+                "purchase_id": p.get("id", ""),
+                "created_at": p.get("created_at", ""),
+                "paid_at": p.get("paid_at", ""),
+                "status": p.get("status", ""),
+                "email": p.get("email", ""),
+                "identity_id": p.get("identity_id", ""),
+                "plan_code": p.get("plan_code", ""),
+                "plan_name": p.get("plan_name", ""),
+                "provider": p.get("provider", ""),
+                "payment_reference": p.get("payment_reference", ""),
+                "payment_id": p.get("payment_id", ""),
+                "amount_gbp": p.get("amount_gbp", ""),
+                "currency": p.get("currency", ""),
+                "credits_granted": p.get("credits_granted", ""),
+                "credits_remaining": p.get("credits_remaining", ""),
+                "credit_type": p.get("credit_type", ""),
+                "is_subscription_purchase": p.get("is_subscription_purchase", ""),
+                "refund_exists": p.get("refund_exists", ""),
+                "latest_refund_status": p.get("latest_refund_status", ""),
+                "latest_refund_id": p.get("latest_refund_id", ""),
+                "refund_action_state": p.get("refund_action_state", ""),
+                "refund_risk_level": risk.get("level", ""),
+                "refund_risk_reason": risk.get("reason", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "purchases.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Purchases CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @bp.route("/refunds/export.csv", methods=["GET"])
