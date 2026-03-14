@@ -620,6 +620,14 @@ class AdminService:
             else:
                 action_state = "eligible"
 
+            # Refund risk score
+            refund_count = len([rr for rr in refund_rows if str(rr["purchase_id"]) == pid])
+            risk = _compute_refund_risk(
+                credits_granted=credits_granted,
+                credits_used=max(0, credits_granted - credits_remaining),
+                refund_count=refund_count,
+            )
+
             purchases.append({
                 "id": pid,
                 "identity_id": iid,
@@ -642,6 +650,7 @@ class AdminService:
                 "latest_refund_status": latest_refund_status,
                 "latest_refund_id": refund_info["refund_id"] if refund_info else None,
                 "refund_action_state": action_state,
+                "refund_risk": risk,
             })
 
         return {
@@ -652,8 +661,319 @@ class AdminService:
         }
 
     # ─────────────────────────────────────────────────────────────
-    # Credit Management
+    # Purchase Detail + Timeline
     # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_purchase_detail(purchase_id: str) -> Dict[str, Any]:
+        """
+        Full purchase investigation view: summary, wallet effects,
+        refunds, jobs, disputes, and combined timeline.
+        """
+        # 1. Purchase
+        purchase = query_one(
+            f"""
+            SELECT p.id, p.identity_id, p.plan_id, p.provider,
+                   p.provider_payment_id, p.payment_id,
+                   p.amount_gbp, p.currency, p.credits_granted,
+                   p.status, p.meta, p.created_at, p.paid_at,
+                   i.email,
+                   pl.code AS plan_code, pl.name AS plan_name
+            FROM {Tables.PURCHASES} p
+            LEFT JOIN {Tables.IDENTITIES} i ON i.id = p.identity_id
+            LEFT JOIN {Tables.PLANS} pl ON pl.id = p.plan_id
+            WHERE p.id = %s::uuid
+            """,
+            (purchase_id,),
+        )
+        if not purchase:
+            return {"ok": False, "error": "Purchase not found"}
+
+        pid = str(purchase["id"])
+        iid = str(purchase["identity_id"])
+        credits_granted = purchase["credits_granted"] or 0
+        meta = purchase["meta"] or {}
+        credit_type = meta.get("credit_type", "general")
+
+        # Wallet balance
+        try:
+            wallet = WalletService.get_all_balances(iid)
+        except Exception:
+            wallet = {"general": 0, "video": 0}
+        credits_remaining = wallet.get("general", 0) + wallet.get("video", 0)
+
+        # 2. Ledger entries for this purchase
+        ledger_rows = query_all(
+            f"""
+            SELECT id, entry_type, amount_credits, credit_type,
+                   ref_type, ref_id, meta, created_at
+            FROM {Tables.LEDGER_ENTRIES}
+            WHERE identity_id = %s::uuid
+              AND (ref_id = %s OR ref_id = %s)
+            ORDER BY created_at
+            """,
+            (iid, pid, purchase_id),
+        )
+        wallet_effects = []
+        for le in ledger_rows:
+            wallet_effects.append({
+                "id": str(le["id"]),
+                "entry_type": le["entry_type"],
+                "amount_credits": le["amount_credits"],
+                "credit_type": le.get("credit_type", "general"),
+                "ref_type": le["ref_type"],
+                "created_at": le["created_at"].isoformat() if le["created_at"] else None,
+            })
+
+        # 3. Refunds for this purchase
+        refund_rows = query_all(
+            f"""
+            SELECT id, refund_type, refund_status, amount_gbp,
+                   credits_reversed, credit_type, reason, admin_note,
+                   executed_by, external_refund_id, metadata,
+                   created_at, executed_at
+            FROM {Tables.REFUNDS}
+            WHERE purchase_id = %s::uuid
+            ORDER BY created_at DESC
+            """,
+            (purchase_id,),
+        )
+        refunds = []
+        for rf in refund_rows:
+            refunds.append({
+                "id": str(rf["id"]),
+                "refund_type": rf["refund_type"],
+                "refund_status": rf["refund_status"],
+                "amount_gbp": float(rf["amount_gbp"]) if rf["amount_gbp"] else 0,
+                "credits_reversed": rf["credits_reversed"] or 0,
+                "credit_type": rf["credit_type"],
+                "reason": rf["reason"],
+                "admin_note": rf["admin_note"],
+                "executed_by": rf["executed_by"],
+                "external_refund_id": rf["external_refund_id"],
+                "metadata": rf["metadata"],
+                "created_at": rf["created_at"].isoformat() if rf["created_at"] else None,
+                "executed_at": rf["executed_at"].isoformat() if rf["executed_at"] else None,
+            })
+
+        # 4. Jobs — recent jobs by this identity after purchase date (max 50)
+        job_rows = query_all(
+            f"""
+            SELECT id, provider, action_code, status, cost_credits,
+                   estimated_provider_cost_gbp, created_at
+            FROM {Tables.JOBS}
+            WHERE identity_id = %s::uuid
+              AND created_at >= %s
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (iid, purchase["created_at"]),
+        )
+        jobs = []
+        total_credits_used = 0
+        for jb in job_rows:
+            cost = jb["cost_credits"] or 0
+            if jb["status"] in ("succeeded", "ready", "failed"):
+                total_credits_used += cost
+            jobs.append({
+                "id": str(jb["id"]),
+                "provider": jb["provider"],
+                "action_code": jb["action_code"],
+                "status": jb["status"],
+                "cost_credits": cost,
+                "estimated_cost_gbp": float(jb["estimated_provider_cost_gbp"]) if jb["estimated_provider_cost_gbp"] else None,
+                "created_at": jb["created_at"].isoformat() if jb["created_at"] else None,
+            })
+
+        # 5. Disputes
+        try:
+            from backend.services.dispute_service import get_disputes_for_purchase
+            disputes = get_disputes_for_purchase(purchase_id)
+        except Exception:
+            disputes = []
+
+        # 6. Refund action state + risk score
+        latest_refund = refunds[0] if refunds else None
+        latest_refund_status = latest_refund["refund_status"] if latest_refund else None
+        p_status = purchase["status"]
+
+        if p_status == "refunded":
+            action_state = "already_refunded"
+        elif p_status not in ("completed",):
+            action_state = "not_refundable"
+        elif latest_refund and latest_refund_status == "executed":
+            action_state = "already_refunded"
+        elif latest_refund and latest_refund_status in ("pending", "manual_review_required", "approved"):
+            action_state = "already_in_refund_flow"
+        else:
+            action_state = "eligible"
+
+        risk = _compute_refund_risk(
+            credits_granted=credits_granted,
+            credits_used=total_credits_used,
+            refund_count=len(refunds),
+        )
+
+        # 7. Build combined timeline
+        timeline = _build_timeline(purchase, wallet_effects, refunds, jobs, disputes)
+
+        purchase_summary = {
+            "id": pid,
+            "identity_id": iid,
+            "email": purchase["email"],
+            "status": p_status,
+            "amount_gbp": float(purchase["amount_gbp"]) if purchase["amount_gbp"] else 0,
+            "currency": purchase["currency"],
+            "credits_granted": credits_granted,
+            "credit_type": credit_type,
+            "payment_provider": purchase["provider"],
+            "payment_reference": purchase["provider_payment_id"],
+            "payment_id": purchase["payment_id"],
+            "plan_code": purchase["plan_code"],
+            "plan_name": purchase["plan_name"],
+            "is_subscription_purchase": bool(purchase["plan_id"]),
+            "created_at": purchase["created_at"].isoformat() if purchase["created_at"] else None,
+            "paid_at": purchase["paid_at"].isoformat() if purchase["paid_at"] else None,
+            "credits_remaining": credits_remaining,
+            "credits_used_since": total_credits_used,
+            "refund_action_state": action_state,
+            "refund_risk": risk,
+            "has_dispute": len(disputes) > 0,
+        }
+
+        return {
+            "ok": True,
+            "purchase": purchase_summary,
+            "wallet_effects": wallet_effects,
+            "refunds": refunds,
+            "jobs": jobs,
+            "disputes": disputes,
+            "timeline": timeline,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Refund risk scoring (module-level helpers)
+# ─────────────────────────────────────────────────────────────────
+
+def _compute_refund_risk(
+    *,
+    credits_granted: int,
+    credits_used: int,
+    refund_count: int,
+) -> Dict[str, str]:
+    """
+    Simple refund risk indicator.
+
+    Thresholds:
+      low    — 0 credits used, no prior refunds
+      medium — <50% credits used, or 1 prior refund attempt
+      high   — >=50% credits used, or 2+ prior refund attempts
+
+    Returns {"level": "low"|"medium"|"high", "reason": "..."}.
+    """
+    if credits_granted <= 0:
+        return {"level": "low", "reason": "No credits granted"}
+
+    usage_ratio = credits_used / credits_granted if credits_granted > 0 else 0
+
+    # High: most credits consumed or repeated refund attempts
+    if usage_ratio >= 0.50 or refund_count >= 2:
+        reasons = []
+        if usage_ratio >= 0.50:
+            pct = int(usage_ratio * 100)
+            reasons.append(f"{pct}% of credits already used")
+        if refund_count >= 2:
+            reasons.append(f"{refund_count} prior refund attempts")
+        return {"level": "high", "reason": "; ".join(reasons)}
+
+    # Medium: some credits used or has a prior refund
+    if credits_used > 0 or refund_count >= 1:
+        reasons = []
+        if credits_used > 0:
+            pct = int(usage_ratio * 100)
+            reasons.append(f"{pct}% of credits used")
+        if refund_count >= 1:
+            reasons.append(f"{refund_count} prior refund attempt")
+        return {"level": "medium", "reason": "; ".join(reasons)}
+
+    # Low: nothing used, no history
+    return {"level": "low", "reason": "No credits used"}
+
+
+def _build_timeline(purchase, wallet_effects, refunds, jobs, disputes):
+    """Build a merged timeline from all purchase-related events."""
+    events = []
+
+    # Purchase events
+    if purchase["created_at"]:
+        events.append({
+            "type": "purchase",
+            "event": "Purchase created",
+            "timestamp": purchase["created_at"].isoformat(),
+            "detail": f"£{float(purchase['amount_gbp'] or 0):.2f}, {purchase['credits_granted'] or 0} credits",
+        })
+    if purchase["paid_at"]:
+        events.append({
+            "type": "purchase",
+            "event": "Payment confirmed",
+            "timestamp": purchase["paid_at"].isoformat(),
+        })
+
+    # Wallet / ledger
+    for le in wallet_effects:
+        events.append({
+            "type": "ledger",
+            "event": f"Ledger: {le['entry_type']}",
+            "timestamp": le["created_at"],
+            "detail": f"{le['amount_credits']:+d} {le.get('credit_type', 'general')} credits",
+        })
+
+    # Refunds
+    for rf in refunds:
+        events.append({
+            "type": "refund",
+            "event": f"Refund {rf['refund_status']}",
+            "timestamp": rf["created_at"],
+            "detail": f"£{rf['amount_gbp']:.2f}" + (f", {rf['credits_reversed']} credits reversed" if rf["credits_reversed"] else ""),
+        })
+        if rf["executed_at"]:
+            events.append({
+                "type": "refund",
+                "event": "Refund executed",
+                "timestamp": rf["executed_at"],
+                "detail": f"by {rf['executed_by'] or 'system'}",
+            })
+
+    # Jobs (only first 20 in timeline to avoid clutter)
+    for jb in jobs[:20]:
+        events.append({
+            "type": "job",
+            "event": f"Job {jb['status']}",
+            "timestamp": jb["created_at"],
+            "detail": f"{jb['provider']} / {jb['action_code']} ({jb['cost_credits']} credits)",
+        })
+
+    # Disputes
+    for d in disputes:
+        events.append({
+            "type": "dispute",
+            "event": f"Dispute {d['dispute_status']}",
+            "timestamp": d["created_at"],
+            "detail": d.get("dispute_reason") or "",
+        })
+
+    # Sort by timestamp descending (newest first)
+    events.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
+    return events
+
+
+# ─────────────────────────────────────────────────────────────────
+# Remaining AdminService methods (credit, reservation, job mgmt)
+# ─────────────────────────────────────────────────────────────────
+
+class _AdminServiceExtra:
+    """Extra AdminService methods — merged into AdminService below."""
 
     @staticmethod
     def grant_credits(
@@ -662,22 +982,10 @@ class AdminService:
         reason: str,
         admin_email: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Grant credits to an identity (admin adjustment).
-
-        Args:
-            identity_id: Target identity UUID
-            amount: Number of credits (positive to grant, negative to deduct)
-            reason: Reason for adjustment
-            admin_email: Email of admin making the adjustment
-
-        Returns:
-            New wallet state
-        """
+        """Grant credits to an identity (admin adjustment)."""
         if amount == 0:
             raise ValueError("Amount cannot be zero")
 
-        # Use wallet service to add ledger entry
         meta = {
             "reason": reason,
             "admin_email": admin_email,
@@ -700,24 +1008,13 @@ class AdminService:
             "wallet": wallet,
         }
 
-    # ─────────────────────────────────────────────────────────────
-    # Reservation Management
-    # ─────────────────────────────────────────────────────────────
-
     @staticmethod
     def list_reservations(
         status: str = "held",
         limit: int = 50,
         offset: int = 0
     ) -> Dict[str, Any]:
-        """
-        List credit reservations.
-
-        Args:
-            status: Filter by status ('held', 'released', or 'all')
-            limit: Max results
-            offset: Pagination offset
-        """
+        """List credit reservations."""
         limit = min(max(1, limit), 100)
         offset = max(0, offset)
 
@@ -732,26 +1029,14 @@ class AdminService:
         if conditions:
             where_clause = "WHERE " + " AND ".join(conditions)
 
-        # Get total
-        count_sql = f"""
-            SELECT COUNT(*) as count
-            FROM {Tables.CREDIT_RESERVATIONS} r
-            {where_clause}
-        """
-        total = query_one(count_sql, params)
+        total = query_one(
+            f"SELECT COUNT(*) as count FROM {Tables.CREDIT_RESERVATIONS} r {where_clause}",
+            params,
+        )
 
-        # Get reservations with identity info
         list_sql = f"""
-            SELECT
-                r.id,
-                r.identity_id,
-                r.action_code,
-                r.cost_credits,
-                r.status,
-                r.created_at,
-                r.expires_at,
-                r.ref_job_id,
-                i.email
+            SELECT r.id, r.identity_id, r.action_code, r.cost_credits,
+                   r.status, r.created_at, r.expires_at, r.ref_job_id, i.email
             FROM {Tables.CREDIT_RESERVATIONS} r
             LEFT JOIN {Tables.IDENTITIES} i ON i.id = r.identity_id
             {where_clause}
@@ -784,15 +1069,9 @@ class AdminService:
 
     @staticmethod
     def release_reservation(reservation_id: str, reason: str = "admin_release") -> bool:
-        """
-        Manually release a held reservation (returns credits to user).
-        """
+        """Manually release a held reservation (returns credits to user)."""
         from backend.services.reservation_service import ReservationService
         return ReservationService.release_reservation(reservation_id)
-
-    # ─────────────────────────────────────────────────────────────
-    # Job Management
-    # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def list_jobs(
@@ -801,9 +1080,7 @@ class AdminService:
         limit: int = 50,
         offset: int = 0
     ) -> Dict[str, Any]:
-        """
-        List jobs with filtering.
-        """
+        """List jobs with filtering."""
         limit = min(max(1, limit), 100)
         offset = max(0, offset)
 
@@ -822,28 +1099,15 @@ class AdminService:
         if conditions:
             where_clause = "WHERE " + " AND ".join(conditions)
 
-        # Get total
-        count_sql = f"""
-            SELECT COUNT(*) as count
-            FROM {Tables.JOBS} j
-            {where_clause}
-        """
-        total = query_one(count_sql, params)
+        total = query_one(
+            f"SELECT COUNT(*) as count FROM {Tables.JOBS} j {where_clause}",
+            params,
+        )
 
-        # Get jobs with identity info
         list_sql = f"""
-            SELECT
-                j.id,
-                j.identity_id,
-                j.provider,
-                j.action_code,
-                j.status,
-                j.cost_credits,
-                j.upstream_job_id,
-                j.error_message,
-                j.created_at,
-                j.updated_at,
-                i.email
+            SELECT j.id, j.identity_id, j.provider, j.action_code,
+                   j.status, j.cost_credits, j.upstream_job_id,
+                   j.error_message, j.created_at, j.updated_at, i.email
             FROM {Tables.JOBS} j
             LEFT JOIN {Tables.IDENTITIES} i ON i.id = j.identity_id
             {where_clause}
@@ -875,3 +1139,9 @@ class AdminService:
             "limit": limit,
             "offset": offset,
         }
+
+
+# Merge extra methods into AdminService
+for _name in dir(_AdminServiceExtra):
+    if not _name.startswith('_'):
+        setattr(AdminService, _name, getattr(_AdminServiceExtra, _name))

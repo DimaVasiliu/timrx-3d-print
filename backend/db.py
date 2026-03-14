@@ -423,6 +423,7 @@ class Tables:
     PROVIDER_ALERTS = f"{_BILLING_SCHEMA}.provider_alerts"
     PROVIDER_LEDGER = f"{_BILLING_SCHEMA}.provider_ledger"
     REFUNDS = f"{_BILLING_SCHEMA}.refunds"
+    PAYMENT_DISPUTES = f"{_BILLING_SCHEMA}.payment_disputes"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"

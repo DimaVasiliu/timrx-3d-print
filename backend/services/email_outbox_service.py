@@ -265,6 +265,26 @@ class EmailOutboxService:
         return {"sent": sent, "failed": failed, "remaining": remaining}
 
     @staticmethod
+    def send_by_id(outbox_id: str) -> bool:
+        """
+        Send a specific email by its outbox row ID.
+
+        Use this after queue_email() + commit to guarantee the exact
+        email just queued is delivered, rather than relying on
+        send_pending_emails() which picks the oldest pending row.
+
+        Returns True if sent, False otherwise.
+        """
+        row = query_one(
+            f"SELECT * FROM {Tables.EMAIL_OUTBOX} WHERE id = %s AND status = %s",
+            (outbox_id, EmailOutboxStatus.PENDING),
+        )
+        if not row:
+            print(f"[EMAIL_OUTBOX] send_by_id: no pending row for id={str(outbox_id)[:8]}")
+            return False
+        return EmailOutboxService._send_single_email(row)
+
+    @staticmethod
     def _send_single_email(email_job: Dict[str, Any]) -> bool:
         """
         Attempt to send a single email from the outbox.

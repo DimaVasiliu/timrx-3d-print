@@ -816,14 +816,19 @@ class MollieService:
                 current_balance = wallet.get("balance_credits", 0) if wallet else 0
 
                 # Insert refund/chargeback ledger entry (idempotent via ON CONFLICT DO NOTHING)
-                # Relies on partial unique index: uq_ledger_refund_per_purchase
+                # Matches partial unique index: uq_ledger_refund_per_purchase or uq_ledger_chargeback_per_purchase
+                # ON CONFLICT WHERE must exactly match the index predicate for the entry_type being inserted
+                conflict_where = (
+                    "entry_type = 'chargeback'" if entry_type == "chargeback"
+                    else "entry_type = 'refund'"
+                )
                 cur.execute(
                     f"""
                     INSERT INTO {Tables.LEDGER_ENTRIES}
                     (identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (identity_id, ref_type, ref_id)
-                        WHERE entry_type IN ('refund', 'chargeback') AND ref_type = 'purchase'
+                    ON CONFLICT (identity_id, ref_id)
+                        WHERE {conflict_where} AND ref_type = 'purchase' AND ref_id IS NOT NULL
                     DO NOTHING
                     RETURNING id
                     """,

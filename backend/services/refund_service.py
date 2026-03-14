@@ -267,8 +267,8 @@ def execute_refund(
                     (identity_id, entry_type, amount_credits, ref_type, ref_id,
                      meta, credit_type, created_at)
                     VALUES (%s, 'refund', %s, 'purchase', %s, %s, %s, NOW())
-                    ON CONFLICT (identity_id, ref_type, ref_id)
-                        WHERE entry_type IN ('refund', 'chargeback') AND ref_type = 'purchase'
+                    ON CONFLICT (identity_id, ref_id)
+                        WHERE entry_type = 'refund' AND ref_type = 'purchase' AND ref_id IS NOT NULL
                     DO NOTHING
                     RETURNING id
                     """,
@@ -783,15 +783,24 @@ def _queue_resolution_email(
         template = EmailTemplate.REFUND_RESOLUTION_APPROVED if resolution == "approved" else EmailTemplate.REFUND_RESOLUTION_DENIED
 
         with transaction() as cur:
-            EmailOutboxService.queue_email(
+            outbox_row = EmailOutboxService.queue_email(
                 cur,
                 to_email=user_email,
                 template=template,
                 payload=payload,
             )
+        outbox_id = str(outbox_row["id"])
 
-        print(f"[ADMIN_REFUND_EMAIL] Queued {resolution} follow-up for refund {refund_id[:8]} to {user_email}")
-        return {"queued": True, "email": user_email}
+        # Send THIS specific email immediately (not any random pending email)
+        sent = False
+        try:
+            print(f"[EMAIL_OUTBOX] Sending by id: template=refund_resolution_{resolution} to={user_email} outbox_id={outbox_id[:8]}")
+            sent = EmailOutboxService.send_by_id(outbox_id)
+            print(f"[EMAIL_OUTBOX] Send result: sent={sent}")
+        except Exception as flush_err:
+            print(f"[EMAIL_OUTBOX] Inline send failed (cron will retry): {flush_err}")
+
+        return {"queued": True, "sent": sent, "email": user_email}
 
     except Exception as e:
         print(f"[ADMIN_REFUND_EMAIL] Failed to queue resolution email: {e}")
@@ -909,8 +918,8 @@ def execute_approved_refund(
                     (identity_id, entry_type, amount_credits, ref_type, ref_id,
                      meta, credit_type, created_at)
                     VALUES (%s, 'refund', %s, 'purchase', %s, %s, %s, NOW())
-                    ON CONFLICT (identity_id, ref_type, ref_id)
-                        WHERE entry_type IN ('refund', 'chargeback') AND ref_type = 'purchase'
+                    ON CONFLICT (identity_id, ref_id)
+                        WHERE entry_type = 'refund' AND ref_type = 'purchase' AND ref_id IS NOT NULL
                     DO NOTHING
                     RETURNING id
                     """,
@@ -959,13 +968,20 @@ def execute_approved_refund(
                 f"credits_reversed={credits_to_reverse} balance: {current_balance} -> {new_balance}"
             )
         except Exception as e:
-            # Update refund record to reflect failure
-            query_one(
-                f"UPDATE {_TABLE} SET refund_status = 'failed', admin_note = COALESCE(admin_note || ' | ', '') || %s WHERE id = %s::uuid RETURNING id",
-                (f"Execution failed: {e}", refund_id),
+            # Transaction rolled back — no credits/wallet/purchase changes were committed.
+            # Do NOT mark refund as 'failed' — it stays 'approved' so admin can retry
+            # after the underlying issue (schema, connection, etc.) is resolved.
+            print(
+                f"[ADMIN_REFUND_EXECUTE_APPROVED_FAILED] refund_id={refund_id[:8]} error={e} "
+                f"(refund stays approved — transaction rolled back, nothing modified)"
             )
-            print(f"[ADMIN_REFUND_EXECUTE_APPROVED_FAILED] refund_id={refund_id[:8]} error={e}")
-            raise
+            return {
+                "ok": False,
+                "error": f"Execution failed (refund remains approved for retry): {e}",
+                "refund_id": refund_id,
+                "refund_status": "approved",
+                "retryable": True,
+            }
     else:
         # No credits to reverse — just mark purchase as refunded
         query_one(
@@ -1200,7 +1216,7 @@ def _queue_refund_email(
         }
 
         with transaction() as cur:
-            EmailOutboxService.queue_email(
+            outbox_row = EmailOutboxService.queue_email(
                 cur,
                 to_email=user_email,
                 template=EmailTemplate.REFUND_CONFIRMATION,
@@ -1209,10 +1225,13 @@ def _queue_refund_email(
                 identity_id=identity_id,
                 purchase_id=purchase_id,
             )
+        outbox_id = str(outbox_row["id"])
 
-        # Best-effort immediate send
+        # Send THIS specific email immediately
         try:
-            EmailOutboxService.send_pending_emails(limit=1)
+            print(f"[EMAIL_OUTBOX] Sending by id: template=refund_confirmation to={user_email} outbox_id={outbox_id[:8]}")
+            sent = EmailOutboxService.send_by_id(outbox_id)
+            print(f"[EMAIL_OUTBOX] Send result: sent={sent}")
         except Exception:
             pass  # Will be picked up by cron retry
 

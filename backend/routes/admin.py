@@ -36,6 +36,10 @@ Endpoints:
 - POST /api/admin/refunds/<id>/resolve           - Resolve a manual-review refund (approve/deny/close)
 - POST /api/admin/refunds/<id>/execute-approved  - Execute an already-approved refund (credit reversal + payment)
 - POST /api/admin/purchases/<id>/start-refund    - Create refund record from purchase (enters review workflow)
+- GET  /api/admin/purchases/<id>                 - Purchase detail with timeline, refunds, jobs, disputes
+- GET  /api/admin/disputes                       - List payment disputes / chargebacks
+- POST /api/admin/purchases/<id>/mark-dispute    - Record a dispute against a purchase
+- POST /api/admin/disputes/<id>/update           - Update dispute status
 
 Environment variables:
   ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
@@ -187,6 +191,95 @@ def list_purchases():
     except DatabaseError as e:
         print(f"[ADMIN] List purchases error: {e}")
         return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/purchases/<purchase_id>", methods=["GET"])
+@require_admin
+def get_purchase_detail(purchase_id):
+    """Full purchase investigation view: summary, timeline, refunds, jobs, disputes."""
+    try:
+        result = AdminService.get_purchase_detail(purchase_id)
+        status_code = 200 if result.get("ok") else 404
+        return jsonify(result), status_code
+    except Exception as e:
+        print(f"[ADMIN] Purchase detail error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/disputes", methods=["GET"])
+@require_admin
+def disputes_list():
+    """List payment disputes / chargebacks."""
+    try:
+        from backend.services.dispute_service import list_disputes
+
+        result = list_disputes(
+            status=request.args.get("status"),
+            purchase_id=request.args.get("purchase_id"),
+            limit=min(int(request.args.get("limit", 50)), 100),
+            offset=max(int(request.args.get("offset", 0)), 0),
+        )
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Disputes list error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/purchases/<purchase_id>/mark-dispute", methods=["POST"])
+@require_admin
+def purchases_mark_dispute(purchase_id):
+    """Record a payment dispute / chargeback against a purchase."""
+    try:
+        from backend.services.dispute_service import create_dispute
+
+        data = request.get_json(silent=True) or {}
+
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = create_dispute(
+            purchase_id=purchase_id,
+            dispute_reason=data.get("dispute_reason"),
+            admin_note=data.get("admin_note"),
+            executed_by=executed_by,
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+    except Exception as e:
+        print(f"[ADMIN] Mark dispute error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/disputes/<dispute_id>/update", methods=["POST"])
+@require_admin
+def disputes_update(dispute_id):
+    """Update a dispute status."""
+    try:
+        from backend.services.dispute_service import update_dispute_status
+
+        data = request.get_json(silent=True) or {}
+        if not data.get("status"):
+            return jsonify({"ok": False, "error": "status is required"}), 400
+
+        result = update_dispute_status(
+            dispute_id=dispute_id,
+            new_status=data["status"],
+            admin_note=data.get("admin_note"),
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+    except Exception as e:
+        print(f"[ADMIN] Dispute update error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @bp.route("/wallet/adjust", methods=["POST"])
@@ -2589,15 +2682,24 @@ def refunds_send_review_email(refund_id):
         }
 
         with transaction() as cur:
-            EmailOutboxService.queue_email(
+            outbox_row = EmailOutboxService.queue_email(
                 cur,
                 to_email=user_email,
                 template=EmailTemplate.REFUND_REVIEW,
                 payload=payload,
             )
+        outbox_id = str(outbox_row["id"])
 
-        print(f"[ADMIN] Queued refund review email for refund {refund_id[:8]} to {user_email}")
-        return jsonify({"ok": True, "queued": True, "email": user_email, "message": "Review email queued"})
+        # Send THIS specific email immediately (not any random pending email)
+        sent = False
+        try:
+            print(f"[EMAIL_OUTBOX] Sending by id: template=refund_review to={user_email} outbox_id={outbox_id[:8]}")
+            sent = EmailOutboxService.send_by_id(outbox_id)
+            print(f"[EMAIL_OUTBOX] Send result: sent={sent}")
+        except Exception as flush_err:
+            print(f"[EMAIL_OUTBOX] Inline send failed (cron will retry): {flush_err}")
+
+        return jsonify({"ok": True, "queued": True, "sent": sent, "email": user_email, "message": "Review email queued and send attempted"})
 
     except Exception as e:
         print(f"[ADMIN] Send review email error: {e}")
