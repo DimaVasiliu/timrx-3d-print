@@ -43,8 +43,15 @@ class MergeService:
     # ── Active subscription statuses that indicate conflict ──
     _ACTIVE_SUB_STATUSES = ("active", "pending_payment", "past_due")
 
+    # ── In-flight job statuses that block merge ──
+    _INFLIGHT_JOB_STATUSES = (
+        "queued", "pending", "processing", "dispatched",
+        "provider_pending", "provider_processing", "stalled",
+    )
+
     # ── Tables migrated via simple UPDATE identity_id ──
     # Order matters: move content tables first, then billing, then ledger last.
+    # NOTE: credit_reservations and jobs are NOT here — they have special handling.
     _SIMPLE_MIGRATE_TABLES = [
         # App content (ON DELETE SET NULL — safe to move)
         Tables.MODELS,
@@ -58,7 +65,6 @@ class MergeService:
         Tables.PURCHASES,
         Tables.INVOICES,
         Tables.RECEIPTS,
-        Tables.CREDIT_RESERVATIONS,
         Tables.EMAIL_OUTBOX,
         Tables.REFUNDS,
         Tables.PAYMENT_DISPUTES,
@@ -119,142 +125,31 @@ class MergeService:
 
         try:
             with transaction() as cur:
-                # ── 1. Validate and resolve canonical IDs ──
-                valid, block_reason, canon_source, canon_target = (
-                    MergeService._validate_merge(source_id, target_id, cur)
+                # ── 1. Pre-flight checks (validate, conflicts, in-flight) ──
+                block = MergeService._preflight_checks(
+                    source_id, target_id, result, cur
                 )
-                result["source_id"] = canon_source
-                result["target_id"] = canon_target
-
-                if not valid:
-                    result["blocked_reason"] = block_reason
-                    print(
-                        f"[MERGE] Blocked: {canon_source[:8]}... → "
-                        f"{canon_target[:8]}...: {block_reason}"
-                    )
+                if block:
                     return result
+                canon_source = result["source_id"]
+                canon_target = result["target_id"]
 
-                # ── 2. Check subscription conflicts ──
-                sub_conflict, sub_details = MergeService._check_subscription_conflict(
-                    canon_source, canon_target, cur
-                )
-                result["subscription_result"] = sub_details
-
-                if sub_conflict:
-                    result["blocked_reason"] = "subscription_conflict"
-                    print(
-                        f"[MERGE] Blocked by subscription conflict: "
-                        f"source={canon_source[:8]}... target={canon_target[:8]}..."
-                    )
-                    return result
-
-                # ── 3. Dry-run stops here ──
+                # ── 2. Dry-run stops here ──
                 if mode == "dry_run":
                     result["success"] = True
-                    result["blocked_reason"] = None
                     print(
                         f"[MERGE] Dry-run OK: {canon_source[:8]}... → "
                         f"{canon_target[:8]}..."
                     )
                     return result
 
-                # ── 4. Migrate simple tables ──
-                for table in MergeService._SIMPLE_MIGRATE_TABLES:
-                    count = MergeService._migrate_table(
-                        cur, table, canon_source, canon_target
-                    )
-                    if count > 0:
-                        result["tables_migrated"][table] = count
-
-                # ── 5. Migrate jobs (special: idempotency key conflicts) ──
-                jobs_count = MergeService._migrate_jobs(
-                    cur, canon_source, canon_target, result["warnings"]
+                # ── 3. Execute migration + finalization ──
+                MergeService._execute_migration(
+                    cur, canon_source, canon_target, result
                 )
-                if jobs_count > 0:
-                    result["tables_migrated"][Tables.JOBS] = jobs_count
-
-                # ── 6. Migrate subscriptions ──
-                sub_count = MergeService._migrate_subscriptions(
-                    cur, canon_source, canon_target
-                )
-                if sub_count > 0:
-                    result["tables_migrated"][Tables.SUBSCRIPTIONS] = sub_count
-                    result["subscription_result"]["migrated"] = sub_count
-
-                # ── 7. Handle mollie_customers ──
-                mollie_count = MergeService._migrate_mollie_customers(
-                    cur, canon_source, canon_target, result["warnings"]
-                )
-                if mollie_count > 0:
-                    result["tables_migrated"][Tables.MOLLIE_CUSTOMERS] = mollie_count
-
-                # ── 8. Merge daily_limits (sum on conflict) ──
-                dl_count = MergeService._merge_daily_limits(
-                    cur, canon_source, canon_target
-                )
-                if dl_count > 0:
-                    result["tables_migrated"][Tables.DAILY_LIMITS] = dl_count
-
-                # ── 9. Migrate ledger entries ──
-                ledger_count = MergeService._migrate_table(
-                    cur, Tables.LEDGER_ENTRIES, canon_source, canon_target
-                )
-                if ledger_count > 0:
-                    result["tables_migrated"][Tables.LEDGER_ENTRIES] = ledger_count
-
-                # ── 10. Reconcile wallets from ledger ──
-                result["wallet_result"] = MergeService._reconcile_wallets(
-                    cur, canon_source, canon_target
-                )
-
-                # ── 11. Revoke source sessions ──
-                result["sessions_revoked"] = MergeService._revoke_source_sessions(
-                    cur, canon_source
-                )
-
-                # ── 12. Mark source as merged ──
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.IDENTITIES}
-                    SET merged_into_id = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (canon_target, canon_source),
-                )
-
-                # ── 13. Write audit record ──
-                total_rows = sum(result["tables_migrated"].values())
-                audit_meta = {
-                    **(metadata or {}),
-                    "tables_migrated": result["tables_migrated"],
-                    "total_rows_migrated": total_rows,
-                    "sessions_revoked": result["sessions_revoked"],
-                    "wallet_result": result["wallet_result"],
-                    "subscription_result": result["subscription_result"],
-                }
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.IDENTITY_MERGES}
-                    (source_identity_id, target_identity_id, merged_by,
-                     merge_reason, merge_mode, metadata)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        canon_source,
-                        canon_target,
-                        merged_by,
-                        reason,
-                        mode,
-                        _json.dumps(audit_meta),
-                    ),
-                )
-
-                result["success"] = True
-                print(
-                    f"[MERGE] Complete: {canon_source[:8]}... → "
-                    f"{canon_target[:8]}... "
-                    f"({total_rows} rows, "
-                    f"{result['sessions_revoked']} sessions revoked)"
+                MergeService._finalize_merge(
+                    cur, canon_source, canon_target,
+                    merged_by, reason, mode, metadata, result
                 )
 
         except Exception as e:
@@ -263,6 +158,175 @@ class MergeService:
             result["success"] = False
 
         return result
+
+    # ─────────────────────────────────────────────────────────
+    #  ORCHESTRATION HELPERS (extracted for cognitive complexity)
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _preflight_checks(
+        source_id: str, target_id: str, result: Dict, cur
+    ) -> bool:
+        """
+        Run all pre-flight validation checks. Populates result dict.
+
+        Returns True if merge should be blocked (result already populated).
+        """
+        valid, block_reason, canon_source, canon_target = (
+            MergeService._validate_merge(source_id, target_id, cur)
+        )
+        result["source_id"] = canon_source
+        result["target_id"] = canon_target
+
+        if not valid:
+            result["blocked_reason"] = block_reason
+            print(
+                f"[MERGE] Blocked: {canon_source[:8]}... → "
+                f"{canon_target[:8]}...: {block_reason}"
+            )
+            return True
+
+        # Subscription conflict
+        sub_conflict, sub_details = MergeService._check_subscription_conflict(
+            canon_source, canon_target, cur
+        )
+        result["subscription_result"] = sub_details
+        if sub_conflict:
+            result["blocked_reason"] = "subscription_conflict"
+            print(
+                f"[MERGE] Blocked by subscription conflict: "
+                f"source={canon_source[:8]}... target={canon_target[:8]}..."
+            )
+            return True
+
+        # In-flight jobs / held reservations
+        inflight_block = MergeService._check_inflight_work(canon_source, cur)
+        if inflight_block:
+            result["blocked_reason"] = inflight_block
+            print(f"[MERGE] Blocked by in-flight work: {inflight_block}")
+            return True
+
+        # Job idempotency key conflicts
+        idem_conflicts = MergeService._check_idempotency_conflicts(
+            canon_source, canon_target, cur
+        )
+        if idem_conflicts > 0:
+            result["blocked_reason"] = (
+                f"job_idempotency_conflict ({idem_conflicts} keys)"
+            )
+            print(
+                f"[MERGE] Blocked: {idem_conflicts} job idempotency "
+                f"key conflict(s) would leave records invisible"
+            )
+            return True
+
+        return False
+
+    @staticmethod
+    def _execute_migration(
+        cur, source_id: str, target_id: str, result: Dict
+    ) -> None:
+        """Execute all data migrations within the active transaction."""
+        # Simple tables
+        for table in MergeService._SIMPLE_MIGRATE_TABLES:
+            count = MergeService._migrate_table(cur, table, source_id, target_id)
+            if count > 0:
+                result["tables_migrated"][table] = count
+
+        # Jobs (safe — idempotency conflicts pre-checked)
+        jobs_count = MergeService._migrate_table(
+            cur, Tables.JOBS, source_id, target_id
+        )
+        if jobs_count > 0:
+            result["tables_migrated"][Tables.JOBS] = jobs_count
+
+        # Credit reservations (safe — held reservations pre-checked)
+        res_count = MergeService._migrate_table(
+            cur, Tables.CREDIT_RESERVATIONS, source_id, target_id
+        )
+        if res_count > 0:
+            result["tables_migrated"][Tables.CREDIT_RESERVATIONS] = res_count
+
+        # Subscriptions (safe — active conflicts pre-checked)
+        sub_count = MergeService._migrate_subscriptions(cur, source_id, target_id)
+        if sub_count > 0:
+            result["tables_migrated"][Tables.SUBSCRIPTIONS] = sub_count
+            result["subscription_result"]["migrated"] = sub_count
+
+        # Mollie customers
+        mollie_count = MergeService._migrate_mollie_customers(
+            cur, source_id, target_id, result["warnings"]
+        )
+        if mollie_count > 0:
+            result["tables_migrated"][Tables.MOLLIE_CUSTOMERS] = mollie_count
+
+        # Daily limits (sum on conflict)
+        dl_count = MergeService._merge_daily_limits(cur, source_id, target_id)
+        if dl_count > 0:
+            result["tables_migrated"][Tables.DAILY_LIMITS] = dl_count
+
+        # Ledger entries (last — before wallet recompute)
+        ledger_count = MergeService._migrate_table(
+            cur, Tables.LEDGER_ENTRIES, source_id, target_id
+        )
+        if ledger_count > 0:
+            result["tables_migrated"][Tables.LEDGER_ENTRIES] = ledger_count
+
+        # Wallet reconciliation from ledger
+        result["wallet_result"] = MergeService._reconcile_wallets(
+            cur, source_id, target_id
+        )
+
+        # Revoke source sessions
+        result["sessions_revoked"] = MergeService._revoke_source_sessions(
+            cur, source_id
+        )
+
+    @staticmethod
+    def _finalize_merge(
+        cur, source_id: str, target_id: str,
+        merged_by: str, reason: str, mode: str,
+        metadata: Optional[Dict], result: Dict
+    ) -> None:
+        """Mark source as merged and write audit record."""
+        # Mark source identity as merged
+        cur.execute(
+            f"""
+            UPDATE {Tables.IDENTITIES}
+            SET merged_into_id = %s, updated_at = NOW()
+            WHERE id = %s
+            """,
+            (target_id, source_id),
+        )
+
+        # Write audit record
+        total_rows = sum(result["tables_migrated"].values())
+        audit_meta = {
+            **(metadata or {}),
+            "tables_migrated": result["tables_migrated"],
+            "total_rows_migrated": total_rows,
+            "sessions_revoked": result["sessions_revoked"],
+            "wallet_result": result["wallet_result"],
+            "subscription_result": result["subscription_result"],
+        }
+        cur.execute(
+            f"""
+            INSERT INTO {Tables.IDENTITY_MERGES}
+            (source_identity_id, target_identity_id, merged_by,
+             merge_reason, merge_mode, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                source_id, target_id, merged_by,
+                reason, mode, _json.dumps(audit_meta),
+            ),
+        )
+
+        result["success"] = True
+        print(
+            f"[MERGE] Complete: {source_id[:8]}... → {target_id[:8]}... "
+            f"({total_rows} rows, {result['sessions_revoked']} sessions revoked)"
+        )
 
     # ─────────────────────────────────────────────────────────
     #  VALIDATION
@@ -370,6 +434,85 @@ class MergeService:
         return False
 
     # ─────────────────────────────────────────────────────────
+    #  IN-FLIGHT WORK & CONFLICT DETECTION
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _check_inflight_work(source_id: str, cur) -> Optional[str]:
+        """
+        Block merge if source has in-flight jobs or held credit reservations.
+
+        In-flight jobs have workers that hold stale identity_id references in
+        memory. Held reservations embed identity_id at creation time and are
+        used for wallet updates at finalization. Migrating either mid-flight
+        risks wallet inconsistency or invisible records.
+
+        Returns:
+            None if safe, or a structured block reason string.
+        """
+        # Check held (active) reservations
+        cur.execute(
+            f"""
+            SELECT COUNT(*) as cnt
+            FROM {Tables.CREDIT_RESERVATIONS}
+            WHERE identity_id = %s AND status = 'held' AND expires_at > NOW()
+            """,
+            (source_id,),
+        )
+        held = fetch_one(cur)
+        held_count = held["cnt"] if held else 0
+        if held_count > 0:
+            return f"source_has_held_reservations ({held_count})"
+
+        # Check in-flight jobs
+        placeholders = ", ".join(["%s"] * len(MergeService._INFLIGHT_JOB_STATUSES))
+        cur.execute(
+            f"""
+            SELECT COUNT(*) as cnt
+            FROM {Tables.JOBS}
+            WHERE identity_id = %s AND status IN ({placeholders})
+            """,
+            (source_id, *MergeService._INFLIGHT_JOB_STATUSES),
+        )
+        inflight = fetch_one(cur)
+        inflight_count = inflight["cnt"] if inflight else 0
+        if inflight_count > 0:
+            return f"source_has_inflight_jobs ({inflight_count})"
+
+        return None
+
+    @staticmethod
+    def _check_idempotency_conflicts(
+        source_id: str, target_id: str, cur
+    ) -> int:
+        """
+        Count job idempotency key conflicts that would prevent full migration.
+
+        After merge, all queries use g.identity_id (canonical = target).
+        Jobs left under source would be permanently invisible to the user.
+        Any conflict must block the merge rather than silently skip records.
+
+        Returns:
+            Number of conflicting idempotency keys (0 = safe).
+        """
+        cur.execute(
+            f"""
+            SELECT COUNT(*) as cnt
+            FROM {Tables.JOBS} src
+            WHERE src.identity_id = %s
+              AND src.idempotency_key IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM {Tables.JOBS} tgt
+                  WHERE tgt.identity_id = %s
+                    AND tgt.idempotency_key = src.idempotency_key
+              )
+            """,
+            (source_id, target_id),
+        )
+        row = fetch_one(cur)
+        return row["cnt"] if row else 0
+
+    # ─────────────────────────────────────────────────────────
     #  SUBSCRIPTION CONFLICT DETECTION
     # ─────────────────────────────────────────────────────────
 
@@ -447,61 +590,6 @@ class MergeService:
             (target_id, source_id),
         )
         return cur.rowcount
-
-    @staticmethod
-    def _migrate_jobs(
-        cur, source_id: str, target_id: str, warnings: List[str]
-    ) -> int:
-        """
-        Migrate jobs with idempotency-key conflict handling.
-
-        Jobs with idempotency_key that would conflict with existing target jobs
-        are left under the source identity (accessible via canonical resolution).
-        """
-        # Move jobs that have no idempotency key (no conflict possible)
-        cur.execute(
-            f"""
-            UPDATE {Tables.JOBS}
-            SET identity_id = %s
-            WHERE identity_id = %s AND idempotency_key IS NULL
-            """,
-            (target_id, source_id),
-        )
-        moved = cur.rowcount
-
-        # Move jobs with idempotency keys that don't conflict
-        cur.execute(
-            f"""
-            UPDATE {Tables.JOBS}
-            SET identity_id = %s
-            WHERE identity_id = %s
-              AND idempotency_key IS NOT NULL
-              AND idempotency_key NOT IN (
-                  SELECT idempotency_key FROM {Tables.JOBS}
-                  WHERE identity_id = %s AND idempotency_key IS NOT NULL
-              )
-            """,
-            (target_id, source_id, target_id),
-        )
-        moved += cur.rowcount
-
-        # Check if any jobs were skipped due to conflicts
-        cur.execute(
-            f"SELECT COUNT(*) as cnt FROM {Tables.JOBS} WHERE identity_id = %s",
-            (source_id,),
-        )
-        remaining = fetch_one(cur)
-        remaining_count = remaining["cnt"] if remaining else 0
-        if remaining_count > 0:
-            warnings.append(
-                f"{remaining_count} jobs skipped (idempotency key conflict)"
-            )
-            print(
-                f"[MERGE] {remaining_count} jobs left on source "
-                f"(idempotency key conflict)"
-            )
-
-        return moved
 
     @staticmethod
     def _migrate_subscriptions(cur, source_id: str, target_id: str) -> int:
@@ -809,8 +897,11 @@ class MergeService:
                     if count > 0:
                         preview["row_counts"][table] = count
 
-                # Count jobs, ledger, subscriptions
-                for table in [Tables.JOBS, Tables.LEDGER_ENTRIES, Tables.SUBSCRIPTIONS]:
+                # Count special-handling tables
+                for table in [
+                    Tables.JOBS, Tables.CREDIT_RESERVATIONS,
+                    Tables.LEDGER_ENTRIES, Tables.SUBSCRIPTIONS,
+                ]:
                     cur.execute(
                         f"SELECT COUNT(*) as cnt FROM {table} WHERE identity_id = %s",
                         (canon_source,),
@@ -826,6 +917,16 @@ class MergeService:
                 )
                 preview["subscription_conflict"] = conflict
                 preview["subscription_details"] = details
+
+                # In-flight work check
+                inflight = MergeService._check_inflight_work(canon_source, cur)
+                preview["inflight_block"] = inflight
+
+                # Idempotency conflict check
+                idem_conflicts = MergeService._check_idempotency_conflicts(
+                    canon_source, canon_target, cur
+                )
+                preview["idempotency_conflicts"] = idem_conflicts
 
                 # Wallet preview
                 cur.execute(
