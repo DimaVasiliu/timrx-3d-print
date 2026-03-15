@@ -613,6 +613,11 @@ class IdentityService:
         half_life = timedelta(days=ttl_days) / 2
         session_age = now_utc() - session_created_at
         if session_age <= half_life:
+            if SESSION_DEBUG:
+                print(
+                    f"[SESSION] Renewal check: {session_id[:8]}... "
+                    f"age={session_age.days}d, threshold={half_life.days}d — not yet"
+                )
             return False
 
         new_expiry = now_utc() + timedelta(days=ttl_days)
@@ -620,11 +625,11 @@ class IdentityService:
             f"UPDATE {Tables.SESSIONS} SET expires_at = %s WHERE id = %s",
             (new_expiry, session_id),
         )
-        if SESSION_DEBUG:
-            print(
-                f"[SESSION] Renewed session {session_id[:8]}... "
-                f"(age={session_age.days}d, new_expiry={new_expiry.isoformat()})"
-            )
+        # Always log renewal so it's observable in production
+        print(
+            f"[SESSION] Renewed session {session_id[:8]}... "
+            f"(age={session_age.days}d, new_expiry={new_expiry.isoformat()})"
+        )
         return True
 
     @staticmethod
@@ -667,9 +672,30 @@ class IdentityService:
 
         # Attempt sliding-window renewal (non-critical)
         try:
+            session_created_at = result.get("session_created_at")
             result["_session_renewed"] = IdentityService._maybe_renew_session(
-                session_id, result.get("session_created_at")
+                session_id, session_created_at
             )
+
+            # ── TEMPORARY DIAGNOSTIC — remove after AUTH-1 verified ──
+            ttl_days = config.SESSION_TTL_DAYS
+            threshold_days = ttl_days / 2
+            age_days = (
+                (now_utc() - session_created_at).total_seconds() / 86400
+                if session_created_at else None
+            )
+            print(
+                f"[SESSION-DIAG] "
+                f"sid={session_id[:8]}... "
+                f"iid={str(result['id'])[:8]}... "
+                f"created={session_created_at.isoformat() if session_created_at else 'None'} "
+                f"expires={result.get('session_expires_at', 'None')} "
+                f"age_days={f'{age_days:.1f}' if age_days is not None else 'None'} "
+                f"threshold={threshold_days:.0f}d "
+                f"renewed={result['_session_renewed']}"
+            )
+            # ── END TEMPORARY DIAGNOSTIC ──
+
         except Exception as e:
             result["_session_renewed"] = False
             if SESSION_DEBUG:
