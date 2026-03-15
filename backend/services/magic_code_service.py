@@ -115,39 +115,47 @@ class MagicCodeService:
     def request_restore(
         email: str,
         ip_address: Optional[str] = None,
-    ) -> Tuple[bool, str]:
+    ) -> Dict[str, Any]:
         """
         Request a magic code for account restore.
 
         Args:
-            email: Email address to send code to
+            email: Email address entered by user (may be a merged alias)
             ip_address: Client IP for rate limiting (optional)
 
         Returns:
-            Tuple of (success: bool, message: str)
+            Dict with keys:
+              ok: bool
+              message: str
+              resolved_email: str or None (canonical email code was sent to, if different)
+              merge_redirected: bool
 
         Rate limits:
         - Max 3 active codes per email
         - 60 second cooldown between requests
         """
-        email = email.strip().lower()
+        input_email = email.strip().lower()
 
         # Validate email format (basic)
-        if not email or "@" not in email or "." not in email:
-            return (False, "Invalid email format")
+        if not input_email or "@" not in input_email or "." not in input_email:
+            return {"ok": False, "message": "Invalid email format"}
 
         # Check if email exists in the system
         identity = query_one(
             f"SELECT id, email, merged_into_id FROM {Tables.IDENTITIES} WHERE email = %s",
-            (email,),
+            (input_email,),
         )
         if not identity:
-            # Don't reveal if email exists - still return success to prevent enumeration
-            # But don't actually send the email
-            print(f"[MAGIC_CODE] Request for unknown email: {email}")
-            return (True, "If this email is registered, a code has been sent")
+            # Anti-enumeration: don't reveal if email exists
+            print(f"[MAGIC_CODE] Request for unknown email: {input_email}")
+            return {
+                "ok": True,
+                "message": "If this email is registered, a code has been sent",
+            }
 
         # Follow merge chain — resolve to canonical identity
+        delivery_email = input_email
+        merge_redirected = False
         if identity.get("merged_into_id"):
             from backend.services.identity_service import IdentityService
             canonical_id = IdentityService.resolve_canonical_id(str(identity["id"]))
@@ -156,17 +164,18 @@ class MagicCodeService:
                 (canonical_id,),
             )
             if canonical and canonical.get("email"):
+                delivery_email = canonical["email"]
+                merge_redirected = True
                 print(
-                    f"[MAGIC_CODE] Merged identity {str(identity['id'])[:8]}... "
-                    f"→ canonical {canonical_id[:8]}... (email: {canonical['email']})"
+                    f"[MAGIC_CODE] Restore alias resolved: "
+                    f"{input_email} → {delivery_email} "
+                    f"(source {str(identity['id'])[:8]}... → canonical {canonical_id[:8]}...)"
                 )
-                identity = canonical
-                email = canonical["email"]
 
-        # Check rate limits
-        rate_limit_ok, rate_limit_msg = MagicCodeService._check_rate_limits(email)
+        # Check rate limits (against input email to prevent abuse via aliases)
+        rate_limit_ok, rate_limit_msg = MagicCodeService._check_rate_limits(input_email)
         if not rate_limit_ok:
-            return (False, rate_limit_msg)
+            return {"ok": False, "message": rate_limit_msg}
 
         # Generate code
         plain_code = MagicCodeService.generate_code()
@@ -175,7 +184,7 @@ class MagicCodeService:
         # Hash IP for storage (privacy)
         ip_hash = hash_string(ip_address) if ip_address else None
 
-        # Store in database
+        # Store code under the INPUT email so redeem can find it by what the user typed
         expiry_minutes = config.MAGIC_CODE_EXPIRY_MINUTES
         with transaction() as cur:
             cur.execute(
@@ -185,29 +194,42 @@ class MagicCodeService:
                 VALUES (%s, %s, NOW() + %s * INTERVAL '1 minute', 0, FALSE, %s, NOW())
                 RETURNING id
                 """,
-                (email, code_hash, expiry_minutes, ip_hash),
+                (input_email, code_hash, expiry_minutes, ip_hash),
             )
             code_record = fetch_one(cur)
 
         if not code_record:
-            print(f"[MAGIC_CODE] Failed to create code record for {email}")
-            return (False, "Failed to create code")
+            print(f"[MAGIC_CODE] Failed to create code record for {input_email}")
+            return {"ok": False, "message": "Failed to create code"}
 
-        # Send email
-        email_sent = send_magic_code(email, plain_code)
+        # Send email to the DELIVERY address (canonical email)
+        email_sent = send_magic_code(delivery_email, plain_code)
         if not email_sent:
-            print(f"[MAGIC_CODE] Failed to send email to {email}")
-            # Still return success to not reveal email issues
-            return (True, "If this email is registered, a code has been sent")
+            print(f"[MAGIC_CODE] Failed to send email to {delivery_email}")
+            return {
+                "ok": True,
+                "message": "If this email is registered, a code has been sent",
+            }
 
         # Notify admin (optional, non-blocking)
         try:
-            notify_restore_request(email)
+            notify_restore_request(delivery_email)
         except Exception as email_err:
             print(f"[MAGIC_CODE] WARNING: Admin notification failed: {email_err}")
 
-        print(f"[MAGIC_CODE] Code sent to {email}, expires in {expiry_minutes} minutes")
-        return (True, "Code sent to your email")
+        print(
+            f"[MAGIC_CODE] Code sent to {delivery_email} "
+            f"(requested via {input_email}), expires in {expiry_minutes} minutes"
+        )
+
+        result = {
+            "ok": True,
+            "message": "Code sent to your email",
+        }
+        if merge_redirected:
+            result["resolved_email"] = delivery_email
+            result["merge_redirected"] = True
+        return result
 
     @staticmethod
     def _check_rate_limits(email: str) -> Tuple[bool, str]:
@@ -276,8 +298,8 @@ class MagicCodeService:
             from backend.services.identity_service import IdentityService
             canonical_id = IdentityService.resolve_canonical_id(identity_id)
             print(
-                f"[MAGIC_CODE] Redeem merge redirect: "
-                f"{identity_id[:8]}... → {canonical_id[:8]}..."
+                f"[MAGIC_CODE] Redeem using canonical target: {canonical_id[:8]}... "
+                f"(input email: {email}, source identity: {identity_id[:8]}...)"
             )
             identity_id = canonical_id
 
@@ -487,7 +509,7 @@ class MagicCodeService:
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def request_code(email: str, ip_address: Optional[str] = None) -> Tuple[bool, str]:
+    def request_code(email: str, ip_address: Optional[str] = None) -> Dict[str, Any]:
         """Alias for request_restore (backward compatibility)."""
         return MagicCodeService.request_restore(email, ip_address)
 

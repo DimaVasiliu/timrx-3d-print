@@ -130,9 +130,10 @@ def request_restore():
     ip_address = _get_client_ip()
 
     # Request the code
-    success, message = MagicCodeService.request_restore(email, ip_address)
+    result = MagicCodeService.request_restore(email, ip_address)
 
-    if not success:
+    if not result.get("ok"):
+        message = result.get("message", "Request failed")
         # Rate limit errors should return 429
         if "wait" in message.lower() or "too many" in message.lower():
             return jsonify({
@@ -149,11 +150,16 @@ def request_restore():
             }
         }), 400
 
-    # Always return success (even if email doesn't exist) to prevent enumeration
-    return jsonify({
+    # Build response — include resolved_email if merge redirect happened
+    response = {
         "ok": True,
-        "message": message,
-    })
+        "message": result.get("message", "Code sent"),
+    }
+    if result.get("merge_redirected"):
+        response["resolved_email"] = result["resolved_email"]
+        response["merge_redirected"] = True
+
+    return jsonify(response)
 
 
 @bp.route("/restore/redeem", methods=["POST"])
