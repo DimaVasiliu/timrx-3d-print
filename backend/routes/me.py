@@ -46,6 +46,16 @@ def get_me():
         reserved = reserved_credits["general"]
         video_reserved = reserved_credits["video"]
 
+    # AUTH-6: last_active_at is updated by restore/verify/merge and serves as
+    # a cross-subdomain freshness marker.  Frontends on different origins compare
+    # this against a locally stored stamp to detect auth changes that happened
+    # on another subdomain.
+    last_active_at = None
+    if identity:
+        raw = identity.get("last_seen_at") or identity.get("created_at")
+        if raw:
+            last_active_at = raw.isoformat() if hasattr(raw, 'isoformat') else str(raw)
+
     return jsonify({
         "ok": True,
         "identity_id": g.identity_id,
@@ -60,6 +70,8 @@ def get_me():
         "reserved_video_credits": video_reserved,
         "available_video_credits": max(0, video_balance - video_reserved),
         "created_at": identity.get("created_at").isoformat() if identity and identity.get("created_at") else None,
+        # AUTH-6: Cross-subdomain freshness marker
+        "last_active_at": last_active_at,
     })
 
 
