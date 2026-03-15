@@ -9,11 +9,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from flask import Blueprint, abort, jsonify, redirect, request, send_from_directory
+from flask import Blueprint, Response, abort, jsonify, redirect, request, send_from_directory
 
 from backend.config import config
 
 bp = Blueprint("frontend", __name__)
+
+# Backend domain (3d.timrx.live) should not be indexed by search engines.
+# Served as a dedicated route so crawlers get a proper 200 response.
+_BACKEND_ROBOTS_TXT = """\
+# 3d.timrx.live — API backend, not intended for indexing.
+# Public site: https://timrx.live
+User-agent: *
+Disallow: /
+"""
 
 # Find frontend directory - check multiple locations
 FRONTEND_DIR = None
@@ -83,6 +92,12 @@ def serve_index_html():
     if not FRONTEND_DIR:
         return _redirect_to_frontend("index.html")
     return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@bp.route("/robots.txt")
+def serve_robots_txt():
+    """Serve robots.txt that blocks indexing of the backend domain."""
+    return Response(_BACKEND_ROBOTS_TXT, mimetype="text/plain")
 
 
 @bp.route("/<path:filename>")
