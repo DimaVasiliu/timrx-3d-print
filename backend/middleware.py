@@ -235,6 +235,64 @@ def with_session(f):
     return decorated
 
 
+def with_optional_session(f):
+    """
+    Decorator that validates an existing session but NEVER creates one.
+
+    AUTH-3: Used by restore/redeem to avoid creating throwaway identities.
+    If no valid session exists, sets g.session_id / g.identity_id / g.identity
+    to None and lets the handler proceed — the handler is responsible for
+    creating a session for the restore target if needed.
+
+    Sets on g:
+        - g.session_id: The session ID, or None
+        - g.identity_id: The identity ID (string), or None
+        - g.identity: The full identity dict, or None
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        IdentityService = _get_identity_service()
+        DatabaseError = _get_database_error()
+
+        _log_session_debug("with_optional_session")
+
+        try:
+            identity = IdentityService.get_current_identity(request)
+
+            if identity:
+                g.session_id = IdentityService.get_session_id_from_request(request)
+                g.identity_id = str(identity["id"])
+                g.identity = identity
+
+                result = f(*args, **kwargs)
+
+                # If session was renewed (sliding window), refresh cookie Max-Age
+                if identity.get("_session_renewed") and g.session_id:
+                    resp = _ensure_response(result)
+                    IdentityService.set_session_cookie(resp, g.session_id)
+                    return resp
+
+                return result
+
+            # No valid session — proceed WITHOUT creating one
+            g.session_id = None
+            g.identity_id = None
+            g.identity = None
+
+            return f(*args, **kwargs)
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in with_optional_session: {e}")
+            return jsonify({
+                "error": {
+                    "code": "DATABASE_ERROR",
+                    "message": "Database error occurred"
+                }
+            }), 500
+
+    return decorated
+
+
 def require_session(f):
     """
     Decorator that requires a valid session.

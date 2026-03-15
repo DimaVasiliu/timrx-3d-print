@@ -15,7 +15,7 @@ Note: Logout is handled by /api/me/logout for consistency with other /me endpoin
 
 from flask import Blueprint, request, jsonify, g
 
-from backend.middleware import with_session, require_admin
+from backend.middleware import with_session, with_optional_session, require_session, require_admin
 from backend.services.magic_code_service import MagicCodeService
 from backend.services.identity_service import IdentityService
 from backend.services.wallet_service import WalletService
@@ -163,7 +163,7 @@ def request_restore():
 
 
 @bp.route("/restore/redeem", methods=["POST"])
-@with_session
+@with_optional_session
 def redeem_restore():
     """
     Verify a magic code and restore session.
@@ -230,17 +230,11 @@ def redeem_restore():
             }
         }), 400
 
-    # Get session ID from middleware
-    session_id = g.session_id
-    if not session_id:
-        return jsonify({
-            "error": {
-                "code": "SESSION_REQUIRED",
-                "message": "Active session required. Please refresh the page.",
-            }
-        }), 401
+    # AUTH-3: Get session ID from middleware — may be None if no cookie existed.
+    # @with_optional_session validates without creating throwaway identities.
+    session_id = g.session_id  # None if no existing session
 
-    # Verify the code and link session
+    # Verify the code and link session (handles session_id=None safely)
     success, identity_id, message, detail = MagicCodeService.redeem_restore(
         email=email,
         code=code,
@@ -273,6 +267,24 @@ def redeem_restore():
 
         return _get_redeem_error_response(message)
 
+    # AUTH-3: If there was no pre-existing session, create one directly
+    # for the restore target identity (no throwaway identity needed).
+    resp_needs_cookie = False
+
+    if not session_id:
+        new_session_id = IdentityService.create_session_for_identity(
+            identity_id,
+            ip_address=_get_client_ip(),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+        if new_session_id:
+            session_id = new_session_id
+            resp_needs_cookie = True
+            print(
+                f"[RESTORE] AUTH-3: Created session directly for target "
+                f"{identity_id[:8]}... (no throwaway identity)"
+            )
+
     # Fetch updated identity and wallet data
     identity = IdentityService.get_identity(identity_id)
     wallet = WalletService.get_wallet(identity_id)
@@ -286,7 +298,7 @@ def redeem_restore():
     if identity and identity.get("created_at"):
         created_at = identity["created_at"].isoformat()
 
-    return jsonify({
+    result = jsonify({
         "ok": True,
         "message": message,
         "me": {
@@ -302,6 +314,12 @@ def redeem_restore():
             "currency": "GBP",
         },
     })
+
+    # Set cookie on the response if a new session was created
+    if resp_needs_cookie and session_id:
+        IdentityService.set_session_cookie(result, session_id)
+
+    return result
 
 
 @bp.route("/status", methods=["GET"])
@@ -555,14 +573,16 @@ def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
             else:
                 raise
 
-        # Mark email verified on canonical identity
+        # NEW-4: Ensure email + email_verified are consistent on canonical.
+        # The code was issued for `email`, so the canonical identity
+        # must end with that exact email and email_verified = TRUE.
         cur.execute(
             f"""
             UPDATE {Tables.IDENTITIES}
-            SET email_verified = TRUE, last_seen_at = NOW()
+            SET email = %s, email_verified = TRUE, last_seen_at = NOW()
             WHERE id = %s
             """,
-            (target_id,),
+            (email, target_id),
         )
 
     # Invalidate pending codes for this email
@@ -608,7 +628,7 @@ def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
 
 
 @bp.route("/email/verify", methods=["POST"])
-@with_session
+@require_session
 def verify_email():
     """
     Verify and attach email to current identity using magic code.
@@ -864,7 +884,7 @@ def request_code_alias():
 
 
 @bp.route("/verify-code", methods=["POST"])
-@with_session
+@with_optional_session
 def verify_code_alias():
     """Alias for /restore/redeem - Verify a magic code and restore session."""
     return redeem_restore()

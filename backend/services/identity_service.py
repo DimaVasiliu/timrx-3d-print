@@ -991,6 +991,49 @@ class IdentityService:
         return session_id, identity_id, identity
 
     @staticmethod
+    def create_session_for_identity(
+        identity_id: str,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        AUTH-3: Create a session directly for an existing identity.
+
+        Used by restore/redeem when no pre-existing session exists, to avoid
+        creating a throwaway anonymous identity just to hold a session.
+
+        Returns session_id on success, None on failure.
+        """
+        session_id = str(uuid.uuid4())
+        expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
+        ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
+        ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
+
+        try:
+            with transaction() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.SESSIONS}
+                    (id, identity_id, created_at, expires_at, ip_hash, user_agent_hash)
+                    VALUES (%s, %s, NOW(), %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (session_id, identity_id, expires_at, ip_hash, ua_hash),
+                )
+                result = fetch_one(cur)
+                if not result:
+                    return None
+
+            print(
+                f"[SESSION] AUTH-3: Created session {session_id[:8]}... "
+                f"for identity {identity_id[:8]}... (direct, no throwaway)"
+            )
+            return session_id
+        except Exception as e:
+            print(f"[SESSION] Failed to create session for {identity_id[:8]}...: {e}")
+            return None
+
+    @staticmethod
     def get_or_create_session(request, response) -> Tuple[str, str]:
         """
         Get existing session or create new anonymous identity + session.

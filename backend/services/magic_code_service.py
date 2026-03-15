@@ -484,7 +484,7 @@ class MagicCodeService:
             )
         # ── End IDENT-2 safety gate + IDENT-1 auto-merge ──────
 
-        # Mark code as consumed and link session to identity
+        # Mark code as consumed and (if session exists) swing session to identity
         with transaction() as cur:
             # Mark code as consumed
             cur.execute(
@@ -496,48 +496,50 @@ class MagicCodeService:
                 (code_id,),
             )
 
-            # Update session to point to this identity
-            # NOTE: updated_at column added in migration 009_sessions_updated_at.sql
-            # Use COALESCE pattern to work both before and after migration
-            try:
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.SESSIONS}
-                    SET identity_id = %s, updated_at = NOW()
-                    WHERE id = %s
-                    RETURNING id
-                    """,
-                    (identity_id, session_id),
-                )
-            except Exception as e:
-                # Fallback if updated_at column doesn't exist yet (pre-migration)
-                if "updated_at" in str(e):
-                    print(f"[MAGIC_CODE] Warning: updated_at column missing, using fallback query")
+            # AUTH-3: Only swing session if one exists.
+            # When called without a session (no cookie), the route handler
+            # creates a fresh session for the target identity directly.
+            if session_id is not None:
+                try:
                     cur.execute(
                         f"""
                         UPDATE {Tables.SESSIONS}
-                        SET identity_id = %s
+                        SET identity_id = %s, updated_at = NOW()
                         WHERE id = %s
                         RETURNING id
                         """,
                         (identity_id, session_id),
                     )
-                else:
-                    raise
-            updated_session = fetch_one(cur)
+                except Exception as e:
+                    # Fallback if updated_at column doesn't exist yet (pre-migration)
+                    if "updated_at" in str(e):
+                        print(f"[MAGIC_CODE] Warning: updated_at column missing, using fallback query")
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.SESSIONS}
+                            SET identity_id = %s
+                            WHERE id = %s
+                            RETURNING id
+                            """,
+                            (identity_id, session_id),
+                        )
+                    else:
+                        raise
+                updated_session = fetch_one(cur)
 
-            if not updated_session:
-                # Session doesn't exist - this is an error
-                raise ValueError(f"Session {session_id} not found")
+                if not updated_session:
+                    raise ValueError(f"Session {session_id} not found")
 
-            # Update identity's last_seen_at and mark email verified
+            # NEW-4: Ensure email + email_verified are consistent.
+            # The code was issued for `email`, so the canonical identity
+            # must end with that exact email and email_verified = TRUE.
             cur.execute(
                 f"""
                 UPDATE {Tables.IDENTITIES}
-                SET last_seen_at = NOW(), email_verified = TRUE
+                SET email = %s, email_verified = TRUE, last_seen_at = NOW()
                 WHERE id = %s
                 """,
-                (identity_id,),
+                (email, identity_id),
             )
 
         # Invalidate other pending codes for this email
