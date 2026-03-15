@@ -262,7 +262,14 @@ class SubscriptionService:
 
     @staticmethod
     def get_active_subscription(identity_id: str) -> Optional[Dict[str, Any]]:
-        """Return the active (or cancelled-but-not-expired) subscription for a user."""
+        """
+        Return the active, pending_payment, or cancelled-but-not-expired
+        subscription for a user.
+
+        Including 'pending_payment' is CRITICAL: the checkout route checks
+        this to prevent duplicate subscription checkouts.  Without it, two
+        rapid POSTs can both pass the guard and create two Mollie payments.
+        """
         if not USE_DB:
             return None
         try:
@@ -280,9 +287,15 @@ class SubscriptionService:
                                mollie_first_payment_id, is_mollie_recurring
                         FROM {Tables.SUBSCRIPTIONS}
                         WHERE identity_id = %s
-                          AND status IN ('active', 'cancelled')
+                          AND status IN ('active', 'pending_payment', 'cancelled')
                           AND (current_period_end IS NULL OR current_period_end > NOW())
-                        ORDER BY created_at DESC
+                        ORDER BY
+                            CASE status
+                                WHEN 'active' THEN 1
+                                WHEN 'pending_payment' THEN 2
+                                WHEN 'cancelled' THEN 3
+                            END,
+                            created_at DESC
                         LIMIT 1
                         """,
                         (identity_id,),

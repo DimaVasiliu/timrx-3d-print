@@ -310,12 +310,77 @@ class MollieService:
     # Webhook Processing
     # ─────────────────────────────────────────────────────────────
 
+    # ─────────────────────────────────────────────────────────────
+    # Webhook-level idempotency guard
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mark_payment_processing(payment_id: str, status: str) -> bool:
+        """
+        Atomically mark a payment_id as being processed.
+
+        Returns True if this is the FIRST processor (proceed with handling).
+        Returns False if another request already processed/is processing this
+        payment+status combination (safe to skip).
+
+        Uses INSERT ... ON CONFLICT DO NOTHING on the processed_webhook_payments
+        table (unique on provider + provider_payment_id + status).
+        """
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        INSERT INTO {Tables.PROCESSED_WEBHOOK_PAYMENTS}
+                            (provider, provider_payment_id, payment_status)
+                        VALUES ('mollie', %s, %s)
+                        ON CONFLICT (provider, provider_payment_id, payment_status)
+                        DO NOTHING
+                        RETURNING id
+                        """,
+                        (payment_id, status),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+                return row is not None
+        except Exception as e:
+            # If table doesn't exist yet (pre-migration), allow processing
+            # to fall through to existing downstream idempotency guards
+            print(f"[MOLLIE] WARNING: processed_webhook_payments guard failed: {e}")
+            return True
+
+    @staticmethod
+    def _mark_payment_completed(payment_id: str, status: str, result_summary: str):
+        """Update the processed_webhook_payments row with completion details."""
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.PROCESSED_WEBHOOK_PAYMENTS}
+                        SET completed_at = NOW(), result_summary = %s
+                        WHERE provider = 'mollie'
+                          AND provider_payment_id = %s
+                          AND payment_status = %s
+                        """,
+                        (result_summary, payment_id, status),
+                    )
+                conn.commit()
+        except Exception:
+            pass  # Best-effort logging, non-critical
+
     @staticmethod
     def handle_webhook(payment_id: str) -> Dict[str, Any]:
         """
         Handle a Mollie webhook notification.
 
         Mollie webhooks only send the payment ID - we fetch full details.
+
+        IDEMPOTENCY: Uses processed_webhook_payments table as a first-line
+        guard.  If this payment_id+status was already processed, returns
+        immediately without re-processing.  Downstream guards (purchase
+        unique constraint, cycle unique constraint, ledger ref_id) remain
+        as defense-in-depth.
 
         Args:
             payment_id: The Mollie payment ID (tr_xxx)
@@ -366,6 +431,24 @@ class MollieService:
         )
 
         # ─────────────────────────────────────────────────────────────
+        # WEBHOOK IDEMPOTENCY GUARD (first line of defense)
+        # ─────────────────────────────────────────────────────────────
+        # Atomically claim this payment_id+status.  If another webhook
+        # delivery already processed (or is processing) it, bail out
+        # immediately.  Downstream guards remain as defense-in-depth.
+        if status in ("paid", "refunded", "charged_back"):
+            if not MollieService._mark_payment_processing(payment_id, status):
+                print(
+                    f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                    f"SKIPPED — already processed (webhook idempotency guard)"
+                )
+                return {
+                    "ok": True,
+                    "status": status,
+                    "message": "Already processed (idempotent)",
+                }
+
+        # ─────────────────────────────────────────────────────────────
         # PAYMENT STATUS HANDLING
         # ─────────────────────────────────────────────────────────────
         # SEPA/Bank payments may be "pending" or "open" before becoming "paid"
@@ -392,6 +475,7 @@ class MollieService:
 
             if result:
                 was_existing = result.get("was_existing", False)
+                summary = "duplicate" if was_existing else "granted"
                 if was_existing:
                     print(
                         f"[MOLLIE] Duplicate webhook ignored (already processed): "
@@ -402,6 +486,7 @@ class MollieService:
                         f"[MOLLIE] Credits granted: payment_id={payment_id}, "
                         f"identity_id={identity_id}, plan_code={plan_code}, credits={credits}"
                     )
+                MollieService._mark_payment_completed(payment_id, status, summary)
                 return {
                     "ok": True,
                     "status": "paid",
@@ -413,6 +498,7 @@ class MollieService:
                     f"[MOLLIE] ERROR: Failed to grant credits: payment_id={payment_id}, "
                     f"identity_id={identity_id}, plan_code={plan_code}"
                 )
+                MollieService._mark_payment_completed(payment_id, status, "error")
                 return {
                     "ok": False,
                     "status": "paid",
@@ -1692,6 +1778,26 @@ class MollieService:
         # Calculate period for this payment
         period_start, period_end = SubscriptionService.calculate_cycle_period(paid_at, billing_day)
 
+        # ─────────────────────────────────────────────────────────────
+        # DUPLICATE-PERIOD GUARD: Reject recurring payments that land
+        # in the same billing period as the first payment.  This catches
+        # the scenario where Mollie was created without startDate and
+        # immediately charged a second time for the already-paid period.
+        # ─────────────────────────────────────────────────────────────
+        first_paid_at = sub.get("first_paid_at")
+        if first_paid_at:
+            first_period_start, _ = SubscriptionService.calculate_cycle_period(
+                first_paid_at, billing_day
+            )
+            if period_start.date() == first_period_start.date():
+                print(
+                    f"[SUB] payment_id={payment_id} status=paid seq=recurring "
+                    f"sub_id={sub_id} granted=false "
+                    f"reason=duplicate_period_same_as_first_payment "
+                    f"period_start={period_start.date()} first_paid={first_paid_at.date()}"
+                )
+                return {"purchase_id": sub_id, "was_existing": True}
+
         # Check if this payment already granted credits
         if SubscriptionService.check_payment_already_granted("mollie", payment_id):
             print(
@@ -2265,6 +2371,11 @@ class MollieService:
 
         Called after first payment succeeds and mandate is established.
 
+        CRITICAL: We MUST set startDate to the NEXT billing date.  Without it
+        Mollie immediately creates a recurring payment for the current period,
+        causing a DUPLICATE CHARGE — the user already paid via the first
+        (sequenceType=first) payment.
+
         Args:
             mollie_customer_id: Mollie customer ID (cst_xxx)
             plan_code: Subscription plan code
@@ -2272,12 +2383,15 @@ class MollieService:
             identity_id: User's identity UUID
 
         Returns:
-            { mollie_subscription_id, interval, next_payment_date }
+            { mollie_subscription_id, interval, next_payment_date, start_date }
         """
         if not MOLLIE_AVAILABLE:
             raise ValueError("Mollie is not configured")
 
-        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        from backend.services.subscription_service import (
+            SUBSCRIPTION_PLANS,
+            SubscriptionService,
+        )
 
         plan = SUBSCRIPTION_PLANS.get(plan_code)
         if not plan:
@@ -2296,12 +2410,27 @@ class MollieService:
         backend_url = config.PUBLIC_BASE_URL.rstrip("/") if config.PUBLIC_BASE_URL else ""
         webhook_url = f"{backend_url}/api/billing/webhook/mollie"
 
+        # ── CRITICAL: Compute startDate so Mollie does NOT charge immediately ──
+        # The first payment already covers the current billing period.
+        # The subscription's first recurring charge must happen NEXT period.
+        now = datetime.now(timezone.utc)
+        billing_day = now.day
+        if cadence == "yearly":
+            next_charge_date = SubscriptionService.add_years(now, 1)
+        else:
+            next_charge_date = SubscriptionService.calculate_next_credit_date(
+                now, billing_day
+            )
+        # Mollie expects startDate as YYYY-MM-DD string
+        start_date_str = next_charge_date.strftime("%Y-%m-%d")
+
         subscription_data = {
             "amount": {
                 "currency": "GBP",
                 "value": f"{price_gbp:.2f}",
             },
             "interval": interval,
+            "startDate": start_date_str,  # PREVENTS immediate duplicate charge
             "description": description,
             "webhookUrl": webhook_url,
             "mandateId": mandate_id,
@@ -2330,13 +2459,15 @@ class MollieService:
 
             print(
                 f"[MOLLIE] Created Mollie subscription {mollie_subscription_id} "
-                f"for customer {mollie_customer_id}, interval={interval}"
+                f"for customer {mollie_customer_id}, interval={interval}, "
+                f"startDate={start_date_str}, nextPayment={next_payment_date}"
             )
 
             return {
                 "mollie_subscription_id": mollie_subscription_id,
                 "interval": interval,
                 "next_payment_date": next_payment_date,
+                "start_date": start_date_str,
                 "status": subscription.get("status"),
             }
 

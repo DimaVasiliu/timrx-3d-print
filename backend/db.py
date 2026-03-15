@@ -425,6 +425,8 @@ class Tables:
     PROVIDER_LEDGER = f"{_BILLING_SCHEMA}.provider_ledger"
     REFUNDS = f"{_BILLING_SCHEMA}.refunds"
     PAYMENT_DISPUTES = f"{_BILLING_SCHEMA}.payment_disputes"
+    PROCESSED_WEBHOOK_PAYMENTS = f"{_BILLING_SCHEMA}.processed_webhook_payments"
+    CHECKOUT_IDEMPOTENCY = f"{_BILLING_SCHEMA}.checkout_idempotency"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"

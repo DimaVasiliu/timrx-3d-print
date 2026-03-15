@@ -1156,6 +1156,12 @@ def subscription_checkout():
 
     Body: { "plan_code": "creator_monthly" }
     Returns: { ok: true, checkout_url: "..." }
+
+    IDEMPOTENCY LAYERS:
+    1. Active/pending subscription check (get_active_subscription)
+    2. checkout_idempotency table — atomic INSERT prevents concurrent POSTs
+       from creating two Mollie payments for the same identity+plan
+    3. Downstream: pending subscription UPSERT, webhook guards
     """
     body = request.get_json(silent=True) or {}
     plan_code = body.get("plan_code", "").strip()
@@ -1167,7 +1173,7 @@ def subscription_checkout():
     if not plan:
         return jsonify({"error": "invalid_plan", "message": f"Unknown plan: {plan_code}"}), 400
 
-    # Check if user already has an active subscription
+    # Check if user already has an active or pending subscription
     # Block checkout to prevent duplicate active subscriptions per identity
     existing = SubscriptionService.get_active_subscription(g.identity_id)
     if existing and existing["status"] in ("active", "pending_payment"):
@@ -1202,6 +1208,47 @@ def subscription_checkout():
     # ALWAYS use identity email for checkout - never trust request body
     # (g.identity is populated by @require_verified_email decorator)
     email = get_checkout_email(g.identity)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECKOUT IDEMPOTENCY: Prevent concurrent double-submit creating two
+    # Mollie payments.  Atomic INSERT claims a 60-second checkout slot.
+    # If another request is already in-flight, return 409.
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    WITH cleanup AS (
+                        DELETE FROM {Tables.CHECKOUT_IDEMPOTENCY}
+                        WHERE identity_id = %s
+                          AND checkout_type = 'subscription'
+                          AND expires_at <= NOW()
+                    )
+                    INSERT INTO {Tables.CHECKOUT_IDEMPOTENCY}
+                        (identity_id, plan_code, checkout_type, expires_at)
+                    VALUES (%s, %s, 'subscription', NOW() + INTERVAL '60 seconds')
+                    ON CONFLICT (identity_id, checkout_type)
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    (g.identity_id, g.identity_id, plan_code),
+                )
+                claimed = cur.fetchone()
+            conn.commit()
+
+        if not claimed:
+            print(
+                f"[BILLING] Subscription checkout blocked (concurrent request): "
+                f"identity={g.identity_id} plan={plan_code}"
+            )
+            return jsonify({
+                "error": "checkout_in_progress",
+                "message": "A checkout is already in progress. Please wait.",
+            }), 429
+    except Exception as e:
+        # If table doesn't exist yet, fall through — downstream guards still protect
+        print(f"[BILLING] checkout_idempotency guard failed (non-fatal): {e}")
 
     try:
         from backend.config import config

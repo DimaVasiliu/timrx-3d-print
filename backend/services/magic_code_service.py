@@ -332,11 +332,10 @@ class MagicCodeService:
         """
         Verify a magic code and link the session to the identity.
 
-        Safety (IDENT-2): If the current session's identity has meaningful
-        data (history, credits, jobs, purchases, subscriptions), the restore
-        is BLOCKED to prevent silent data loss. The code is NOT consumed so
-        the user can retry after contacting support or once a merge flow
-        exists.
+        Safety (IDENT-2 + IDENT-1): If the current session's identity has
+        meaningful data, an automatic merge is attempted. If the merge is
+        blocked (subscription conflict, in-flight jobs, etc.), the code is
+        NOT consumed so the user can retry later.
 
         Args:
             email: Email address the code was sent to
@@ -408,32 +407,82 @@ class MagicCodeService:
 
         code_id = str(code_record["id"])
 
-        # ── IDENT-2 safety gate ──────────────────────────────────
+        # ── IDENT-2 safety gate + IDENT-1 auto-merge ────────────
         # Check BEFORE consuming the code so a blocked restore
         # preserves the code for a future retry.
         safety = MagicCodeService.check_restore_safety(session_id, identity_id)
 
         if not safety["safe"]:
-            # Do NOT consume the code — user can retry after merge/support
+            source_id = safety.get("source_id")
+            reason = safety.get("reason")
+
+            # Non-data reasons (e.g. safety_check_error) → block immediately
+            if reason != "source_has_data" or not source_id:
+                print(
+                    f"[RESTORE] Restore DENIED (non-mergeable): session {session_id[:8]}...: "
+                    f"reason={reason}, "
+                    f"source={source_id[:8] + '...' if source_id else 'unknown'}, "
+                    f"target={identity_id[:8]}..."
+                )
+                return (
+                    False,
+                    None,
+                    "Restore cannot complete automatically. Please contact support.",
+                    {
+                        "error_code": "RESTORE_BLOCKED_DATA_CONFLICT",
+                        "reason": reason,
+                        "next_step": "contact_support",
+                    },
+                )
+
+            # Source has data → attempt automatic merge (IDENT-1)
+            from backend.services.merge_service import MergeService
+
             print(
-                f"[RESTORE] Restore DENIED for session {session_id[:8]}...: "
-                f"reason={safety['reason']}, "
-                f"source={safety['source_id'][:8] + '...' if safety.get('source_id') else 'unknown'}, "
-                f"target={identity_id[:8]}..."
+                f"[RESTORE] Source {source_id[:8]}... has data, "
+                f"attempting auto-merge → target {identity_id[:8]}..."
             )
-            return (
-                False,
-                None,
-                "This device already has saved work or credits. "
-                "To avoid losing access, this restore cannot complete automatically yet. "
-                "Please contact support to merge your accounts.",
-                {
-                    "error_code": "RESTORE_BLOCKED_DATA_CONFLICT",
-                    "reason": safety["reason"],
-                    "next_step": "contact_support",
+
+            merge_result = MergeService.execute_merge(
+                source_id=source_id,
+                target_id=identity_id,
+                merged_by="system",
+                reason="restore",
+                metadata={
+                    "trigger": "redeem_restore",
+                    "session_id": session_id,
+                    "email": email,
+                    "source_stats": safety.get("stats"),
                 },
             )
-        # ── End IDENT-2 safety gate ──────────────────────────────
+
+            if not merge_result["success"]:
+                blocked = merge_result.get("blocked_reason", "unknown")
+                print(
+                    f"[RESTORE] Auto-merge BLOCKED: {source_id[:8]}... → "
+                    f"{identity_id[:8]}...: {blocked}"
+                )
+                # Do NOT consume the code — user can retry later
+                return (
+                    False,
+                    None,
+                    "Your accounts could not be merged automatically. "
+                    "Please wait for any active jobs to finish or contact support.",
+                    {
+                        "error_code": "RESTORE_MERGE_BLOCKED",
+                        "blocked_reason": blocked,
+                        "next_step": MergeService._suggest_next_step(blocked),
+                    },
+                )
+
+            # Merge succeeded — log summary and continue to session swing
+            print(
+                f"[RESTORE] Auto-merge OK: {source_id[:8]}... → "
+                f"{identity_id[:8]}... | "
+                f"tables={merge_result.get('tables_migrated', {})}, "
+                f"sessions_revoked={merge_result.get('sessions_revoked', 0)}"
+            )
+        # ── End IDENT-2 safety gate + IDENT-1 auto-merge ──────
 
         # Mark code as consumed and link session to identity
         with transaction() as cur:

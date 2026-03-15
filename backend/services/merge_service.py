@@ -160,6 +160,26 @@ class MergeService:
         return result
 
     # ─────────────────────────────────────────────────────────
+    #  NEXT-STEP SUGGESTIONS (for restore UX)
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _suggest_next_step(blocked_reason: str) -> str:
+        """Map a blocked_reason to a user-facing next-step hint."""
+        if not blocked_reason:
+            return "contact_support"
+        r = blocked_reason.lower()
+        if "inflight" in r or "in_flight" in r or "reservation" in r:
+            return "wait_for_jobs"
+        if "subscription" in r:
+            return "contact_support_subscription"
+        if "idempotency" in r:
+            return "wait_for_jobs"
+        if "cycle" in r or "already_merged" in r:
+            return "contact_support"
+        return "contact_support"
+
+    # ─────────────────────────────────────────────────────────
     #  ORCHESTRATION HELPERS (extracted for cognitive complexity)
     # ─────────────────────────────────────────────────────────
 

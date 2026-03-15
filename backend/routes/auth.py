@@ -248,13 +248,25 @@ def redeem_restore():
     )
 
     if not success or not identity_id:
-        # IDENT-2: structured blocked-restore response
+        # IDENT-2: structured blocked-restore response (data conflict)
         if detail and detail.get("error_code") == "RESTORE_BLOCKED_DATA_CONFLICT":
             return jsonify({
                 "ok": False,
                 "error": {
                     "code": "RESTORE_BLOCKED_DATA_CONFLICT",
                     "message": message,
+                    "next_step": detail.get("next_step", "contact_support"),
+                },
+            }), 409
+
+        # IDENT-1: merge was attempted but blocked
+        if detail and detail.get("error_code") == "RESTORE_MERGE_BLOCKED":
+            return jsonify({
+                "ok": False,
+                "error": {
+                    "code": "RESTORE_MERGE_BLOCKED",
+                    "message": message,
+                    "blocked_reason": detail.get("blocked_reason"),
                     "next_step": detail.get("next_step", "contact_support"),
                 },
             }), 409
@@ -425,6 +437,176 @@ def attach_email():
     })
 
 
+def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
+    """
+    Handle cross-identity verify: source identity is trying to verify an email
+    that belongs to a different canonical identity (target).
+
+    Attempts automatic merge of source → target when safe, then completes
+    verification on the canonical identity.
+
+    Returns a Flask response (success or error).
+    """
+    from backend.db import transaction, Tables
+    from backend.services.merge_service import MergeService
+
+    # Check if source has meaningful data
+    safety = MagicCodeService.check_restore_safety(session_id, target_id)
+    source_has_data = not safety["safe"] and safety.get("reason") == "source_has_data"
+    safety_error = not safety["safe"] and safety.get("reason") != "source_has_data"
+
+    if safety_error:
+        # Safety check itself failed → block, do NOT consume code
+        print(
+            f"[VERIFY] Cross-identity blocked (safety error): "
+            f"source={source_id[:8]}..., target={target_id[:8]}..., "
+            f"reason={safety.get('reason')}"
+        )
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "VERIFY_MERGE_BLOCKED",
+                "message": "This email could not be verified automatically on this device.",
+                "next_step": "contact_support",
+            },
+        }), 409
+
+    if source_has_data:
+        # Attempt automatic merge: source → canonical email owner
+        print(
+            f"[VERIFY] Source {source_id[:8]}... has data, "
+            f"attempting merge → target {target_id[:8]}..."
+        )
+        merge_result = MergeService.execute_merge(
+            source_id=source_id,
+            target_id=target_id,
+            merged_by="system",
+            reason="verify_email",
+            metadata={
+                "trigger": "verify_email",
+                "session_id": session_id,
+                "email": email,
+                "source_stats": safety.get("stats"),
+            },
+        )
+
+        if not merge_result["success"]:
+            blocked = merge_result.get("blocked_reason", "unknown")
+            print(
+                f"[VERIFY] Merge BLOCKED: {source_id[:8]}... → "
+                f"{target_id[:8]}...: {blocked}"
+            )
+            # Do NOT consume code — user can retry later
+            return jsonify({
+                "ok": False,
+                "error": {
+                    "code": "VERIFY_MERGE_BLOCKED",
+                    "message": "This email could not be verified automatically on this device.",
+                    "blocked_reason": blocked,
+                    "next_step": MergeService._suggest_next_step(blocked),
+                },
+            }), 409
+
+        print(
+            f"[VERIFY] Merge OK: {source_id[:8]}... → {target_id[:8]}... | "
+            f"tables={merge_result.get('tables_migrated', {})}, "
+            f"sessions_revoked={merge_result.get('sessions_revoked', 0)}"
+        )
+    else:
+        print(
+            f"[VERIFY] Source {source_id[:8]}... has no data, "
+            f"swinging session to canonical {target_id[:8]}..."
+        )
+
+    # Source has no data OR merge succeeded → consume code + swing session
+    with transaction() as cur:
+        # Consume code
+        cur.execute(
+            f"""
+            UPDATE {Tables.MAGIC_CODES}
+            SET consumed = TRUE, consumed_at = NOW()
+            WHERE id = %s
+            """,
+            (code_id,),
+        )
+
+        # Swing session to canonical identity
+        try:
+            cur.execute(
+                f"""
+                UPDATE {Tables.SESSIONS}
+                SET identity_id = %s, updated_at = NOW()
+                WHERE id = %s
+                RETURNING id
+                """,
+                (target_id, session_id),
+            )
+        except Exception as e:
+            if "updated_at" in str(e):
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.SESSIONS}
+                    SET identity_id = %s
+                    WHERE id = %s
+                    RETURNING id
+                    """,
+                    (target_id, session_id),
+                )
+            else:
+                raise
+
+        # Mark email verified on canonical identity
+        cur.execute(
+            f"""
+            UPDATE {Tables.IDENTITIES}
+            SET email_verified = TRUE, last_seen_at = NOW()
+            WHERE id = %s
+            """,
+            (target_id,),
+        )
+
+    # Invalidate pending codes for this email
+    MagicCodeService.invalidate_codes_for_email(email)
+
+    # Resume subscriptions paused due to email_unverified on the canonical identity
+    subscriptions_resumed = 0
+    try:
+        with transaction() as cur:
+            cur.execute(
+                f"""
+                UPDATE {Tables.SUBSCRIPTIONS}
+                SET pause_reason = NULL,
+                    paused_at = NULL,
+                    updated_at = NOW()
+                WHERE identity_id::text = %s
+                  AND pause_reason = 'email_unverified'
+                RETURNING id
+                """,
+                (target_id,),
+            )
+            resumed = cur.fetchall() or []
+            subscriptions_resumed = len(resumed)
+            for row in resumed:
+                print(f"[VERIFY] Resumed subscription {row['id']} after cross-identity verify")
+    except Exception as e:
+        print(f"[VERIFY] Error resuming subscriptions for {target_id}: {e}")
+
+    print(
+        f"[VERIFY] Cross-identity verify+merge complete: "
+        f"{source_id[:8]}... → {target_id[:8]}..., email={_mask_email(email)}"
+    )
+
+    return jsonify({
+        "ok": True,
+        "message": "Email verified successfully",
+        "email_verified": True,
+        "email_attached": True,
+        "identity_changed": True,
+        "identity_id": target_id,
+        "subscriptions_resumed": subscriptions_resumed,
+    })
+
+
 @bp.route("/email/verify", methods=["POST"])
 @with_session
 def verify_email():
@@ -435,6 +617,9 @@ def verify_email():
     1. User calls POST /api/auth/email/attach (sends code to email)
     2. User enters code and calls POST /api/auth/email/verify
     3. Code is verified, email is attached to identity idempotently
+
+    For cross-identity cases (email belongs to another canonical identity),
+    an automatic merge is attempted (IDENT-1) rather than just blocking.
 
     Request body:
     {
@@ -447,7 +632,8 @@ def verify_email():
         "ok": true,
         "message": "Email verified successfully",
         "email_verified": true,
-        "email_attached": true
+        "email_attached": true,
+        "identity_changed": false
     }
 
     Error responses:
@@ -456,22 +642,8 @@ def verify_email():
     - 400 CODE_EXPIRED: Code has expired
     - 400 TOO_MANY_ATTEMPTS: Max attempts exceeded
     - 401 NO_SESSION: No active session
-    - 409 ATTACH_CONFLICT: Email could not be attached (neutral, anti-enum safe)
-
-    Manual test:
-    ```bash
-    # 1. Attach email (sends code)
-    curl -X POST http://localhost:5001/api/auth/email/attach \
-      -H "Content-Type: application/json" \
-      -b "timrx_sid=YOUR_SESSION_ID" \
-      -d '{"email": "test@example.com"}'
-
-    # 2. Verify with code from email
-    curl -X POST http://localhost:5001/api/auth/email/verify \
-      -H "Content-Type: application/json" \
-      -b "timrx_sid=YOUR_SESSION_ID" \
-      -d '{"email": "test@example.com", "code": "123456"}'
-    ```
+    - 409 VERIFY_MERGE_BLOCKED: Cross-identity merge blocked (code preserved)
+    - 409 ATTACH_CONFLICT: Fallback (legacy, should be rare now)
     """
     data = request.get_json() or {}
 
@@ -565,49 +737,50 @@ def verify_email():
 
     code_id = str(code_record["id"])
 
-    # ── Attach email to identity idempotently ──
-    # Get current identity email (safely handle None)
+    # ── Determine verification target ──
     current_email = None
     if identity and identity.get("email"):
         current_email = identity["email"].lower() if isinstance(identity["email"], str) else None
 
+    # ── IDENT-1: Cross-identity verify+merge ──
+    # If this email belongs to another canonical identity, attempt to merge
+    # the current identity into the email owner rather than just blocking.
+    if current_email != email:
+        existing_owner = IdentityService.get_identity_by_email(email)
+        if existing_owner and str(existing_owner["id"]) != identity_id:
+            canonical_owner_id = str(existing_owner["id"])
+            # Resolve to canonical if the email owner was itself merged
+            if existing_owner.get("merged_into_id"):
+                canonical_owner_id = IdentityService.resolve_canonical_id(
+                    canonical_owner_id
+                )
+            # Only cross-identity if canonical differs from current session
+            if canonical_owner_id != identity_id:
+                print(
+                    f"[AUTH] verify_email cross-identity: "
+                    f"source={identity_id[:8]}... → "
+                    f"canonical={canonical_owner_id[:8]}... "
+                    f"email={_mask_email(email)}"
+                )
+                return _handle_verify_merge(
+                    code_id=code_id,
+                    email=email,
+                    source_id=identity_id,
+                    target_id=canonical_owner_id,
+                    session_id=g.session_id,
+                )
+
+    # ── Same-identity case: attach email idempotently ──
     email_attached = False
 
     if current_email == email:
         # Email already on this identity - just verify it
         pass
     elif current_email is None:
-        # Identity has no email - check if email belongs to another identity
-        existing = IdentityService.get_identity_by_email(email)
-        if existing and str(existing["id"]) != identity_id:
-            # Email belongs to another identity - cannot attach
-            # IDENT-3: Neutral response — don't confirm account existence
-            print(f"[AUTH] verify_email blocked: email={_mask_email(email)} belongs to another identity (attach conflict)")
-            return jsonify({
-                "error": {
-                    "code": "ATTACH_CONFLICT",
-                    "message": "This email could not be verified on this device. If you've used it before, try Restore Account.",
-                    "recommended_flow": "restore",
-                }
-            }), 409
+        # Identity has no email, and email is free → attach it
         email_attached = True
     else:
-        # Identity has a DIFFERENT email - user is changing their email
-        # This is allowed if they can verify ownership of the new email via code.
-        # Check if new email belongs to another identity first.
-        existing = IdentityService.get_identity_by_email(email)
-        if existing and str(existing["id"]) != identity_id:
-            # New email belongs to another identity - cannot change to it
-            # IDENT-3: Neutral response — don't confirm account existence
-            print(f"[AUTH] verify_email blocked: new email={_mask_email(email)} belongs to another identity (attach conflict)")
-            return jsonify({
-                "error": {
-                    "code": "ATTACH_CONFLICT",
-                    "message": "This email could not be verified on this device. If you've used it before, try Restore Account.",
-                    "recommended_flow": "restore",
-                }
-            }), 409
-        # Email change is allowed - will update email and set verified=TRUE
+        # Identity has a DIFFERENT email, and new email is free → change it
         email_attached = True
         print(f"[AUTH] Email change requested: identity {identity_id} from {_mask_email(current_email)} to {_mask_email(email)}")
 
