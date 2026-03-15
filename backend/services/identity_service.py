@@ -414,6 +414,63 @@ class IdentityService:
             current_id = next_id
         return current_id
 
+    @staticmethod
+    def record_merge(
+        source_identity_id: str,
+        target_identity_id: str,
+        *,
+        merged_by: str = "system",
+        merge_reason: Optional[str] = None,
+        merge_mode: str = "manual",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Record a merge event in the identity_merges audit table.
+        Append-only — never updates or deletes rows.
+
+        Does NOT execute the merge itself (no data migration, no
+        merged_into_id update). That is the responsibility of a
+        future IDENT-1 merge service.
+
+        Args:
+            source_identity_id: The identity being merged away
+            target_identity_id: The canonical identity receiving data
+            merged_by: Who initiated ("system", "admin", admin email, etc.)
+            merge_reason: Free-text reason ("fragmentation", "user request", etc.)
+            merge_mode: "manual", "automatic", "dry_run"
+            metadata: Optional JSONB blob (e.g. asset counts, pre-merge snapshot)
+
+        Returns:
+            The created audit row, or None on failure.
+        """
+        import json as _json
+        try:
+            row = execute_returning(
+                f"""
+                INSERT INTO {Tables.IDENTITY_MERGES}
+                (source_identity_id, target_identity_id, merged_by,
+                 merge_reason, merge_mode, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    source_identity_id,
+                    target_identity_id,
+                    merged_by,
+                    merge_reason,
+                    merge_mode,
+                    _json.dumps(metadata or {}),
+                ),
+            )
+            print(
+                f"[MERGE-AUDIT] Recorded: {source_identity_id[:8]}... → "
+                f"{target_identity_id[:8]}... mode={merge_mode} by={merged_by}"
+            )
+            return row
+        except Exception as e:
+            print(f"[MERGE-AUDIT] Failed to record merge: {type(e).__name__}: {e}")
+            return None
+
     # ─────────────────────────────────────────────────────────────
     # Identity Lookups (all follow merged_into_id)
     # ─────────────────────────────────────────────────────────────

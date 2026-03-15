@@ -400,6 +400,7 @@ class Tables:
     """Table name constants with schema prefixes."""
     # Billing schema
     IDENTITIES = f"{_BILLING_SCHEMA}.identities"
+    IDENTITY_MERGES = f"{_BILLING_SCHEMA}.identity_merges"
     SESSIONS = f"{_BILLING_SCHEMA}.sessions"
     MAGIC_CODES = f"{_BILLING_SCHEMA}.magic_codes"
     WALLETS = f"{_BILLING_SCHEMA}.wallets"
