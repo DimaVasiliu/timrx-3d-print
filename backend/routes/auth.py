@@ -415,10 +415,13 @@ def attach_email():
     # Generate and send verification code (result ignored - always return generic success)
     MagicCodeService.request_restore(email, ip_address)
 
-    # Always return generic success to prevent enumeration
+    # Always return generic success to prevent enumeration.
+    # IDENT-4: Always include restore hint so frontend can show guidance
+    # regardless of whether email is actually taken (anti-enum safe).
     return jsonify({
         "ok": True,
         "message": "If valid, a verification code has been sent",
+        "hint": "restore_available",
     })
 
 
@@ -453,7 +456,7 @@ def verify_email():
     - 400 CODE_EXPIRED: Code has expired
     - 400 TOO_MANY_ATTEMPTS: Max attempts exceeded
     - 401 NO_SESSION: No active session
-    - 409 EMAIL_IN_USE: Email belongs to another verified identity
+    - 409 ATTACH_CONFLICT: Email could not be attached (neutral, anti-enum safe)
 
     Manual test:
     ```bash
@@ -578,12 +581,13 @@ def verify_email():
         existing = IdentityService.get_identity_by_email(email)
         if existing and str(existing["id"]) != identity_id:
             # Email belongs to another identity - cannot attach
-            # User must use restore flow to take over that account
-            print(f"[AUTH] verify_email failed: email={_mask_email(email)} belongs to another identity")
+            # IDENT-3: Neutral response — don't confirm account existence
+            print(f"[AUTH] verify_email blocked: email={_mask_email(email)} belongs to another identity (attach conflict)")
             return jsonify({
                 "error": {
-                    "code": "EMAIL_IN_USE",
-                    "message": "This email is already associated with another account. Use 'Restore Account' to access it.",
+                    "code": "ATTACH_CONFLICT",
+                    "message": "This email could not be verified on this device. If you've used it before, try Restore Account.",
+                    "recommended_flow": "restore",
                 }
             }), 409
         email_attached = True
@@ -594,11 +598,13 @@ def verify_email():
         existing = IdentityService.get_identity_by_email(email)
         if existing and str(existing["id"]) != identity_id:
             # New email belongs to another identity - cannot change to it
-            print(f"[AUTH] verify_email failed: new email={_mask_email(email)} belongs to another identity")
+            # IDENT-3: Neutral response — don't confirm account existence
+            print(f"[AUTH] verify_email blocked: new email={_mask_email(email)} belongs to another identity (attach conflict)")
             return jsonify({
                 "error": {
-                    "code": "EMAIL_IN_USE",
-                    "message": "This email is already associated with another account. Use 'Restore Account' to access it.",
+                    "code": "ATTACH_CONFLICT",
+                    "message": "This email could not be verified on this device. If you've used it before, try Restore Account.",
+                    "recommended_flow": "restore",
                 }
             }), 409
         # Email change is allowed - will update email and set verified=TRUE
