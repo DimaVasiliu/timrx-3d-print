@@ -13,6 +13,10 @@ Handles:
 Note: Logout is handled by /api/me/logout for consistency with other /me endpoints.
 """
 
+import time
+import random
+from functools import wraps
+
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import with_session, with_optional_session, require_session, require_admin
@@ -85,7 +89,44 @@ def _get_client_ip() -> str:
     return request.remote_addr or ""
 
 
+# ─────────────────────────────────────────────────────────────
+# IDENT-3: Anti-enumeration timing equalization
+# ─────────────────────────────────────────────────────────────
+
+# Minimum execution time (seconds) for auth endpoints.
+# Set to cover the typical slow path (code generation + email send).
+_AUTH_MIN_RESPONSE_SECS = 0.35
+
+
+def anti_enumeration(min_secs=_AUTH_MIN_RESPONSE_SECS):
+    """
+    IDENT-3: Decorator that equalizes response timing to prevent
+    email-existence enumeration via timing side-channels.
+
+    Ensures every request takes at least `min_secs` plus random jitter,
+    so fast-path (unknown email) and slow-path (known email, code sent)
+    are indistinguishable from the outside.
+    """
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            start = time.monotonic()
+            try:
+                return f(*args, **kwargs)
+            finally:
+                elapsed = time.monotonic() - start
+                remaining = min_secs - elapsed
+                # Random jitter 0–50ms prevents statistical averaging
+                jitter = random.uniform(0, 0.05)
+                pad = max(0, remaining) + jitter
+                if pad > 0:
+                    time.sleep(pad)
+        return wrapper
+    return decorator
+
+
 @bp.route("/restore/request", methods=["POST"])
+@anti_enumeration()
 def request_restore():
     """
     Request a magic code to restore account access.
@@ -150,20 +191,19 @@ def request_restore():
             }
         }), 400
 
-    # Build response — include resolved_email if merge redirect happened
-    response = {
+    # IDENT-3: Always include resolved_email and merge_redirected to
+    # normalize response shape (prevents enumeration via field presence).
+    return jsonify({
         "ok": True,
         "message": result.get("message", "Code sent"),
-    }
-    if result.get("merge_redirected"):
-        response["resolved_email"] = result["resolved_email"]
-        response["merge_redirected"] = True
-
-    return jsonify(response)
+        "resolved_email": result.get("resolved_email", None),
+        "merge_redirected": bool(result.get("merge_redirected")),
+    })
 
 
 @bp.route("/restore/redeem", methods=["POST"])
 @with_optional_session
+@anti_enumeration()
 def redeem_restore():
     """
     Verify a magic code and restore session.
@@ -255,12 +295,15 @@ def redeem_restore():
 
         # IDENT-1: merge was attempted but blocked
         if detail and detail.get("error_code") == "RESTORE_MERGE_BLOCKED":
+            # IDENT-3: blocked_reason logged in MagicCodeService, NOT sent to client
+            print(
+                f"[RESTORE] Merge blocked: {detail.get('blocked_reason', 'unknown')}"
+            )
             return jsonify({
                 "ok": False,
                 "error": {
                     "code": "RESTORE_MERGE_BLOCKED",
                     "message": message,
-                    "blocked_reason": detail.get("blocked_reason"),
                     "next_step": detail.get("next_step", "contact_support"),
                 },
             }), 409
@@ -353,6 +396,7 @@ def auth_status():
 
 @bp.route("/email/attach", methods=["POST"])
 @with_session
+@anti_enumeration()
 def attach_email():
     """
     Attach an email to the current identity and send verification code.
@@ -515,12 +559,12 @@ def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
                 f"{target_id[:8]}...: {blocked}"
             )
             # Do NOT consume code — user can retry later
+            # IDENT-3: blocked_reason logged above but NOT sent to client
             return jsonify({
                 "ok": False,
                 "error": {
                     "code": "VERIFY_MERGE_BLOCKED",
                     "message": "This email could not be verified automatically on this device.",
-                    "blocked_reason": blocked,
                     "next_step": MergeService._suggest_next_step(blocked),
                 },
             }), 409
@@ -629,6 +673,7 @@ def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
 
 @bp.route("/email/verify", methods=["POST"])
 @require_session
+@anti_enumeration()
 def verify_email():
     """
     Verify and attach email to current identity using magic code.
@@ -663,7 +708,6 @@ def verify_email():
     - 400 TOO_MANY_ATTEMPTS: Max attempts exceeded
     - 401 NO_SESSION: No active session
     - 409 VERIFY_MERGE_BLOCKED: Cross-identity merge blocked (code preserved)
-    - 409 ATTACH_CONFLICT: Fallback (legacy, should be rare now)
     """
     data = request.get_json() or {}
 
@@ -864,11 +908,15 @@ def verify_email():
 
     print(f"[AUTH] Email verified for identity {identity_id}: {_mask_email(email)} (attached={email_attached}, subs_resumed={subscriptions_resumed})")
 
+    # IDENT-3: Always include identity_changed and identity_id to normalize
+    # response shape (same keys as cross-identity path).
     return jsonify({
         "ok": True,
         "message": "Email verified successfully",
         "email_verified": True,
         "email_attached": email_attached,
+        "identity_changed": False,
+        "identity_id": identity_id,
         "subscriptions_resumed": subscriptions_resumed,
     })
 

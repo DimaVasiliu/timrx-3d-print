@@ -3445,3 +3445,225 @@ def merge_history():
     except Exception as e:
         print(f"[ADMIN] Merge history error: {e}")
         return jsonify({"ok": False, "error": "Merge history failed"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDENT-5: Orphaned Asset Audit & Cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/orphans/summary", methods=["GET"])
+@require_admin
+def orphan_summary():
+    """
+    Quick count of orphan candidates per asset type and category.
+
+    Query params:
+        - age_days: Min age in days (default 30)
+
+    Response:
+        {
+          "ok": true,
+          "summary": {
+            "models": { "ownerless": 0, "merged_away": 2, ... "total": 5 },
+            "images": { ... },
+            "videos": { ... },
+            "age_threshold_days": 30
+          }
+        }
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        age_days = int(request.args.get("age_days", 30))
+        result = OrphanAuditService.summary(age_threshold_days=age_days)
+        return jsonify({"ok": True, "summary": result})
+    except Exception as e:
+        print(f"[ADMIN] Orphan summary error: {e}")
+        return jsonify({"ok": False, "error": f"Orphan summary failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/audit", methods=["GET"])
+@require_admin
+def orphan_audit():
+    """
+    Row-level orphan detail for a given asset_type + category.
+
+    Query params:
+        - asset_type: "models" | "images" | "videos" (required)
+        - category: "ownerless" | "merged_away" | "soft_deleted" | "unlinked" | "failed" (required)
+        - age_days: Min age in days (default 30)
+        - limit: Max rows (default 100, max 500)
+
+    Response:
+        {
+          "ok": true,
+          "orphans": [
+            {
+              "id": "uuid",
+              "asset_type": "models",
+              "category": "ownerless",
+              "identity_id": null,
+              "s3_bucket": "timrx-assets",
+              "s3_keys": { "glb_s3_key": "models/meshy/abc.glb", ... },
+              "status": "completed",
+              "created_at": "...",
+              "deleted_at": null,
+              "has_active_job": false,
+              "safe_to_quarantine": true
+            }
+          ],
+          "count": 5
+        }
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        asset_type = request.args.get("asset_type", "").strip()
+        category = request.args.get("category", "").strip()
+        age_days = int(request.args.get("age_days", 30))
+        limit = min(int(request.args.get("limit", 100)), 500)
+
+        if not asset_type or not category:
+            return jsonify({"ok": False, "error": "asset_type and category required"}), 400
+
+        if asset_type not in ("models", "images", "videos"):
+            return jsonify({"ok": False, "error": "asset_type must be models, images, or videos"}), 400
+
+        if category not in ("ownerless", "merged_away", "soft_deleted", "unlinked", "failed"):
+            return jsonify({"ok": False, "error": "Invalid category"}), 400
+
+        rows = OrphanAuditService.audit(
+            asset_type=asset_type,
+            category=category,
+            age_threshold_days=age_days,
+            limit=limit,
+        )
+
+        return jsonify({"ok": True, "orphans": rows, "count": len(rows)})
+    except Exception as e:
+        print(f"[ADMIN] Orphan audit error: {e}")
+        return jsonify({"ok": False, "error": f"Orphan audit failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/quarantine", methods=["POST"])
+@require_admin
+def orphan_quarantine():
+    """
+    Quarantine (soft-delete) orphan candidates.
+
+    Request body:
+        {
+          "asset_type": "models" | "images" | "videos",
+          "category": "ownerless" | "failed",
+          "age_days": 30,
+          "limit": 100,
+          "dry_run": true  (default: true)
+        }
+
+    Only ownerless and failed categories can be auto-quarantined.
+    merged_away should use the merge tool. unlinked requires manual review.
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        asset_type = data.get("asset_type", "").strip()
+        category = data.get("category", "").strip()
+        age_days = int(data.get("age_days", 30))
+        limit = min(int(data.get("limit", 100)), 500)
+        dry_run = data.get("dry_run", True)
+
+        if not asset_type or not category:
+            return jsonify({"ok": False, "error": "asset_type and category required"}), 400
+
+        result = OrphanAuditService.quarantine_orphans(
+            asset_type=asset_type,
+            category=category,
+            age_threshold_days=age_days,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+        if "error" in result:
+            return jsonify({"ok": False, "error": result["error"]}), 400
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Orphan quarantine error: {e}")
+        return jsonify({"ok": False, "error": f"Quarantine failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/fix-merged", methods=["POST"])
+@require_admin
+def orphan_fix_merged():
+    """
+    Re-migrate assets from merged-away identities to canonical owners.
+
+    Request body:
+        {
+          "asset_type": "models" | "images" | "videos",
+          "limit": 500,
+          "dry_run": true  (default: true)
+        }
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        asset_type = data.get("asset_type", "").strip()
+        limit = min(int(data.get("limit", 500)), 1000)
+        dry_run = data.get("dry_run", True)
+
+        if not asset_type:
+            return jsonify({"ok": False, "error": "asset_type required"}), 400
+
+        result = OrphanAuditService.fix_merged_away(
+            asset_type=asset_type,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+        if "error" in result:
+            return jsonify({"ok": False, "error": result["error"]}), 400
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Fix merged error: {e}")
+        return jsonify({"ok": False, "error": f"Fix merged failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/s3-keys", methods=["GET"])
+@require_admin
+def orphan_s3_keys():
+    """
+    Collect S3 keys from soft-deleted assets for optional storage cleanup.
+    Does NOT delete anything — returns keys for review.
+
+    Query params:
+        - asset_type: "models" | "images" | "videos" (required)
+        - age_days: Min days since deletion (default 90)
+        - limit: Max assets (default 200)
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        asset_type = request.args.get("asset_type", "").strip()
+        age_days = int(request.args.get("age_days", 90))
+        limit = min(int(request.args.get("limit", 200)), 1000)
+
+        if not asset_type:
+            return jsonify({"ok": False, "error": "asset_type required"}), 400
+
+        result = OrphanAuditService.collect_s3_keys_for_cleanup(
+            asset_type=asset_type,
+            age_threshold_days=age_days,
+            limit=limit,
+        )
+
+        if "error" in result:
+            return jsonify({"ok": False, "error": result["error"]}), 400
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] S3 keys error: {e}")
+        return jsonify({"ok": False, "error": f"S3 key collection failed: {type(e).__name__}"}), 500
