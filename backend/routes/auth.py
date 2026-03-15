@@ -241,13 +241,24 @@ def redeem_restore():
         }), 401
 
     # Verify the code and link session
-    success, identity_id, message = MagicCodeService.redeem_restore(
+    success, identity_id, message, detail = MagicCodeService.redeem_restore(
         email=email,
         code=code,
         session_id=session_id,
     )
 
     if not success or not identity_id:
+        # IDENT-2: structured blocked-restore response
+        if detail and detail.get("error_code") == "RESTORE_BLOCKED_DATA_CONFLICT":
+            return jsonify({
+                "ok": False,
+                "error": {
+                    "code": "RESTORE_BLOCKED_DATA_CONFLICT",
+                    "message": message,
+                    "next_step": detail.get("next_step", "contact_support"),
+                },
+            }), 409
+
         return _get_redeem_error_response(message)
 
     # Fetch updated identity and wallet data

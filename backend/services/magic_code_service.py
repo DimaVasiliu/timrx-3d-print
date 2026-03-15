@@ -56,14 +56,26 @@ class MagicCodeService:
         return hashlib.sha256(code.encode()).hexdigest()
 
     # ─────────────────────────────────────────────────────────────
-    # Restore Diagnostics
+    # Restore Safety Check (IDENT-2 hotfix)
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _log_restore_diagnostic(session_id: str, target_identity_id: str) -> None:
+    def check_restore_safety(
+        session_id: str, target_identity_id: str
+    ) -> Dict[str, Any]:
         """
-        Log whether the identity being abandoned during restore has meaningful data.
-        Non-blocking — failures here never affect the restore flow.
+        Determine whether switching this session to target_identity_id is safe.
+
+        Returns dict:
+            safe: bool — True if restore can proceed
+            source_id: str or None — current session's identity
+            reason: str — human-readable explanation
+            stats: dict or None — source identity data stats (when relevant)
+
+        A restore is BLOCKED when the source identity has meaningful data
+        (history, credits, jobs, or purchases) that would be silently
+        abandoned. This prevents data loss until a proper merge service
+        exists (IDENT-1).
         """
         try:
             current_session = query_one(
@@ -71,41 +83,92 @@ class MagicCodeService:
                 (session_id,),
             )
             if not current_session:
-                return
-            source_id = str(current_session["identity_id"])
-            if source_id == target_identity_id:
-                return
+                # No source session — shouldn't happen, but allow (middleware
+                # will catch downstream)
+                return {"safe": True, "source_id": None, "reason": "no_source_session", "stats": None}
 
+            source_id = str(current_session["identity_id"])
+
+            if source_id == target_identity_id:
+                print(
+                    f"[RESTORE] Same identity — source=target={source_id[:8]}..., safe"
+                )
+                return {"safe": True, "source_id": source_id, "reason": "same_identity", "stats": None}
+
+            # Query source identity data breadth
             source_stats = query_one(
                 f"""
                 SELECT
                     COALESCE(w.balance_credits, 0) as balance,
-                    (SELECT COUNT(*) FROM {Tables.HISTORY_ITEMS} WHERE identity_id = %s) as history_count,
-                    (SELECT COUNT(*) FROM {Tables.JOBS} WHERE identity_id = %s) as job_count
+                    (SELECT COUNT(*) FROM {Tables.HISTORY_ITEMS}
+                     WHERE identity_id = %s AND deleted_at IS NULL) as history_count,
+                    (SELECT COUNT(*) FROM {Tables.JOBS}
+                     WHERE identity_id = %s) as job_count,
+                    (SELECT COUNT(*) FROM {Tables.PURCHASES}
+                     WHERE identity_id = %s AND status = 'paid') as purchase_count,
+                    (SELECT COUNT(*) FROM {Tables.SUBSCRIPTIONS}
+                     WHERE identity_id::text = %s
+                       AND status IN ('active', 'paused')) as active_sub_count
                 FROM {Tables.WALLETS} w
                 WHERE w.identity_id = %s
                 """,
-                (source_id, source_id, source_id),
+                (source_id, source_id, source_id, source_id, source_id),
             )
-            if not source_stats:
-                return
 
-            h = int(source_stats["history_count"])
-            j = int(source_stats["job_count"])
-            b = int(source_stats["balance"])
-            if h > 0 or j > 0 or b > 0:
+            if not source_stats:
+                # No wallet row ⇒ identity was never used, safe to abandon
                 print(
-                    f"[RESTORE] DATA AT RISK: session switching from identity "
-                    f"{source_id[:8]}... to {target_identity_id[:8]}... — "
-                    f"source has history={h}, jobs={j}, balance={b}"
+                    f"[RESTORE] No wallet for source {source_id[:8]}..., safe"
                 )
+                return {"safe": True, "source_id": source_id, "reason": "no_wallet", "stats": None}
+
+            stats = {
+                "history": int(source_stats["history_count"]),
+                "jobs": int(source_stats["job_count"]),
+                "balance": int(source_stats["balance"]),
+                "purchases": int(source_stats["purchase_count"]),
+                "active_subscriptions": int(source_stats["active_sub_count"]),
+            }
+
+            has_data = (
+                stats["history"] > 0
+                or stats["jobs"] > 0
+                or stats["balance"] > 0
+                or stats["purchases"] > 0
+                or stats["active_subscriptions"] > 0
+            )
+
+            if has_data:
+                print(
+                    f"[RESTORE] BLOCKED: source {source_id[:8]}... → target "
+                    f"{target_identity_id[:8]}... — source has "
+                    f"history={stats['history']}, jobs={stats['jobs']}, "
+                    f"balance={stats['balance']}, purchases={stats['purchases']}, "
+                    f"subs={stats['active_subscriptions']}"
+                )
+                return {
+                    "safe": False,
+                    "source_id": source_id,
+                    "reason": "source_has_data",
+                    "stats": stats,
+                }
             else:
                 print(
-                    f"[RESTORE] Identity switch {source_id[:8]}... -> "
-                    f"{target_identity_id[:8]}... (source has no data, safe)"
+                    f"[RESTORE] Safe: source {source_id[:8]}... has no data, "
+                    f"proceeding to target {target_identity_id[:8]}..."
                 )
-        except Exception as diag_err:
-            print(f"[RESTORE] Diagnostic check failed (non-blocking): {diag_err}")
+                return {"safe": True, "source_id": source_id, "reason": "source_empty", "stats": stats}
+
+        except Exception as err:
+            # Safety check failure must NOT silently allow data loss.
+            # Block the restore and log the error.
+            print(f"[RESTORE] Safety check ERROR — blocking restore as precaution: {err}")
+            return {
+                "safe": False,
+                "source_id": None,
+                "reason": "safety_check_error",
+                "stats": None,
+            }
 
     # ─────────────────────────────────────────────────────────────
     # Request Code (Step 1)
@@ -257,14 +320,23 @@ class MagicCodeService:
     # Redeem Code (Step 2)
     # ─────────────────────────────────────────────────────────────
 
+    # Return type for redeem_restore: 4-tuple adding optional structured detail
+    # (success, identity_id, message, detail_or_none)
+
     @staticmethod
     def redeem_restore(
         email: str,
         code: str,
         session_id: str,
-    ) -> Tuple[bool, Optional[str], str]:
+    ) -> Tuple[bool, Optional[str], str, Optional[Dict[str, Any]]]:
         """
         Verify a magic code and link the session to the identity.
+
+        Safety (IDENT-2): If the current session's identity has meaningful
+        data (history, credits, jobs, purchases, subscriptions), the restore
+        is BLOCKED to prevent silent data loss. The code is NOT consumed so
+        the user can retry after contacting support or once a merge flow
+        exists.
 
         Args:
             email: Email address the code was sent to
@@ -272,17 +344,21 @@ class MagicCodeService:
             session_id: Current session ID to link to the identity
 
         Returns:
-            Tuple of (success: bool, identity_id: Optional[str], message: str)
+            Tuple of (success, identity_id, message, detail):
+              - success: bool
+              - identity_id: str or None
+              - message: str
+              - detail: dict or None — structured info when restore is blocked
         """
         email = email.strip().lower()
         code = code.strip()
 
         # Validate inputs
         if not email or not code or not session_id:
-            return (False, None, "Missing required fields")
+            return (False, None, "Missing required fields", None)
 
         if len(code) != 6 or not code.isdigit():
-            return (False, None, "Invalid code format")
+            return (False, None, "Invalid code format", None)
 
         # Get identity for this email
         identity = query_one(
@@ -290,7 +366,7 @@ class MagicCodeService:
             (email,),
         )
         if not identity:
-            return (False, None, "Invalid email or code")
+            return (False, None, "Invalid email or code", None)
 
         # Follow merge chain — always link session to canonical identity
         identity_id = str(identity["id"])
@@ -324,16 +400,40 @@ class MagicCodeService:
         if not code_record:
             # Code not found - increment attempts on most recent code for this email
             MagicCodeService._increment_attempts(email)
-            return (False, None, "Invalid or expired code")
+            return (False, None, "Invalid or expired code", None)
 
         # Check max attempts on this specific code
         if code_record["attempts"] >= config.MAGIC_CODE_MAX_ATTEMPTS:
-            return (False, None, "Too many failed attempts. Please request a new code")
+            return (False, None, "Too many failed attempts. Please request a new code", None)
 
         code_id = str(code_record["id"])
 
-        # Log diagnostic info about the identity switch (non-blocking)
-        MagicCodeService._log_restore_diagnostic(session_id, identity_id)
+        # ── IDENT-2 safety gate ──────────────────────────────────
+        # Check BEFORE consuming the code so a blocked restore
+        # preserves the code for a future retry.
+        safety = MagicCodeService.check_restore_safety(session_id, identity_id)
+
+        if not safety["safe"]:
+            # Do NOT consume the code — user can retry after merge/support
+            print(
+                f"[RESTORE] Restore DENIED for session {session_id[:8]}...: "
+                f"reason={safety['reason']}, "
+                f"source={safety['source_id'][:8] + '...' if safety.get('source_id') else 'unknown'}, "
+                f"target={identity_id[:8]}..."
+            )
+            return (
+                False,
+                None,
+                "This device already has saved work or credits. "
+                "To avoid losing access, this restore cannot complete automatically yet. "
+                "Please contact support to merge your accounts.",
+                {
+                    "error_code": "RESTORE_BLOCKED_DATA_CONFLICT",
+                    "reason": safety["reason"],
+                    "next_step": "contact_support",
+                },
+            )
+        # ── End IDENT-2 safety gate ──────────────────────────────
 
         # Mark code as consumed and link session to identity
         with transaction() as cur:
@@ -381,7 +481,7 @@ class MagicCodeService:
                 # Session doesn't exist - this is an error
                 raise ValueError(f"Session {session_id} not found")
 
-            # Update identity's last_seen_at
+            # Update identity's last_seen_at and mark email verified
             cur.execute(
                 f"""
                 UPDATE {Tables.IDENTITIES}
@@ -395,7 +495,7 @@ class MagicCodeService:
         MagicCodeService.invalidate_codes_for_email(email)
 
         print(f"[MAGIC_CODE] Successfully restored session for {email}, identity={identity_id}")
-        return (True, identity_id, "Account restored successfully")
+        return (True, identity_id, "Account restored successfully", None)
 
     @staticmethod
     def _increment_attempts(email: str) -> None:
@@ -514,6 +614,6 @@ class MagicCodeService:
         return MagicCodeService.request_restore(email, ip_address)
 
     @staticmethod
-    def verify_code(email: str, code: str, session_id: str) -> Tuple[bool, Optional[str], str]:
+    def verify_code(email: str, code: str, session_id: str) -> Tuple[bool, Optional[str], str, Optional[Dict[str, Any]]]:
         """Alias for redeem_restore (backward compatibility)."""
         return MagicCodeService.redeem_restore(email, code, session_id)
