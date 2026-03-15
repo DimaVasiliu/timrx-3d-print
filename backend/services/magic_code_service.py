@@ -138,7 +138,7 @@ class MagicCodeService:
 
         # Check if email exists in the system
         identity = query_one(
-            f"SELECT id, email FROM {Tables.IDENTITIES} WHERE email = %s",
+            f"SELECT id, email, merged_into_id FROM {Tables.IDENTITIES} WHERE email = %s",
             (email,),
         )
         if not identity:
@@ -146,6 +146,22 @@ class MagicCodeService:
             # But don't actually send the email
             print(f"[MAGIC_CODE] Request for unknown email: {email}")
             return (True, "If this email is registered, a code has been sent")
+
+        # Follow merge chain — resolve to canonical identity
+        if identity.get("merged_into_id"):
+            from backend.services.identity_service import IdentityService
+            canonical_id = IdentityService.resolve_canonical_id(str(identity["id"]))
+            canonical = query_one(
+                f"SELECT id, email FROM {Tables.IDENTITIES} WHERE id = %s",
+                (canonical_id,),
+            )
+            if canonical and canonical.get("email"):
+                print(
+                    f"[MAGIC_CODE] Merged identity {str(identity['id'])[:8]}... "
+                    f"→ canonical {canonical_id[:8]}... (email: {canonical['email']})"
+                )
+                identity = canonical
+                email = canonical["email"]
 
         # Check rate limits
         rate_limit_ok, rate_limit_msg = MagicCodeService._check_rate_limits(email)
@@ -248,13 +264,22 @@ class MagicCodeService:
 
         # Get identity for this email
         identity = query_one(
-            f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
+            f"SELECT id, merged_into_id FROM {Tables.IDENTITIES} WHERE email = %s",
             (email,),
         )
         if not identity:
             return (False, None, "Invalid email or code")
 
+        # Follow merge chain — always link session to canonical identity
         identity_id = str(identity["id"])
+        if identity.get("merged_into_id"):
+            from backend.services.identity_service import IdentityService
+            canonical_id = IdentityService.resolve_canonical_id(identity_id)
+            print(
+                f"[MAGIC_CODE] Redeem merge redirect: "
+                f"{identity_id[:8]}... → {canonical_id[:8]}..."
+            )
+            identity_id = canonical_id
 
         # Hash the provided code
         code_hash = MagicCodeService.hash_code(code)

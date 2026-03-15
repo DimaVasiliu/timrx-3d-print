@@ -386,35 +386,79 @@ class IdentityService:
         print(f"[IDENTITY] Created new identity: {identity_id} (email: {normalized_email or 'anonymous'})")
         return identity
 
+    # ─────────────────────────────────────────────────────────────
+    # Merge Resolution
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def resolve_canonical_id(identity_id: str, max_hops: int = 3) -> str:
+        """
+        Follow the merged_into_id chain to the canonical (non-merged) identity.
+
+        Returns the original identity_id if the identity is not merged.
+        Follows up to max_hops redirects to guard against cycles.
+        """
+        current_id = identity_id
+        for hop in range(max_hops):
+            row = query_one(
+                f"SELECT id, merged_into_id FROM {Tables.IDENTITIES} WHERE id = %s",
+                (current_id,),
+            )
+            if not row or not row.get("merged_into_id"):
+                break
+            next_id = str(row["merged_into_id"])
+            print(
+                f"[IDENTITY] Merge redirect hop {hop + 1}: "
+                f"{current_id[:8]}... → {next_id[:8]}..."
+            )
+            current_id = next_id
+        return current_id
+
+    # ─────────────────────────────────────────────────────────────
+    # Identity Lookups (all follow merged_into_id)
+    # ─────────────────────────────────────────────────────────────
+
     @staticmethod
     def get_identity(identity_id: str) -> Optional[Dict[str, Any]]:
         """
         Get an identity by ID.
+        Follows merged_into_id to canonical identity if merged.
         Returns None if not found.
         """
+        canonical_id = IdentityService.resolve_canonical_id(identity_id)
         return query_one(
             f"SELECT * FROM {Tables.IDENTITIES} WHERE id = %s",
-            (identity_id,),
+            (canonical_id,),
         )
 
     @staticmethod
     def get_identity_by_email(email: str) -> Optional[Dict[str, Any]]:
         """
         Get an identity by email address.
+        Follows merged_into_id to canonical identity if merged.
         Returns None if not found.
         """
         normalized_email = email.strip().lower()
-        return query_one(
+        result = query_one(
             f"SELECT * FROM {Tables.IDENTITIES} WHERE email = %s",
             (normalized_email,),
         )
+        if result and result.get("merged_into_id"):
+            canonical_id = IdentityService.resolve_canonical_id(str(result["id"]))
+            return query_one(
+                f"SELECT * FROM {Tables.IDENTITIES} WHERE id = %s",
+                (canonical_id,),
+            )
+        return result
 
     @staticmethod
     def get_identity_with_wallet(identity_id: str) -> Optional[Dict[str, Any]]:
         """
         Get identity with wallet balance.
+        Follows merged_into_id to canonical identity if merged.
         Returns combined dict with identity and wallet fields.
         """
+        canonical_id = IdentityService.resolve_canonical_id(identity_id)
         return query_one(
             f"""
             SELECT i.*, w.balance_credits
@@ -422,7 +466,7 @@ class IdentityService:
             LEFT JOIN {Tables.WALLETS} w ON w.identity_id = i.id
             WHERE i.id = %s
             """,
-            (identity_id,),
+            (canonical_id,),
         )
 
     # Reasons for email attachment failure (internal use only - never expose to users)
@@ -639,6 +683,11 @@ class IdentityService:
         Returns None if session is invalid, expired, or revoked.
         Also updates identity's last_seen_at.
 
+        Merge resolution:
+        - If the session's identity has merged_into_id set, updates the
+          session row in-place to point to the canonical identity and
+          returns canonical identity data. No new session or cookie needed.
+
         Session renewal (sliding window):
         - If >50% of SESSION_TTL_DAYS has elapsed since session creation,
           extends expires_at by another full TTL from now.
@@ -664,6 +713,36 @@ class IdentityService:
         if not result:
             return None
 
+        # ── Merge resolution: redirect session to canonical identity ──
+        if result.get("merged_into_id"):
+            source_id = str(result["id"])
+            canonical_id = IdentityService.resolve_canonical_id(source_id)
+            if canonical_id != source_id:
+                # Update session row in-place — no cookie churn
+                execute(
+                    f"UPDATE {Tables.SESSIONS} SET identity_id = %s WHERE id = %s",
+                    (canonical_id, session_id),
+                )
+                print(
+                    f"[SESSION] Merge redirect: session {session_id[:8]}... "
+                    f"moved {source_id[:8]}... → {canonical_id[:8]}..."
+                )
+                # Re-query to get canonical identity data
+                result = query_one(
+                    f"""
+                    SELECT i.*, s.id as session_id, s.expires_at as session_expires_at,
+                           s.created_at as session_created_at
+                    FROM {Tables.SESSIONS} s
+                    JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
+                    WHERE s.id = %s
+                      AND s.revoked_at IS NULL
+                      AND s.expires_at > NOW()
+                    """,
+                    (session_id,),
+                )
+                if not result:
+                    return None
+
         # Touch identity in background (don't fail if this fails)
         try:
             IdentityService.touch_identity(str(result["id"]))
@@ -678,7 +757,6 @@ class IdentityService:
             )
         except Exception as e:
             result["_session_renewed"] = False
-            # Always log renewal failures — was silently swallowed before
             print(f"[SESSION] Renewal FAILED for {session_id[:8]}...: {type(e).__name__}: {e}")
 
         # ── TEMPORARY DIAGNOSTIC — remove after AUTH-1 verified ──
