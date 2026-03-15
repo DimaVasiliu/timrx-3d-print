@@ -671,13 +671,18 @@ class IdentityService:
             pass
 
         # Attempt sliding-window renewal (non-critical)
+        session_created_at = result.get("session_created_at")
         try:
-            session_created_at = result.get("session_created_at")
             result["_session_renewed"] = IdentityService._maybe_renew_session(
                 session_id, session_created_at
             )
+        except Exception as e:
+            result["_session_renewed"] = False
+            # Always log renewal failures — was silently swallowed before
+            print(f"[SESSION] Renewal FAILED for {session_id[:8]}...: {type(e).__name__}: {e}")
 
-            # ── TEMPORARY DIAGNOSTIC — remove after AUTH-1 verified ──
+        # ── TEMPORARY DIAGNOSTIC — remove after AUTH-1 verified ──
+        try:
             ttl_days = config.SESSION_TTL_DAYS
             threshold_days = ttl_days / 2
             age_days = (
@@ -694,12 +699,9 @@ class IdentityService:
                 f"threshold={threshold_days:.0f}d "
                 f"renewed={result['_session_renewed']}"
             )
-            # ── END TEMPORARY DIAGNOSTIC ──
-
-        except Exception as e:
-            result["_session_renewed"] = False
-            if SESSION_DEBUG:
-                print(f"[SESSION] Renewal failed for {session_id[:8]}...: {e}")
+        except Exception:
+            pass
+        # ── END TEMPORARY DIAGNOSTIC ──
 
         return result
 
