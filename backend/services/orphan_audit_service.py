@@ -20,7 +20,7 @@ Safety rules:
 """
 
 from typing import Dict, List, Any, Optional
-from backend.db import query, query_one, execute, transaction, Tables, fetch_one
+from backend.db import query_all, query_one, execute, transaction, Tables, fetch_one
 
 
 # ─────────────────────────────────────────────────────────
@@ -184,7 +184,7 @@ class OrphanAuditService:
         base_select = f"a.id, a.identity_id, a.s3_bucket, {s3_select}, a.status, a.created_at, a.deleted_at"
 
         if category == "ownerless":
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT {base_select}
                 FROM {table} a
@@ -196,7 +196,7 @@ class OrphanAuditService:
                 (age_threshold_days, limit),
             )
         elif category == "merged_away":
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT {base_select}, i.merged_into_id
                 FROM {table} a
@@ -209,7 +209,7 @@ class OrphanAuditService:
                 (age_threshold_days, limit),
             )
         elif category == "soft_deleted":
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT {base_select}
                 FROM {table} a
@@ -221,7 +221,7 @@ class OrphanAuditService:
                 (age_threshold_days, limit),
             )
         elif category == "unlinked":
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT {base_select}
                 FROM {table} a
@@ -235,7 +235,7 @@ class OrphanAuditService:
                 (age_threshold_days, limit),
             )
         elif category == "failed":
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT {base_select}
                 FROM {table} a
@@ -360,7 +360,7 @@ class OrphanAuditService:
         age_filter = f"AND a.created_at < NOW() - INTERVAL '{int(age_threshold_days)} days'"
 
         if dry_run:
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT a.id FROM {table} a
                 WHERE {where} {age_filter} {active_job_exclude}
@@ -438,7 +438,7 @@ class OrphanAuditService:
 
         s3_select = ", ".join(f"a.{col}" for col in s3_key_cols)
 
-        rows = query(
+        rows = query_all(
             f"""
             SELECT a.id, a.s3_bucket, {s3_select}
             FROM {table} a
@@ -495,7 +495,7 @@ class OrphanAuditService:
         table = cfg["table"]
 
         if dry_run:
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT a.id, a.identity_id, i.merged_into_id
                 FROM {table} a

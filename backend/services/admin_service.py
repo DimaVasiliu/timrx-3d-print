@@ -1210,7 +1210,7 @@ class IdentityInspectionService:
         # Subscriptions (with status)
         subs = query_all(
             f"""
-            SELECT id, status, plan_id, created_at, current_period_end
+            SELECT id, status, plan_code, created_at, current_period_end
             FROM {Tables.SUBSCRIPTIONS}
             WHERE identity_id = %s
             ORDER BY created_at DESC
@@ -1248,7 +1248,7 @@ class IdentityInspectionService:
                 {
                     "id": str(s["id"]),
                     "status": s["status"],
-                    "plan_id": s.get("plan_id"),
+                    "plan_code": s.get("plan_code"),
                     "created_at": ts(s.get("created_at")),
                     "current_period_end": ts(s.get("current_period_end")),
                 }

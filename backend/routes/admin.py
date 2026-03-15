@@ -3384,14 +3384,14 @@ def merge_history():
           "total": int
         }
     """
-    from backend.db import query, query_one, Tables
+    from backend.db import query_all, query_one, Tables
 
     try:
         limit = min(int(request.args.get("limit", 50)), 200)
         identity_id = request.args.get("identity_id", "").strip()
 
         if identity_id:
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT id, source_identity_id, target_identity_id,
                        merged_by, merge_reason, merge_mode, created_at, metadata
@@ -3410,7 +3410,7 @@ def merge_history():
                 (identity_id, identity_id),
             )
         else:
-            rows = query(
+            rows = query_all(
                 f"""
                 SELECT id, source_identity_id, target_identity_id,
                        merged_by, merge_reason, merge_mode, created_at, metadata
