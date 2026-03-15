@@ -3201,13 +3201,36 @@ def find_fragments():
 @require_admin
 def merge_preview():
     """
-    Dry-run merge simulation. Shows what WOULD happen if source identity
-    were merged into target identity. No data is changed.
+    Full merge preview combining identity inspection + real merge-engine
+    blocker checks.  No data is changed.
 
     Request body:
         { "source_id": "uuid", "target_id": "uuid" }
+
+    Response (200):
+        {
+          "ok": true,
+          "merge_preview": {
+            "source": { identity_id, email, email_verified },
+            "target": { identity_id, email, email_verified },
+            "would_transfer": { history_items, jobs, models, ... },
+            "target_after_merge": { history_items, jobs, credit_balance },
+            "conflicts": [ { type, severity, detail } ],
+            "safe_to_merge": bool,
+            "engine": {
+              "valid": bool,
+              "blocked_reason": str|null,
+              "row_counts": { table: count },
+              "subscription_conflict": bool,
+              "inflight_block": {...},
+              "idempotency_conflicts": [...],
+              "wallet_preview": { source_general, source_video, target_general, target_video }
+            }
+          }
+        }
     """
     from backend.services.admin_service import IdentityInspectionService
+    from backend.services.merge_service import MergeService
 
     try:
         data = request.get_json(silent=True) or {}
@@ -3219,11 +3242,206 @@ def merge_preview():
         if source_id == target_id:
             return jsonify({"ok": False, "error": "source_id and target_id must be different"}), 400
 
-        result = IdentityInspectionService.dry_run_merge(source_id, target_id)
-        if not result:
+        # Identity-level inspection (emails, counts, conflict hints)
+        inspection = IdentityInspectionService.dry_run_merge(source_id, target_id)
+        if not inspection:
             return jsonify({"ok": False, "error": "One or both identities not found"}), 404
 
-        return jsonify({"ok": True, "merge_preview": result})
+        # Real merge-engine preview (canonical resolution, real blockers)
+        engine = MergeService.preview_merge(source_id, target_id)
+
+        # Combine: if the engine finds a blocker the inspection missed, mark unsafe
+        if engine.get("blocked_reason"):
+            inspection["safe_to_merge"] = False
+            inspection["conflicts"].append({
+                "type": "ENGINE_BLOCK",
+                "severity": "BLOCKER",
+                "detail": engine["blocked_reason"],
+            })
+
+        inspection["engine"] = engine
+
+        return jsonify({"ok": True, "merge_preview": inspection})
     except Exception as e:
         print(f"[ADMIN] Merge preview error: {e}")
         return jsonify({"ok": False, "error": "Merge preview failed"}), 500
+
+
+@bp.route("/identity/merge-execute", methods=["POST"])
+@require_admin
+def merge_execute():
+    """
+    Admin-triggered identity merge.  Calls the same MergeService.execute_merge()
+    used by automatic restore/verify merges but records the admin as initiator.
+
+    Request body:
+        {
+          "source_id": "uuid",
+          "target_id": "uuid",
+          "reason": "optional free-text reason (default: admin_manual)"
+        }
+
+    Response (200 success):
+        {
+          "ok": true,
+          "merge_result": {
+            "success": true,
+            "source_id": "canonical-uuid",
+            "target_id": "canonical-uuid",
+            "tables_migrated": { table: count },
+            "wallet_result": {...},
+            "subscription_result": {...},
+            "sessions_revoked": int,
+            "warnings": [...]
+          }
+        }
+
+    Response (409 blocked):
+        {
+          "ok": false,
+          "error": "Merge blocked",
+          "blocked_reason": "...",
+          "next_step": "..."
+        }
+    """
+    from backend.services.merge_service import MergeService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        source_id = data.get("source_id", "").strip()
+        target_id = data.get("target_id", "").strip()
+        reason = data.get("reason", "").strip() or "admin_manual"
+
+        if not source_id or not target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id required"}), 400
+        if source_id == target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id must be different"}), 400
+
+        print(
+            f"[ADMIN] Merge execute requested: "
+            f"source={source_id[:8]}... → target={target_id[:8]}..., reason={reason}"
+        )
+
+        result = MergeService.execute_merge(
+            source_id=source_id,
+            target_id=target_id,
+            merged_by="admin",
+            reason=reason,
+            mode="full",
+            metadata={
+                "trigger": "admin_merge_execute",
+                "admin_reason": reason,
+            },
+        )
+
+        if not result["success"]:
+            blocked = result.get("blocked_reason", "unknown")
+            print(f"[ADMIN] Merge BLOCKED: {source_id[:8]}... → {target_id[:8]}...: {blocked}")
+            return jsonify({
+                "ok": False,
+                "error": "Merge blocked",
+                "blocked_reason": blocked,
+                "next_step": MergeService._suggest_next_step(blocked),
+            }), 409
+
+        print(
+            f"[ADMIN] Merge OK: {source_id[:8]}... → {target_id[:8]}... | "
+            f"tables={result.get('tables_migrated', {})}, "
+            f"sessions_revoked={result.get('sessions_revoked', 0)}"
+        )
+
+        return jsonify({"ok": True, "merge_result": result})
+    except Exception as e:
+        print(f"[ADMIN] Merge execute error: {e}")
+        return jsonify({"ok": False, "error": f"Merge execution failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/identity/merge-history", methods=["GET"])
+@require_admin
+def merge_history():
+    """
+    List recent identity merges from the audit table.
+
+    Query params:
+        - limit: Max rows (default 50, max 200)
+        - identity_id: Filter by source OR target identity
+
+    Response (200):
+        {
+          "ok": true,
+          "merges": [
+            {
+              "id": "uuid",
+              "source_identity_id": "uuid",
+              "target_identity_id": "uuid",
+              "merged_by": "system"|"admin",
+              "merge_reason": "restore"|"verify_email"|"admin_manual",
+              "merge_mode": "full",
+              "created_at": "ISO timestamp",
+              "metadata": { tables_migrated, total_rows_migrated, ... }
+            }
+          ],
+          "total": int
+        }
+    """
+    from backend.db import query, query_one, Tables
+
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        identity_id = request.args.get("identity_id", "").strip()
+
+        if identity_id:
+            rows = query(
+                f"""
+                SELECT id, source_identity_id, target_identity_id,
+                       merged_by, merge_reason, merge_mode, created_at, metadata
+                FROM {Tables.IDENTITY_MERGES}
+                WHERE source_identity_id::text = %s OR target_identity_id::text = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, identity_id, limit),
+            )
+            count_row = query_one(
+                f"""
+                SELECT COUNT(*) as cnt FROM {Tables.IDENTITY_MERGES}
+                WHERE source_identity_id::text = %s OR target_identity_id::text = %s
+                """,
+                (identity_id, identity_id),
+            )
+        else:
+            rows = query(
+                f"""
+                SELECT id, source_identity_id, target_identity_id,
+                       merged_by, merge_reason, merge_mode, created_at, metadata
+                FROM {Tables.IDENTITY_MERGES}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            count_row = query_one(
+                f"SELECT COUNT(*) as cnt FROM {Tables.IDENTITY_MERGES}"
+            )
+
+        merges = []
+        for row in (rows or []):
+            merges.append({
+                "id": str(row["id"]),
+                "source_identity_id": str(row["source_identity_id"]),
+                "target_identity_id": str(row["target_identity_id"]),
+                "merged_by": row["merged_by"],
+                "merge_reason": row["merge_reason"],
+                "merge_mode": row["merge_mode"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "metadata": row.get("metadata") or {},
+            })
+
+        return jsonify({
+            "ok": True,
+            "merges": merges,
+            "total": count_row["cnt"] if count_row else 0,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Merge history error: {e}")
+        return jsonify({"ok": False, "error": "Merge history failed"}), 500
