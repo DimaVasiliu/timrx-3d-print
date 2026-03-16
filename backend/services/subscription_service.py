@@ -464,10 +464,12 @@ class SubscriptionService:
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    # Fetch subscription to determine credits and check yearly remaining
+                    # Fetch subscription with all fields needed for entitlement check
                     cur.execute(
                         f"""
-                        SELECT id, identity_id, plan_code, status, credits_remaining_months
+                        SELECT id, identity_id, plan_code, status,
+                               credits_remaining_months,
+                               suspended_at, expired_at, ends_at, prepaid_until
                         FROM {Tables.SUBSCRIPTIONS}
                         WHERE id::text = %s
                         """,
@@ -478,13 +480,63 @@ class SubscriptionService:
                         print(f"[SUB] Subscription {subscription_id} not found")
                         return None
 
+                    # ── ENTITLEMENT GUARD ─────────────────────────────────
+                    # Defense-in-depth: block grants even if caller forgot to
+                    # filter.  Allowed statuses for credit grants:
+                    #   active     — normal paying subscription
+                    #   cancelled  — user cancelled but still within paid period
+                    # All other statuses (suspended, past_due, expired,
+                    # pending, pending_payment) must NOT receive credits.
+                    _GRANT_ALLOWED_STATUSES = {"active", "cancelled"}
+                    sub_status = sub.get("status")
+
+                    if sub_status not in _GRANT_ALLOWED_STATUSES:
+                        print(
+                            f"[SUB] Grant blocked — status '{sub_status}' not in "
+                            f"{_GRANT_ALLOWED_STATUSES}: sub={subscription_id}"
+                        )
+                        return None
+
+                    if sub.get("suspended_at"):
+                        print(
+                            f"[SUB] Grant blocked — subscription suspended "
+                            f"(suspended_at={sub['suspended_at']}): sub={subscription_id}"
+                        )
+                        return None
+
+                    if sub.get("expired_at"):
+                        print(
+                            f"[SUB] Grant blocked — subscription expired "
+                            f"(expired_at={sub['expired_at']}): sub={subscription_id}"
+                        )
+                        return None
+
+                    from datetime import timezone as _tz
+                    _now = datetime.now(_tz.utc)
+
+                    if sub.get("ends_at") and sub["ends_at"] <= _now:
+                        print(
+                            f"[SUB] Grant blocked — past ends_at "
+                            f"({sub['ends_at'].isoformat()}): sub={subscription_id}"
+                        )
+                        return None
+
+                    is_yearly = "_yearly" in sub["plan_code"]
+
+                    if is_yearly and sub.get("prepaid_until") and sub["prepaid_until"] <= _now:
+                        print(
+                            f"[SUB] Grant blocked — yearly prepaid_until passed "
+                            f"({sub['prepaid_until'].isoformat()}): sub={subscription_id}"
+                        )
+                        return None
+                    # ── END ENTITLEMENT GUARD ─────────────────────────────
+
                     plan = SUBSCRIPTION_PLANS.get(sub["plan_code"])
                     if not plan:
                         print(f"[SUB] Unknown plan for subscription {subscription_id}: {sub['plan_code']}")
                         return None
 
                     # For yearly plans, check if any months remain
-                    is_yearly = "_yearly" in sub["plan_code"]
                     remaining = sub.get("credits_remaining_months")
                     if is_yearly and remaining is not None and remaining <= 0:
                         print(f"[SUB] Yearly subscription {subscription_id} has no remaining months")
@@ -588,49 +640,14 @@ class SubscriptionService:
     @staticmethod
     def run_pending_grants() -> int:
         """
-        Find active subscriptions that need a credit grant for the current
-        period and grant them.  Returns the number of grants issued.
+        Legacy endpoint — delegates to the hardened process_due_credit_allocations().
 
-        Safe to call repeatedly (idempotent per period).
+        Returns the number of grants issued (for backward-compatible callers).
         """
-        if not USE_DB:
-            return 0
-
-        granted = 0
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    # Find active subs where the current period hasn't been granted
-                    cur.execute(
-                        f"""
-                        SELECT s.id, s.identity_id, s.plan_code,
-                               s.current_period_start, s.current_period_end
-                        FROM {Tables.SUBSCRIPTIONS} s
-                        WHERE s.status = 'active'
-                          AND s.current_period_start IS NOT NULL
-                          AND s.current_period_start <= NOW()
-                          AND NOT EXISTS (
-                              SELECT 1 FROM {Tables.SUBSCRIPTION_CYCLES} c
-                              WHERE c.subscription_id = s.id
-                                AND c.period_start = s.current_period_start
-                          )
-                        """,
-                    )
-                    subs = cur.fetchall()
-
-            for sub in subs or []:
-                cycle_id = SubscriptionService.grant_subscription_credits(
-                    str(sub["id"]),
-                    sub["current_period_start"],
-                    sub["current_period_end"],
-                )
-                if cycle_id:
-                    granted += 1
-
-        except Exception as e:
-            print(f"[SUB] Error running pending grants: {e}")
-
-        print(f"[SUB] run_pending_grants: issued {granted} grant(s)")
+        print("[SUB] run_pending_grants: delegating to process_due_credit_allocations()")
+        result = SubscriptionService.process_due_credit_allocations()
+        granted = result.get("granted", 0) if isinstance(result, dict) else 0
+        print(f"[SUB] run_pending_grants (delegated): issued {granted} grant(s)")
         return granted
 
     @staticmethod

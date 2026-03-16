@@ -673,10 +673,20 @@ class MollieService:
             # Fetch current wallet balance to return in response
             # This allows frontend to update UI immediately without polling /api/me
             from backend.services.wallet_service import WalletService
+            from backend.services.wallet_service import get_credit_type_for_plan, CreditType
             wallet = WalletService.get_or_create_wallet(identity_id)
             balance_credits = wallet.get("balance_credits", 0) if wallet else 0
             reserved_credits = wallet.get("reserved_credits", 0) if wallet else 0
             available_credits = max(0, balance_credits - reserved_credits)
+            balance_video_credits = wallet.get("balance_video_credits", 0) if wallet else 0
+            reserved_video_credits = wallet.get("reserved_video_credits", 0) if wallet else 0
+            available_video_credits = max(0, balance_video_credits - reserved_video_credits)
+
+            # Determine credit type so frontend knows which pool was topped up
+            try:
+                credit_type = get_credit_type_for_plan(plan_code) if plan_code else CreditType.GENERAL
+            except Exception:
+                credit_type = CreditType.GENERAL
 
             return {
                 "ok": True,
@@ -684,10 +694,16 @@ class MollieService:
                 "credits_granted": True,
                 "was_existing": was_existing,
                 "message": "Credits granted" if not was_existing else "Already processed",
-                # Include wallet balance for frontend to use directly
+                "credit_type": credit_type,
+                "plan_code": plan_code,
+                # General credits pool
                 "balance_credits": balance_credits,
                 "reserved_credits": reserved_credits,
                 "available_credits": available_credits,
+                # Video credits pool
+                "balance_video_credits": balance_video_credits,
+                "reserved_video_credits": reserved_video_credits,
+                "available_video_credits": available_video_credits,
                 "identity_id": identity_id,
             }
         else:
@@ -1098,6 +1114,39 @@ class MollieService:
                 f"sub_id={sub_id} payment_id={payment_id} identity={identity_id}"
             )
 
+            # ── Cancel the Mollie subscription object so no future charges occur ──
+            mollie_sub_id = sub.get("provider_subscription_id")
+            mollie_cust_id = sub.get("mollie_customer_id")
+            provider_cancelled = False
+            if mollie_sub_id and mollie_cust_id:
+                try:
+                    provider_cancelled = MollieService.cancel_mollie_subscription(
+                        mollie_cust_id, mollie_sub_id
+                    )
+                    if provider_cancelled:
+                        print(
+                            f"[SUB] Mollie subscription cancelled after suspension: "
+                            f"sub={mollie_sub_id} customer={mollie_cust_id}"
+                        )
+                    else:
+                        # May already be cancelled on Mollie's side — not fatal
+                        print(
+                            f"[SUB] WARNING: Could not cancel Mollie subscription "
+                            f"after suspension (may already be cancelled): "
+                            f"sub={mollie_sub_id} customer={mollie_cust_id}"
+                        )
+                except Exception as cancel_err:
+                    # Never fail the suspension because of a provider-side error
+                    print(
+                        f"[SUB] WARNING: Mollie subscription cancel failed after "
+                        f"suspension (non-fatal): sub={mollie_sub_id} err={cancel_err}"
+                    )
+            else:
+                print(
+                    f"[SUB] No Mollie subscription to cancel (no provider IDs): "
+                    f"sub_id={sub_id}"
+                )
+
             # TODO: Send email notification to user about suspension
 
             return {
@@ -1105,6 +1154,7 @@ class MollieService:
                 "was_existing": False,
                 "subscription_id": sub_id,
                 "reason": suspend_reason,
+                "provider_cancelled": provider_cancelled,
             }
 
         except Exception as e:
