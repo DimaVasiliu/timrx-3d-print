@@ -1565,6 +1565,88 @@ Need help? Reply to this email or contact support@timrx.live
     return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
 
 
+def send_subscription_suspended_email(
+    to_email: str,
+    plan_code: str,
+    suspend_reason: str = "refund",
+) -> bool:
+    """
+    Send email when a subscription is suspended due to refund or chargeback.
+    """
+    # Get plan info
+    try:
+        from backend.services.subscription_service import SUBSCRIPTION_PLANS
+        plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
+        plan_name = plan_info.get("name", plan_code.replace("_", " ").title())
+    except Exception:
+        plan_name = plan_code.replace("_", " ").title()
+
+    reason_label = "a chargeback" if suspend_reason == "chargeback" else "a refund"
+
+    subject = f"Your TimrX {plan_name} Subscription Has Been Suspended"
+
+    logo_bytes = _load_logo()
+
+    warning_banner = f'''
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#fef2f2;border:1px solid #fca5a5;border-radius:8px;margin-bottom:20px;">
+            <tr>
+                <td style="padding:20px;">
+                    <p style="margin:0 0 8px 0;font-size:16px;font-weight:600;color:#991b1b;font-family:Arial,Helvetica,sans-serif;">
+                        Subscription Suspended
+                    </p>
+                    <p style="margin:0;font-size:14px;color:#b91c1c;font-family:Arial,Helvetica,sans-serif;">
+                        Your {plan_name} subscription has been suspended due to {reason_label}.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    body_html = f'''
+        {warning_banner}
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+                <td>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        Monthly credit allocations have been paused and no further charges will be made on this subscription.
+                        Any remaining credits in your account are still available to use.
+                    </p>
+                    <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        If you believe this was a mistake, please contact our support team and we'll be happy to help resolve the situation.
+                    </p>
+                    <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
+                        You can resubscribe at any time from your account if you'd like to continue using TimrX.
+                    </p>
+                </td>
+            </tr>
+        </table>
+    '''
+
+    html_body = render_email_html(
+        title="Subscription Suspended",
+        intro=f"Your {plan_name} subscription has been suspended due to {reason_label}.",
+        body_html=body_html,
+        logo_cid="timrx_logo" if logo_bytes else None,
+    )
+
+    text_body = f"""Subscription Suspended - TimrX
+
+Your {plan_name} subscription has been suspended due to {reason_label}.
+
+Monthly credit allocations have been paused and no further charges will be made on this subscription. Any remaining credits in your account are still available to use.
+
+If you believe this was a mistake, please contact our support team and we'll be happy to help resolve the situation.
+
+You can resubscribe at any time from your account if you'd like to continue using TimrX.
+
+---
+TimrX - 3D Print Hub
+Need help? Reply to this email or contact support@timrx.live
+"""
+
+    return _send_with_logo(to_email, subject, html_body, text_body, logo_bytes)
+
+
 def send_past_due_reminder_email(
     to_email: str,
     plan_code: str,

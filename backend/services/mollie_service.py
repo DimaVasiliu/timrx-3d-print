@@ -1326,7 +1326,20 @@ class MollieService:
                     f"sub_id={sub_id}"
                 )
 
-            # TODO: Send email notification to user about suspension
+            # Send suspension notification email (never fail the suspension flow)
+            customer_email = (updated_sub or {}).get("customer_email") or sub.get("customer_email")
+            if customer_email:
+                try:
+                    SubscriptionService._send_subscription_suspended_email(
+                        customer_email=customer_email,
+                        plan_code=plan_code,
+                        suspend_reason=suspend_reason,
+                    )
+                    print(f"[SUB] Suspension email sent: sub_id={sub_id} email={customer_email}")
+                except Exception as email_err:
+                    print(f"[SUB] WARNING: Suspension email failed (non-fatal): sub_id={sub_id} err={email_err}")
+            else:
+                print(f"[SUB] No customer email for suspension notification: sub_id={sub_id}")
 
             return {
                 "suspended": True,

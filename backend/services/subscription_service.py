@@ -2264,6 +2264,27 @@ class SubscriptionService:
             return False
 
     @staticmethod
+    def _send_subscription_suspended_email(
+        customer_email: str,
+        plan_code: str,
+        suspend_reason: str = "refund",
+    ) -> bool:
+        """Send email when subscription is suspended due to refund/chargeback."""
+        try:
+            from backend.emailer import send_subscription_suspended_email
+            return send_subscription_suspended_email(
+                to_email=customer_email,
+                plan_code=plan_code,
+                suspend_reason=suspend_reason,
+            )
+        except ImportError:
+            print(f"[SUB] send_subscription_suspended_email not available")
+            return False
+        except Exception as e:
+            print(f"[SUB] Error sending subscription suspended email: {e}")
+            return False
+
+    @staticmethod
     def _send_subscription_renewed_email(
         customer_email: str,
         plan_code: str,
