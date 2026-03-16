@@ -1207,10 +1207,12 @@ class IdentityInspectionService:
             except Exception:
                 counts[label] = -1  # Table may not exist
 
-        # Subscriptions (with status)
+        # Subscriptions (with status and failure info)
         subs = query_all(
             f"""
-            SELECT id, status, plan_code, created_at, current_period_end
+            SELECT id, status, plan_code, created_at, current_period_end,
+                   failure_count, failed_at, suspended_at, ends_at,
+                   provider_subscription_id
             FROM {Tables.SUBSCRIPTIONS}
             WHERE identity_id = %s
             ORDER BY created_at DESC
@@ -1248,9 +1250,15 @@ class IdentityInspectionService:
                 {
                     "id": str(s["id"]),
                     "status": s["status"],
+                    "is_past_due": s["status"] == "past_due",
                     "plan_code": s.get("plan_code"),
                     "created_at": ts(s.get("created_at")),
                     "current_period_end": ts(s.get("current_period_end")),
+                    "failure_count": s.get("failure_count", 0) or 0,
+                    "failed_at": ts(s.get("failed_at")),
+                    "suspended_at": ts(s.get("suspended_at")),
+                    "ends_at": ts(s.get("ends_at")),
+                    "provider_subscription_id": s.get("provider_subscription_id"),
                 }
                 for s in subs
             ],
