@@ -563,19 +563,198 @@ class MollieService:
                     "error": "Failed to process refund",
                 }
 
-        # Non-paid statuses: failed, canceled, expired, open, pending
-        # No credits granted - just acknowledge the webhook
+        # ─────────────────────────────────────────────────────────────
+        # FAILED / CANCELED / EXPIRED — subscription lifecycle handling
+        # ─────────────────────────────────────────────────────────────
+        # Never grant credits.  For subscription-related payments,
+        # transition the subscription to past_due so the user sees the
+        # correct state and the grant cron stops allocating credits.
+        #
+        # One-time purchase failures are logged but need no state change
+        # (no subscription to mark past_due).
+        #
+        # Idempotency: uses _mark_payment_processing() so the same
+        # payment_id+status pair is only handled once.  mark_past_due()
+        # itself is also guarded (WHERE status = 'active'), so repeated
+        # calls for different failed payments on an already-past_due sub
+        # still increment failure_count correctly.
+        # ─────────────────────────────────────────────────────────────
         if status in ("failed", "canceled", "expired"):
-            print(
-                f"[MOLLIE] Payment {status} - no credits granted: payment_id={payment_id}, "
-                f"identity_id={identity_id}, plan_code={plan_code}"
+            is_subscription = subscription_id or payment_type in (
+                "subscription_first", "subscription_recurring",
             )
 
+            if is_subscription:
+                # Claim this payment+status for idempotency (same mechanism
+                # used by paid/refunded paths).  If already processed, skip.
+                if not MollieService._mark_payment_processing(payment_id, status):
+                    print(
+                        f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                        f"SKIPPED — already processed (webhook idempotency guard)"
+                    )
+                    return {
+                        "ok": True,
+                        "status": status,
+                        "message": f"Payment {status} already processed (idempotent)",
+                    }
+
+                # Find the subscription to mark as past_due
+                sub = MollieService._find_subscription_for_failed_payment(
+                    subscription_id, identity_id, payment_type,
+                )
+
+                if sub:
+                    from backend.services.subscription_service import SubscriptionService
+                    sub_id = str(sub["id"])
+                    sub_status = sub.get("status")
+
+                    # Only escalate active → past_due.
+                    # If already past_due, just bump failure_count.
+                    # If suspended/cancelled/expired, leave as-is.
+                    if sub_status == "active":
+                        marked = SubscriptionService.mark_past_due(sub_id, f"payment_{status}")
+                        MollieService._mark_payment_completed(payment_id, status,
+                                                              "marked_past_due" if marked else "mark_past_due_failed")
+                        print(
+                            f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                            f"sub_id={sub_id} action=marked_past_due success={marked}"
+                        )
+                        return {
+                            "ok": True,
+                            "status": status,
+                            "message": f"Subscription {sub_id} marked past_due",
+                            "subscription_id": sub_id,
+                        }
+                    elif sub_status == "past_due":
+                        # Already past_due — bump failure_count for tracking
+                        MollieService._increment_failure_count(sub_id)
+                        MollieService._mark_payment_completed(payment_id, status, "failure_count_bumped")
+                        print(
+                            f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                            f"sub_id={sub_id} action=failure_count_bumped (already past_due)"
+                        )
+                        return {
+                            "ok": True,
+                            "status": status,
+                            "message": f"Subscription {sub_id} already past_due, failure_count incremented",
+                            "subscription_id": sub_id,
+                        }
+                    else:
+                        # suspended / cancelled / expired — no state change needed
+                        MollieService._mark_payment_completed(payment_id, status, f"no_op_status_{sub_status}")
+                        print(
+                            f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                            f"sub_id={sub_id} action=no_op (sub already {sub_status})"
+                        )
+                        return {
+                            "ok": True,
+                            "status": status,
+                            "message": f"Subscription {sub_id} is {sub_status}, no action needed",
+                            "subscription_id": sub_id,
+                        }
+                else:
+                    MollieService._mark_payment_completed(payment_id, status, "sub_not_found")
+                    print(
+                        f"[SUB] payment_id={payment_id} status={status} seq={seq_type} "
+                        f"action=no_op reason=subscription_not_found "
+                        f"identity={identity_id} mollie_sub={subscription_id}"
+                    )
+            else:
+                # One-time purchase failure — no subscription to mark
+                print(
+                    f"[MOLLIE] One-time payment {status} — no action: "
+                    f"payment_id={payment_id} identity={identity_id} plan={plan_code}"
+                )
+
+            return {
+                "ok": True,
+                "status": status,
+                "message": f"Payment {status} handled",
+            }
+
+        # Unrecognised status — acknowledge safely
         return {
             "ok": True,
             "status": status,
             "message": f"Payment status is '{status}', no action taken",
         }
+
+    # ─────────────────────────────────────────────────────────────
+    # Helpers for failed-payment handling
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _find_subscription_for_failed_payment(
+        mollie_subscription_id: Optional[str],
+        identity_id: str,
+        payment_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Locate the internal subscription related to a failed payment.
+
+        Tries provider_subscription_id first (most reliable), then falls back
+        to identity lookup for first-payment failures where Mollie hasn't
+        assigned a subscriptionId yet.
+        """
+        from backend.services.subscription_service import SubscriptionService
+
+        if mollie_subscription_id:
+            sub = SubscriptionService.get_subscription_by_provider_id(
+                "mollie", mollie_subscription_id,
+            )
+            if sub:
+                return sub
+
+        # Fallback: find by identity (for subscription_first failures where
+        # Mollie hasn't assigned a subscriptionId yet, or recurring payments
+        # with missing metadata)
+        if identity_id and identity_id != "unknown" and payment_type in (
+            "subscription_first", "subscription_recurring", "",
+        ):
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""
+                            SELECT * FROM {Tables.SUBSCRIPTIONS}
+                            WHERE identity_id = %s
+                              AND status IN ('active', 'past_due', 'pending_payment')
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            (identity_id,),
+                        )
+                        return cur.fetchone()
+            except Exception as e:
+                print(f"[SUB] Error finding subscription for failed payment: {e}")
+
+        return None
+
+    @staticmethod
+    def _increment_failure_count(subscription_id: str) -> None:
+        """
+        Bump failure_count and update failed_at for an already-past_due subscription.
+
+        Used when additional failed payments arrive after the initial past_due transition.
+        """
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.SUBSCRIPTIONS}
+                        SET failure_count = COALESCE(failure_count, 0) + 1,
+                            failed_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id::text = %s
+                        """,
+                        (subscription_id,),
+                    )
+                conn.commit()
+        except Exception as e:
+            print(f"[SUB] Error incrementing failure_count for {subscription_id}: {e}")
+
+    # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def confirm_payment(payment_id: str, identity_id: str) -> Dict[str, Any]:
@@ -1824,6 +2003,20 @@ class MollieService:
         plan_code = sub["plan_code"]
         billing_day = sub.get("billing_day") or paid_at.day
         is_yearly = "_yearly" in plan_code
+
+        # ─────────────────────────────────────────────────────────────
+        # RECOVERY: If subscription is past_due, a successful payment
+        # means the payment method worked — reactivate before granting
+        # so the entitlement guard in grant_subscription_credits() allows
+        # the grant.  Only reactivate from past_due, never from
+        # suspended/cancelled/expired.
+        # ─────────────────────────────────────────────────────────────
+        if sub.get("status") == "past_due":
+            print(
+                f"[SUB] payment_id={payment_id} seq=recurring sub_id={sub_id} "
+                f"action=reactivating_from_past_due"
+            )
+            SubscriptionService.reactivate_subscription(sub_id)
 
         # Calculate period for this payment
         period_start, period_end = SubscriptionService.calculate_cycle_period(paid_at, billing_day)
