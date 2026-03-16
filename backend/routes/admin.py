@@ -1637,12 +1637,16 @@ def run_all_subscription_jobs():
     This is a convenience endpoint that runs:
     1. Credit allocation processing (process_due_credit_allocations)
     2. Expired subscription check (check_expired_subscriptions)
+    3. Past-due subscription expiry (check_and_expire_past_due_subscriptions)
+    4. Past-due reminder emails (send_past_due_reminders)
 
     Recommended frequency: every 1-6 hours
 
     Returns:
         - credits: Credit allocation results
         - expired: Number of subscriptions expired
+        - past_due_expired: Past-due subscriptions that timed out
+        - reminders: Past-due reminder email results
     """
     try:
         from backend.services.subscription_service import SubscriptionService
@@ -1653,8 +1657,14 @@ def run_all_subscription_jobs():
         # Process credit allocations
         credit_result = SubscriptionService.process_due_credit_allocations()
 
-        # Check expired subscriptions
+        # Check expired subscriptions (cancelled past period_end)
         expired_count = SubscriptionService.check_expired_subscriptions()
+
+        # Expire past_due subscriptions that have timed out
+        past_due_result = SubscriptionService.check_and_expire_past_due_subscriptions()
+
+        # Send past_due reminder emails (day 3 + day 5, idempotent)
+        reminder_result = SubscriptionService.send_past_due_reminders()
 
         return jsonify({
             "ok": True,
@@ -1664,6 +1674,14 @@ def run_all_subscription_jobs():
                 "errors": credit_result.get("errors", 0),
             },
             "expired": expired_count,
+            "past_due_expired": {
+                "period_end_expired": past_due_result.get("period_end_expired", 0),
+                "past_due_expired": past_due_result.get("past_due_expired", 0),
+            },
+            "reminders": {
+                "sent": reminder_result.get("sent", 0),
+                "skipped": reminder_result.get("skipped", 0),
+            },
         })
     except Exception as e:
         print(f"[ADMIN] Subscription jobs error: {e}")
