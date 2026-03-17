@@ -83,6 +83,7 @@ class MergeService:
         reason: str = "restore",
         mode: str = "full",
         metadata: Optional[Dict[str, Any]] = None,
+        skip_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute a full identity merge: source → target.
@@ -145,7 +146,8 @@ class MergeService:
 
                 # ── 3. Execute migration + finalization ──
                 MergeService._execute_migration(
-                    cur, canon_source, canon_target, result
+                    cur, canon_source, canon_target, result,
+                    skip_session_id=skip_session_id,
                 )
                 MergeService._finalize_merge(
                     cur, canon_source, canon_target,
@@ -244,7 +246,8 @@ class MergeService:
 
     @staticmethod
     def _execute_migration(
-        cur, source_id: str, target_id: str, result: Dict
+        cur, source_id: str, target_id: str, result: Dict,
+        skip_session_id: Optional[str] = None,
     ) -> None:
         """Execute all data migrations within the active transaction."""
         # Simple tables
@@ -297,9 +300,10 @@ class MergeService:
             cur, source_id, target_id
         )
 
-        # Revoke source sessions
+        # Revoke source sessions (skip the caller's active session so it
+        # can be swung to the target identity after merge completes)
         result["sessions_revoked"] = MergeService._revoke_source_sessions(
-            cur, source_id
+            cur, source_id, skip_session_id=skip_session_id
         )
 
     @staticmethod
@@ -848,26 +852,46 @@ class MergeService:
     # ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _revoke_source_sessions(cur, source_id: str) -> int:
+    def _revoke_source_sessions(
+        cur, source_id: str, skip_session_id: Optional[str] = None
+    ) -> int:
         """
         Revoke all active sessions for the source identity.
 
-        Future session validation will find the identity merged and
-        resolve to canonical via merged_into_id chain.
+        If skip_session_id is provided, that session is excluded from
+        revocation so the caller can swing it to the target identity
+        after the merge completes (prevents the user from losing their
+        active session mid-restore).
         """
-        cur.execute(
-            f"""
-            UPDATE {Tables.SESSIONS}
-            SET revoked_at = NOW()
-            WHERE identity_id = %s
-              AND revoked_at IS NULL
-              AND expires_at > NOW()
-            """,
-            (source_id,),
-        )
+        if skip_session_id:
+            cur.execute(
+                f"""
+                UPDATE {Tables.SESSIONS}
+                SET revoked_at = NOW()
+                WHERE identity_id = %s
+                  AND revoked_at IS NULL
+                  AND expires_at > NOW()
+                  AND id != %s
+                """,
+                (source_id, skip_session_id),
+            )
+        else:
+            cur.execute(
+                f"""
+                UPDATE {Tables.SESSIONS}
+                SET revoked_at = NOW()
+                WHERE identity_id = %s
+                  AND revoked_at IS NULL
+                  AND expires_at > NOW()
+                """,
+                (source_id,),
+            )
         count = cur.rowcount
         if count > 0:
-            print(f"[MERGE] Revoked {count} active session(s) for source identity")
+            print(
+                f"[MERGE] Revoked {count} active session(s) for source identity"
+                + (f" (kept {skip_session_id[:8]}...)" if skip_session_id else "")
+            )
         return count
 
     # ─────────────────────────────────────────────────────────

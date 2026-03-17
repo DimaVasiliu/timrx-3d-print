@@ -550,6 +550,7 @@ def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
                 "email": email,
                 "source_stats": safety.get("stats"),
             },
+            skip_session_id=session_id,
         )
 
         if not merge_result["success"]:

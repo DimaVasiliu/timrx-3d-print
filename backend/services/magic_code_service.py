@@ -454,6 +454,7 @@ class MagicCodeService:
                     "email": email,
                     "source_stats": safety.get("stats"),
                 },
+                skip_session_id=session_id,
             )
 
             if not merge_result["success"]:
