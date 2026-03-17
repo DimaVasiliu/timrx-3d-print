@@ -281,17 +281,24 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
     return result
 
 
-def build_source_payload(body: dict, identity_id: str | None = None):
-    """Validate and build the source payload for Meshy operations."""
+def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: str = "input_task_id"):
+    """Validate and build the source payload for Meshy operations.
+
+    Args:
+        prefer: Which source to prefer when both are available.
+            "input_task_id" — best for refine (Meshy needs internal task data).
+            "model_url" — best for retexture/remesh (works with any model file).
+    """
     input_task_id = (body.get("input_task_id") or "").strip()
     model_url = (body.get("model_url") or "").strip()
-    # When both are provided, prefer input_task_id (more reliable for Meshy-origin
-    # models — Meshy uses its own internal reference instead of downloading from URL).
-    # Fall back to model_url only if input_task_id resolution fails.
     if input_task_id and model_url:
-        print(f"[build_source_payload] Both input_task_id and model_url provided, preferring input_task_id={input_task_id}")
+        print(f"[build_source_payload] Both provided, prefer={prefer} input_task_id={input_task_id}")
     if not input_task_id and not model_url:
         return None, "input_task_id or model_url required"
+
+    # When caller prefers model_url and we have one, skip input_task_id entirely
+    if prefer == "model_url" and model_url:
+        input_task_id = ""  # go straight to model_url path below
 
     if input_task_id:
         # Resolve internal IDs to original Meshy task IDs when needed.
@@ -331,29 +338,43 @@ def build_source_payload(body: dict, identity_id: str | None = None):
 
         if model_url and is_s3_url(model_url) and identity_id and USE_DB:
             s3_key = parse_s3_key(model_url)
+            # Collect identity IDs to check (current + any that merged into current)
+            identity_ids = [identity_id]
+            try:
+                with get_conn() as conn:
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(
+                            f"SELECT id::text FROM {Tables.IDENTITIES} WHERE merged_into_id = %s",
+                            (identity_id,),
+                        )
+                        identity_ids.extend(r["id"] for r in cur.fetchall())
+            except Exception:
+                pass  # proceed with just the current identity
+
             with get_conn() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # Check ownership in MODELS table (direct columns)
-                    # AND in HISTORY_ITEMS table (both direct glb_url column and payload->>'glb_url')
+                    # Check ownership in MODELS and HISTORY_ITEMS tables
+                    # Include merged identities so models from pre-merge still pass
                     cur.execute(
                         f"""
                         SELECT 1
                         FROM {Tables.MODELS}
-                        WHERE identity_id = %s AND (glb_s3_key = %s OR glb_url = %s)
+                        WHERE identity_id = ANY(%s) AND (glb_s3_key = %s OR glb_url = %s)
                         UNION
                         SELECT 1
                         FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s AND (
+                        WHERE identity_id = ANY(%s) AND (
                             glb_url = %s
                             OR payload->>'glb_url' = %s
                             OR payload->>'model_url' = %s
                         )
                         LIMIT 1
                         """,
-                        (identity_id, s3_key, model_url, identity_id, model_url, model_url, model_url),
+                        (identity_ids, s3_key, model_url, identity_ids, model_url, model_url, model_url),
                     )
                     row = cur.fetchone()
             if not row:
+                print(f"[build_source_payload] S3 ownership check failed: identity={identity_id} ids_checked={identity_ids} s3_key={s3_key}")
                 return None, "Model URL not found or access denied"
             signed = presign_s3_url(model_url)
             if signed:
