@@ -137,6 +137,11 @@ GENERAL_ACTION_CODES = {
     "refine",
     "remesh",
     "retexture",
+    "rigging",
+    "animation",
+    # Legacy uppercase variants
+    "MESHY_RIGGING",
+    "MESHY_ANIMATION",
 }
 
 # All known action codes (union of video + general)
