@@ -116,6 +116,7 @@ VIDEO_ACTION_CODES = {
 
 # Action codes that use GENERAL credits (3D + images)
 GENERAL_ACTION_CODES = {
+    # Legacy codes (backwards compatibility)
     "MESHY_TEXT_TO_3D",
     "MESHY_IMAGE_TO_3D",
     "MESHY_REFINE",
@@ -127,6 +128,15 @@ GENERAL_ACTION_CODES = {
     "GEMINI_IMAGE",
     "GEMINI_IMAGE_2K",
     "GEMINI_IMAGE_4K",
+    # Lowercase canonical variants (preferred)
+    "image_generate",
+    "image_generate_2k",
+    "image_generate_4k",
+    "text_to_3d_generate",
+    "image_to_3d_generate",
+    "refine",
+    "remesh",
+    "retexture",
 }
 
 # All known action codes (union of video + general)
