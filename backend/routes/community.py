@@ -42,32 +42,62 @@ def community_feed_mod():
                 type_filter = "AND cp.model_id IS NOT NULL"
             elif asset_type == "image":
                 type_filter = "AND cp.image_id IS NOT NULL"
+            elif asset_type == "video":
+                type_filter = "AND cp.history_item_id IS NOT NULL AND h_count.item_type = 'video'"
             elif asset_type == "history":
                 type_filter = "AND cp.history_item_id IS NOT NULL"
 
-            cursor.execute(f"""
-                SELECT COUNT(*) FROM timrx_app.community_posts cp
-                WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
-            """)
+            # For video filter we need a subquery join; use simpler count approach
+            if asset_type == "video":
+                cursor.execute("""
+                    SELECT COUNT(*) FROM timrx_app.community_posts cp
+                    JOIN timrx_app.history_items h_count ON cp.history_item_id = h_count.id
+                    WHERE cp.status = 'published' AND cp.deleted_at IS NULL
+                    AND h_count.item_type = 'video'
+                """)
+            else:
+                cursor.execute(f"""
+                    SELECT COUNT(*) FROM timrx_app.community_posts cp
+                    WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
+                """)
             total = cursor.fetchone()[0]
 
-            cursor.execute(f"""
-                SELECT
-                    cp.id, cp.display_name, cp.prompt_public, cp.show_prompt, cp.created_at,
-                    cp.model_id, cp.image_id, cp.history_item_id,
-                    m.title as model_title, m.prompt as model_prompt, m.thumbnail_url as model_thumbnail,
-                    m.glb_url as model_glb_url,
-                    i.filename as image_filename, i.thumbnail_url as image_thumbnail,
-                    h.title as history_title, h.prompt as history_prompt, h.thumbnail_url as history_thumbnail,
-                    h.glb_url as history_glb_url, h.image_url as history_image_url
-                FROM timrx_app.community_posts cp
-                LEFT JOIN timrx_app.models m ON cp.model_id = m.id
-                LEFT JOIN timrx_app.images i ON cp.image_id = i.id
-                LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
-                WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
-                ORDER BY cp.created_at DESC
-                LIMIT %s OFFSET %s
-            """, (limit, offset))
+            if asset_type == "video":
+                cursor.execute("""
+                    SELECT
+                        cp.id, cp.display_name, cp.prompt_public, cp.show_prompt, cp.created_at,
+                        cp.model_id, cp.image_id, cp.history_item_id,
+                        NULL as model_title, NULL as model_prompt, NULL as model_thumbnail, NULL as model_glb_url,
+                        NULL as image_filename, NULL as image_thumbnail,
+                        h.title as history_title, h.prompt as history_prompt, h.thumbnail_url as history_thumbnail,
+                        h.glb_url as history_glb_url, h.image_url as history_image_url,
+                        h.item_type as history_item_type, h.video_url as history_video_url
+                    FROM timrx_app.community_posts cp
+                    JOIN timrx_app.history_items h ON cp.history_item_id = h.id
+                    WHERE cp.status = 'published' AND cp.deleted_at IS NULL
+                    AND h.item_type = 'video'
+                    ORDER BY cp.created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (limit, offset))
+            else:
+                cursor.execute(f"""
+                    SELECT
+                        cp.id, cp.display_name, cp.prompt_public, cp.show_prompt, cp.created_at,
+                        cp.model_id, cp.image_id, cp.history_item_id,
+                        m.title as model_title, m.prompt as model_prompt, m.thumbnail_url as model_thumbnail,
+                        m.glb_url as model_glb_url,
+                        i.filename as image_filename, i.thumbnail_url as image_thumbnail,
+                        h.title as history_title, h.prompt as history_prompt, h.thumbnail_url as history_thumbnail,
+                        h.glb_url as history_glb_url, h.image_url as history_image_url,
+                        h.item_type as history_item_type, h.video_url as history_video_url
+                    FROM timrx_app.community_posts cp
+                    LEFT JOIN timrx_app.models m ON cp.model_id = m.id
+                    LEFT JOIN timrx_app.images i ON cp.image_id = i.id
+                    LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
+                    WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
+                    ORDER BY cp.created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (limit, offset))
 
             rows = cursor.fetchall()
             cursor.close()
@@ -77,9 +107,10 @@ def community_feed_mod():
         for row in rows:
             (post_id, display_name, prompt_public, show_prompt, created_at,
              model_id, image_id, history_item_id,
-             model_title, model_prompt, model_thumbnail, model_glb_url,
+             model_title, _model_prompt, model_thumbnail, _model_glb_url,
              image_filename, image_thumbnail,
-             history_title, history_prompt, history_thumbnail, history_glb_url, history_image_url) = row
+             history_title, _history_prompt, history_thumbnail, history_glb_url, _history_image_url,
+             history_item_type, history_video_url) = row
 
             post = {
                 "id": str(post_id),
@@ -106,12 +137,22 @@ def community_feed_mod():
                     "thumbnail_url": image_thumbnail,
                 }
             elif history_item_id:
-                post["asset_type"] = "history"
-                post["asset"] = {
-                    "id": str(history_item_id),
-                    "title": history_title,
-                    "thumbnail_url": history_thumbnail,
-                }
+                # Surface video history items as "video" type for the gallery
+                if history_item_type == "video":
+                    post["asset_type"] = "video"
+                    post["asset"] = {
+                        "id": str(history_item_id),
+                        "title": history_title,
+                        "thumbnail_url": history_thumbnail,
+                        "video_url": history_video_url,
+                    }
+                else:
+                    post["asset_type"] = "model" if history_glb_url else "image"
+                    post["asset"] = {
+                        "id": str(history_item_id),
+                        "title": history_title,
+                        "thumbnail_url": history_thumbnail,
+                    }
 
             posts.append(post)
 
