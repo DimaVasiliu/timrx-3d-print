@@ -92,7 +92,7 @@ def community_feed_mod():
                         cp.model_id, cp.image_id, cp.history_item_id,
                         m.title as model_title, m.prompt as model_prompt, m.thumbnail_url as model_thumbnail,
                         m.glb_url as model_glb_url,
-                        i.filename as image_filename, i.thumbnail_url as image_thumbnail,
+                        i.image_url as image_filename, i.thumbnail_url as image_thumbnail,
                         h.title as history_title, h.prompt as history_prompt, h.thumbnail_url as history_thumbnail,
                         h.glb_url as history_glb_url, h.image_url as history_image_url,
                         h.item_type as history_item_type, h.video_url as history_video_url
