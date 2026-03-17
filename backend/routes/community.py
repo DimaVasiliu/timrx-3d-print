@@ -7,9 +7,15 @@ Registered under /api/_mod to avoid conflicts during migration.
 from __future__ import annotations
 
 import logging
+import traceback
 import requests as http_requests
 
 from flask import Blueprint, jsonify, request
+
+try:
+    from psycopg.rows import tuple_row as _tuple_row
+except ImportError:
+    _tuple_row = None
 
 from backend.config import config
 from backend.db import USE_DB, get_conn
@@ -35,7 +41,7 @@ def community_feed_mod():
         asset_type = request.args.get("type")
 
         with get_conn() as conn:
-            cursor = conn.cursor()
+            cursor = conn.cursor(row_factory=_tuple_row) if _tuple_row else conn.cursor()
 
             type_filter = ""
             if asset_type == "model":
@@ -210,7 +216,7 @@ def community_share_mod():
                 }), 400
 
             with get_conn() as conn:
-                cursor = conn.cursor()
+                cursor = conn.cursor(row_factory=_tuple_row) if _tuple_row else conn.cursor()
 
                 if asset_type == "model":
                     cursor.execute("""
@@ -252,7 +258,8 @@ def community_share_mod():
             return jsonify({"ok": True, "post_id": str(post_id), "source": "modular"})
 
         except Exception as e:
-            print(f"[COMMUNITY][mod] Error in share: {e}")
+            print(f"[COMMUNITY][mod] Error in share: {type(e).__name__}: {e}")
+            print(traceback.format_exc())
             return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
 
     return _inner()
@@ -274,7 +281,7 @@ def community_delete_mod(post_id: str):
 
         try:
             with get_conn() as conn:
-                cursor = conn.cursor()
+                cursor = conn.cursor(row_factory=_tuple_row) if _tuple_row else conn.cursor()
                 cursor.execute("""
                     UPDATE timrx_app.community_posts
                     SET status = 'deleted', deleted_at = NOW()
