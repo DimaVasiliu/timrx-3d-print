@@ -36,7 +36,7 @@ from backend.services.pricing_service import (
     CANONICAL_TO_DB,
 )
 from backend.services.reservation_service import ReservationService
-from backend.services.wallet_service import WalletService
+from backend.services.wallet_service import WalletService, get_credit_type_for_action
 from backend.utils import log_generation_event
 
 
@@ -152,8 +152,9 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
             # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - No cost for {canonical_action}, no reservation needed")
             return None, None
 
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
+        credit_type = get_credit_type_for_action(canonical_action)
+        balance = WalletService.get_balance(identity_id, credit_type)
+        reserved = WalletService.get_reserved_credits(identity_id, credit_type)
         available = max(0, balance - reserved)
 
         # print(
