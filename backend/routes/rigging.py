@@ -123,9 +123,15 @@ def rig_start():
     except Exception as e:
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+        # Surface actionable face-limit errors instead of generic message
+        err_str = str(e)
+        user_msg = None
+        if "face limit" in err_str.lower() or "exceeds the" in err_str.lower():
+            user_msg = "Model has too many faces for rigging (max 300K). Please remesh the model first, then try rigging again."
         return jsonify(sanitize_provider_error(
             provider="meshy", error=e, job_id=internal_job_id,
             code=MODEL_GENERATION_FAILED,
+            message=user_msg,
         )), 502
 
     finalize_job_credits(reservation_id, internal_job_id, identity_id)
