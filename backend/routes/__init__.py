@@ -48,6 +48,7 @@ def register_blueprints(app):
     from backend.routes.text_to_3d import bp as text_to_3d_bp
     from backend.routes.image_to_3d import bp as image_to_3d_bp
     from backend.routes.mesh_operations import bp as mesh_ops_bp
+    from backend.routes.rigging import bp as rigging_bp
     from backend.routes.history import bp as history_bp
     from backend.routes.community import bp as community_bp
     from backend.routes.contact import bp as contact_bp
@@ -90,6 +91,7 @@ def register_blueprints(app):
     app.register_blueprint(text_to_3d_bp, url_prefix="/api/_mod")
     app.register_blueprint(image_to_3d_bp, url_prefix="/api/_mod")
     app.register_blueprint(mesh_ops_bp, url_prefix="/api/_mod")
+    app.register_blueprint(rigging_bp, url_prefix="/api/_mod")
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
     app.register_blueprint(video_bp, url_prefix="/api/_mod")
@@ -113,6 +115,7 @@ def register_blueprints(app):
     app.register_blueprint(health_bp, url_prefix="/api", name="health_compat")
     app.register_blueprint(assets_bp, url_prefix="/api", name="assets_compat")
     app.register_blueprint(mesh_ops_bp, url_prefix="/api", name="mesh_ops_compat")
+    app.register_blueprint(rigging_bp, url_prefix="/api", name="rigging_compat")
     app.register_blueprint(image_gen_bp, url_prefix="/api", name="image_gen_compat")
     app.register_blueprint(community_bp, url_prefix="/api", name="community_compat")
     app.register_blueprint(video_bp, url_prefix="/api", name="video_compat")

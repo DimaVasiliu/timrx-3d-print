@@ -14,7 +14,7 @@ from backend.config import ACTION_KEYS, MESHY_API_KEY
 from backend.utils import derive_display_title
 from backend.db import USE_DB, get_conn
 from backend.middleware import with_session
-from backend.services.async_dispatch import _dispatch_meshy_image_to_3d_async, get_executor
+from backend.services.async_dispatch import _dispatch_meshy_image_to_3d_async, _dispatch_meshy_multi_image_to_3d_async, get_executor
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.job_service import (
@@ -300,6 +300,281 @@ def image_to_3d_status_mod(job_id: str):
 
         if reservation_id:
             # Use internal_job_id (not meshy_job_id) for credit release tracking
+            release_job_credits(reservation_id, "provider_job_failed", internal_job_id or meshy_job_id)
+
+        if internal_job_id:
+            _update_job_status_failed(internal_job_id, error_msg)
+
+    return jsonify(out)
+
+
+# ─────────────────────────────────────────────────────────────
+# Multi-Image to 3D
+# ─────────────────────────────────────────────────────────────
+
+@bp.route("/multi-image-to-3d/start", methods=["POST", "OPTIONS"])
+@with_session
+def multi_image_to_3d_start_mod():
+    """Internal wrapper route around Meshy's /openapi/v1/multi-image-to-3d endpoint.
+    Accepts 1-4 image URLs and dispatches to Meshy via async worker."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    log_event("multi-image-to-3d/start:incoming[mod]", body)
+
+    image_urls = body.get("image_urls")
+    if not isinstance(image_urls, list) or not (1 <= len(image_urls) <= 4):
+        return jsonify({"error": "image_urls must be an array of 1-4 image URLs"}), 400
+    # Validate each entry is a non-empty string
+    image_urls = [u.strip() for u in image_urls if isinstance(u, str) and u.strip()]
+    if not (1 <= len(image_urls) <= 4):
+        return jsonify({"error": "image_urls must contain 1-4 valid image URLs"}), 400
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = ACTION_KEYS["image-to-3d"]
+    prompt = (body.get("prompt") or "").strip()
+    title = derive_display_title(prompt, None) if prompt else "Multi-Image to 3D Model"
+    job_meta = {
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": title,
+        "stage": "image3d",
+    }
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
+
+    payload = {
+        "image_urls": image_urls,
+        "ai_model": body.get("model") or "latest",
+        "enable_pbr": body.get("enable_pbr", True),
+    }
+
+    store_meta = {
+        "stage": "image3d",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": title,
+        "original_image_urls": image_urls,
+        "ai_model": payload.get("ai_model"),
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+    }
+
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    get_executor().submit(
+        _dispatch_meshy_multi_image_to_3d_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        payload,
+        store_meta,
+    )
+
+    log_event("multi-image-to-3d/start:dispatched[mod]", {"internal_job_id": internal_job_id})
+
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "source": "modular",
+    })
+
+
+@bp.route("/multi-image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def multi_image_to_3d_status_mod(job_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    log_event("multi-image-to-3d/status:incoming[mod]", {"job_id": job_id})
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id = g.identity_id
+    meshy_job_id = job_id
+    internal_job = None
+    ownership_verified = False
+
+    if USE_DB:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, status, upstream_job_id, error_message
+                        FROM timrx_billing.jobs
+                        WHERE id::text = %s AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (job_id, identity_id),
+                    )
+                    internal_job = cur.fetchone()
+
+            if internal_job:
+                ownership_verified = True
+                if internal_job["status"] == "queued":
+                    return jsonify({
+                        "status": "queued",
+                        "pct": 0,
+                        "stage": "image3d",
+                        "message": "Job is being dispatched to provider...",
+                        "job_id": job_id,
+                    })
+
+                if internal_job["status"] == "failed":
+                    return jsonify({
+                        "status": "failed",
+                        "error": internal_job.get("error_message", "Job failed"),
+                        "job_id": job_id,
+                    })
+
+                if internal_job["upstream_job_id"]:
+                    meshy_job_id = internal_job["upstream_job_id"]
+                else:
+                    return jsonify({
+                        "status": "pending",
+                        "pct": 0,
+                        "stage": "image3d",
+                        "message": "Waiting for provider response...",
+                        "job_id": job_id,
+                    })
+        except Exception as e:
+            print(f"[STATUS][mod] Error checking internal job {job_id}: {e}")
+
+    if not ownership_verified:
+        store = load_store()
+        store_meta = store.get(job_id) or {}
+        if store_meta:
+            job_user_id = store_meta.get("identity_id") or store_meta.get("user_id")
+            if identity_id and job_user_id and job_user_id != identity_id:
+                return jsonify({"error": "Job not found or access denied"}), 404
+
+            upstream_hint = store_meta.get("upstream_job_id") or store_meta.get("meshy_task_id")
+            stage_hint = store_meta.get("stage") or "image3d"
+            if not upstream_hint:
+                return jsonify({
+                    "status": "queued",
+                    "pct": 0,
+                    "stage": stage_hint,
+                    "message": "Job is being dispatched to provider...",
+                    "job_id": job_id,
+                })
+            meshy_job_id = upstream_hint
+            ownership_verified = True
+
+    if not ownership_verified and not verify_job_ownership(meshy_job_id, identity_id):
+        return jsonify({"error": "Job not found or access denied"}), 404
+
+    try:
+        ms = mesh_get(f"/openapi/v1/multi-image-to-3d/{meshy_job_id}")
+        log_event("multi-image-to-3d/status:meshy-resp[mod]", ms)
+    except Exception as e:
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
+        return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
+    out = normalize_meshy_task(ms, stage="image3d")
+    log_status_summary("multi-image-to-3d[mod]", meshy_job_id, out)
+
+    store = load_store()
+    meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
+    if identity_id and not meta.get("identity_id"):
+        meta["identity_id"] = identity_id
+        meta["user_id"] = identity_id
+
+    if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
+        if not meta.get("prompt"):
+            meta["prompt"] = out.get("prompt") or ""
+        if not meta.get("root_prompt"):
+            meta["root_prompt"] = meta.get("prompt")
+
+        if not meta.get("title") or meta.get("title") == "Untitled":
+            meta["title"] = derive_display_title(
+                meta.get("prompt"),
+                None,
+                root_prompt=meta.get("root_prompt"),
+            )
+
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
+        s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type="multi-image-to-3d", user_id=user_id)
+
+        if s3_result and s3_result.get("success"):
+            if s3_result.get("glb_url"):
+                out["glb_url"] = s3_result["glb_url"]
+            if s3_result.get("thumbnail_url"):
+                out["thumbnail_url"] = s3_result["thumbnail_url"]
+            if s3_result.get("textured_glb_url"):
+                out["textured_glb_url"] = s3_result["textured_glb_url"]
+            if s3_result.get("model_urls"):
+                out["model_urls"] = s3_result["model_urls"]
+            if s3_result.get("texture_urls"):
+                out["texture_urls"] = s3_result["texture_urls"]
+
+            reservation_id = meta.get("reservation_id")
+            internal_job_id = meta.get("internal_job_id")
+            if reservation_id:
+                finalize_job_credits(reservation_id, internal_job_id or meshy_job_id, user_id)
+
+            if internal_job_id:
+                _update_job_status_ready(
+                    internal_job_id,
+                    upstream_job_id=meshy_job_id,
+                    model_id=s3_result.get("model_id"),
+                    glb_url=s3_result.get("glb_url"),
+                )
+
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(
+                identity_id,
+                upstream_job_id=meshy_job_id,
+                alt_upstream_job_id=job_id,
+            )
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[multi-image-to-3d][mod] DB lookup for finalized model failed: {e}")
+
+    if out["status"] == "failed":
+        reservation_id = meta.get("reservation_id")
+        internal_job_id = meta.get("internal_job_id")
+        error_msg = out.get("message") or out.get("error") or "Provider job failed"
+
+        if reservation_id:
             release_job_credits(reservation_id, "provider_job_failed", internal_job_id or meshy_job_id)
 
         if internal_job_id:

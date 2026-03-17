@@ -65,22 +65,38 @@ def text_to_3d_start_mod():
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-preview"]
+    ai_model = body.get("model") or "latest"
+
+    # Block removed Meshy 4
+    if ai_model in ("meshy-4", "meshy4"):
+        return jsonify({"ok": False, "error": "Meshy 4 is no longer supported. Use meshy-5 or latest."}), 400
+
     payload = {
         "mode": "preview",
         "prompt": prompt,
-        "ai_model": body.get("model") or "latest",
+        "ai_model": ai_model,
     }
-
-    art_style = body.get("art_style")
-    if art_style:
-        payload["art_style"] = art_style
 
     symmetry_mode = (body.get("symmetry_mode") or "").strip().lower()
     if symmetry_mode in {"off", "auto", "on"}:
         payload["symmetry_mode"] = symmetry_mode
 
-    if "is_a_t_pose" in body:
-        payload["is_a_t_pose"] = bool(body.get("is_a_t_pose"))
+    # pose_mode replaces deprecated is_a_t_pose (enum: "", "a-pose", "t-pose")
+    pose_mode = (body.get("pose_mode") or "").strip().lower()
+    if pose_mode in {"a-pose", "t-pose"}:
+        payload["pose_mode"] = pose_mode
+
+    # New Meshy params
+    model_type = (body.get("model_type") or "").strip().lower()
+    if model_type in {"standard", "lowpoly"}:
+        payload["model_type"] = model_type
+
+    if body.get("should_remesh") is not None:
+        payload["should_remesh"] = bool(body["should_remesh"])
+    if body.get("should_texture") is not None:
+        payload["should_texture"] = bool(body["should_texture"])
+    # NOTE: enable_pbr is NOT valid for text-to-3d preview.
+    # It belongs in: refine flows and image-to-3d (when should_texture=true).
 
     license_choice = normalize_license(body.get("license"))
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
@@ -92,11 +108,10 @@ def text_to_3d_start_mod():
         "root_prompt": prompt,
         "title": prompt[:50] if prompt else None,
         "stage": "preview",
-        "art_style": art_style or "realistic",
-        "model": payload["ai_model"],
+        "model": ai_model,
         "license": license_choice,
         "symmetry_mode": payload.get("symmetry_mode", "auto"),
-        "is_a_t_pose": bool(body.get("is_a_t_pose")),
+        "pose_mode": pose_mode,
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
@@ -111,12 +126,11 @@ def text_to_3d_start_mod():
         "prompt": prompt,
         "title": derive_display_title(prompt, None),
         "root_prompt": prompt,
-        "art_style": art_style or "realistic",
-        "model": payload["ai_model"],
+        "model": ai_model,
         "created_at": now_s() * 1000,
         "license": license_choice,
         "symmetry_mode": payload.get("symmetry_mode", "auto"),
-        "is_a_t_pose": bool(body.get("is_a_t_pose")),
+        "pose_mode": pose_mode,
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
@@ -251,7 +265,6 @@ def text_to_3d_refine_mod():
         "prompt": original_prompt,
         "root_prompt": root_prompt,
         "title": title,
-        "art_style": preview_meta.get("art_style"),
         "texture_prompt": texture_prompt,
         "user_id": identity_id,
         "identity_id": identity_id,
@@ -317,22 +330,26 @@ def text_to_3d_remesh_start_mod():
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
+    ai_model = body.get("model") or "latest"
+    if ai_model in ("meshy-4", "meshy4"):
+        return jsonify({"ok": False, "error": "Meshy 4 is no longer supported."}), 400
+
     payload = {
         "mode": "preview",
         "prompt": prompt,
-        "ai_model": body.get("model") or "latest",
+        "ai_model": ai_model,
         "topology": "triangle",
         "should_remesh": True,
         "target_polycount": body.get("target_polycount", 45000),
-        "art_style": body.get("art_style", "realistic"),
     }
 
     symmetry_mode = (body.get("symmetry_mode") or "").strip().lower()
     if symmetry_mode in {"off", "auto", "on"}:
         payload["symmetry_mode"] = symmetry_mode
 
-    if "is_a_t_pose" in body:
-        payload["is_a_t_pose"] = bool(body.get("is_a_t_pose"))
+    pose_mode = (body.get("pose_mode") or "").strip().lower()
+    if pose_mode in {"a-pose", "t-pose"}:
+        payload["pose_mode"] = pose_mode
 
     license_choice = normalize_license(body.get("license"))
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
@@ -344,11 +361,10 @@ def text_to_3d_remesh_start_mod():
         "root_prompt": prompt,
         "title": title,
         "stage": "preview",
-        "art_style": payload.get("art_style"),
-        "model": payload.get("ai_model"),
+        "model": ai_model,
         "license": license_choice,
         "symmetry_mode": payload.get("symmetry_mode", "auto"),
-        "is_a_t_pose": bool(body.get("is_a_t_pose")),
+        "pose_mode": pose_mode,
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "remesh_like": True,
@@ -381,13 +397,12 @@ def text_to_3d_remesh_start_mod():
         "prompt": prompt,
         "root_prompt": prompt,
         "title": title,
-        "art_style": payload["art_style"],
-        "model": payload["ai_model"],
+        "model": ai_model,
         "created_at": now_s() * 1000,
         "remesh_like": True,
         "license": license_choice,
         "symmetry_mode": payload.get("symmetry_mode", "auto"),
-        "is_a_t_pose": bool(body.get("is_a_t_pose")),
+        "pose_mode": pose_mode,
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "user_id": identity_id,
@@ -540,7 +555,7 @@ def text_to_3d_status_mod(job_id: str):
         meta["identity_id"] = identity_id
         meta["user_id"] = identity_id
 
-    for key in ("batch_count", "batch_slot", "batch_group_id", "license", "symmetry_mode", "is_a_t_pose"):
+    for key in ("batch_count", "batch_slot", "batch_group_id", "license", "symmetry_mode", "pose_mode"):
         if key in meta and key not in out:
             out[key] = meta.get(key)
     meta.update({"last_status": out["status"], "last_pct": out["pct"], "stage": out["stage"]})

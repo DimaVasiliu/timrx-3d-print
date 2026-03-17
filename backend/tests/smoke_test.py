@@ -267,8 +267,7 @@ class SmokeTests:
         """Test POST /api/_mod/text-to-3d/start."""
         status, data = self.api("POST", "/api/_mod/text-to-3d/start", {
             "prompt": f"A simple test cube {RUN_ID}",
-            "art_style": "realistic",
-            "model": "meshy-4",
+            "model": "latest",
         }, timeout=120)
 
         job_id = data.get("job_id")

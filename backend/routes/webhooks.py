@@ -1,10 +1,11 @@
 """
 Webhook routes for external service callbacks.
 
-Two webhook endpoints:
+Three webhook endpoints:
 
 1. POST /api/webhooks/piapi        — PiAPI account-level notifications (quota, suspension)
 2. POST /api/webhooks/piapi/task   — PiAPI task-level completion callbacks (video jobs)
+3. POST /api/webhooks/meshy/task   — Meshy task-level completion callbacks (3D jobs)
 
 Provider completion models:
   - Seedance: POLL-FIRST. PiAPI currently strips webhook_config for Seedance
@@ -12,15 +13,21 @@ Provider completion models:
     completion path. If PiAPI ever starts delivering webhooks for Seedance,
     this endpoint will accelerate completion as an optional fast path.
   - Vertex: Poll-only (no webhook API in Vertex AI Veo).
+  - Meshy: POLL-FIRST. Webhook is an optional accelerator for 3D model jobs.
 
 Render env vars:
     PIAPI_WEBHOOK_ENABLED   — "true" to accept webhooks (default: false)
     PIAPI_WEBHOOK_SECRET    — shared secret for verification
     PIAPI_WEBHOOK_LOG_BODY  — "true" to log full payload (default: false)
+    MESHY_WEBHOOK_ENABLED   — "true" to accept Meshy webhooks (default: false)
+    MESHY_WEBHOOK_SECRET    — optional shared secret for webhook verification (app-managed, not Meshy-signed)
 
 Webhook URL to register in PiAPI dashboard:
     https://3d.timrx.live/api/webhooks/piapi       (account)
     https://3d.timrx.live/api/webhooks/piapi/task   (task — set via webhook_config per task)
+
+Meshy webhook URL:
+    https://3d.timrx.live/api/webhooks/meshy/task
 """
 
 from __future__ import annotations
@@ -521,4 +528,310 @@ def piapi_task_webhook():
 
     # ── Unknown status ───────────────────────────────────────
     print(f"[WEBHOOK] unknown status={raw_status} task_id={task_id}")
+    return jsonify({"ok": True, "action": "ignored_unknown_status"}), 200
+
+
+# ── Meshy Webhook Helpers ─────────────────────────────────────
+
+def _meshy_webhook_secret_is_valid() -> bool:
+    """
+    Check app-managed webhook secret if configured.
+
+    This is NOT a Meshy-signed secret — Meshy does not currently send
+    signed verification headers. This is an app-side shared secret you
+    append as a query param when registering the webhook URL in Meshy's
+    dashboard (e.g. ?secret=YOUR_SECRET).
+
+    Accepts either:
+      - Header: X-Webhook-Secret: <secret>
+      - Query param: ?secret=<secret>
+
+    Returns True if secret matches or if no secret is configured.
+    """
+    secret = config.MESHY_WEBHOOK_SECRET
+    if not secret:
+        return True
+
+    header_val = request.headers.get("X-Webhook-Secret", "")
+    query_val = request.args.get("secret", "")
+    return header_val == secret or query_val == secret
+
+
+def _find_and_claim_3d_job(upstream_id: str, new_status: str) -> Optional[Dict[str, Any]]:
+    """
+    Atomically find a 3D job by upstream_job_id and transition it.
+
+    Same as _find_and_claim_job but matches stage='3d' instead of 'video'.
+    Returns the job row dict if the transition succeeded, or None if:
+      - no job found for this upstream_id
+      - job is already in a terminal or finalizing state (idempotent no-op)
+    """
+    from backend.db import USE_DB, get_conn, Tables
+
+    if not USE_DB:
+        return None
+
+    excluded = ", ".join(f"'{s}'" for s in _TERMINAL_AND_FINALIZING)
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = %s,
+                        updated_at = NOW(),
+                        meta = COALESCE(meta, '{{}}'::jsonb)
+                               || %s::jsonb
+                    WHERE upstream_job_id = %s
+                      AND stage = '3d'
+                      AND status NOT IN ({excluded})
+                    RETURNING id, identity_id, provider, reservation_id,
+                              upstream_job_id, prompt, meta, action_code,
+                              status, stage
+                    """,
+                    (
+                        new_status,
+                        json.dumps({
+                            "webhook_claimed_at": time.time(),
+                            "webhook_status": new_status,
+                            "webhook_source": "meshy",
+                        }),
+                        upstream_id,
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return row
+    except Exception as e:
+        print(f"[MESHY_WEBHOOK] DB error finding job for upstream_id={upstream_id}: {e}")
+        return None
+
+
+def _meshy_webhook_finalize_success(
+    job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    task_data: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> None:
+    """
+    Finalize a successful 3D job triggered by Meshy webhook.
+
+    Steps:
+      1. Extract model URLs from the Meshy task payload
+      2. Save finished job to normalized DB tables
+      3. Finalize credits (capture)
+      4. Transition job to 'ready'
+
+    If finalization fails, transitions to 'stalled' so the poll worker
+    can recover.
+    """
+    try:
+        from backend.services.meshy_service import extract_model_urls
+        from backend.services.s3_service import save_finished_job_to_normalized_db
+        from backend.services.credits_helper import finalize_job_credits
+        from backend.services.expense_guard import ExpenseGuard
+
+        # Extract model URLs from the Meshy payload
+        model_urls = extract_model_urls(task_data)
+
+        # Build the status_out dict for the normalized DB saver
+        status_out = {
+            "status": "done",
+            "model_urls": model_urls.get("model_urls", {}),
+            "textured_model_urls": model_urls.get("textured_model_urls", {}),
+            "glb_url": model_urls.get("glb_url", ""),
+            "thumbnail_url": model_urls.get("thumbnail_url", ""),
+        }
+
+        # Determine the job type from meta
+        job_type = meta.get("task", "text-to-3d") or "text-to-3d"
+
+        # Save to normalized DB tables (history/items/models/images)
+        save_finished_job_to_normalized_db(
+            job_id=job_id,
+            status_out=status_out,
+            meta=meta,
+            job_type=job_type,
+            user_id=identity_id,
+        )
+
+        # Finalize credits (capture the reservation)
+        if reservation_id:
+            try:
+                finalize_job_credits(str(reservation_id), job_id)
+                print(f"[MESHY_WEBHOOK] credits FINALIZED job={job_id}")
+            except Exception as e:
+                print(f"[MESHY_WEBHOOK] credit finalize error job={job_id}: {e}")
+
+        # Transition to ready
+        _transition_job_status(job_id, "ready", {
+            "completed_at": "NOW()",
+            "claimed_by": None,
+            "claimed_at": None,
+        }, meta_patch={
+            "webhook_finalized": True,
+            "webhook_finalized_at": time.time(),
+            "webhook_source": "meshy",
+        })
+
+        ExpenseGuard.unregister_active_job(job_id)
+        print(f"[MESHY_WEBHOOK] finalized job={job_id}")
+
+    except Exception as e:
+        print(f"[MESHY_WEBHOOK] finalization FAILED job={job_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+        _transition_job_status(job_id, "stalled", meta_patch={
+            "webhook_finalize_error": str(e)[:300],
+            "webhook_finalize_failed_at": time.time(),
+            "webhook_source": "meshy",
+        })
+        print(f"[MESHY_WEBHOOK] job={job_id} marked stalled for worker recovery")
+
+
+# ── Meshy Task Webhook ────────────────────────────────────────
+
+@bp.route("/webhooks/meshy/task", methods=["POST"])
+def meshy_task_webhook():
+    """
+    Receive Meshy task-level completion callbacks for 3D model jobs.
+
+    Optional accelerator — polling in job_worker.py remains the canonical
+    completion path. If Meshy delivers a webhook first, this handler will
+    accelerate completion.
+
+    The handler:
+      1. Verifies the shared secret
+      2. Extracts task id and status from the payload
+      3. Maps Meshy status to internal status via MESHY_STATUS_MAP
+      4. Finds the local job by upstream_job_id (stage='3d')
+      5. Atomically transitions the job (prevents duplicate handling)
+      6. Finalizes success or marks failure
+      7. Returns 200 so Meshy does not retry
+
+    Idempotency: duplicate deliveries are safe — the atomic transition
+    ensures only the first delivery triggers state changes.
+    """
+    from backend.services.meshy_service import MESHY_STATUS_MAP
+
+    # Entry-point log
+    content_length = request.content_length or 0
+    has_secret_header = bool(request.headers.get("X-Webhook-Secret"))
+    has_secret_query = bool(request.args.get("secret"))
+    print(
+        f"[MESHY_WEBHOOK] HIT /api/webhooks/meshy/task method={request.method} "
+        f"content_length={content_length} "
+        f"secret_header={'yes' if has_secret_header else 'no'} "
+        f"secret_query={'yes' if has_secret_query else 'no'} "
+        f"remote={request.remote_addr}"
+    )
+
+    # Gate
+    if not config.MESHY_WEBHOOK_ENABLED:
+        print("[MESHY_WEBHOOK] IGNORED: webhook_disabled in config")
+        return jsonify({"error": "webhook_disabled"}), 403
+
+    # Auth
+    if not _meshy_webhook_secret_is_valid():
+        print("[MESHY_WEBHOOK] REJECTED: invalid secret (header/query mismatch)")
+        return jsonify({"error": "unauthorized"}), 401
+
+    print("[MESHY_WEBHOOK] auth passed")
+
+    # Parse
+    data, err = _safe_get_json()
+    if err:
+        print(f"[MESHY_WEBHOOK] bad request: {err}")
+        return jsonify({"error": "bad_request", "message": err}), 400
+
+    # Meshy sends the task object directly or nested under "data"/"task"
+    task_data = data
+    for key in ("data", "task"):
+        nested = data.get(key)
+        if isinstance(nested, dict) and (nested.get("id") or nested.get("task_id")):
+            task_data = nested
+            break
+
+    # Extract task_id — Meshy uses "id" (not "task_id")
+    task_id = task_data.get("id") or task_data.get("task_id") or data.get("id")
+
+    if not task_id:
+        print(f"[MESHY_WEBHOOK] IGNORED: no task id in payload keys={sorted(data.keys())}")
+        return jsonify({"ok": True, "action": "ignored_no_task_id"}), 200
+
+    # Map Meshy status to internal status
+    raw_status = (task_data.get("status") or "unknown").upper()
+    internal_status = MESHY_STATUS_MAP.get(raw_status, raw_status.lower() or "unknown")
+    progress = task_data.get("progress", "?")
+
+    print(
+        f"[MESHY_WEBHOOK] received task_id={task_id} raw_status={raw_status} "
+        f"internal={internal_status} progress={progress}"
+    )
+
+    # ── Success ──────────────────────────────────────────────
+    if internal_status == "done":
+        # Atomically claim the job for finalization
+        job = _find_and_claim_3d_job(task_id, "finalizing")
+        if not job:
+            print(f"[MESHY_WEBHOOK] task_id={task_id} no claimable job (unknown or already handled)")
+            return jsonify({"ok": True, "action": "no_op"}), 200
+
+        job_id = str(job["id"])
+        identity_id = str(job.get("identity_id") or "")
+        reservation_id = str(job.get("reservation_id") or "") or None
+        meta = job.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+
+        print(f"[MESHY_WEBHOOK] finalizing job={job_id} task_id={task_id}")
+
+        # Dispatch finalization to background thread so we return 200 fast
+        from backend.services.async_dispatch import get_executor
+        executor = get_executor()
+        executor.submit(
+            _meshy_webhook_finalize_success,
+            job_id, identity_id, reservation_id,
+            task_data, meta,
+        )
+
+        return jsonify({"ok": True, "action": "finalizing", "job_id": job_id}), 200
+
+    # ── Failure ──────────────────────────────────────────────
+    if internal_status == "failed":
+        error_msg = _extract_error_message(task_data)
+        error_code = ErrorCategory.INTERNAL
+
+        job = _find_and_claim_3d_job(task_id, "failed")
+        if not job:
+            print(f"[MESHY_WEBHOOK] task_id={task_id} failed but no claimable job (unknown or already handled)")
+            return jsonify({"ok": True, "action": "no_op"}), 200
+
+        job_id = str(job["id"])
+        meta = job.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+
+        print(f"[MESHY_WEBHOOK] failing job={job_id} task_id={task_id} error={error_msg[:100]}")
+
+        _webhook_mark_failed(job_id, meta, error_msg, error_code, "meshy")
+
+        return jsonify({"ok": True, "action": "failed", "job_id": job_id}), 200
+
+    # ── In-progress / pending ────────────────────────────────
+    if internal_status in ("running", "pending"):
+        print(f"[MESHY_WEBHOOK] progress task_id={task_id} status={internal_status} progress={progress}")
+        return jsonify({"ok": True, "action": "progress_noted"}), 200
+
+    # ── Unknown status ───────────────────────────────────────
+    print(f"[MESHY_WEBHOOK] unknown status={raw_status} task_id={task_id}")
     return jsonify({"ok": True, "action": "ignored_unknown_status"}), 200

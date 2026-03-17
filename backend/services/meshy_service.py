@@ -244,7 +244,21 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
 
     glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, rigged_fbx = extract_model_urls(ms)
 
-    return {
+    # Extract error message from Meshy's response for failed tasks
+    error_message = None
+    if status == "failed":
+        # Meshy returns errors in various formats
+        task_error = _pick_first(containers, ["task_error", "error"])
+        if isinstance(task_error, dict):
+            error_message = task_error.get("message") or task_error.get("detail") or str(task_error)
+        elif isinstance(task_error, str):
+            error_message = task_error
+        if not error_message:
+            error_message = _pick_first(containers, ["message", "error_message", "fail_reason"])
+        task_id = _pick_first(containers, ["id", "task_id"])
+        print(f"[MESHY_TASK_FAILED] task_id={task_id} stage={stage} error={error_message} raw_status={st_raw}")
+
+    result = {
         "id": _pick_first(containers, ["id", "task_id"]),
         "status": status,
         "pct": pct,
@@ -262,14 +276,20 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
         # Parent job reference for derived jobs (texture/remesh/rig) - used for metadata inheritance
         "original_job_id": _pick_first(containers, ["original_job_id", "source_task_id", "preview_task_id", "input_task_id"]),
     }
+    if error_message:
+        result["message"] = error_message
+    return result
 
 
 def build_source_payload(body: dict, identity_id: str | None = None):
     """Validate and build the source payload for Meshy operations."""
     input_task_id = (body.get("input_task_id") or "").strip()
     model_url = (body.get("model_url") or "").strip()
+    # When both are provided, prefer input_task_id (more reliable for Meshy-origin
+    # models — Meshy uses its own internal reference instead of downloading from URL).
+    # Fall back to model_url only if input_task_id resolution fails.
     if input_task_id and model_url:
-        return None, "Provide only one of input_task_id or model_url"
+        print(f"[build_source_payload] Both input_task_id and model_url provided, preferring input_task_id={input_task_id}")
     if not input_task_id and not model_url:
         return None, "input_task_id or model_url required"
 
@@ -279,10 +299,17 @@ def build_source_payload(body: dict, identity_id: str | None = None):
             from backend.services.job_service import resolve_meshy_job_id, verify_job_ownership
             resolved = resolve_meshy_job_id(input_task_id)
             if identity_id and not verify_job_ownership(resolved, identity_id):
-                return None, "Job not found or access denied"
-            return {"input_task_id": resolved}, None
-        except Exception:
-            return {"input_task_id": input_task_id}, None
+                if model_url:
+                    print(f"[build_source_payload] input_task_id={input_task_id} ownership check failed, falling back to model_url")
+                else:
+                    return None, "Job not found or access denied"
+            else:
+                return {"input_task_id": resolved}, None
+        except Exception as e:
+            if model_url:
+                print(f"[build_source_payload] input_task_id resolution failed ({e}), falling back to model_url")
+            else:
+                return {"input_task_id": input_task_id}, None
 
     # Normalize proxy URLs (our proxy includes `u` query param)
     if model_url and ("/api/proxy-glb" in model_url or "/api/_mod/proxy-glb" in model_url):

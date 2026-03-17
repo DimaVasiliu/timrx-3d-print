@@ -528,6 +528,10 @@ class Config:
     PIAPI_WEBHOOK_SECRET: str = field(default_factory=lambda: _get_env("PIAPI_WEBHOOK_SECRET"))
     PIAPI_WEBHOOK_LOG_BODY: bool = field(default_factory=lambda: _get_env_bool("PIAPI_WEBHOOK_LOG_BODY", False))
 
+    # Meshy webhook settings
+    MESHY_WEBHOOK_ENABLED: bool = field(default_factory=lambda: _get_env_bool("MESHY_WEBHOOK_ENABLED", False))
+    MESHY_WEBHOOK_SECRET: str = field(default_factory=lambda: _get_env("MESHY_WEBHOOK_SECRET"))
+
     @property
     def PIAPI_WEBHOOK_URL(self) -> str:
         """
@@ -541,6 +545,19 @@ class Config:
             return ""
         base = self.PUBLIC_BASE_URL.rstrip("/")
         return f"{base}/api/webhooks/piapi/task"
+
+    @property
+    def MESHY_WEBHOOK_URL(self) -> str:
+        """
+        Full URL for Meshy task-level webhook callbacks.
+
+        Derived from PUBLIC_BASE_URL. Empty string when PUBLIC_BASE_URL is
+        not set or Meshy webhooks are disabled.
+        """
+        if not self.MESHY_WEBHOOK_ENABLED or not self.PUBLIC_BASE_URL:
+            return ""
+        base = self.PUBLIC_BASE_URL.rstrip("/")
+        return f"{base}/api/webhooks/meshy/task"
 
     # ─────────────────────────────────────────────────────────────
     # fal.ai Seedance 1.5 Pro Video Generation
@@ -604,6 +621,8 @@ class Config:
             "video_generate": "video_generate",
             "video_text_generate": "video_text_generate",
             "video_image_animate": "video_image_animate",
+            "rigging": "rigging",
+            "animation": "animation",
         }
     )
 

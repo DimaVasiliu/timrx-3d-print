@@ -95,9 +95,10 @@ MESHY_ENDPOINTS = {
     "text_to_3d_generate": "/openapi/v2/text-to-3d",
     "image_to_3d_generate": "/openapi/v1/image-to-3d",
     "refine": "/openapi/v2/text-to-3d",  # Uses mode=refine
-    "remesh": "/openapi/v2/models/remesh",
-    "texture": "/openapi/v2/models/retexture",
-    "rig": "/openapi/v2/models/rigging",
+    "remesh": "/openapi/v1/remesh",
+    "texture": "/openapi/v1/retexture",
+    "rig": "/openapi/v1/rigging",
+    "multi_image_to_3d_generate": "/openapi/v1/multi-image-to-3d",
 }
 
 

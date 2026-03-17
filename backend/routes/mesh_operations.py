@@ -383,6 +383,10 @@ def mesh_retexture_mod():
     if ai_model:
         payload["ai_model"] = ai_model
 
+    # Log payload for debugging (redact long URLs)
+    log_payload = {k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v) for k, v in payload.items()}
+    print(f"[RETEXTURE] Sending to Meshy: identity={identity_id} job={internal_job_id} payload={log_payload}")
+
     try:
         resp = mesh_post("/openapi/v1/retexture", payload)
         log_event("mesh/retexture:meshy-resp[mod]", resp)

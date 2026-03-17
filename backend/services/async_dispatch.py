@@ -695,6 +695,106 @@ def _dispatch_meshy_image_to_3d_async(internal_job_id, identity_id, reservation_
     return dispatch_meshy_image_to_3d_async(internal_job_id, identity_id, reservation_id, payload, store_meta, image_url)
 
 
+def dispatch_meshy_multi_image_to_3d_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    payload: dict,
+    store_meta: dict,
+    image_urls: list,
+):
+    """Dispatch a multi-image-to-3D job to Meshy (POST /openapi/v1/multi-image-to-3d)."""
+    start_time = time.time()
+
+    try:
+        user_id = identity_id
+        prompt = store_meta.get("prompt", "")
+
+        # Upload any data-URL images to S3 first so Meshy gets accessible URLs
+        resolved_urls = []
+        for idx, url in enumerate(image_urls):
+            is_data_url = isinstance(url, str) and url.startswith("data:")
+            if is_data_url and AWS_BUCKET_MODELS:
+                try:
+                    s3_name = prompt if prompt else f"multi_image_to_3d_source_{idx}"
+                    s3_url = safe_upload_to_s3(
+                        url,
+                        "image/png",
+                        "source_images",
+                        s3_name,
+                        user_id=user_id,
+                        key_base=f"source_images/{user_id or 'public'}/{internal_job_id}_{idx}",
+                        provider="user",
+                    )
+                    if s3_url:
+                        resolved_urls.append(s3_url)
+                        continue
+                except Exception as e:
+                    print(f"[ASYNC] Failed to pre-upload data URL {idx} to S3: {e}")
+            resolved_urls.append(url)
+
+        payload["image_urls"] = resolved_urls
+
+        resp = mesh_post("/openapi/v1/multi-image-to-3d", payload)
+        meshy_task_id = resp.get("result") or resp.get("id")
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if not meshy_task_id:
+            print(f"[ASYNC] ERROR: No task_id from Meshy multi-image-to-3d for job {internal_job_id}")
+            if reservation_id:
+                release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            update_job_status_failed(internal_job_id, "3D model generation failed. Please try again.")
+            return
+
+        update_job_with_upstream_id(internal_job_id, meshy_task_id)
+
+        # Upload non-data-URL source images to S3 for archival
+        if AWS_BUCKET_MODELS:
+            for idx, url in enumerate(resolved_urls):
+                if not (isinstance(url, str) and url.startswith("data:")):
+                    try:
+                        s3_name = prompt if prompt else f"multi_image_to_3d_source_{idx}"
+                        safe_upload_to_s3(
+                            url,
+                            "image/png",
+                            "source_images",
+                            s3_name,
+                            user_id=user_id,
+                            key_base=f"source_images/{user_id or 'public'}/{meshy_task_id}_{idx}",
+                            provider="user",
+                        )
+                    except Exception as e:
+                        print(f"[ASYNC] WARNING: Failed to upload source image {idx} to S3: {e}")
+
+        store = load_store()
+        store_meta["upstream_job_id"] = meshy_task_id
+        store[meshy_task_id] = store_meta
+        store[internal_job_id] = {**store_meta, "meshy_task_id": meshy_task_id}
+        save_store(store)
+
+        save_active_job_to_db(
+            meshy_task_id,
+            "multi-image-to-3d",
+            "image3d",
+            store_meta,
+            identity_id,
+        )
+
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} action=multi-image-to-3d duration_ms={duration_ms} error={e}")
+        if reservation_id:
+            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Generation failed. Please try again.")
+
+
+def _dispatch_meshy_multi_image_to_3d_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
+    image_urls = (payload or {}).get("image_urls") or (store_meta or {}).get("original_image_urls") or []
+    return dispatch_meshy_multi_image_to_3d_async(internal_job_id, identity_id, reservation_id, payload, store_meta, image_urls)
+
+
 def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     payload = payload or {}
     prompt = payload.get("prompt") or store_meta.get("prompt") or ""

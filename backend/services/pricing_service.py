@@ -16,6 +16,8 @@ CANONICAL ACTION KEYS (use these in new code):
 - refine               (10c) - Refine/upscale 3D model
 - remesh               (10c) - Remesh 3D model (same cost as refine)
 - retexture            (15c) - Apply new texture to 3D model
+- rigging              (15c) - Rig a 3D model for animation  [TimrX internal cost; Meshy API charges 5 credits]
+- animation            (10c) - Animate a rigged 3D model     [TimrX internal cost; Meshy API charges 3 credits]
 - video_generate       (75c) - Generic video generation
 - video_text_generate  (75c) - Text-to-video generation
 - video_image_animate  (110c) - Image-to-video animation
@@ -57,6 +59,8 @@ class CanonicalActions:
     VIDEO_GENERATE = "video_generate"
     VIDEO_TEXT_GENERATE = "video_text_generate"
     VIDEO_IMAGE_ANIMATE = "video_image_animate"
+    RIGGING = "rigging"
+    ANIMATION = "animation"
     GEMINI_VIDEO = "gemini_video"  # Legacy alias for Vertex video — retained for DB compat
 
 
@@ -72,6 +76,8 @@ CANONICAL_TO_DB = {
     CanonicalActions.REFINE: "MESHY_REFINE",
     CanonicalActions.REMESH: "MESHY_REFINE",  # Remesh uses same cost as refine
     CanonicalActions.RETEXTURE: "MESHY_RETEXTURE",
+    CanonicalActions.RIGGING: "MESHY_RIGGING",
+    CanonicalActions.ANIMATION: "MESHY_ANIMATION",
     # Video generation
     CanonicalActions.VIDEO_GENERATE: "VIDEO_GENERATE",
     CanonicalActions.VIDEO_TEXT_GENERATE: "VIDEO_TEXT_GENERATE",
@@ -109,6 +115,10 @@ ALIAS_TO_CANONICAL = {
 
     # Retexture aliases
     "texture": CanonicalActions.RETEXTURE,
+
+    # Rigging / Animation aliases
+    "rig": CanonicalActions.RIGGING,
+    "animate": CanonicalActions.ANIMATION,
 
     # Video aliases
     "video": CanonicalActions.VIDEO_GENERATE,
@@ -246,6 +256,8 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
     {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
     {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
+    {"action_code": "MESHY_RIGGING", "cost_credits": 15, "provider": "meshy"},
+    {"action_code": "MESHY_ANIMATION", "cost_credits": 10, "provider": "meshy"},
     # Image Generation — OpenAI (tiered by resolution)
     {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},       # Standard
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 15, "provider": "openai"},    # 2K
