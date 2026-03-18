@@ -176,4 +176,3 @@
     {"action_id": 85, "name": "Axe Stance", "category": "Fighting", "subcategory": "Transitioning", "tags": ["combat", "axe", "stance"], "sort_order": 260, "enabled": true},
     {"action_id": 88, "name": "Chest Pound Taunt", "category": "Fighting", "subcategory": "Transitioning", "tags": ["taunt", "chest", "pound"], "sort_order": 261, "enabled": true}
   ]
-  
