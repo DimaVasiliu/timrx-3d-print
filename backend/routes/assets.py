@@ -243,11 +243,31 @@ def proxy_glb_mod():
                     )
                 row = cur.fetchone()
         if not row:
+            # Diagnostic: check if the asset exists under ANY identity
+            actual_owner = None
+            if meshy_task_id:
+                try:
+                    with get_conn() as diag_conn:
+                        with diag_conn.cursor(row_factory=dict_row) as diag_cur:
+                            diag_cur.execute(
+                                f"""
+                                SELECT identity_id::text, 'jobs' as src FROM {Tables.JOBS}
+                                WHERE upstream_job_id = %s LIMIT 1
+                                """,
+                                (meshy_task_id,),
+                            )
+                            diag_row = diag_cur.fetchone()
+                            if diag_row:
+                                actual_owner = f"{diag_row['identity_id']}(via {diag_row['src']})"
+                except Exception:
+                    pass
+
             ids_str = identity_id if len(identity_ids) == 1 else f"{identity_id}+{len(identity_ids)-1}merged"
             print(
-                f"[proxy-glb][mod] ownership check failed: no row found "
-                f"identity={ids_str} meshy_task={meshy_task_id or 'none'} "
-                f"s3_key={s3_key[:60] if s3_key else 'none'} url={u[:80]}..."
+                f"[proxy-glb][mod] DENIED: identity={ids_str} "
+                f"meshy_task={meshy_task_id or 'none'} "
+                f"actual_owner={actual_owner or 'unknown'} "
+                f"url={u[:100]}..."
             )
             resp = jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}})
             resp.headers.update(cors_headers)
