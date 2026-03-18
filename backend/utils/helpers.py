@@ -363,9 +363,9 @@ def log_generation_event(
             "event": event,
             "provider": provider,
             "action_code": action_code,
-            "identity_id": identity_id[:8] + "..." if identity_id else None,
-            "job_id": job_id,
-            "reservation_id": reservation_id[:8] + "..." if reservation_id else None,
+            "identity_id": str(identity_id)[:8] + "..." if identity_id else None,
+            "job_id": str(job_id) if job_id else None,
+            "reservation_id": str(reservation_id)[:8] + "..." if reservation_id else None,
             "cost": cost,
             "status": status,
         }
