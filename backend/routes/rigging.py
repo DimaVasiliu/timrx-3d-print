@@ -71,9 +71,10 @@ def rig_start():
     body = request.get_json(silent=True) or {}
     log_event("rig/start:incoming", body)
 
-    # Prefer model_url for rigging — Meshy input_task_ids expire after 3 days,
-    # but our S3 model URLs persist. This lets users rig old models.
-    source, err = build_source_payload(body, identity_id=identity_id, prefer="model_url")
+    # Prefer input_task_id for rigging — Meshy's original model retains textures.
+    # S3 model_url is often a decimated/remeshed GLB without materials.
+    # Falls back to model_url automatically if input_task_id resolution fails.
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
