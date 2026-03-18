@@ -174,12 +174,15 @@ def rig_start():
 def rig_status(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
-    log_event("rig/status:incoming", {"job_id": job_id})
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    import time as _time
+    _t0 = _time.monotonic()
+
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
+    _t_own = _time.monotonic()
     if not ownership["found"]:
         return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
     if not ownership["authorized"]:
@@ -187,7 +190,6 @@ def rig_status(job_id: str):
 
     try:
         ms = get_rigging_task(job_id)
-        log_event("rig/status:meshy-resp", ms)
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({
@@ -195,10 +197,25 @@ def rig_status(job_id: str):
             "message": "Failed to fetch rigging status. Please try again.",
         }), 502
 
+    _t_meshy = _time.monotonic()
     out = normalize_rigging_response(ms)
-    log_status_summary("rig/status", job_id, out)
 
-    # Persist rigging outputs when done
+    # Compact timing log with Meshy's raw status and queue position
+    _elapsed_own = int((_t_own - _t0) * 1000)
+    _elapsed_meshy = int((_t_meshy - _t_own) * 1000)
+    _queue = out.get("preceding_tasks")
+    _queue_str = f" queue={_queue}" if _queue is not None else ""
+    print(
+        f"[rig/status] job={job_id} status={out['status']}({out.get('meshy_status','?')}) "
+        f"pct={out['pct']}{_queue_str} "
+        f"own={_elapsed_own}ms meshy={_elapsed_meshy}ms src={ownership.get('source','?')}"
+    )
+
+    # For non-final states, return immediately — no S3 work, no heavy logging
+    if out["status"] not in ("done", "failed"):
+        return jsonify(out)
+
+    # ── Final state: persist rigging outputs ──
     if out["status"] == "done" and (
         out.get("rigged_character_glb_url") or out.get("rigged_character_fbx_url")
     ):
@@ -407,12 +424,15 @@ def rig_animate():
 def rig_animate_status(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
-    log_event("rig/animate/status:incoming", {"job_id": job_id})
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    import time as _time
+    _t0 = _time.monotonic()
+
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
+    _t_own = _time.monotonic()
     if not ownership["found"]:
         return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
     if not ownership["authorized"]:
@@ -420,7 +440,6 @@ def rig_animate_status(job_id: str):
 
     try:
         ms = get_animation_task(job_id)
-        log_event("rig/animate/status:meshy-resp", ms)
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({
@@ -428,10 +447,24 @@ def rig_animate_status(job_id: str):
             "message": "Failed to fetch animation status. Please try again.",
         }), 502
 
+    _t_meshy = _time.monotonic()
     out = normalize_animation_response(ms)
-    log_status_summary("rig/animate/status", job_id, out)
 
-    # Persist animation outputs when done (same pattern as rigging)
+    _elapsed_own = int((_t_own - _t0) * 1000)
+    _elapsed_meshy = int((_t_meshy - _t_own) * 1000)
+    _queue = out.get("preceding_tasks")
+    _queue_str = f" queue={_queue}" if _queue is not None else ""
+    print(
+        f"[anim/status] job={job_id} status={out['status']}({out.get('meshy_status','?')}) "
+        f"pct={out['pct']}{_queue_str} "
+        f"own={_elapsed_own}ms meshy={_elapsed_meshy}ms src={ownership.get('source','?')}"
+    )
+
+    # For non-final states, return immediately
+    if out["status"] not in ("done", "failed"):
+        return jsonify(out)
+
+    # ── Final state: persist animation outputs ──
     if out["status"] == "done" and (
         out.get("animation_glb_url") or out.get("animation_fbx_url")
     ):

@@ -101,7 +101,22 @@ def normalize_rigging_response(ms: dict) -> dict:
     # Normalize basic_animations from Meshy's object format to array format
     basic_animations = _normalize_basic_animations(raw_animations)
 
-    return {
+    # Queue position (Meshy returns this for PENDING tasks)
+    preceding = _pick_first(containers, ["preceding_tasks"])
+    try:
+        preceding = int(preceding) if preceding is not None else None
+    except (TypeError, ValueError):
+        preceding = None
+
+    # Task error details (for failed tasks)
+    task_error = _pick_first(containers, ["task_error"])
+    error_msg = None
+    if isinstance(task_error, dict):
+        error_msg = task_error.get("message")
+    elif isinstance(task_error, str) and task_error:
+        error_msg = task_error
+
+    result = {
         "id": _pick_first(containers, ["id", "task_id"]),
         "status": status,
         "pct": pct,
@@ -111,7 +126,13 @@ def normalize_rigging_response(ms: dict) -> dict:
         "basic_animations": basic_animations,
         "basic_animations_raw": raw_animations,
         "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
+        "meshy_status": st_raw,
     }
+    if preceding is not None:
+        result["preceding_tasks"] = preceding
+    if error_msg:
+        result["message"] = error_msg
+    return result
 
 
 def _normalize_basic_animations(raw: Any) -> list[dict] | None:
@@ -257,7 +278,22 @@ def normalize_animation_response(ms: dict) -> dict:
     if animation_glb and not str(animation_glb).startswith("http"):
         animation_glb = None
 
-    return {
+    # Queue position
+    preceding = _pick_first(containers, ["preceding_tasks"])
+    try:
+        preceding = int(preceding) if preceding is not None else None
+    except (TypeError, ValueError):
+        preceding = None
+
+    # Task error
+    task_error = _pick_first(containers, ["task_error"])
+    error_msg = None
+    if isinstance(task_error, dict):
+        error_msg = task_error.get("message")
+    elif isinstance(task_error, str) and task_error:
+        error_msg = task_error
+
+    result = {
         "id": _pick_first(containers, ["id", "task_id"]),
         "status": status,
         "pct": pct,
@@ -268,4 +304,10 @@ def normalize_animation_response(ms: dict) -> dict:
         "processed_armature_fbx_url": processed_armature_fbx,
         "processed_animation_fps_fbx_url": processed_animation_fps_fbx,
         "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
+        "meshy_status": st_raw,
     }
+    if preceding is not None:
+        result["preceding_tasks"] = preceding
+    if error_msg:
+        result["message"] = error_msg
+    return result
