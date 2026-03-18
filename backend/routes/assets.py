@@ -165,43 +165,54 @@ def proxy_glb_mod():
         resp.headers.update(cors_headers)
         return resp, 503
 
-    # Ownership check
+    # Ownership check — include merged identities so assets from pre-merge
+    # sessions remain accessible after identity consolidation.
     try:
+        identity_ids = [identity_id]
         with get_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                # Collect any identities that merged into the current one
+                try:
+                    cur.execute(
+                        f"SELECT id::text FROM {Tables.IDENTITIES} WHERE merged_into_id = %s",
+                        (identity_id,),
+                    )
+                    identity_ids.extend(r["id"] for r in cur.fetchall())
+                except Exception:
+                    pass  # proceed with just current identity
+
                 if s3_key:
-                    # For S3 URLs: check by key in models AND by full URL in both tables
                     cur.execute(
                         f"""
                         SELECT 1
                         FROM {Tables.MODELS}
-                        WHERE identity_id = %s AND (
+                        WHERE identity_id = ANY(%s) AND (
                             glb_s3_key = %s OR thumbnail_s3_key = %s
                             OR glb_url = %s OR thumbnail_url = %s
                         )
                         UNION
                         SELECT 1
                         FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
+                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
                         LIMIT 1
                         """,
-                        (identity_id, s3_key, s3_key, u, u, identity_id, u, u),
+                        (identity_ids, s3_key, s3_key, u, u, identity_ids, u, u),
                     )
                 elif meshy_task_id:
-                    # Check multiple tables where Meshy task ID might be stored
+                    # Check active_jobs, jobs, models, and history_items for Meshy task ID
                     cur.execute(
                         f"""
-                        SELECT 1
-                        FROM {Tables.ACTIVE_JOBS}
-                        WHERE identity_id = %s AND upstream_job_id = %s
+                        SELECT 1 FROM {Tables.ACTIVE_JOBS}
+                        WHERE identity_id = ANY(%s) AND upstream_job_id = %s
                         UNION
-                        SELECT 1
-                        FROM {Tables.JOBS}
-                        WHERE identity_id = %s AND upstream_job_id = %s
+                        SELECT 1 FROM {Tables.JOBS}
+                        WHERE identity_id = ANY(%s) AND upstream_job_id = %s
                         UNION
-                        SELECT 1
-                        FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s
+                        SELECT 1 FROM {Tables.MODELS}
+                        WHERE identity_id = ANY(%s) AND upstream_job_id = %s
+                        UNION
+                        SELECT 1 FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = ANY(%s)
                           AND (
                             payload->>'original_job_id' = %s
                             OR payload->>'preview_task_id' = %s
@@ -210,9 +221,10 @@ def proxy_glb_mod():
                         LIMIT 1
                         """,
                         (
-                            identity_id, meshy_task_id,
-                            identity_id, meshy_task_id,
-                            identity_id, meshy_task_id, meshy_task_id, meshy_task_id,
+                            identity_ids, meshy_task_id,
+                            identity_ids, meshy_task_id,
+                            identity_ids, meshy_task_id,
+                            identity_ids, meshy_task_id, meshy_task_id, meshy_task_id,
                         ),
                     )
                 else:
@@ -220,18 +232,23 @@ def proxy_glb_mod():
                         f"""
                         SELECT 1
                         FROM {Tables.MODELS}
-                        WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
+                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
                         UNION
                         SELECT 1
                         FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s AND (glb_url = %s OR thumbnail_url = %s)
+                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
                         LIMIT 1
                         """,
-                        (identity_id, u, u, identity_id, u, u),
+                        (identity_ids, u, u, identity_ids, u, u),
                     )
                 row = cur.fetchone()
         if not row:
-            print(f"[proxy-glb][mod] ownership check failed: no row found for identity={identity_id}, url={u[:80]}...")
+            ids_str = identity_id if len(identity_ids) == 1 else f"{identity_id}+{len(identity_ids)-1}merged"
+            print(
+                f"[proxy-glb][mod] ownership check failed: no row found "
+                f"identity={ids_str} meshy_task={meshy_task_id or 'none'} "
+                f"s3_key={s3_key[:60] if s3_key else 'none'} url={u[:80]}..."
+            )
             resp = jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}})
             resp.headers.update(cors_headers)
             return resp, 404
