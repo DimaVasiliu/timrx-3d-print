@@ -2280,9 +2280,16 @@ def billing_health():
         )
         stats = {row["status"]: row["count"] for row in (stats_rows or [])}
 
-        # Get total count
-        total_row = query_one("SELECT COUNT(*) as total FROM timrx_billing.subscriptions")
+        # Get filtered total for pagination
+        total_row = query_one(
+            f"SELECT COUNT(*) as total FROM timrx_billing.subscriptions s {where_clause}",
+            params,
+        )
         total = total_row["total"] if total_row else 0
+
+        # Get global total for summary cards
+        total_all_row = query_one("SELECT COUNT(*) as total FROM timrx_billing.subscriptions")
+        total_all = total_all_row["total"] if total_all_row else 0
 
         # Format response with row hints
         def get_row_hint(status):
@@ -2337,6 +2344,9 @@ def billing_health():
                 "pending_payment": stats.get("pending_payment", 0),
             },
             "total": total,
+            "total_all": total_all,
+            "stats_scope": "global",
+            "filter_status": status_filter,
             "limit": limit,
             "offset": offset,
         })

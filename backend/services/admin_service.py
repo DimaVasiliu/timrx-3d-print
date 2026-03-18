@@ -20,6 +20,37 @@ from datetime import datetime, timezone
 from backend.db import query_one, query_all, execute_returning, transaction, Tables
 from backend.services.wallet_service import WalletService
 
+_SUCCESSFUL_ANALYTICS_JOB_STATUSES = (
+    "succeeded",
+    "ready",
+    "completed",
+    "complete",
+    "done",
+)
+_SUCCESSFUL_ANALYTICS_JOB_STATUSES_SQL = ", ".join(
+    f"'{status}'" for status in _SUCCESSFUL_ANALYTICS_JOB_STATUSES
+)
+_ACTION_CATEGORY_CASE_SQL = """
+    CASE
+        WHEN action_code ILIKE 'OPENAI_IMAGE%%'
+          OR action_code ILIKE 'GEMINI_IMAGE%%'
+          OR action_code ILIKE 'image_generate%%'
+        THEN 'image'
+        WHEN action_code ILIKE 'MESHY_%%'
+          OR action_code ILIKE 'text_to_3d_%%'
+          OR action_code ILIKE 'image_to_3d_%%'
+          OR action_code IN ('refine', 'remesh', 'retexture', 'rigging', 'animation')
+        THEN '3d_model'
+        WHEN action_code ILIKE 'VIDEO_%%'
+          OR action_code ILIKE 'video_%%'
+          OR action_code ILIKE 'GEMINI_VIDEO'
+          OR action_code ILIKE 'seedance_%%'
+          OR action_code ILIKE 'fal_seedance_%%'
+        THEN 'video'
+        ELSE 'other'
+    END
+"""
+
 
 class AdminService:
     """Admin operations service."""
@@ -139,16 +170,12 @@ class AdminService:
         by_type_rows = query_all(
             f"""
             SELECT
-                CASE
-                    WHEN action_code LIKE 'OPENAI%%' OR action_code LIKE 'image%%' THEN 'image'
-                    WHEN action_code LIKE 'MESHY%%' THEN '3d_model'
-                    WHEN action_code LIKE 'VIDEO%%' OR action_code LIKE 'video%%' OR action_code = 'GEMINI_VIDEO' THEN 'video'
-                    ELSE 'other'
-                END as category,
+                {_ACTION_CATEGORY_CASE_SQL} as category,
                 COALESCE(SUM(cost_credits), 0) as total_credits,
                 COUNT(*) as job_count
             FROM {Tables.JOBS}
-            WHERE status = 'completed' AND created_at >= NOW() - %s * INTERVAL '1 day'
+            WHERE status IN ({_SUCCESSFUL_ANALYTICS_JOB_STATUSES_SQL})
+              AND created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY category
             ORDER BY total_credits DESC
             """,
@@ -179,7 +206,8 @@ class AdminService:
                 MAX(j.created_at) as last_active
             FROM {Tables.JOBS} j
             LEFT JOIN {Tables.IDENTITIES} i ON i.id = j.identity_id
-            WHERE j.status = 'completed' AND j.created_at >= NOW() - %s * INTERVAL '1 day'
+            WHERE j.status IN ({_SUCCESSFUL_ANALYTICS_JOB_STATUSES_SQL})
+              AND j.created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY j.identity_id, i.email
             ORDER BY total_spent DESC
             LIMIT 20
@@ -212,7 +240,8 @@ class AdminService:
                 COALESCE(SUM(cost_credits), 0) as credits_spent,
                 COUNT(*) as job_count
             FROM {Tables.JOBS}
-            WHERE status = 'completed' AND created_at >= NOW() - %s * INTERVAL '1 day'
+            WHERE status IN ({_SUCCESSFUL_ANALYTICS_JOB_STATUSES_SQL})
+              AND created_at >= NOW() - %s * INTERVAL '1 day'
             GROUP BY DATE(created_at)
             ORDER BY date ASC
             """,
