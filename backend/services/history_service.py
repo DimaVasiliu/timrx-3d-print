@@ -1603,6 +1603,17 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             rigged_fbx_url = status_data.get("rigged_character_fbx_url")
             raw_texture_urls = status_data.get("texture_urls")
 
+            # ── Animation outputs: map into standard model fields ──────────
+            # Meshy animation responses use animation_glb_url / animation_fbx_url
+            # instead of glb_url. Map them so the rest of the save pipeline
+            # (S3 upload, model row, history row) treats them as a normal model.
+            animation_glb = status_data.get("animation_glb_url")
+            animation_fbx = status_data.get("animation_fbx_url")
+            if animation_glb and not glb_url:
+                glb_url = animation_glb
+            if animation_fbx and not rigged_fbx_url:
+                rigged_fbx_url = animation_fbx
+
             texture_items: list[tuple[str, str]] = []
             if isinstance(raw_texture_urls, str):
                 texture_items = [("texture", raw_texture_urls)]
@@ -1927,6 +1938,17 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "model_urls": model_urls,
                 "textured_model_urls": textured_model_urls,
             }
+            # Animation-specific output URLs in payload for history item retrieval
+            if status_data.get("animation_glb_url"):
+                payload["animation_glb_url"] = status_data["animation_glb_url"]
+            if status_data.get("animation_fbx_url"):
+                payload["animation_fbx_url"] = status_data["animation_fbx_url"]
+            if status_data.get("processed_usdz_url"):
+                payload["processed_usdz_url"] = status_data["processed_usdz_url"]
+            if status_data.get("processed_armature_fbx_url"):
+                payload["processed_armature_fbx_url"] = status_data["processed_armature_fbx_url"]
+            if status_data.get("processed_animation_fps_fbx_url"):
+                payload["processed_animation_fps_fbx_url"] = status_data["processed_animation_fps_fbx_url"]
             # Persist parent_task_id for lineage tracking (for derived jobs like texture/remesh/rig)
             if parent_task_id:
                 payload["parent_job_id"] = parent_task_id
@@ -1970,6 +1992,17 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         "stage": final_stage,
                         "s3_bucket": s3_bucket,
                     }
+                    # Animation-specific post-processed outputs
+                    if status_data.get("animation_glb_url"):
+                        model_meta["animation_glb_url"] = status_data["animation_glb_url"]
+                    if status_data.get("animation_fbx_url"):
+                        model_meta["animation_fbx_url"] = status_data["animation_fbx_url"]
+                    if status_data.get("processed_usdz_url"):
+                        model_meta["processed_usdz_url"] = status_data["processed_usdz_url"]
+                    if status_data.get("processed_armature_fbx_url"):
+                        model_meta["processed_armature_fbx_url"] = status_data["processed_armature_fbx_url"]
+                    if status_data.get("processed_animation_fps_fbx_url"):
+                        model_meta["processed_animation_fps_fbx_url"] = status_data["processed_animation_fps_fbx_url"]
                     # Store parent reference for lineage tracking (derived jobs like texture/remesh/rig)
                     if parent_task_id:
                         model_meta["parent_job_id"] = parent_task_id
