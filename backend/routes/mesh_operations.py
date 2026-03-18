@@ -226,6 +226,14 @@ def mesh_remesh_status_mod(job_id: str):
     out = normalize_meshy_task(ms, stage="remesh")
     log_status_summary("mesh/remesh[mod]", job_id, out)
 
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(job_id)
+        except Exception as e:
+            print(f"[mesh/remesh] auto-refund failed: {e}")
+
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
         store = load_store()
         meta = get_job_metadata(job_id, store)
@@ -459,6 +467,14 @@ def mesh_retexture_status_mod(job_id: str):
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
     out = normalize_meshy_task(ms, stage="texture")
     log_status_summary("mesh/retexture[mod]", job_id, out)
+
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(job_id)
+        except Exception as e:
+            print(f"[mesh/retexture] auto-refund failed: {e}")
 
     if out["status"] == "done" and (out.get("glb_url") or out.get("textured_glb_url") or out.get("thumbnail_url")):
         store = load_store()

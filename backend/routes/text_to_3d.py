@@ -566,6 +566,14 @@ def text_to_3d_status_mod(job_id: str):
     store[job_id] = meta
     save_store(store)
 
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(job_id)
+        except Exception as e:
+            print(f"[text-to-3d/status] auto-refund failed: {e}")
+
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
         user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
         s3_result = save_finished_job_to_normalized_db(job_id, out, meta, job_type="text-to-3d", user_id=user_id)

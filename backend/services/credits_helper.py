@@ -372,6 +372,47 @@ def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id:
         print(f"[CREDITS] !!! RELEASE ERROR: reservation_id={reservation_id} job_id={job_id} error={e}")
 
 
+def refund_failed_job(job_id: str) -> bool:
+    """
+    Auto-refund credits for a Meshy job that failed during async processing.
+
+    Looks up the reservation_id from the in-memory store or the jobs table,
+    then releases it. Idempotent — safe to call multiple times for the same job.
+
+    Returns True if credits were released, False if no reservation found or
+    already released/finalized.
+    """
+    # 1. Check in-memory store first
+    from backend.services.job_service import load_store
+    store = load_store()
+    meta = store.get(job_id, {})
+    reservation_id = meta.get("reservation_id")
+
+    # 2. Fall back to jobs table
+    if not reservation_id:
+        try:
+            from backend.db import USE_DB, get_conn, dict_row, Tables
+            if USE_DB:
+                with get_conn() as conn:
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(
+                            f"SELECT reservation_id FROM {Tables.JOBS} WHERE upstream_job_id = %s OR id::text = %s LIMIT 1",
+                            (job_id, job_id),
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            reservation_id = row.get("reservation_id")
+        except Exception as e:
+            print(f"[CREDITS] refund_failed_job: DB lookup failed for {job_id}: {e}")
+
+    if not reservation_id:
+        print(f"[CREDITS] refund_failed_job: no reservation_id found for job={job_id}")
+        return False
+
+    release_job_credits(reservation_id, "meshy_async_failed", job_id)
+    return True
+
+
 def get_current_balance(identity_id: str) -> Optional[dict]:
     """Get current credit balance info for a user."""
     if not CREDITS_AVAILABLE or not identity_id:

@@ -222,6 +222,14 @@ def image_to_3d_status_mod(job_id: str):
     out = normalize_meshy_task(ms, stage="image3d")
     log_status_summary("image-to-3d[mod]", meshy_job_id, out)
 
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(meshy_job_id)
+        except Exception as e:
+            print(f"[image-to-3d/status] auto-refund failed: {e}")
+
     store = load_store()
     meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
     if identity_id and not meta.get("identity_id"):
@@ -500,6 +508,14 @@ def multi_image_to_3d_status_mod(job_id: str):
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
     out = normalize_meshy_task(ms, stage="image3d")
     log_status_summary("multi-image-to-3d[mod]", meshy_job_id, out)
+
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(meshy_job_id)
+        except Exception as e:
+            print(f"[multi-image-to-3d/status] auto-refund failed: {e}")
 
     store = load_store()
     meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
