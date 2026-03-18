@@ -4,17 +4,21 @@ Rigging & Animation Routes Blueprint (Modular)
 Registered under /api/_mod.
 
 Routes:
-  POST /rig/start                   — start a rigging task
-  GET  /rig/status/<job_id>         — poll rigging status
-  POST /rig/animate                 — start an animation task
-  GET  /rig/animate/status/<job_id> — poll animation status
+  POST /rig/start                          — start a rigging task
+  GET  /rig/status/<job_id>                — poll rigging status
+  GET  /rig/stream/<job_id>                — SSE stream rigging progress
+  POST /rig/animate                        — start an animation task
+  GET  /rig/animate/status/<job_id>        — poll animation status
+  GET  /rig/animate/stream/<job_id>        — SSE stream animation progress
+  GET  /rig/animations/library             — animation library catalog
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, Response, jsonify, request, g
 
 from backend.config import ACTION_KEYS, MESHY_API_KEY
 from backend.db import USE_DB
@@ -38,9 +42,11 @@ from backend.services.meshy_service import build_source_payload
 from backend.services.rigging_service import (
     create_rigging_task,
     get_rigging_task,
+    stream_rigging_task,
     normalize_rigging_response,
     create_animation_task,
     get_animation_task,
+    stream_animation_task,
     normalize_animation_response,
 )
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -231,6 +237,45 @@ def rig_status(job_id: str):
     return jsonify(out)
 
 
+# ─── GET /rig/stream/<job_id> — SSE proxy for rigging ──────────────────────
+
+@bp.route("/rig/stream/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def rig_stream(job_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id = g.identity_id
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    def generate():
+        try:
+            for line in stream_rigging_task(job_id):
+                if line:
+                    yield line.decode("utf-8", errors="replace") + "\n"
+                else:
+                    yield "\n"
+        except Exception as e:
+            error_event = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield error_event
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ─── POST /rig/animate ──────────────────────────────────────────────────────
 
 @bp.route("/rig/animate", methods=["POST", "OPTIONS"])
@@ -248,32 +293,46 @@ def rig_animate():
     body = request.get_json(silent=True) or {}
     log_event("rig/animate:incoming", body)
 
-    rigging_task_id = (body.get("rigging_task_id") or "").strip()
-    animation_action = (body.get("animation_action") or "").strip()
+    # Accept both old field name (rigging_task_id) and correct Meshy name (rig_task_id)
+    rig_task_id = (body.get("rig_task_id") or body.get("rigging_task_id") or "").strip()
 
-    if not rigging_task_id:
-        return jsonify({"ok": False, "error": "rigging_task_id required"}), 400
-    if not animation_action:
-        return jsonify({"ok": False, "error": "animation_action required"}), 400
+    # action_id must be an integer (Meshy animation library ID)
+    raw_action_id = body.get("action_id")
+    if raw_action_id is None:
+        return jsonify({"ok": False, "error": "action_id required (integer)"}), 400
+    try:
+        action_id = int(raw_action_id)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "action_id must be an integer"}), 400
+
+    if not rig_task_id:
+        return jsonify({"ok": False, "error": "rig_task_id required"}), 400
+
+    # Optional post_process
+    post_process = body.get("post_process")
+    if post_process and not isinstance(post_process, dict):
+        post_process = None
 
     # Resolve internal IDs to Meshy IDs when needed
     try:
         from backend.services.job_service import resolve_meshy_job_id, verify_job_ownership
-        resolved_id = resolve_meshy_job_id(rigging_task_id)
+        resolved_id = resolve_meshy_job_id(rig_task_id)
         if not verify_job_ownership(resolved_id, identity_id):
             return jsonify({"ok": False, "error": "Job not found or access denied"}), 403
-        rigging_task_id = resolved_id
+        rig_task_id = resolved_id
     except Exception:
-        pass  # Use rigging_task_id as-is
+        pass  # Use rig_task_id as-is
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["animation"]
 
     job_meta = {
         "stage": "animate",
-        "rigging_task_id": rigging_task_id,
-        "animation_action": animation_action,
+        "rig_task_id": rig_task_id,
+        "action_id": action_id,
     }
+    if post_process:
+        job_meta["post_process"] = post_process
 
     reservation_id, credit_error = start_paid_job(
         identity_id, action_key, internal_job_id, job_meta
@@ -293,7 +352,7 @@ def rig_animate():
     )
 
     try:
-        resp = create_animation_task(rigging_task_id, animation_action)
+        resp = create_animation_task(rig_task_id, action_id, post_process=post_process)
         log_event("rig/animate:meshy-resp", resp)
         meshy_task_id = resp.get("result") or resp.get("id")
         if not meshy_task_id:
@@ -322,8 +381,8 @@ def rig_animate():
     store[meshy_task_id] = {
         "stage": "animate",
         "created_at": now_s() * 1000,
-        "rigging_task_id": rigging_task_id,
-        "animation_action": animation_action,
+        "rig_task_id": rig_task_id,
+        "action_id": action_id,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -372,4 +431,112 @@ def rig_animate_status(job_id: str):
     out = normalize_animation_response(ms)
     log_status_summary("rig/animate/status", job_id, out)
 
+    # Persist animation outputs when done (same pattern as rigging)
+    if out["status"] == "done" and (
+        out.get("animation_glb_url") or out.get("animation_fbx_url")
+    ):
+        try:
+            from backend.services.s3_service import save_finished_job_to_normalized_db
+
+            store = load_store()
+            meta = get_job_metadata(job_id, store)
+            if identity_id and not meta.get("identity_id"):
+                meta["identity_id"] = identity_id
+                meta["user_id"] = identity_id
+
+            user_id = (
+                meta.get("identity_id")
+                or meta.get("user_id")
+                or getattr(g, "identity_id", None)
+            )
+            s3_result = save_finished_job_to_normalized_db(
+                job_id, out, meta, job_type="animate", user_id=user_id
+            )
+            if s3_result and s3_result.get("success"):
+                for key in (
+                    "animation_glb_url", "animation_fbx_url",
+                    "processed_usdz_url", "processed_armature_fbx_url",
+                    "processed_animation_fps_fbx_url",
+                    "glb_url", "thumbnail_url",
+                ):
+                    if s3_result.get(key):
+                        out[key] = s3_result[key]
+                if s3_result.get("db_ok") is False:
+                    out["db_ok"] = False
+                    out["db_errors"] = s3_result.get("db_errors")
+        except Exception as e:
+            print(f"[rig/animate/status] persist failed: {e}")
+
     return jsonify(out)
+
+
+# ─── GET /rig/animate/stream/<job_id> — SSE proxy for animation ─────────────
+
+@bp.route("/rig/animate/stream/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def rig_animate_stream(job_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id = g.identity_id
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    def generate():
+        try:
+            for line in stream_animation_task(job_id):
+                if line:
+                    yield line.decode("utf-8", errors="replace") + "\n"
+                else:
+                    yield "\n"
+        except Exception as e:
+            error_event = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            yield error_event
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# ─── GET /rig/animations/library — curated animation catalog ───────────────
+
+@bp.route("/rig/animations/library", methods=["GET", "OPTIONS"])
+@with_session
+def animation_library():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    from backend.services.animation_library import get_animation_library
+    catalog = get_animation_library()
+
+    # Optional filtering
+    category = request.args.get("category", "").strip()
+    search = request.args.get("q", "").strip().lower()
+    enabled_only = request.args.get("enabled", "true").lower() != "false"
+
+    items = catalog
+    if enabled_only:
+        items = [a for a in items if a.get("enabled", True)]
+    if category:
+        items = [a for a in items if a.get("category", "").lower() == category.lower()]
+    if search:
+        items = [
+            a for a in items
+            if search in a.get("name", "").lower()
+            or search in a.get("category", "").lower()
+            or search in a.get("subcategory", "").lower()
+            or any(search in t.lower() for t in a.get("tags", []))
+        ]
+
+    return jsonify({"ok": True, "count": len(items), "items": items})

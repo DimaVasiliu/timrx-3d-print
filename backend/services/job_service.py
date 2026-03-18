@@ -98,6 +98,7 @@ MESHY_ENDPOINTS = {
     "remesh": "/openapi/v1/remesh",
     "texture": "/openapi/v1/retexture",
     "rig": "/openapi/v1/rigging",
+    "animate": "/openapi/v1/animations",
     "multi_image_to_3d_generate": "/openapi/v1/multi-image-to-3d",
 }
 
