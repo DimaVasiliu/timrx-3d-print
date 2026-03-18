@@ -1016,6 +1016,7 @@ def history_item_update_mod(item_id: str):
 
                         orphaned_jobs = []
                         with conn.cursor() as cur:
+                            # Delete the requested history item
                             cur.execute(
                                 f"""
                                 DELETE FROM {Tables.HISTORY_ITEMS}
@@ -1023,6 +1024,15 @@ def history_item_update_mod(item_id: str):
                                 """,
                                 (str(item_id), identity_id),
                             )
+
+                            # Delete any OTHER history items referencing the same asset
+                            # to avoid ON DELETE SET NULL violating the asset_xor constraint
+                            if model_id:
+                                cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE model_id = %s AND identity_id = %s", (model_id, identity_id))
+                            if image_id:
+                                cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE image_id = %s AND identity_id = %s", (image_id, identity_id))
+                            if video_id:
+                                cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE video_id = %s AND identity_id = %s", (video_id, identity_id))
 
                             if model_id:
                                 cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s AND identity_id = %s", (model_id, identity_id))
