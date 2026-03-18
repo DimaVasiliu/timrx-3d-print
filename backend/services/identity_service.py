@@ -1064,10 +1064,52 @@ class IdentityService:
             if SESSION_DEBUG:
                 print(f"[SESSION] Invalid/expired session {cookie_session_id[:8]}..., creating new")
 
-        # Create new anonymous identity + session atomically
+        # Before creating a new identity, check if this IP already has a recent
+        # anonymous identity. Reuse it instead of creating a new one to prevent
+        # fragmentation and free-credit farming.
         ip_address = request.remote_addr
         user_agent = request.headers.get("User-Agent", "")
+        ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
 
+        if ip_hash:
+            try:
+                existing = query_one(
+                    f"""
+                    SELECT i.id as identity_id
+                    FROM {Tables.SESSIONS} s
+                    JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
+                    WHERE s.ip_hash = %s
+                      AND i.merged_into_id IS NULL
+                      AND i.email IS NULL
+                      AND s.expires_at > NOW()
+                    ORDER BY s.created_at DESC
+                    LIMIT 1
+                    """,
+                    (ip_hash,),
+                )
+                if existing:
+                    # Reuse identity, but create a fresh session for this browser
+                    reuse_id = str(existing["identity_id"])
+                    new_sid = str(uuid.uuid4())
+                    expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
+                    ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
+                    with transaction() as cur:
+                        cur.execute(
+                            f"""
+                            INSERT INTO {Tables.SESSIONS}
+                            (id, identity_id, created_at, expires_at, ip_hash, user_agent_hash)
+                            VALUES (%s, %s, NOW(), %s, %s, %s)
+                            """,
+                            (new_sid, reuse_id, expires_at, ip_hash, ua_hash),
+                        )
+                    if SESSION_DEBUG:
+                        print(f"[SESSION] Reused identity {reuse_id[:8]}... for IP (anti-fragmentation)")
+                    IdentityService.set_session_cookie(response, new_sid)
+                    return new_sid, reuse_id
+            except Exception:
+                pass  # Fall through to normal creation
+
+        # Create new anonymous identity + session atomically
         session_id, identity_id, _ = IdentityService._create_anonymous_session_atomic(
             ip_address, user_agent
         )
