@@ -129,11 +129,17 @@ def rig_start():
     except Exception as e:
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
-        # Surface actionable face-limit errors instead of generic message
-        err_str = str(e)
+        # Surface actionable errors instead of generic message
+        err_str = str(e).lower()
         user_msg = None
-        if "face limit" in err_str.lower() or "exceeds the" in err_str.lower():
+        if "face limit" in err_str or "exceeds the" in err_str:
             user_msg = "Model has too many faces for rigging (max 300K). Please remesh the model first, then try rigging again."
+        elif "input task not found" in err_str or "task not found" in err_str:
+            user_msg = "The source model has expired or is no longer available on Meshy. Please generate a new model or upload a GLB file directly."
+        elif "pose estimation" in err_str:
+            user_msg = "Rigging failed: could not detect a humanoid pose. Make sure the model is a clear bipedal character with visible limbs."
+        elif "400" in err_str and "model_url" in err_str:
+            user_msg = "The model URL is not accessible. Please try uploading the file directly."
         return jsonify(sanitize_provider_error(
             provider="meshy", error=e, job_id=internal_job_id,
             code=MODEL_GENERATION_FAILED,
