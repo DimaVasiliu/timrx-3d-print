@@ -169,8 +169,8 @@ def mesh_remesh_mod():
             code=MODEL_GENERATION_FAILED,
         )), 502
 
-    # Use internal_job_id (not meshy_task_id) for credit finalization tracking
-    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    # Credits: do NOT finalize now — remesh is async.
+    # Finalize on terminal success in status endpoint; release on failure.
 
     # Update internal job with upstream id for ownership/status
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -226,13 +226,26 @@ def mesh_remesh_status_mod(job_id: str):
     out = normalize_meshy_task(ms, stage="remesh")
     log_status_summary("mesh/remesh[mod]", job_id, out)
 
-    # Auto-refund on async failure
+    # ── Async credit handling (same pattern as retexture) ──────────────
     if out["status"] == "failed":
         try:
             from backend.services.credits_helper import refund_failed_job
             refund_failed_job(job_id)
         except Exception as e:
             print(f"[mesh/remesh] auto-refund failed: {e}")
+
+    if out["status"] == "done":
+        # Finalize (capture) credits now that Meshy confirmed success
+        try:
+            store_for_credits = load_store()
+            meta_for_credits = get_job_metadata(job_id, store_for_credits)
+            res_id = meta_for_credits.get("reservation_id")
+            int_job = meta_for_credits.get("internal_job_id") or job_id
+            cred_identity = meta_for_credits.get("identity_id") or identity_id
+            if res_id:
+                finalize_job_credits(res_id, int_job, cred_identity)
+        except Exception as e:
+            print(f"[mesh/remesh] credit finalize on done failed: {e}")
 
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
         store = load_store()
@@ -315,9 +328,19 @@ def mesh_retexture_mod():
 
     body = request.get_json(silent=True) or {}
     log_event("mesh/retexture:incoming[mod]", body)
-    source, err = build_source_payload(body, identity_id=identity_id, prefer="model_url")
+
+    # ── Source resolution ────────────────────────────────────────────────
+    # Meshy retexture: prefer input_task_id (Meshy already has the model
+    # data internally — avoids async "input file could not be processed"
+    # failures that happen with model_url when UVs/geometry are lost).
+    # Fall back to model_url for uploaded/imported models or expired tasks.
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
     if err:
         return jsonify({"error": err}), 400
+
+    # Diagnostic: log which source mode was selected and why
+    source_mode = "task" if source.get("input_task_id") else "model_url"
+    _log_retexture_source(source, body, source_mode)
 
     prompt = (body.get("text_style_prompt") or "").strip()
     style_img = (body.get("image_style_url") or "").strip()
@@ -334,21 +357,16 @@ def mesh_retexture_mod():
     # Only validate source_task_id if not using model_url (model_url is the source itself)
     source_task_id = None
     if source.get("model_url"):
-        # When using model_url, we don't need a source_task_id for Meshy
         source_task_id = source_task_id_input  # May be None, that's OK
     else:
-        # Resolve and validate source task ID before reserving credits
         source_task_id, validation_error = _resolve_and_validate_source_task(source_task_id_input, store)
         if validation_error:
             return validation_error
 
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
-    # Use texture_prompt as fallback for prompt/root_prompt (often contains original description)
-    texture_prompt_text = prompt or ""  # texture prompt from body
+    texture_prompt_text = prompt or ""
     original_prompt = source_meta.get("prompt") or body.get("prompt") or texture_prompt_text or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt or texture_prompt_text or ""
-    # Use explicit title, or derive from prompt/root_prompt
-    # derive_display_title handles generic titles (like "Textured Model") automatically
     explicit_title = body.get("title") or source_meta.get("title")
     title = derive_display_title(original_prompt or texture_prompt_text, explicit_title, root_prompt=root_prompt or texture_prompt_text)
 
@@ -357,7 +375,7 @@ def mesh_retexture_mod():
         "root_prompt": root_prompt,
         "title": title,
         "stage": "texture",
-        "source_task_id": source_task_id,  # Use resolved ID
+        "source_task_id": source_task_id,
         "texture_prompt": prompt or None,
         "enable_pbr": bool(body.get("enable_pbr", False)),
     }
@@ -378,6 +396,7 @@ def mesh_retexture_mod():
         status="queued",
     )
 
+    # ── Build Meshy payload — NEVER include both input_task_id and model_url ─
     payload = {
         **source,
         "enable_original_uv": bool(body.get("enable_original_uv", True)),
@@ -391,28 +410,68 @@ def mesh_retexture_mod():
     if ai_model:
         payload["ai_model"] = ai_model
 
-    # Log payload for debugging (redact long URLs)
     log_payload = {k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v) for k, v in payload.items()}
-    print(f"[RETEXTURE] Sending to Meshy: identity={identity_id} job={internal_job_id} payload={log_payload}")
+    print(f"[RETEXTURE] Sending to Meshy: identity={identity_id} job={internal_job_id} source_mode={source_mode} payload={log_payload}")
 
+    # ── Dispatch to Meshy with auto-fallback ─────────────────────────────
+    # If input_task_id is rejected (stale/expired/wrong type), retry once
+    # with model_url if the frontend provided one.
+    resp = None
+    used_fallback = False
     try:
         resp = mesh_post("/openapi/v1/retexture", payload)
-        log_event("mesh/retexture:meshy-resp[mod]", resp)
-        meshy_task_id = resp.get("result") or resp.get("id")
-        if not meshy_task_id:
-            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
-            print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} error=no_task_id_in_response raw={resp}")
-            return jsonify({"ok": False, "error": "MODEL_GENERATION_FAILED", "message": "3D model generation failed. Please try again."}), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
-        return jsonify(sanitize_provider_error(
-            provider="meshy", error=e, job_id=internal_job_id,
-            code=MODEL_GENERATION_FAILED,
-        )), 502
+        err_str = str(e).lower()
+        has_model_url_fallback = bool(body.get("model_url")) and source.get("input_task_id")
+        task_id_rejected = (
+            "task not found" in err_str
+            or "input task" in err_str
+            or ("400" in err_str and "input_task_id" in err_str)
+        )
 
-    # Use internal_job_id (not meshy_task_id) for credit finalization tracking
-    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+        if task_id_rejected and has_model_url_fallback:
+            print(f"[RETEXTURE:FALLBACK] input_task_id rejected, retrying with model_url job={internal_job_id}")
+            fallback_source, fallback_err = build_source_payload(
+                {"model_url": body["model_url"]},
+                identity_id=identity_id,
+                prefer="model_url",
+            )
+            if not fallback_err:
+                fallback_payload = {k: v for k, v in payload.items() if k != "input_task_id"}
+                fallback_payload["model_url"] = fallback_source["model_url"]
+                try:
+                    resp = mesh_post("/openapi/v1/retexture", fallback_payload)
+                    used_fallback = True
+                    print(f"[RETEXTURE:FALLBACK] model_url fallback succeeded job={internal_job_id}")
+                except Exception as e2:
+                    release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+                    from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+                    print(f"[RETEXTURE:FALLBACK] model_url fallback also failed job={internal_job_id}: {e2}")
+                    return jsonify(sanitize_provider_error(
+                        provider="meshy", error=e2, job_id=internal_job_id,
+                        code=MODEL_GENERATION_FAILED,
+                    )), 502
+
+        if resp is None:
+            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+            from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+            return jsonify(sanitize_provider_error(
+                provider="meshy", error=e, job_id=internal_job_id,
+                code=MODEL_GENERATION_FAILED,
+            )), 502
+
+    log_event("mesh/retexture:meshy-resp[mod]", resp)
+    meshy_task_id = resp.get("result") or resp.get("id")
+    if not meshy_task_id:
+        release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} error=no_task_id_in_response raw={resp}")
+        return jsonify({"ok": False, "error": "MODEL_GENERATION_FAILED", "message": "3D model generation failed. Please try again."}), 502
+
+    # ── Credits: do NOT finalize now ─────────────────────────────────────
+    # Retexture is async — Meshy accepted the task but hasn't processed it.
+    # Finalize only when the status endpoint sees terminal success ("done").
+    # Release on terminal failure ("failed") via refund_failed_job().
+    # This prevents capturing credits for tasks that Meshy later rejects.
 
     # Update internal job with upstream id for ownership/status
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
@@ -440,7 +499,34 @@ def mesh_retexture_mod():
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "source": "modular",
+        "source_mode": "model_url" if used_fallback else source_mode,
     })
+
+
+def _log_retexture_source(source: dict, body: dict, source_mode: str):
+    """Structured diagnostic log for retexture source resolution."""
+    input_id = body.get("input_task_id") or body.get("source_task_id") or ""
+    model_url = body.get("model_url") or ""
+    resolved_id = source.get("input_task_id") or ""
+    resolved_url = source.get("model_url") or ""
+
+    # Classify the input_task_id type
+    id_type = "none"
+    if input_id:
+        import re
+        if re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', input_id):
+            id_type = "uuid_internal_or_meshy"
+        else:
+            id_type = "meshy_task_id"
+
+    print(
+        f"[RETEXTURE:SRC] source_mode={source_mode}"
+        f" input_id_type={id_type}"
+        f" input_task_id={input_id[:40] if input_id else 'none'}"
+        f" resolved_task_id={resolved_id[:40] if resolved_id else 'none'}"
+        f" model_url={'yes_s3' if 's3' in model_url.lower() else ('yes_other' if model_url else 'none')}"
+        f" resolved_url={'yes' if resolved_url else 'none'}"
+    )
 
 
 @bp.route("/mesh/retexture/<job_id>", methods=["GET", "OPTIONS"])
@@ -468,13 +554,28 @@ def mesh_retexture_status_mod(job_id: str):
     out = normalize_meshy_task(ms, stage="texture")
     log_status_summary("mesh/retexture[mod]", job_id, out)
 
-    # Auto-refund on async failure
+    # ── Async credit handling ────────────────────────────────────────────
+    # Credits are reserved at POST time but NOT finalized until terminal
+    # status.  This ensures failed async jobs refund properly.
     if out["status"] == "failed":
         try:
             from backend.services.credits_helper import refund_failed_job
             refund_failed_job(job_id)
         except Exception as e:
             print(f"[mesh/retexture] auto-refund failed: {e}")
+
+    if out["status"] == "done":
+        # Finalize (capture) credits now that Meshy confirmed success
+        try:
+            store_for_credits = load_store()
+            meta_for_credits = get_job_metadata(job_id, store_for_credits)
+            res_id = meta_for_credits.get("reservation_id")
+            int_job = meta_for_credits.get("internal_job_id") or job_id
+            cred_identity = meta_for_credits.get("identity_id") or identity_id
+            if res_id:
+                finalize_job_credits(res_id, int_job, cred_identity)
+        except Exception as e:
+            print(f"[mesh/retexture] credit finalize on done failed: {e}")
 
     if out["status"] == "done" and (out.get("glb_url") or out.get("textured_glb_url") or out.get("thumbnail_url")):
         store = load_store()

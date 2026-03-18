@@ -71,7 +71,9 @@ def rig_start():
     body = request.get_json(silent=True) or {}
     log_event("rig/start:incoming", body)
 
-    source, err = build_source_payload(body, identity_id=identity_id)
+    # Prefer model_url for rigging — Meshy input_task_ids expire after 3 days,
+    # but our S3 model URLs persist. This lets users rig old models.
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="model_url")
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
@@ -146,7 +148,8 @@ def rig_start():
             message=user_msg,
         )), 502
 
-    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    # Credits: do NOT finalize now — rigging is async.
+    # Finalize on terminal success in status endpoint; release on failure.
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     store = load_store()
@@ -220,6 +223,27 @@ def rig_status(job_id: str):
     # For non-final states, return immediately — no S3 work, no heavy logging
     if out["status"] not in ("done", "failed"):
         return jsonify(out)
+
+    # ── Async credit handling (same pattern as retexture/remesh) ──
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(job_id)
+        except Exception as e:
+            print(f"[rig/status] auto-refund failed: {e}")
+
+    if out["status"] == "done":
+        try:
+            store_for_credits = load_store()
+            meta_for_credits = get_job_metadata(job_id, store_for_credits)
+            res_id = meta_for_credits.get("reservation_id")
+            int_job = meta_for_credits.get("internal_job_id") or job_id
+            cred_identity = meta_for_credits.get("identity_id") or identity_id
+            if res_id:
+                from backend.services.credits_helper import finalize_job_credits
+                finalize_job_credits(res_id, int_job, cred_identity)
+        except Exception as e:
+            print(f"[rig/status] credit finalize on done failed: {e}")
 
     # ── Final state: persist rigging outputs ──
     if out["status"] == "done" and (
@@ -397,7 +421,8 @@ def rig_animate():
             code=MODEL_GENERATION_FAILED,
         )), 502
 
-    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+    # Credits: do NOT finalize now — animation is async.
+    # Finalize on terminal success in status endpoint; release on failure.
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     store = load_store()
@@ -469,6 +494,27 @@ def rig_animate_status(job_id: str):
     # For non-final states, return immediately
     if out["status"] not in ("done", "failed"):
         return jsonify(out)
+
+    # ── Async credit handling ──
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(job_id)
+        except Exception as e:
+            print(f"[anim/status] auto-refund failed: {e}")
+
+    if out["status"] == "done":
+        try:
+            store_for_credits = load_store()
+            meta_for_credits = get_job_metadata(job_id, store_for_credits)
+            res_id = meta_for_credits.get("reservation_id")
+            int_job = meta_for_credits.get("internal_job_id") or job_id
+            cred_identity = meta_for_credits.get("identity_id") or identity_id
+            if res_id:
+                from backend.services.credits_helper import finalize_job_credits
+                finalize_job_credits(res_id, int_job, cred_identity)
+        except Exception as e:
+            print(f"[anim/status] credit finalize on done failed: {e}")
 
     # ── Final state: persist animation outputs ──
     if out["status"] == "done" and (

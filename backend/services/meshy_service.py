@@ -284,10 +284,17 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
 def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: str = "input_task_id"):
     """Validate and build the source payload for Meshy operations.
 
+    Returns a dict with EXACTLY ONE key: either {"input_task_id": ...} or
+    {"model_url": ...}.  Never both — Meshy silently prefers input_task_id
+    when both are present, and a stale/wrong one causes async failures even
+    when model_url is valid.
+
     Args:
         prefer: Which source to prefer when both are available.
-            "input_task_id" — best for refine (Meshy needs internal task data).
-            "model_url" — best for retexture/remesh (works with any model file).
+            "input_task_id" — best for retexture/refine (model is already
+                in Meshy's system, preserves UV/geometry metadata).
+            "model_url" — best for rigging/remesh or when task ID is
+                expired/unavailable.
     """
     input_task_id = (body.get("input_task_id") or "").strip()
     model_url = (body.get("model_url") or "").strip()
