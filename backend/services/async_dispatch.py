@@ -116,18 +116,30 @@ def dispatch_meshy_refine_async(
     # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=refine reservation_id={reservation_id}")
 
     try:
-        resp = mesh_post("/openapi/v2/text-to-3d", payload)
+        # Meshy has eventual consistency: a just-completed preview may not be
+        # found for refine for a few seconds.  Retry once after a short delay.
+        resp = None
+        last_err = None
+        for attempt in range(2):
+            try:
+                resp = mesh_post("/openapi/v2/text-to-3d", payload)
+                break
+            except Exception as e:
+                last_err = e
+                err_lower = str(e).lower()
+                is_not_found = "preview task not found" in err_lower or "task not found" in err_lower
+                if is_not_found and attempt == 0:
+                    print(f"[ASYNC] Meshy refine: preview not found, retrying in 3s (job={internal_job_id})")
+                    time.sleep(3)
+                    continue
+                raise
+
+        if resp is None:
+            raise last_err or RuntimeError("Refine dispatch failed")
+
         meshy_task_id = resp.get("result")
 
         duration_ms = int((time.time() - start_time) * 1000)
-        # print(
-        #     f"[ASYNC] Meshy refine returned task_id={meshy_task_id} "
-        #     f"for job {internal_job_id} in {duration_ms}ms"
-        # )
-        # print(
-        #     f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} "
-        #     f"upstream_id={meshy_task_id} status=accepted"
-        # )
 
         if not meshy_task_id:
             print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} error=refine_returned_no_task_id")
