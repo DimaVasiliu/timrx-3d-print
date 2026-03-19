@@ -34,13 +34,17 @@ def _cur(conn):
     return conn.cursor(row_factory=_tuple_row) if _tuple_row else conn.cursor()
 
 
-def _get_gen_type(item_type, glb_url, gen_action):
+def _get_gen_type(item_type, glb_url, gen_action, animation_glb_url=None):
     """Map history item fields to a human-readable generation type label."""
     action = (gen_action or '').lower()
     if item_type == 'video':
         if any(k in action for k in ('image', 'animate', 'img2vid', 'image_animate')):
             return 'Image to Video'
         return 'Text to Video'
+    elif animation_glb_url or action in ('animate', 'animation', 'meshy_animation'):
+        return 'Animated 3D'
+    elif action in ('rig', 'rigging', 'meshy_rig', 'meshy_rigging'):
+        return 'Rigged 3D'
     elif glb_url:
         if any(k in action for k in ('image', 'img', 'image_to_3d')):
             return 'Image to 3D'
@@ -85,6 +89,12 @@ def community_feed_mod():
                 "AND cp.history_item_id IS NOT NULL "
                 "AND h.item_type = 'video'"
             )
+        elif asset_type == "animated":
+            type_filter = (
+                "AND cp.history_item_id IS NOT NULL "
+                "AND (h.payload->>'animation_glb_url') IS NOT NULL "
+                "AND (h.payload->>'animation_glb_url') != ''"
+            )
 
         with get_conn() as conn:
             cursor = _cur(conn)
@@ -113,7 +123,8 @@ def community_feed_mod():
                     h.image_url      AS history_image_url,
                     h.item_type      AS history_item_type,
                     h.video_url      AS history_video_url,
-                    h.payload->>'action' AS gen_action
+                    h.payload->>'action' AS gen_action,
+                    h.payload->>'animation_glb_url' AS animation_glb_url
                 FROM timrx_app.community_posts cp
                 LEFT JOIN timrx_app.models        m ON cp.model_id        = m.id
                 LEFT JOIN timrx_app.images        i ON cp.image_id        = i.id
@@ -132,9 +143,10 @@ def community_feed_mod():
                  model_title, model_thumbnail,
                  _image_url, image_thumbnail,
                  history_title, history_thumbnail, history_glb_url, _history_image_url,
-                 history_item_type, history_video_url, gen_action) = row
+                 history_item_type, history_video_url, gen_action,
+                 animation_glb_url) = row
 
-                gen_type = _get_gen_type(history_item_type or '', history_glb_url, gen_action)
+                gen_type = _get_gen_type(history_item_type or '', history_glb_url, gen_action, animation_glb_url)
 
                 post = {
                     "id":           str(post_id),
@@ -164,11 +176,16 @@ def community_feed_mod():
                         }
                     else:
                         post["asset_type"] = "model" if history_glb_url else "image"
-                        post["asset"] = {
+                        asset = {
                             "id":            str(history_item_id),
                             "title":         history_title,
                             "thumbnail_url": history_thumbnail,
                         }
+                        if animation_glb_url:
+                            asset["animation_glb_url"] = animation_glb_url
+                        elif history_glb_url:
+                            asset["glb_url"] = history_glb_url
+                        post["asset"] = asset
 
                 posts.append(post)
 

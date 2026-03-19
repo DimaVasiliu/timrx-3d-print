@@ -1024,6 +1024,34 @@ def history_item_update_mod(item_id: str):
 
                         orphaned_jobs = []
                         with conn.cursor() as cur:
+                            # Remove community posts referencing this history item,
+                            # its sibling history items, or its model/image assets.
+                            # Must happen BEFORE deleting history items to avoid
+                            # ON DELETE SET NULL violating ck_community_one_ref.
+                            cur.execute(
+                                """
+                                DELETE FROM timrx_app.community_posts
+                                WHERE identity_id = %s AND (
+                                    history_item_id::text = %s
+                                    OR (model_id IS NOT NULL AND model_id = %s)
+                                    OR (image_id IS NOT NULL AND image_id = %s)
+                                    OR history_item_id IN (
+                                        SELECT id FROM timrx_app.history_items
+                                        WHERE identity_id = %s AND (
+                                            (model_id IS NOT NULL AND model_id = %s)
+                                            OR (image_id IS NOT NULL AND image_id = %s)
+                                            OR (video_id IS NOT NULL AND video_id = %s)
+                                        )
+                                    )
+                                )
+                                """,
+                                (identity_id, str(item_id), model_id, image_id,
+                                 identity_id, model_id, image_id, video_id),
+                            )
+                            community_deleted = cur.rowcount
+                            if community_deleted:
+                                print(f"[DELETE] removed {community_deleted} community post(s) for history_item={item_id}")
+
                             # Delete the requested history item
                             cur.execute(
                                 f"""
