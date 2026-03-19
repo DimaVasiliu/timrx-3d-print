@@ -77,6 +77,8 @@ GENERIC_TITLES = frozenset({
     "remeshed model",
     "refined model",
     "rigged model",
+    "animated model",
+    "animation",
     "image to 3d model",
     "generated model",
     "model",
@@ -86,6 +88,10 @@ GENERIC_TITLES = frozenset({
 
 # Regex to detect hex-like IDs (24+ hex chars, like Meshy task IDs)
 _HEX_ID_PATTERN = re.compile(r"^[0-9a-f]{24,}$", re.IGNORECASE)
+# Regex to detect "Animation #123" style labels (useless to users)
+_ANIMATION_NUM_PATTERN = re.compile(r"^animation\s*#\s*\d+$", re.IGNORECASE)
+# Regex to detect "Rig <filename>" style labels
+_RIG_LABEL_PATTERN = re.compile(r"^rig\s+", re.IGNORECASE)
 
 
 def is_generic_title(title: str | None) -> bool:
@@ -96,6 +102,7 @@ def is_generic_title(title: str | None) -> bool:
     - Empty strings
     - Common placeholders: "Untitled", "Textured Model", etc.
     - Hex IDs (24+ hex chars like Meshy task IDs)
+    - "Animation #123" style auto-generated labels
 
     Returns True if the title is generic and should NOT be used.
     """
@@ -109,6 +116,9 @@ def is_generic_title(title: str | None) -> bool:
         return True
     # Check if it looks like a hex ID (24+ hex chars)
     if _HEX_ID_PATTERN.match(t):
+        return True
+    # Check for "Animation #10" auto-labels
+    if _ANIMATION_NUM_PATTERN.match(t):
         return True
     return False
 
