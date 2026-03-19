@@ -284,10 +284,18 @@ def history_mod():
 
                         items.append(item)
 
-                    for i, item in enumerate(items[:3]):
-                        thumb = item.get("thumbnail_url")
-                        thumb_preview = (thumb[:60] + "...") if isinstance(thumb, str) else "None"
-                        print(f"[History][mod] Item {i}: title={item.get('title')}, thumbnail={thumb_preview}")
+                    # Diagnostic: log rig/animate items specifically
+                    for item in items:
+                        stage = (item.get("stage") or "").lower()
+                        if stage in ("rig", "animate", "animation"):
+                            thumb = item.get("thumbnail_url")
+                            thumb_src = "s3" if (isinstance(thumb, str) and "s3.amazonaws" in thumb) else ("data" if (isinstance(thumb, str) and thumb.startswith("data:")) else ("url" if thumb else "none"))
+                            title_src = "h.title" if r.get("title") else ("m.title" if r.get("m_title") else "derived")
+                            print(
+                                f"[History][{stage}] id={item['id'][:12]}... "
+                                f"title={repr(item.get('title','')[:40])} title_src={title_src} "
+                                f"thumb={thumb_src} model_id={item.get('model_id','none')[:12] if item.get('model_id') else 'none'}"
+                            )
 
                     save_history_store(items)
                 except Exception as e:

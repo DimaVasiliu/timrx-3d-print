@@ -212,11 +212,15 @@ def rig_start():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["rigging"]
 
+    # Accept optional prompt/title from frontend for title persistence
+    rig_prompt = (body.get("prompt") or body.get("title") or "").strip()
+
     job_meta = {
         "stage": "rig",
         "height_meters": height_meters,
         "source_task_id": source.get("input_task_id"),
         "model_url": source.get("model_url"),
+        "prompt": rig_prompt or None,
     }
 
     reservation_id, credit_error = start_paid_job(
@@ -283,6 +287,7 @@ def rig_start():
         "height_meters": height_meters,
         "source_task_id": source.get("input_task_id"),
         "model_url": source.get("model_url"),
+        "prompt": rig_prompt or None,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -502,10 +507,15 @@ def rig_animate():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["animation"]
 
+    # Accept optional prompt/title from frontend for title persistence
+    anim_prompt = (body.get("prompt") or body.get("title") or "").strip()
+
     job_meta = {
         "stage": "animate",
         "rig_task_id": rig_task_id,
         "action_id": action_id,
+        "source_task_id": rig_task_id,  # parent lookup uses this to inherit title
+        "prompt": anim_prompt or None,
     }
     if post_process:
         job_meta["post_process"] = post_process
@@ -560,6 +570,8 @@ def rig_animate():
         "created_at": now_s() * 1000,
         "rig_task_id": rig_task_id,
         "action_id": action_id,
+        "source_task_id": rig_task_id,
+        "prompt": anim_prompt or None,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
