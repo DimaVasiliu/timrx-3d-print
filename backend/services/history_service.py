@@ -2690,7 +2690,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         if not db_save_ok:
             print(f"[DB] save_finished_job completed with db_ok=False job_id={job_id}")
 
-        return {
+        result = {
             "success": True,
             "db_ok": db_save_ok and len(db_errors) == 0,
             "db_errors": db_errors or None,
@@ -2707,6 +2707,18 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             "image_id": image_id,
             "history_item_id": history_item_id,
         }
+        # For animation jobs, include animation-specific URLs in the return.
+        # After S3 upload, the canonical glb_url is the S3 copy of the animation GLB.
+        # Map it back so callers (rigging route) can update the response.
+        if job_type == "animate" and final_glb_url:
+            result["animation_glb_url"] = final_glb_url
+            # animation FBX is not uploaded to S3 (wiped at line 1824), use original
+            if status_data.get("animation_fbx_url"):
+                result["animation_fbx_url"] = status_data["animation_fbx_url"]
+            for key in ("processed_usdz_url", "processed_armature_fbx_url", "processed_animation_fps_fbx_url"):
+                if status_data.get(key):
+                    result[key] = status_data[key]
+        return result
     except Exception as e:
         print(f"[DB] Failed to save finished job {job_id}: {e}")
         final_glb_url = locals().get("final_glb_url")

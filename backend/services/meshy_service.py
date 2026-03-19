@@ -318,6 +318,7 @@ def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: 
                 else:
                     return None, "Job not found or access denied"
             else:
+                print(f"[RIG_SOURCE] resolved: input_task_id={resolved} (original={input_task_id})")
                 return {"input_task_id": resolved}, None
         except Exception as e:
             if model_url:
@@ -389,4 +390,5 @@ def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: 
     except Exception as e:
         print(f"[Meshy] build_source_payload ownership/sign check failed: {e}")
 
+    print(f"[RIG_SOURCE] fallback: model_url={'s3' if 's3.amazonaws' in model_url else 'other'}({model_url[:60]})")
     return {"model_url": model_url}, None
