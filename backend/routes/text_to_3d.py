@@ -211,12 +211,42 @@ def text_to_3d_refine_mod():
     # If the input is a UUID and resolution returned the same value, the upstream ID is missing
     if _looks_like_internal_uuid(preview_task_id_input) and preview_task_id == preview_task_id_input:
         # Check if this might be a Meshy task ID directly (could be valid)
-        # Look in store to see if we have any record of this ID
+        # Check in-memory store first, then DB (store is per-worker, may miss cross-worker jobs)
         store = load_store()
         store_entry = store.get(preview_task_id_input) or {}
-        if not store_entry.get("glb_url") and not store_entry.get("status") == "done":
-            # No record of completion - this is likely an internal ID that wasn't resolved
-            print(f"[Refine][mod] ERROR: Could not resolve preview_task_id {preview_task_id_input} to Meshy task ID")
+        found_in_store = store_entry.get("glb_url") or store_entry.get("status") == "done"
+
+        # If not in store, check DB — the job may have been handled by a different worker
+        found_in_db = False
+        if not found_in_store:
+            try:
+                from backend.db import USE_DB, get_conn, Tables
+                from psycopg.rows import dict_row
+                if USE_DB:
+                    with get_conn() as conn:
+                        with conn.cursor(row_factory=dict_row) as cur:
+                            cur.execute(
+                                f"""
+                                SELECT 1 FROM {Tables.JOBS}
+                                WHERE upstream_job_id = %s AND status IN ('ready', 'completed', 'done')
+                                UNION
+                                SELECT 1 FROM {Tables.MODELS}
+                                WHERE upstream_job_id = %s
+                                UNION
+                                SELECT 1 FROM {Tables.HISTORY_ITEMS}
+                                WHERE payload->>'original_job_id' = %s AND status = 'finished'
+                                LIMIT 1
+                                """,
+                                (preview_task_id_input, preview_task_id_input, preview_task_id_input),
+                            )
+                            found_in_db = cur.fetchone() is not None
+                if found_in_db:
+                    print(f"[Refine][mod] preview_task_id {preview_task_id_input} not in store but found in DB (cross-worker)")
+            except Exception as e:
+                print(f"[Refine][mod] DB fallback check failed: {e}")
+
+        if not found_in_store and not found_in_db:
+            print(f"[Refine][mod] ERROR: Could not resolve preview_task_id {preview_task_id_input} to Meshy task ID (not in store or DB)")
             return jsonify({
                 "ok": False,
                 "error": "Preview task ID not found or not yet ready. Ensure the preview completed successfully before refining.",
