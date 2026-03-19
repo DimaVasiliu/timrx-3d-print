@@ -263,11 +263,17 @@ def proxy_glb_mod():
                     pass
 
             ids_str = identity_id if len(identity_ids) == 1 else f"{identity_id}+{len(identity_ids)-1}merged"
+            # Determine asset type for clearer diagnostics
+            url_path = p.path.lower()
+            asset_type = "animation" if "/animations/" in url_path else "rig" if "/rigging/" in url_path else "model"
             print(
-                f"[proxy-glb][mod] DENIED: identity={ids_str} "
+                f"[PROXY_GLB] DENIED: identity={ids_str} "
+                f"merged_count={len(identity_ids)} "
                 f"meshy_task={meshy_task_id or 'none'} "
+                f"asset_type={asset_type} "
                 f"actual_owner={actual_owner or 'unknown'} "
-                f"url={u[:100]}..."
+                f"s3={'yes' if is_our_s3 else 'no'} "
+                f"url={u[:120]}"
             )
             resp = jsonify({"ok": False, "error": {"code": "NOT_FOUND", "message": "Asset not found"}})
             resp.headers.update(cors_headers)

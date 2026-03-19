@@ -54,6 +54,127 @@ from backend.utils.helpers import log_event, log_status_summary, now_s
 bp = Blueprint("rigging", __name__)
 
 
+# ─── POST /rig/preflight ─────────────────────────────────────────────────────
+
+@bp.route("/rig/preflight", methods=["POST", "OPTIONS"])
+@with_session
+def rig_preflight():
+    """
+    Pre-flight check before rigging submission.
+
+    Validates:
+    - Source model resolution (input_task_id or model_url)
+    - Face count against Meshy's 300K limit
+    - Whether the source model still exists upstream
+    - Whether model is already rigged
+
+    Returns riggable=true/false with reason + recommended_action.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    print(f"[RIG_PREFLIGHT] identity={identity_id} body_keys={list(body.keys())}")
+
+    # Resolve source model
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
+    if err:
+        print(f"[RIG_PREFLIGHT] source_resolution_failed: {err}")
+        return jsonify({
+            "ok": True,
+            "riggable": False,
+            "reason": f"Source model not available: {err}",
+            "recommended_action": "unsupported",
+            "source": None,
+            "face_count": None,
+            "vertex_count": None,
+        })
+
+    result = {
+        "ok": True,
+        "riggable": True,
+        "reason": None,
+        "recommended_action": "proceed",
+        "source": {
+            "input_task_id": source.get("input_task_id"),
+            "model_url": source.get("model_url"),
+        },
+        "face_count": None,
+        "vertex_count": None,
+        "already_rigged": False,
+    }
+
+    # Check if the source is already a rigged model
+    source_task_id = source.get("input_task_id")
+    if source_task_id and USE_DB:
+        try:
+            from backend.db import get_conn, Tables
+            from psycopg.rows import dict_row
+            with get_conn() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    # Check if this task ID is already a rig result
+                    cur.execute(
+                        f"""
+                        SELECT payload->>'stage' as stage
+                        FROM {Tables.HISTORY_ITEMS}
+                        WHERE identity_id = %s
+                          AND (payload->>'original_job_id' = %s
+                               OR payload->>'source_task_id' = %s)
+                          AND payload->>'stage' = 'rig'
+                        LIMIT 1
+                        """,
+                        (identity_id, source_task_id, source_task_id),
+                    )
+                    if cur.fetchone():
+                        result["already_rigged"] = True
+                        print(f"[RIG_PREFLIGHT] model already rigged: task={source_task_id}")
+        except Exception as e:
+            print(f"[RIG_PREFLIGHT] already-rigged check failed: {e}")
+
+    # Try to get face count from Meshy task metadata
+    if source_task_id:
+        try:
+            from backend.services.meshy_service import mesh_get
+            task_info = mesh_get(f"/openapi/v1/text-to-3d/{source_task_id}")
+            # Meshy may return topology info in task metadata
+            face_count = None
+            vertex_count = None
+            # Check output containers for topology info
+            for container_key in ["output", "result", ""]:
+                container = task_info.get(container_key, task_info) if container_key else task_info
+                if isinstance(container, dict):
+                    face_count = face_count or container.get("face_count") or container.get("faces")
+                    vertex_count = vertex_count or container.get("vertex_count") or container.get("vertices")
+            if face_count:
+                result["face_count"] = int(face_count)
+                result["vertex_count"] = int(vertex_count) if vertex_count else None
+                if result["face_count"] > 300000:
+                    result["riggable"] = False
+                    result["reason"] = f"Model has {result['face_count']:,} faces (limit: 300,000). Remesh the model first."
+                    result["recommended_action"] = "remesh_first"
+                    print(f"[RIG_PREFLIGHT] too_many_faces: {result['face_count']} > 300K")
+            print(f"[RIG_PREFLIGHT] source={source_task_id} faces={face_count} vertices={vertex_count} riggable={result['riggable']}")
+        except Exception as e:
+            # Non-fatal: can't get face count from this endpoint, proceed anyway
+            err_str = str(e).lower()
+            if "not found" in err_str or "404" in err_str:
+                # Try image-to-3d endpoint
+                try:
+                    task_info = mesh_get(f"/openapi/v1/image-to-3d/{source_task_id}")
+                    print(f"[RIG_PREFLIGHT] found via image-to-3d: task={source_task_id}")
+                except Exception:
+                    print(f"[RIG_PREFLIGHT] task_lookup_failed (may be fine for uploaded models): {e}")
+            else:
+                print(f"[RIG_PREFLIGHT] task_info_error: {e}")
+
+    print(f"[RIG_PREFLIGHT] result: riggable={result['riggable']} action={result['recommended_action']} faces={result['face_count']}")
+    return jsonify(result)
+
+
 # ─── POST /rig/start ────────────────────────────────────────────────────────
 
 @bp.route("/rig/start", methods=["POST", "OPTIONS"])
@@ -69,14 +190,16 @@ def rig_start():
         return auth_error
 
     body = request.get_json(silent=True) or {}
-    log_event("rig/start:incoming", body)
+    print(f"[RIG_SUBMIT] identity={identity_id} keys={list(body.keys())}")
 
     # Prefer input_task_id for rigging — Meshy's original model retains textures.
     # S3 model_url is often a decimated/remeshed GLB without materials.
     # Falls back to model_url automatically if input_task_id resolution fails.
     source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
     if err:
+        print(f"[RIG_SOURCE] FAILED identity={identity_id} error={err}")
         return jsonify({"ok": False, "error": err}), 400
+    print(f"[RIG_SOURCE] resolved: input_task_id={source.get('input_task_id')} model_url={'yes' if source.get('model_url') else 'no'}")
 
     # Parse optional height_meters (default 1.7)
     try:
@@ -279,8 +402,13 @@ def rig_status(job_id: str):
                 if s3_result.get("db_ok") is False:
                     out["db_ok"] = False
                     out["db_errors"] = s3_result.get("db_errors")
+                    print(f"[ASSET_SAVE] WARN rig job={job_id} db_errors={s3_result.get('db_errors')}")
+                else:
+                    print(f"[RIG_DONE] job={job_id} glb={'yes' if s3_result.get('glb_url') else 'no'} db=ok")
+            else:
+                print(f"[ASSET_SAVE] FAIL rig job={job_id} result={s3_result}")
         except Exception as e:
-            print(f"[rig/status] persist failed: {e}")
+            print(f"[ASSET_SAVE] ERROR rig job={job_id} error={e}")
 
     return jsonify(out)
 
@@ -339,7 +467,7 @@ def rig_animate():
         return auth_error
 
     body = request.get_json(silent=True) or {}
-    log_event("rig/animate:incoming", body)
+    print(f"[ANIM_SUBMIT] identity={identity_id} rig_task_id={body.get('rig_task_id')} action_id={body.get('action_id')}")
 
     # Accept both old field name (rigging_task_id) and correct Meshy name (rig_task_id)
     rig_task_id = (body.get("rig_task_id") or body.get("rigging_task_id") or "").strip()
@@ -550,8 +678,13 @@ def rig_animate_status(job_id: str):
                 if s3_result.get("db_ok") is False:
                     out["db_ok"] = False
                     out["db_errors"] = s3_result.get("db_errors")
+                    print(f"[ASSET_SAVE] WARN anim job={job_id} db_errors={s3_result.get('db_errors')}")
+                else:
+                    print(f"[ANIM_DONE] job={job_id} glb={'yes' if s3_result.get('glb_url') else 'no'} db=ok")
+            else:
+                print(f"[ASSET_SAVE] FAIL anim job={job_id} result={s3_result}")
         except Exception as e:
-            print(f"[rig/animate/status] persist failed: {e}")
+            print(f"[ASSET_SAVE] ERROR anim job={job_id} error={e}")
 
     return jsonify(out)
 
