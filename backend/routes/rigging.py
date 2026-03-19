@@ -742,6 +742,113 @@ def rig_animate_stream(job_id: str):
 
 # ─── GET /rig/animations/library — curated animation catalog ───────────────
 
+# ─── PATCH /rig/thumbnail/<job_id> — persist captured thumbnail to S3 + DB ──
+
+@bp.route("/rig/thumbnail/<job_id>", methods=["PATCH", "OPTIONS"])
+@with_session
+def rig_thumbnail(job_id: str):
+    """
+    Persist a frontend-captured thumbnail for a rig/animate asset.
+
+    The viewer captures a data URL after model loads. This endpoint uploads it
+    to S3 and updates models + history_items so thumbnails survive page reload.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    thumbnail_data_url = (body.get("thumbnail_url") or "").strip()
+    if not thumbnail_data_url:
+        return jsonify({"ok": False, "error": "thumbnail_url required"}), 400
+    if not thumbnail_data_url.startswith("data:"):
+        return jsonify({"ok": False, "error": "Only data: URLs accepted (base64 thumbnail)"}), 400
+
+    # Verify ownership
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"ok": False, "error": "Job not found"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"ok": False, "error": "Access denied"}), 403
+
+    # Upload data URL to S3
+    try:
+        from backend.services.s3_service import ensure_s3_url_for_data_uri
+        s3_thumbnail_url = ensure_s3_url_for_data_uri(
+            thumbnail_data_url,
+            "thumbnails",
+            f"thumbnails/{identity_id}/{job_id}",
+            user_id=identity_id,
+            name="thumbnail",
+            provider="meshy",
+        )
+        if not s3_thumbnail_url:
+            print(f"[RIG_THUMB] S3 upload returned None for job={job_id}")
+            return jsonify({"ok": False, "error": "Thumbnail upload failed"}), 500
+    except Exception as e:
+        print(f"[RIG_THUMB] S3 upload error for job={job_id}: {e}")
+        return jsonify({"ok": False, "error": "Thumbnail upload failed"}), 500
+
+    # Update models + history_items in DB
+    updated_tables = []
+    if USE_DB:
+        try:
+            from backend.db import get_conn, Tables
+            from psycopg.rows import dict_row
+            from backend.services.s3_service import parse_s3_key
+            s3_key = parse_s3_key(s3_thumbnail_url) if s3_thumbnail_url else None
+            with get_conn() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    # Update models table
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.MODELS}
+                        SET thumbnail_url = %s,
+                            thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
+                            updated_at = NOW()
+                        WHERE upstream_job_id = %s AND identity_id = %s
+                        RETURNING id
+                        """,
+                        (s3_thumbnail_url, s3_key, job_id, identity_id),
+                    )
+                    model_row = cur.fetchone()
+                    if model_row:
+                        updated_tables.append("models")
+
+                    # Update history_items table
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.HISTORY_ITEMS}
+                        SET thumbnail_url = %s, updated_at = NOW()
+                        WHERE identity_id = %s
+                          AND (payload->>'original_job_id' = %s
+                               OR id::text = %s)
+                        RETURNING id
+                        """,
+                        (s3_thumbnail_url, identity_id, job_id, job_id),
+                    )
+                    hist_row = cur.fetchone()
+                    if hist_row:
+                        updated_tables.append("history_items")
+                conn.commit()
+        except Exception as e:
+            print(f"[RIG_THUMB] DB update error for job={job_id}: {e}")
+
+    print(
+        f"[RIG_THUMB] job={job_id} "
+        f"s3_url={s3_thumbnail_url[:60]}... "
+        f"updated={','.join(updated_tables) or 'none'}"
+    )
+    return jsonify({
+        "ok": True,
+        "thumbnail_url": s3_thumbnail_url,
+        "updated": updated_tables,
+    })
+
+
 @bp.route("/rig/animations/library", methods=["GET", "OPTIONS"])
 @with_session
 def animation_library():

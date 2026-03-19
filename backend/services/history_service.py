@@ -1659,12 +1659,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             parent_title = None
             parent_prompt = None
             parent_root_prompt = None
+            parent_thumbnail = None
             if parent_task_id:
                 try:
                     # First try history_items (by id or payload->original_job_id)
                     cur.execute(
                         f"""
-                        SELECT title, prompt, root_prompt
+                        SELECT title, prompt, root_prompt, thumbnail_url
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE id::text = %s OR payload->>'original_job_id' = %s
                         LIMIT 1
@@ -1676,7 +1677,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     if not parent_row:
                         cur.execute(
                             f"""
-                            SELECT title, prompt, root_prompt
+                            SELECT title, prompt, root_prompt, thumbnail_url
                             FROM {Tables.MODELS}
                             WHERE upstream_job_id = %s OR upstream_id = %s
                             LIMIT 1
@@ -1688,11 +1689,16 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         parent_title = parent_row.get("title")
                         parent_prompt = parent_row.get("prompt")
                         parent_root_prompt = parent_row.get("root_prompt")
+                        parent_thumbnail = parent_row.get("thumbnail_url")
                         # Inherit from parent when current values are missing or generic
                         if (not final_prompt or is_generic_title(final_prompt)) and parent_prompt:
                             final_prompt = parent_prompt
                         if (not root_prompt or is_generic_title(root_prompt)) and (parent_root_prompt or parent_prompt):
                             root_prompt = parent_root_prompt or parent_prompt
+                        # Inherit thumbnail from parent for rig/animate when Meshy doesn't provide one
+                        if not thumbnail_url and parent_thumbnail and job_type in ("rig", "animate"):
+                            thumbnail_url = parent_thumbnail
+                            print(f"[ASSET_SAVE] {job_type} thumbnail inherited from parent: {parent_thumbnail[:60]}...")
                 except Exception as parent_lookup_err:
                     log_db_continue("parent_metadata_lookup", parent_lookup_err)
             s3_bucket = AWS_BUCKET_MODELS or None
