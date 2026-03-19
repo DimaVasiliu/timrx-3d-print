@@ -1696,10 +1696,8 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         if (not root_prompt or is_generic_title(root_prompt)) and (parent_root_prompt or parent_prompt):
                             root_prompt = parent_root_prompt or parent_prompt
                         # Inherit thumbnail from parent for rig/animate when Meshy doesn't provide one.
-                        # Set flag so we skip S3 key derivation (parent owns that key, uniqueness conflict).
                         if not thumbnail_url and parent_thumbnail and job_type in ("rig", "animate"):
                             thumbnail_url = parent_thumbnail
-                            thumbnail_s3_key_from_upload = "__inherited__"  # sentinel: don't derive key
                             print(f"[ASSET_SAVE] {job_type} thumbnail inherited from parent: {parent_thumbnail[:60]}...")
                 except Exception as parent_lookup_err:
                     log_db_continue("parent_metadata_lookup", parent_lookup_err)
@@ -1990,12 +1988,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     f"thumbnail={'yes' if final_thumbnail_url else 'no'}"
                 )
             glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
-            # When thumbnail was inherited from parent, don't derive S3 key — the parent
-            # owns that key and the uq_models_thumb_s3_key UNIQUE index would reject it.
-            if thumbnail_s3_key_from_upload == "__inherited__":
-                thumbnail_s3_key = None  # URL-only reference, no key ownership
-            else:
-                thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
+            thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
             image_s3_key = None
             thumb_s3_key = None
             image_reused = None

@@ -407,11 +407,21 @@ def rig_status(job_id: str):
                 if s3_result.get("db_ok") is False:
                     out["db_ok"] = False
                     out["db_errors"] = s3_result.get("db_errors")
-                    print(f"[ASSET_SAVE] WARN rig job={job_id} db_errors={s3_result.get('db_errors')}")
+                    print(
+                        f"[ASSET_SAVE] FAIL rig job={job_id} "
+                        f"model_id={s3_result.get('model_id')} "
+                        f"db_errors={s3_result.get('db_errors')}"
+                    )
                 else:
-                    print(f"[RIG_DONE] job={job_id} glb={'yes' if s3_result.get('glb_url') else 'no'} db=ok")
+                    print(
+                        f"[RIG_DONE] job={job_id} "
+                        f"model_id={s3_result.get('model_id')} "
+                        f"glb={'yes' if s3_result.get('glb_url') else 'no'} "
+                        f"thumb={'yes' if s3_result.get('thumbnail_url') else 'no'} "
+                        f"db=ok"
+                    )
             else:
-                print(f"[ASSET_SAVE] FAIL rig job={job_id} result={s3_result}")
+                print(f"[ASSET_SAVE] FAIL rig job={job_id} save_returned={s3_result}")
         except Exception as e:
             print(f"[ASSET_SAVE] ERROR rig job={job_id} error={e}")
 
@@ -690,11 +700,21 @@ def rig_animate_status(job_id: str):
                 if s3_result.get("db_ok") is False:
                     out["db_ok"] = False
                     out["db_errors"] = s3_result.get("db_errors")
-                    print(f"[ASSET_SAVE] WARN anim job={job_id} db_errors={s3_result.get('db_errors')}")
+                    print(
+                        f"[ASSET_SAVE] FAIL anim job={job_id} "
+                        f"model_id={s3_result.get('model_id')} "
+                        f"db_errors={s3_result.get('db_errors')}"
+                    )
                 else:
-                    print(f"[ANIM_DONE] job={job_id} glb={'yes' if s3_result.get('glb_url') else 'no'} db=ok")
+                    print(
+                        f"[ANIM_DONE] job={job_id} "
+                        f"model_id={s3_result.get('model_id')} "
+                        f"glb={'yes' if s3_result.get('glb_url') else 'no'} "
+                        f"thumb={'yes' if s3_result.get('thumbnail_url') else 'no'} "
+                        f"db=ok"
+                    )
             else:
-                print(f"[ASSET_SAVE] FAIL anim job={job_id} result={s3_result}")
+                print(f"[ASSET_SAVE] FAIL anim job={job_id} save_returned={s3_result}")
         except Exception as e:
             print(f"[ASSET_SAVE] ERROR anim job={job_id} error={e}")
 
