@@ -1652,6 +1652,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 job_meta.get("original_job_id")
                 or status_data.get("original_job_id")
                 or job_meta.get("source_task_id")
+                or job_meta.get("rig_task_id")       # animation -> parent rig
                 or job_meta.get("preview_task_id")
                 or status_data.get("preview_task_id")
             )
@@ -1968,6 +1969,18 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 explicit_title,
                 root_prompt=root_prompt or job_meta.get("root_prompt"),
             )
+            # Diagnostic: log title/thumbnail resolution for rig/animate jobs
+            if job_type in ("rig", "animate"):
+                print(
+                    f"[ASSET_SAVE] {job_type} title_resolution: "
+                    f"incoming_title={repr(incoming_title)} "
+                    f"parent_title={repr(parent_title)} "
+                    f"final_prompt={repr(final_prompt)[:60]} "
+                    f"explicit_title={repr(explicit_title)} "
+                    f"final_title={repr(final_title)} "
+                    f"parent_task_id={parent_task_id} "
+                    f"thumbnail={'yes' if final_thumbnail_url else 'no'}"
+                )
             glb_s3_key = model_s3_key_from_upload or get_s3_key_from_url(final_glb_url)
             thumbnail_s3_key = thumbnail_s3_key_from_upload or get_s3_key_from_url(final_thumbnail_url)
             image_s3_key = None
