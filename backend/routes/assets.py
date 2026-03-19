@@ -184,14 +184,14 @@ def proxy_glb_mod():
                 if s3_key:
                     cur.execute(
                         f"""
-                        SELECT 1
+                        SELECT 'models' AS src
                         FROM {Tables.MODELS}
                         WHERE identity_id = ANY(%s) AND (
                             glb_s3_key = %s OR thumbnail_s3_key = %s
                             OR glb_url = %s OR thumbnail_url = %s
                         )
                         UNION
-                        SELECT 1
+                        SELECT 'history_items' AS src
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
                         LIMIT 1
@@ -202,16 +202,16 @@ def proxy_glb_mod():
                     # Check active_jobs, jobs, models, and history_items for Meshy task ID
                     cur.execute(
                         f"""
-                        SELECT 1 FROM {Tables.ACTIVE_JOBS}
+                        SELECT 'active_jobs' AS src FROM {Tables.ACTIVE_JOBS}
                         WHERE identity_id = ANY(%s) AND upstream_job_id = %s
                         UNION
-                        SELECT 1 FROM {Tables.JOBS}
+                        SELECT 'jobs' AS src FROM {Tables.JOBS}
                         WHERE identity_id = ANY(%s) AND upstream_job_id = %s
                         UNION
-                        SELECT 1 FROM {Tables.MODELS}
+                        SELECT 'models' AS src FROM {Tables.MODELS}
                         WHERE identity_id = ANY(%s) AND upstream_job_id = %s
                         UNION
-                        SELECT 1 FROM {Tables.HISTORY_ITEMS}
+                        SELECT 'history_items' AS src FROM {Tables.HISTORY_ITEMS}
                         WHERE identity_id = ANY(%s)
                           AND (
                             payload->>'original_job_id' = %s
@@ -230,11 +230,11 @@ def proxy_glb_mod():
                 else:
                     cur.execute(
                         f"""
-                        SELECT 1
+                        SELECT 'models' AS src
                         FROM {Tables.MODELS}
                         WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
                         UNION
-                        SELECT 1
+                        SELECT 'history_items' AS src
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
                         LIMIT 1
@@ -242,6 +242,14 @@ def proxy_glb_mod():
                         (identity_ids, u, u, identity_ids, u, u),
                     )
                 row = cur.fetchone()
+        if row:
+            matched_table = row.get("src", "unknown") if isinstance(row, dict) else "match"
+            print(
+                f"[PROXY_GLB] OK: identity={identity_id} "
+                f"meshy_task={meshy_task_id or 'none'} "
+                f"matched={matched_table} "
+                f"s3={'yes' if is_our_s3 else 'no'}"
+            )
         if not row:
             # Diagnostic: check if the asset exists under ANY identity
             actual_owner = None
