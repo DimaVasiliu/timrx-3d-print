@@ -84,7 +84,7 @@ def _ensure_public_image_url(image_data: str) -> str:
 
 # ── Seedance constraints ────────────────────────────────────────
 SUPPORTED_DURATIONS = frozenset({5, 10, 15})
-SUPPORTED_ASPECTS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4"})
+SUPPORTED_ASPECTS = frozenset({"16:9", "9:16", "4:3", "3:4"})
 
 # Maps user-facing tier name → PiAPI task_type string.
 TIER_TO_TASK_TYPE = {
