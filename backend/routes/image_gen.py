@@ -18,7 +18,7 @@ from flask import Blueprint, Response, jsonify, request
 from backend.config import OPENAI_API_KEY, config
 from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session
-from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, dispatch_gemini_image_async, update_job_status_ready, update_job_status_failed
+from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, dispatch_gemini_image_async, dispatch_piapi_nano_banana_async, update_job_status_ready, update_job_status_failed
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.expense_guard import ExpenseGuard
 from backend.services.gemini_image_service import (
@@ -30,6 +30,11 @@ from backend.services.gemini_image_service import (
     ALLOWED_ASPECT_RATIOS,
     ALLOWED_IMAGE_SIZES,
 )
+from backend.services.piapi_nano_banana_service import (
+    check_piapi_configured,
+    ALLOWED_ASPECT_RATIOS as PIAPI_ALLOWED_ASPECT_RATIOS,
+    ALLOWED_RESOLUTIONS as PIAPI_ALLOWED_RESOLUTIONS,
+)
 from backend.services.history_service import get_canonical_image_row, save_image_to_normalized_db
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
@@ -39,19 +44,45 @@ from backend.utils.helpers import now_s, log_event
 bp = Blueprint("image_gen", __name__)
 
 
-# ── Image quality → action key mapping ────────────────────────
-# Maps image_size (Google) or resolution tier to the correct action key.
-# Must match pricing_service.py DEFAULT_ACTION_COSTS.
-_IMAGE_ACTION_BY_SIZE = {
-    "1K": "image_generate",       # Standard → OPENAI_IMAGE (10 credits)
-    "2K": "image_generate_2k",    # 2K       → OPENAI_IMAGE_2K (15 credits)
-    "4K": "image_generate_4k",    # 4K       → OPENAI_IMAGE_4K (20 credits)
+# ── Provider-aware image action key mapping ──────────────────
+# Each provider has its own DB action code with distinct pricing:
+#   OpenAI:      image_generate (10c), image_generate_2k (15c)
+#   Gemini:      gemini_image_generate (10c), gemini_image_generate_2k (15c)
+#   Nano Banana: piapi_image_generate (15c), piapi_image_generate_2k (20c), piapi_image_generate_4k (30c)
+# NOTE: 4K is EXCLUSIVE to Nano Banana. OpenAI/Gemini do NOT support 4K.
+_IMAGE_ACTION_BY_PROVIDER_SIZE = {
+    "openai": {
+        "1K": "image_generate",
+        "2K": "image_generate_2k",
+    },
+    "google": {
+        "1K": "gemini_image_generate",
+        "2K": "gemini_image_generate_2k",
+    },
+    "nano_banana": {
+        "1K": "piapi_image_generate",
+        "2K": "piapi_image_generate_2k",
+        "4K": "piapi_image_generate_4k",
+    },
 }
 
 
-def _get_image_action_key(image_size: str = "1K") -> str:
-    """Return the canonical action key for the given image quality/size tier."""
-    return _IMAGE_ACTION_BY_SIZE.get(image_size, "image_generate")
+def _get_image_action_key(image_size: str = "1K", provider: str = "openai") -> str:
+    """Return the provider-specific canonical action key for the given quality tier."""
+    provider_map = _IMAGE_ACTION_BY_PROVIDER_SIZE.get(provider, _IMAGE_ACTION_BY_PROVIDER_SIZE["openai"])
+    return provider_map.get(image_size, provider_map.get("1K", "image_generate"))
+
+
+def _validate_4k_provider(image_size: str, provider: str):
+    """Reject 4K requests for non-Nano-Banana providers. Returns error response or None."""
+    if image_size == "4K" and provider != "nano_banana":
+        return jsonify({
+            "error": "invalid_params",
+            "message": "4K resolution is only available with the Nano Banana provider.",
+            "field": "image_size",
+            "allowed_for_4k": ["nano_banana"]
+        }), 400
+    return None
 
 
 # OpenAI blob hosts (from monolith)
@@ -99,9 +130,19 @@ def image_generate_unified():
         return ("", 204)
 
     body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "openai").lower()
+    provider = (body.get("provider") or "nano_banana").lower()
 
-    if provider == "google":
+    # 4K is exclusive to Nano Banana — reject early for other providers
+    req_size = (body.get("image_size") or body.get("imageSize") or body.get("resolution") or "").upper()
+    if req_size == "4K":
+        err = _validate_4k_provider(req_size, provider)
+        if err:
+            return err
+
+    if provider == "nano_banana":
+        # Route to PiAPI Nano Banana 2
+        return _handle_nano_banana_image_generate(body)
+    elif provider == "google":
         # Route to Gemini Imagen
         return _handle_gemini_image_generate(body)
     elif provider == "openai":
@@ -111,8 +152,156 @@ def image_generate_unified():
         return jsonify({
             "error": "invalid_provider",
             "message": f"Unknown image provider: {provider}",
-            "allowed": ["google", "openai"]
+            "allowed": ["nano_banana", "google", "openai"]
         }), 400
+
+
+def _handle_nano_banana_image_generate(body: dict):
+    """Handle PiAPI Nano Banana 2 image generation (async, returns job_id for polling)."""
+    # Fail-fast: Check if PiAPI is configured
+    is_configured, config_error = check_piapi_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "piapi_not_configured",
+            "message": "Nano Banana image provider is not configured. Set PIAPI_API_KEY.",
+            "details": {"hint": config_error}
+        }), 500
+
+    # Require authentication
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({
+            "error": "invalid_params",
+            "message": "prompt is required",
+            "field": "prompt"
+        }), 400
+
+    # Parse options — map from UI format to PiAPI format
+    # UI sends aspect_ratio in Google-style ("1:1", "9:16", "16:9")
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
+    # UI sends image_size ("1K", "2K") — map to PiAPI resolution
+    resolution = body.get("image_size") or body.get("imageSize") or body.get("resolution") or "1K"
+    output_format = body.get("output_format") or "png"
+
+    # Stability guardrails
+    guard_error = ExpenseGuard.check_image_request(n=1)
+    if guard_error:
+        return guard_error
+
+    # Idempotency check
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
+    # Validate aspect_ratio
+    if aspect_ratio not in PIAPI_ALLOWED_ASPECT_RATIOS:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid aspect_ratio: {aspect_ratio}",
+            "field": "aspect_ratio",
+            "allowed": list(PIAPI_ALLOWED_ASPECT_RATIOS)
+        }), 400
+
+    # Validate resolution
+    if resolution not in PIAPI_ALLOWED_RESOLUTIONS:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid resolution: {resolution}",
+            "field": "resolution",
+            "allowed": list(PIAPI_ALLOWED_RESOLUTIONS)
+        }), 400
+
+    # Generate job ID
+    internal_job_id = str(uuid.uuid4())
+
+    # Reserve credits (provider-specific: Nano Banana is premium)
+    action_key = _get_image_action_key(resolution, "nano_banana")
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "model": "nano-banana-2", "provider": "nano_banana"},
+    )
+    if credit_error:
+        return credit_error
+
+    # Store metadata for async processing
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": "nano-banana-2",
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "output_format": output_format,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "nano_banana",
+    }
+
+    # Save to in-memory store
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    # Create job record for tracking
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="nano_banana",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    # Register active job for concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id)
+
+    # Dispatch async — PiAPI task creation + polling happens in background thread
+    get_executor().submit(
+        dispatch_piapi_nano_banana_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        prompt,
+        aspect_ratio,
+        resolution,
+        output_format,
+        store_meta,
+    )
+
+    log_event("image/generate:nano_banana:queued", {"internal_job_id": internal_job_id})
+
+    # Return immediately with job_id for polling
+    balance_info = get_current_balance(identity_id)
+    response_data = {
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": "nano-banana-2",
+        "provider": "nano_banana",
+    }
+
+    # Cache response for idempotency
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+
+    return jsonify(response_data)
 
 
 def _handle_gemini_image_generate(body: dict):
@@ -179,8 +368,8 @@ def _handle_gemini_image_generate(body: dict):
     # Generate job ID
     internal_job_id = str(uuid.uuid4())
 
-    # Reserve credits (creates held reservation in DB)
-    action_key = _get_image_action_key(image_size)
+    # Reserve credits (provider-specific: Gemini uses google tier)
+    action_key = _get_image_action_key(image_size, "google")
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
@@ -470,8 +659,8 @@ def gemini_image_mod():
     # Generate job ID
     internal_job_id = str(uuid.uuid4())
 
-    # Reserve credits (creates held reservation in DB)
-    action_key = _get_image_action_key(image_size)
+    # Reserve credits (provider-specific: Gemini uses google tier)
+    action_key = _get_image_action_key(image_size, "google")
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
@@ -880,6 +1069,126 @@ def gemini_image_status_mod(job_id: str):
             "aspect_ratio": meta.get("aspect_ratio"),
             "image_size": meta.get("image_size"),
             "provider": "google",
+            "new_balance": balance_info["available"] if balance_info else None,
+        })
+
+    return jsonify({"error": "Job not found"}), 404
+
+
+@bp.route("/image/piapi/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session
+def piapi_image_status_mod(job_id: str):
+    """
+    Poll status of a PiAPI Nano Banana image generation job.
+
+    Returns:
+    - status: "queued" | "done" | "failed"
+    - On done: image_url, image_urls
+    - On failed: error message
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    store = load_store()
+    meta = store.get(job_id) or {}
+
+    if USE_DB:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, status, error_message, meta
+                        FROM timrx_billing.jobs
+                        WHERE id::text = %s AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (job_id, identity_id),
+                    )
+                    job = cur.fetchone()
+
+            if job:
+                job_meta = job.get("meta") or {}
+                if isinstance(job_meta, str):
+                    try:
+                        job_meta = __import__('json').loads(job_meta)
+                    except Exception:
+                        job_meta = {}
+
+                if job["status"] == "queued":
+                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image..."})
+
+                if job["status"] == "processing":
+                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image with Nano Banana..."})
+
+                if job["status"] == "failed":
+                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "error": job.get("error_message", "Image generation failed")})
+
+                if job["status"] == "ready":
+                    image_url = meta.get("image_url") or job_meta.get("image_url")
+                    image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
+
+                    canonical = get_canonical_image_row(
+                        identity_id,
+                        upstream_id=job_id,
+                        alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
+                    )
+                    if canonical:
+                        if canonical.get("image_url"):
+                            image_url = canonical["image_url"]
+                            image_urls = [image_url]
+                        if canonical.get("thumbnail_url"):
+                            meta["thumbnail_url"] = canonical["thumbnail_url"]
+
+                    balance_info = get_current_balance(identity_id) if identity_id else None
+
+                    return jsonify({
+                        "ok": True,
+                        "status": "done",
+                        "job_id": job_id,
+                        "image_id": job_id,
+                        "image_url": image_url,
+                        "image_urls": image_urls,
+                        "model": meta.get("model") or job_meta.get("model") or "nano-banana-2",
+                        "aspect_ratio": meta.get("aspect_ratio") or job_meta.get("aspect_ratio"),
+                        "resolution": meta.get("resolution") or job_meta.get("resolution"),
+                        "provider": "nano_banana",
+                        "new_balance": balance_info["available"] if balance_info else None,
+                    })
+        except Exception as e:
+            print(f"[STATUS][mod] Error checking PiAPI job {job_id}: {e}")
+
+    # Fallback to in-memory store
+    if meta.get("status") == "done":
+        canonical = get_canonical_image_row(
+            identity_id,
+            upstream_id=job_id,
+            alt_upstream_id=meta.get("image_id"),
+        )
+        if canonical:
+            if canonical.get("image_url"):
+                meta["image_url"] = canonical["image_url"]
+                meta["image_urls"] = [canonical["image_url"]]
+            if canonical.get("thumbnail_url"):
+                meta["thumbnail_url"] = canonical["thumbnail_url"]
+
+        balance_info = get_current_balance(identity_id) if identity_id else None
+
+        return jsonify({
+            "ok": True,
+            "status": "done",
+            "job_id": job_id,
+            "image_id": job_id,
+            "image_url": meta.get("image_url"),
+            "image_urls": meta.get("image_urls", []),
+            "model": meta.get("model") or "nano-banana-2",
+            "aspect_ratio": meta.get("aspect_ratio"),
+            "resolution": meta.get("resolution"),
+            "provider": "nano_banana",
             "new_balance": balance_info["available"] if balance_info else None,
         })
 

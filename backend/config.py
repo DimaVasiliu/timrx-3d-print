@@ -462,6 +462,8 @@ class Config:
     OPENAI_API_KEY: str = field(default_factory=lambda: _get_env("OPENAI_API_KEY"))
     # GEMINI_API_KEY with fallback to GOOGLE_API_KEY for backward compatibility
     GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY"))
+    # PiAPI (Nano Banana 2 image generation)
+    PIAPI_API_KEY: str = field(default_factory=lambda: _get_env("PIAPI_API_KEY"))
 
     # Discord webhook for community share notifications
     DISCORD_WEBHOOK_URL: str = field(default_factory=lambda: _get_env("DISCORD_WEBHOOK_URL"))
@@ -822,6 +824,7 @@ MESHY_API_KEY = config.MESHY_API_KEY
 MESHY_API_BASE = config.MESHY_API_BASE
 OPENAI_API_KEY = config.OPENAI_API_KEY
 GEMINI_API_KEY = config.GEMINI_API_KEY
+PIAPI_API_KEY = config.PIAPI_API_KEY
 DEFAULT_MODEL_TITLE = config.DEFAULT_MODEL_TITLE
 ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS

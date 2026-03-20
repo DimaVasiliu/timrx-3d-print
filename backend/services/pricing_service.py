@@ -8,9 +8,12 @@ Responsibilities:
 - Normalize action keys to canonical form
 
 CANONICAL ACTION KEYS (use these in new code):
-- image_generate       (10c) - Standard AI image generation
-- image_generate_2k    (15c) - 2K resolution AI image
-- image_generate_4k    (20c) - 4K resolution AI image
+- image_generate          (10c) - OpenAI standard image (1K)
+- image_generate_2k       (15c) - OpenAI 2K image
+- gemini_image_generate   (10c) - Gemini standard image (1K)
+- gemini_image_generate_2k(15c) - Gemini 2K image
+- piapi_image_generate    (15c) - Nano Banana standard image (1K) — PREMIUM
+- piapi_image_generate_2k (20c) - Nano Banana 2K image — PREMIUM
 - text_to_3d_generate  (20c) - Text to 3D preview generation
 - image_to_3d_generate (30c) - Image to 3D conversion
 - refine               (10c) - Refine/upscale 3D model
@@ -45,10 +48,17 @@ from backend.db import query_one, query_all, execute, Tables
 # Canonical action keys (use these in all new code)
 class CanonicalActions:
     """Canonical action key constants."""
-    # Image generation (tiered by resolution)
-    IMAGE_GENERATE = "image_generate"           # Standard (10c)
-    IMAGE_GENERATE_2K = "image_generate_2k"     # 2K resolution (15c)
-    IMAGE_GENERATE_4K = "image_generate_4k"     # 4K resolution (20c)
+    # Image generation — OpenAI (default/cheapest tier)
+    IMAGE_GENERATE = "image_generate"                      # OpenAI standard 1K (10c)
+    IMAGE_GENERATE_2K = "image_generate_2k"                # OpenAI 2K (15c)
+    IMAGE_GENERATE_4K = "image_generate_4k"                # OpenAI 4K (20c)
+    # Image generation — Gemini (same price as OpenAI)
+    GEMINI_IMAGE_GENERATE = "gemini_image_generate"        # Gemini standard 1K (10c)
+    GEMINI_IMAGE_GENERATE_2K = "gemini_image_generate_2k"  # Gemini 2K (15c)
+    # Image generation — Nano Banana PREMIUM
+    PIAPI_IMAGE_GENERATE = "piapi_image_generate"          # Nano Banana standard 1K (15c)
+    PIAPI_IMAGE_GENERATE_2K = "piapi_image_generate_2k"    # Nano Banana 2K (20c)
+    PIAPI_IMAGE_GENERATE_4K = "piapi_image_generate_4k"    # Nano Banana 4K (30c) — EXCLUSIVE
     # 3D generation
     TEXT_TO_3D_GENERATE = "text_to_3d_generate"
     IMAGE_TO_3D_GENERATE = "image_to_3d_generate"
@@ -66,10 +76,17 @@ class CanonicalActions:
 
 # Canonical key -> DB action code mapping
 CANONICAL_TO_DB = {
-    # Image generation (tiered)
-    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",           # Standard 10c
-    CanonicalActions.IMAGE_GENERATE_2K: "OPENAI_IMAGE_2K",     # 2K 15c
-    CanonicalActions.IMAGE_GENERATE_4K: "OPENAI_IMAGE_4K",     # 4K 20c
+    # Image generation — OpenAI (10c / 15c / 20c)
+    CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",
+    CanonicalActions.IMAGE_GENERATE_2K: "OPENAI_IMAGE_2K",
+    CanonicalActions.IMAGE_GENERATE_4K: "OPENAI_IMAGE_4K",
+    # Image generation — Gemini (10c / 15c)
+    CanonicalActions.GEMINI_IMAGE_GENERATE: "GEMINI_IMAGE",
+    CanonicalActions.GEMINI_IMAGE_GENERATE_2K: "GEMINI_IMAGE_2K",
+    # Image generation — Nano Banana PREMIUM (15c / 20c / 30c)
+    CanonicalActions.PIAPI_IMAGE_GENERATE: "PIAPI_IMAGE",
+    CanonicalActions.PIAPI_IMAGE_GENERATE_2K: "PIAPI_IMAGE_2K",
+    CanonicalActions.PIAPI_IMAGE_GENERATE_4K: "PIAPI_IMAGE_4K",
     # 3D generation
     CanonicalActions.TEXT_TO_3D_GENERATE: "MESHY_TEXT_TO_3D",
     CanonicalActions.IMAGE_TO_3D_GENERATE: "MESHY_IMAGE_TO_3D",
@@ -258,16 +275,18 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
     {"action_code": "MESHY_RIGGING", "cost_credits": 15, "provider": "meshy"},
     {"action_code": "MESHY_ANIMATION", "cost_credits": 10, "provider": "meshy"},
-    # Image Generation — OpenAI (tiered by resolution)
-    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},       # Standard
+    # Image Generation — OpenAI (10c / 15c / 20c)
+    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},       # Standard 1K
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 15, "provider": "openai"},    # 2K
     {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 20, "provider": "openai"},    # 4K
-    # Image Generation — Google Imagen (same tiers, same prices as OpenAI)
-    # These are separate DB entries for future provider-specific routing.
-    # Currently all images route via canonical image_generate → OPENAI_IMAGE.
-    {"action_code": "GEMINI_IMAGE", "cost_credits": 10, "provider": "google"},       # Standard
+    # Image Generation — Google Imagen (10c / 15c / 20c — same as OpenAI)
+    {"action_code": "GEMINI_IMAGE", "cost_credits": 10, "provider": "google"},       # Standard 1K
     {"action_code": "GEMINI_IMAGE_2K", "cost_credits": 15, "provider": "google"},    # 2K
     {"action_code": "GEMINI_IMAGE_4K", "cost_credits": 20, "provider": "google"},    # 4K
+    # Image Generation — PiAPI Nano Banana PREMIUM (15c / 20c / 30c)
+    {"action_code": "PIAPI_IMAGE", "cost_credits": 15, "provider": "nano_banana"},       # Standard 1K
+    {"action_code": "PIAPI_IMAGE_2K", "cost_credits": 20, "provider": "nano_banana"},    # 2K
+    {"action_code": "PIAPI_IMAGE_4K", "cost_credits": 30, "provider": "nano_banana"},    # 4K — EXCLUSIVE to Nano Banana
     # Video Generation - Vertex (Veo) variant costs by duration/resolution
     # Text-to-Video variants
     {"action_code": "video_text_generate_4s_720p", "cost_credits": 75, "provider": "vertex"},
@@ -680,7 +699,7 @@ class PricingService:
                 "credits": 250,
                 "perks": {"priority": false, "retention_days": 30},
                 "estimates": {
-                    "ai_images": 50,      # credits / 5
+                    "ai_images": 40,      # 400 credits / 10 (OpenAI tier)
                     "text_to_3d": 12,     # credits / 20
                     "image_to_3d": 8      # credits / 30
                 }
@@ -693,7 +712,7 @@ class PricingService:
 
         # Get action costs for estimates
         costs = PricingService.get_action_costs()
-        image_cost = costs.get("image_generate", 10)          # Standard image
+        image_cost = costs.get("image_generate", 10)          # Standard image (1K, OpenAI tier)
         text_to_3d_cost = costs.get("text_to_3d_generate", 20)
         image_to_3d_cost = costs.get("image_to_3d_generate", 30)
 

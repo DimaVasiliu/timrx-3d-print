@@ -6,9 +6,12 @@ incrementally without changing the credit/identity pipeline semantics.
 
 CANONICAL ACTION KEYS:
 Use these canonical keys when calling start_paid_job():
-- image_generate       (10c) - Standard AI image
-- image_generate_2k    (15c) - 2K AI image
-- image_generate_4k    (20c) - 4K AI image
+- image_generate          (10c) - OpenAI standard image (1K)
+- image_generate_2k       (15c) - OpenAI 2K image
+- gemini_image_generate   (10c) - Gemini standard image (1K)
+- gemini_image_generate_2k(15c) - Gemini 2K image
+- piapi_image_generate    (15c) - Nano Banana standard image (1K, premium)
+- piapi_image_generate_2k (20c) - Nano Banana 2K image (premium)
 - text_to_3d_generate  (20c) - Text to 3D preview
 - image_to_3d_generate (30c) - Image to 3D
 - refine               (10c) - Refine 3D model

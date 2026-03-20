@@ -213,10 +213,15 @@ def get_action_costs():
                 {"action_key": "refine", "credits": 10},
                 {"action_key": "remesh", "credits": 10},
                 {"action_key": "retexture", "credits": 15},
-                # Image generation
+                # Image generation — OpenAI/Gemini tier
                 {"action_key": "image_generate", "credits": 10},
                 {"action_key": "image_generate_2k", "credits": 15},
-                {"action_key": "image_generate_4k", "credits": 20},
+                {"action_key": "gemini_image_generate", "credits": 10},
+                {"action_key": "gemini_image_generate_2k", "credits": 15},
+                # Image generation — Nano Banana premium tier
+                {"action_key": "piapi_image_generate", "credits": 15},
+                {"action_key": "piapi_image_generate_2k", "credits": 20},
+                {"action_key": "piapi_image_generate_4k", "credits": 30},
                 # Video generation - base costs (minimum)
                 {"action_key": "video_generate", "credits": 75},
                 {"action_key": "video_text_generate", "credits": 75},
