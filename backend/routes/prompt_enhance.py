@@ -13,7 +13,7 @@ from backend.services.prompt_enhance_service import (
     enhance_prompt,
     PromptEnhanceError,
 )
-from backend.services.prompt_safety_service import check_prompt_safety
+from backend.services.prompt_safety_service import check_prompt_safety, get_safety_analytics
 
 bp = Blueprint("prompt_enhance", __name__)
 
@@ -114,3 +114,86 @@ def prompt_enhance():
             "ok": False,
             "error": "Prompt enhancement is temporarily unavailable. Please try again.",
         }), 503
+
+
+@bp.route("/safety-check", methods=["POST", "OPTIONS"])
+@with_session
+def safety_check_dry_run():
+    """
+    Dry-run safety check endpoint.
+    Evaluates a prompt against the safety rules and returns the full
+    debug breakdown WITHOUT recording strikes or applying penalties.
+
+    Request body:
+    {
+        "prompt": "...",
+        "medium": "video" | "image" | "text",   (default: "video")
+        "provider": "vertex" | "seedance" | ...  (default: "vertex")
+    }
+
+    Response:
+    {
+        "ok": true,
+        "decision": "allow" | "warn" | "block",
+        "categories": [...],
+        "message": "...",
+        "rewrite_hint": "...",
+        "debug": {
+            "scores": { "violence": 0, ... },
+            "matched_rules": ["V01_shoot_person", ...],
+            "matched_details": [...],
+            "safe_context_count": 5,
+            "has_harmful_verbs": false,
+            "safe_reduced": true,
+            "multiplier": 1.56,
+            "thresholds_used": { ... }
+        }
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    body = request.get_json(silent=True) or {}
+
+    raw_prompt = (body.get("prompt") or "").strip()
+    if not raw_prompt:
+        return jsonify({"ok": False, "error": "prompt is required"}), 400
+
+    medium   = (body.get("medium") or "video").strip().lower()
+    provider = (body.get("provider") or "vertex").strip().lower()
+
+    result = check_prompt_safety(raw_prompt, medium=medium, provider=provider, dry_run=True)
+
+    return jsonify({
+        "ok": True,
+        **result,
+    })
+
+
+@bp.route("/safety-analytics", methods=["GET", "OPTIONS"])
+@with_session
+def safety_analytics():
+    """
+    Admin/debug endpoint: aggregate safety data.
+
+    Query params:
+        hours  – lookback window (default 24)
+
+    Response:
+    {
+        "ok": true,
+        "period_hours": 24,
+        "blocks_by_category": { "_total": 12 },
+        "warns_by_category": { "_total": 5 },
+        "false_negative_candidates": 3,
+        "top_rejection_providers": { "vertex": 2 },
+        "top_matched_rules": { "V01_shoot_person": 4 },
+        "total_strikes": 17
+    }
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    hours = int(request.args.get("hours", 24))
+    data = get_safety_analytics(hours=hours)
+    return jsonify({"ok": True, **data})

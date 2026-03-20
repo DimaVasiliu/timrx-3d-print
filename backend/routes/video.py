@@ -60,7 +60,7 @@ from backend.services.pricing_service import (
     get_video_credit_cost,
 )
 from backend.services.video_limits import validate_video_rate_limits
-from backend.services.prompt_safety_service import check_prompt_safety
+from backend.services.prompt_safety_service import check_prompt_safety, record_provider_rejection
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("video", __name__)
@@ -1052,6 +1052,23 @@ def _video_status_handler(job_id: str):
 
                     # Surface user-friendly message for filtered errors
                     user_message = job_meta.get("user_message") if error_code == "provider_filtered_third_party" else None
+
+                    # Record upstream rejection for safety tuning
+                    if error_code in ("provider_filtered_content", "provider_filtered_third_party"):
+                        _prompt = meta.get("prompt") or job_meta.get("prompt") or ""
+                        _provider = meta.get("provider") or job_meta.get("provider") or "vertex"
+                        if _prompt:
+                            # Re-run safety check in dry-run to capture what local safety saw
+                            _local = check_prompt_safety(_prompt, medium="video", provider=_provider, dry_run=True)
+                            record_provider_rejection(
+                                provider=_provider, medium="video", prompt=_prompt,
+                                local_decision=_local["decision"],
+                                matched_rules=_local.get("debug", {}).get("matched_rules", []),
+                                cat_scores={k: v for k, v in _local.get("debug", {}).get("scores", {}).items()},
+                                rejection_code=error_code,
+                                rejection_message=failure_reason[:500] if failure_reason else "",
+                                job_id=job_id,
+                            )
 
                     resp = {
                         "ok": False,
