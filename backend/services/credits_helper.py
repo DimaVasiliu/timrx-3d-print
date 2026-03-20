@@ -246,6 +246,14 @@ def finalize_job_credits(
     """
     Finalize (capture) credits after successful job completion.
 
+    IDEMPOTENCY: Safe to call multiple times for the same reservation_id.
+    ReservationService.finalize_reservation() locks the row FOR UPDATE and
+    checks status: if already 'finalized' it returns was_already_finalized=True
+    without any wallet deduction. If already 'released' it returns
+    was_already_released=True. Only the 'held' -> 'finalized' transition
+    actually debits the wallet. This means concurrent or duplicate finalize
+    calls (from poll worker + live status check, or poll + webhook) are safe.
+
     Args:
         reservation_id: The credit reservation ID to finalize
         job_id: The job ID (for logging)

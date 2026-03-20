@@ -646,6 +646,29 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
         print(f"[JOB] skip job={job_id} reason=non_video_stage stage={stage} provider={provider_name}")
         return
 
+    # ── Crash-window safeguard ──
+    # If the process crashed between the PiAPI POST response and
+    # _mark_job_for_worker(), the meta may contain an upstream_id that
+    # never made it into the DB upstream_job_id column.  Detect this and
+    # skip re-dispatch to avoid creating a duplicate upstream task at PiAPI.
+    existing_upstream = (
+        meta.get("upstream_id")
+        or meta.get("operation_name")
+        or job.get("upstream_job_id")
+    )
+    if existing_upstream:
+        print(
+            f"[JOB] dispatch SKIPPED job={job_id} — upstream_id already exists "
+            f"({existing_upstream[:20]}…), recovering to poll instead"
+        )
+        # Ensure the DB column is set (it may have been missed in the crash)
+        _transition_job(job_id, "dispatched", {
+            "upstream_job_id": existing_upstream,
+            "last_provider_status": "pending",
+            "next_poll_at": "NOW() + INTERVAL '5 seconds'",
+        }, meta_patch={"upstream_id": existing_upstream, "recovered_dispatch": True})
+        return
+
     print(f"[JOB] dispatching job={job_id} provider={provider_name} stage={stage}")
 
     try:
@@ -1031,12 +1054,17 @@ def _ts(val) -> Optional[float]:
 
 # ── Finalization ────────────────────────────────────────────
 
-def _try_transition_to_finalizing(job_id: str) -> bool:
+def try_transition_to_finalizing(job_id: str) -> bool:
     """
     Atomically transition job to 'finalizing' only if not already terminal.
 
-    Returns True if this worker won the transition, False if the job was
-    already in a terminal or finalizing state (e.g. another poll cycle or webhook got there first).
+    Returns True if the caller won the transition, False if the job was
+    already in a terminal or finalizing state (e.g. another poll cycle,
+    webhook, live status check, or rescue got there first).
+
+    This is the **sole CAS guard** for video finalization.  Every code path
+    that calls _finalize_video_success MUST win this transition first.
+    Callers: job_worker._finalize_success, video.py live check, job_rescue.
     """
     if not USE_DB:
         return True
@@ -1061,7 +1089,7 @@ def _try_transition_to_finalizing(job_id: str) -> bool:
             conn.commit()
             return row is not None
     except Exception as e:
-        print(f"[JOB] _try_transition_to_finalizing error job={job_id}: {e}")
+        print(f"[JOB] try_transition_to_finalizing error job={job_id}: {e}")
         return False
 
 
@@ -1083,7 +1111,7 @@ def _finalize_success(
     """
     print(f"[JOB] finalizing job={job_id} provider={provider_name} video_url={video_url[:80]}...")
 
-    if not _try_transition_to_finalizing(job_id):
+    if not try_transition_to_finalizing(job_id):
         print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal")
         return
 
@@ -1152,7 +1180,7 @@ def _finalize_success_with_bytes(
     """
     print(f"[JOB] finalizing job={job_id} provider={provider_name} video_bytes={len(video_bytes)} bytes")
 
-    if not _try_transition_to_finalizing(job_id):
+    if not try_transition_to_finalizing(job_id):
         print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal")
         return
 

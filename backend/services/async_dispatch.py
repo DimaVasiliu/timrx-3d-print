@@ -1372,15 +1372,33 @@ def _poll_video_completion(
     poll_interval: int = 3,
 ):
     """
-    Provider-aware video polling with exponential backoff for Vertex.
+    LEGACY — no longer called.  Retained for reference only.
 
-    For 'google' (Gemini AI Studio), delegates to _poll_gemini_video_completion.
+    All video polling is now handled by the durable job_worker.py which uses
+    DB-based claiming, heartbeats, and atomic CAS finalization.  The dispatch
+    thread (dispatch_gemini_video_async) calls _mark_job_for_worker() and
+    exits immediately — it never falls through to this function.
+
+    If you are adding a new provider, add its polling logic to
+    job_worker._poll_provider_once() instead.
+
+    Previous responsibility:
+    Provider-aware video polling with exponential backoff for Vertex.
     For 'vertex', uses exponential backoff (2s initial, 10s max, ~6min timeout).
 
     Status response may contain:
     - video_url: URL to download video from
     - video_bytes: Raw video bytes (base64 decoded) - used by Vertex
     """
+    # ── DEAD CODE GUARD ──
+    # This function is no longer called. All polling is handled by the durable
+    # job_worker. If this executes, something is seriously wrong.
+    print(
+        f"[ASYNC] CRITICAL: legacy _poll_video_completion reached unexpectedly! "
+        f"job={internal_job_id} provider={provider_name} — returning immediately"
+    )
+    return
+
     from backend.services.video_router import resolve_video_provider
 
     if provider_name == "google":
@@ -1552,14 +1570,18 @@ def _poll_seedance_with_state_awareness(
     store_meta: dict,
 ):
     """
-    Seedance-specific polling that distinguishes pending (never started) from
-    processing (actively rendering).
+    LEGACY — no longer called.  Only reachable from _poll_video_completion
+    which is itself dead code.  Retained for reference only.
 
-    - Pending jobs get a longer leash — provider queue may be busy.
-    - Only marks failed on explicit provider failure or hard timeout.
-    - Reduces poll frequency after soft timeout.
-    - Updates DB/store with provider_pending status so frontend shows "Queued".
+    All Seedance polling is now handled by job_worker._poll_provider_once().
     """
+    # ── DEAD CODE GUARD ──
+    print(
+        f"[ASYNC] CRITICAL: legacy _poll_seedance_with_state_awareness reached! "
+        f"job={internal_job_id} — returning immediately"
+    )
+    return
+
     task_type = store_meta.get("task_type", "seedance-2-fast-preview")
     pend_soft, pend_hard, proc_soft, proc_hard = _SEEDANCE_TIMEOUTS.get(
         task_type, _SEEDANCE_DEFAULT_TIMEOUTS,

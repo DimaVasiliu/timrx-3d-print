@@ -5,7 +5,7 @@ Registered under /api/_mod and /api for compatibility.
 
 Active providers:
 - vertex   (Veo 3.1)       — durations 4/6/8s, aspects 16:9/9:16, resolutions 720p/1080p/4k
-- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 16:9/9:16/1:1, tiers fast/preview
+- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 16:9/9:16/4:3/3:4, tiers fast/preview
 
 Endpoints:
 - POST /video/generate   — Unified start (text2video or image2video) — legacy
@@ -784,9 +784,13 @@ def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | Non
     """
     One-shot live check against PiAPI for an orphaned Seedance job.
 
-    If PiAPI says done → finalize (upload to S3, update DB, update history).
+    If PiAPI says done → claim via atomic CAS, then finalize.
     If PiAPI says failed → mark failed.
     If still processing → return None (let normal status response handle it).
+
+    IMPORTANT: Uses try_transition_to_finalizing() as an atomic CAS guard
+    to prevent duplicate finalization if the durable worker, webhook, or
+    rescue system is concurrently finalizing the same job.
     """
     upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
     if not upstream_id:
@@ -806,9 +810,16 @@ def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | Non
         if not video_url:
             return None
 
-        print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI! Finalizing now.")
+        # ── Atomic CAS guard: claim the job for finalization ──
+        # This prevents double-finalization if the durable worker or
+        # rescue system is concurrently processing the same job.
+        from backend.services.job_worker import try_transition_to_finalizing
+        if not try_transition_to_finalizing(job_id):
+            print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI but already finalizing/terminal — skipping")
+            return None
 
-        # Finalize in background to not block the status response
+        print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI — CAS won, finalizing now.")
+
         try:
             from backend.services.async_dispatch import (
                 _finalize_video_success,
@@ -822,16 +833,36 @@ def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | Non
                 job_id, identity_id or "", reservation_id,
                 video_url, store_meta, provider_name="seedance",
             )
+
+            return jsonify({
+                "ok": True,
+                "status": "done",
+                "job_id": job_id,
+                "video_url": video_url,
+                "message": "Video ready",
+            })
         except Exception as e:
             print(f"[VIDEO STATUS] Live finalize failed for {job_id}: {e}")
-
-        return jsonify({
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "video_url": video_url,
-            "message": "Video ready",
-        })
+            # Transition back to stalled so the durable worker can reclaim.
+            # WHERE status = 'finalizing' prevents reopening a job that another
+            # thread successfully finalized to 'ready' in the meantime.
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"""UPDATE {Tables.JOBS}
+                                SET status = 'stalled', updated_at = NOW(),
+                                    meta = COALESCE(meta, '{{}}'::jsonb)
+                                        || '{{"live_finalize_failed": true}}'::jsonb
+                                WHERE id::text = %s AND status = 'finalizing'""",
+                            (job_id,),
+                        )
+                    conn.commit()
+            except Exception as rollback_err:
+                print(f"[VIDEO STATUS] rollback to stalled failed for {job_id}: {rollback_err}")
+            # Return None — fall through to normal status response so
+            # the frontend sees the actual DB state, not a false "done".
+            return None
 
     if status == "failed":
         return _live_check_mark_failed(job_id, job_meta, status_resp)

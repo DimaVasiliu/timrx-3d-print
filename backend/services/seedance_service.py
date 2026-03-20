@@ -309,9 +309,49 @@ def check_seedance_status(task_id: str) -> Dict[str, Any]:
 
 
 # ── Download video ───────────────────────────────────────────
+def _validate_video_bytes(data: bytes, content_type: str, video_url: str) -> None:
+    """
+    Validate that downloaded bytes are actually an MP4 video.
+
+    PiAPI serves completed videos from ephemeral URLs (img.theapi.app).
+    If the URL expired or an error page was returned, we may receive HTML
+    or an empty body instead of video data. Uploading garbage to S3 would
+    corrupt the user's result, so we validate before returning.
+
+    MP4 files contain an 'ftyp' box: bytes 4-8 == b'ftyp'.
+    """
+    if len(data) < 8:
+        raise RuntimeError(
+            f"seedance_download_corrupt: response too small "
+            f"({len(data)} bytes, content_type={content_type}, url={video_url[:80]})"
+        )
+
+    # MP4 'ftyp' box signature check
+    if data[4:8] == b"ftyp":
+        return  # valid MP4
+
+    # Content-type says video but bytes don't match — warn but allow
+    # (some providers may use non-ftyp container formats)
+    if content_type.startswith("video/"):
+        print(
+            f"[Seedance] WARNING: downloaded bytes lack ftyp signature "
+            f"but content_type={content_type} — allowing"
+        )
+        return
+
+    # Non-video content-type AND no ftyp → definitely not a video
+    raise RuntimeError(
+        f"seedance_download_not_video: expected video, got content_type={content_type}, "
+        f"first_bytes={data[:16]!r}, url={video_url[:80]}"
+    )
+
+
 def download_seedance_video(video_url: str) -> Tuple[bytes, str]:
     """
     Download video bytes from a Seedance result URL.
+
+    Validates the response is actually an MP4 before returning.
+    Raises RuntimeError on download failure or corrupt/expired URLs.
 
     Returns:
         (video_bytes, content_type)
@@ -323,4 +363,7 @@ def download_seedance_video(video_url: str) -> Tuple[bytes, str]:
         raise RuntimeError(f"seedance_download_error: {e}")
 
     content_type = resp.headers.get("Content-Type", "video/mp4")
+
+    _validate_video_bytes(resp.content, content_type, video_url)
+
     return resp.content, content_type
