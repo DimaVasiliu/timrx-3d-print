@@ -502,7 +502,9 @@ def _handle_openai_image_generate(body: dict):
         return jsonify(cached)
 
     internal_job_id = str(uuid.uuid4())
-    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
+    # Resolve provider-specific action key from image_size if provided
+    image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
+    action_key = _get_image_action_key(image_size, "openai")
 
     reservation_id, credit_error = start_paid_job(
         identity_id,
@@ -774,8 +776,9 @@ def openai_image_mod():
     response_format = (body.get("response_format") or "url").strip()
 
     internal_job_id = str(uuid.uuid4())
-    # Use credits helper action key mapping in routes
-    action_key = "image_generate"  # Canonical key -> OPENAI_IMAGE (10 credits)
+    # Resolve provider-specific action key from image_size if provided
+    image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
+    action_key = _get_image_action_key(image_size, "openai")
 
     # DEBUG: Trace OpenAI image credit flow
     print(f"[OPENAI_IMAGE:DEBUG] >>> Route handler: identity_id={identity_id}, action_key={action_key}, job_id={internal_job_id}")

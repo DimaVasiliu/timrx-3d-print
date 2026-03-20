@@ -541,6 +541,18 @@ def save_image_to_normalized_db(
                         width, height = int(parts[0]), int(parts[1])
                     except ValueError:
                         pass
+                elif size and ":" in size:
+                    # Parse aspect_ratio@resolution format (e.g. "9:16@2K", "1:1@1K")
+                    aspect_part = size.split("@")[0] if "@" in size else size
+                    try:
+                        aw, ah = [int(x) for x in aspect_part.split(":")]
+                        # Derive pixel dimensions from aspect ratio (base 1024)
+                        if aw >= ah:
+                            width, height = 1024, int(1024 * ah / aw)
+                        else:
+                            width, height = int(1024 * aw / ah), 1024
+                    except (ValueError, ZeroDivisionError):
+                        pass
 
                 history_uuid = existing_history_id or str(uuid.uuid4())
                 image_uuid = str(uuid.uuid4())
