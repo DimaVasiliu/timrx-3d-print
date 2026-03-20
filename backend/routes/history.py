@@ -826,6 +826,80 @@ def history_item_add_mod():
     return _inner()
 
 
+# ─── Debug: inspect lineage family ────────────────────────────────────────
+@bp.route("/history/lineage/<item_id>", methods=["GET", "OPTIONS"])
+@with_session
+def history_lineage_debug(item_id: str):
+    """Debug endpoint: shows the full lineage family for a given item."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    identity_id = g.identity_id
+    if not USE_DB:
+        return jsonify({"error": "DB not available"}), 503
+    try:
+        with get_conn() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Find the item's lineage_origin_id
+                cur.execute(
+                    f"""
+                    SELECT id, lineage_origin_id, stage, title, status,
+                           payload->>'original_job_id' as original_job_id,
+                           payload->>'source_task_id' as source_task_id,
+                           payload->>'preview_task_id' as preview_task_id,
+                           payload->>'rig_task_id' as rig_task_id
+                    FROM {Tables.HISTORY_ITEMS}
+                    WHERE id::text = %s AND identity_id = %s
+                    """,
+                    (str(item_id), identity_id),
+                )
+                item = cur.fetchone()
+                if not item:
+                    return jsonify({"error": "Item not found"}), 404
+
+                root_id = item.get("lineage_origin_id") or item["id"]
+
+                # Find all items in the same family
+                cur.execute(
+                    f"""
+                    SELECT id, lineage_origin_id, stage, title, status, created_at,
+                           payload->>'original_job_id' as original_job_id,
+                           payload->>'source_task_id' as source_task_id,
+                           payload->>'preview_task_id' as preview_task_id,
+                           payload->>'rig_task_id' as rig_task_id,
+                           thumbnail_url IS NOT NULL as has_thumbnail
+                    FROM {Tables.HISTORY_ITEMS}
+                    WHERE identity_id = %s AND lineage_origin_id = %s
+                    ORDER BY created_at ASC
+                    """,
+                    (identity_id, root_id),
+                )
+                family = cur.fetchall()
+
+                return jsonify({
+                    "ok": True,
+                    "queried_item": str(item_id),
+                    "lineage_root": str(root_id),
+                    "family_size": len(family),
+                    "members": [
+                        {
+                            "id": str(r["id"]),
+                            "stage": r["stage"],
+                            "title": (r["title"] or "")[:50],
+                            "status": r["status"],
+                            "lineage_origin_id": str(r["lineage_origin_id"]) if r["lineage_origin_id"] else None,
+                            "original_job_id": r["original_job_id"],
+                            "source_task_id": r["source_task_id"],
+                            "preview_task_id": r["preview_task_id"],
+                            "rig_task_id": r["rig_task_id"],
+                            "has_thumbnail": r["has_thumbnail"],
+                        }
+                        for r in family
+                    ],
+                })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @bp.route("/history/item/<item_id>", methods=["GET", "PATCH", "DELETE", "OPTIONS"])
 def history_item_update_mod(item_id: str):
     @with_session
