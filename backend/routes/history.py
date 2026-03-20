@@ -75,6 +75,7 @@ def history_mod():
                                     h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
                                     h.thumbnail_url, h.glb_url, h.image_url, h.video_url, h.payload, h.created_at,
                                     h.model_id, h.image_id, h.video_id,
+                                    h.lineage_origin_id,
                                     -- Model data from joined models table
                                     m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
                                     m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
@@ -185,6 +186,8 @@ def history_mod():
                         }
 
                         # Base fields from history_items
+                        if r.get("lineage_origin_id"):
+                            item["lineage_origin_id"] = str(r["lineage_origin_id"])
                         if r["stage"]:
                             item["stage"] = r["stage"]
                         if r["title"]:
