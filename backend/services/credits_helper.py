@@ -307,6 +307,7 @@ def finalize_job_credits(
             return {"success": False, "new_balance": None, "cost": None}
         elif result.get("was_already_finalized"):
             print(f"[CREDITS] FINALIZE: already finalized (idempotent): reservation_id={reservation_id} job_id={job_id}")
+            print(f"[SEEDANCE_OBS] event=credits_already_finalized reservation={reservation_id} job={job_id}")
             # Already finalized = success, but we don't have the balance from this call
             # Fetch current balance for the caller
             current_balance = None
@@ -318,6 +319,7 @@ def finalize_job_credits(
             return {"success": True, "new_balance": current_balance, "cost": result.get("cost")}
         elif result.get("was_already_released"):
             print(f"[CREDITS] FINALIZE FAILED: already released (job was cancelled/failed): reservation_id={reservation_id} job_id={job_id}")
+            print(f"[SEEDANCE_OBS] event=credits_already_released_free_delivery reservation={reservation_id} job={job_id}")
             return {"success": False, "new_balance": None, "cost": None}
         else:
             new_balance = result.get("balance")

@@ -1397,6 +1397,7 @@ def _poll_video_completion(
         f"[ASYNC] CRITICAL: legacy _poll_video_completion reached unexpectedly! "
         f"job={internal_job_id} provider={provider_name} — returning immediately"
     )
+    print(f"[SEEDANCE_OBS] event=legacy_poller_hit func=_poll_video_completion job={internal_job_id}")
     return
 
     from backend.services.video_router import resolve_video_provider
@@ -1580,6 +1581,7 @@ def _poll_seedance_with_state_awareness(
         f"[ASYNC] CRITICAL: legacy _poll_seedance_with_state_awareness reached! "
         f"job={internal_job_id} — returning immediately"
     )
+    print(f"[SEEDANCE_OBS] event=legacy_poller_hit func=_poll_seedance_with_state_awareness job={internal_job_id}")
     return
 
     task_type = store_meta.get("task_type", "seedance-2-fast-preview")

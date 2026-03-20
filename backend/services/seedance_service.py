@@ -321,6 +321,7 @@ def _validate_video_bytes(data: bytes, content_type: str, video_url: str) -> Non
     MP4 files contain an 'ftyp' box: bytes 4-8 == b'ftyp'.
     """
     if len(data) < 8:
+        print(f"[SEEDANCE_OBS] event=download_rejected reason=too_small bytes={len(data)} content_type={content_type}")
         raise RuntimeError(
             f"seedance_download_corrupt: response too small "
             f"({len(data)} bytes, content_type={content_type}, url={video_url[:80]})"
@@ -340,6 +341,7 @@ def _validate_video_bytes(data: bytes, content_type: str, video_url: str) -> Non
         return
 
     # Non-video content-type AND no ftyp → definitely not a video
+    print(f"[SEEDANCE_OBS] event=download_rejected reason=not_video content_type={content_type} bytes={len(data)}")
     raise RuntimeError(
         f"seedance_download_not_video: expected video, got content_type={content_type}, "
         f"first_bytes={data[:16]!r}, url={video_url[:80]}"

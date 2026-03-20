@@ -816,9 +816,11 @@ def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | Non
         from backend.services.job_worker import try_transition_to_finalizing
         if not try_transition_to_finalizing(job_id):
             print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI but already finalizing/terminal — skipping")
+            print(f"[SEEDANCE_OBS] event=cas_lost actor=status_endpoint job={job_id}")
             return None
 
         print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI — CAS won, finalizing now.")
+        print(f"[SEEDANCE_OBS] event=cas_won actor=status_endpoint job={job_id}")
 
         try:
             from backend.services.async_dispatch import (

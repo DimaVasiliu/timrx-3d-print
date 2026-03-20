@@ -661,6 +661,7 @@ def _dispatch_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
             f"[JOB] dispatch SKIPPED job={job_id} — upstream_id already exists "
             f"({existing_upstream[:20]}…), recovering to poll instead"
         )
+        print(f"[SEEDANCE_OBS] event=dispatch_skipped_existing_upstream job={job_id} upstream={existing_upstream[:20]}")
         # Ensure the DB column is set (it may have been missed in the crash)
         _transition_job(job_id, "dispatched", {
             "upstream_job_id": existing_upstream,
@@ -1113,7 +1114,10 @@ def _finalize_success(
 
     if not try_transition_to_finalizing(job_id):
         print(f"[JOB] skip finalize job={job_id} — already finalizing/terminal")
+        print(f"[SEEDANCE_OBS] event=cas_lost actor=worker job={job_id} provider={provider_name}")
         return
+
+    print(f"[SEEDANCE_OBS] event=cas_won actor=worker job={job_id} provider={provider_name}")
 
     from backend.services.async_dispatch import _finalize_video_success
 
