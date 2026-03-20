@@ -257,24 +257,64 @@ def rig_start():
                 "message": "Rigging failed. Please try again.",
             }), 502
     except Exception as e:
-        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
-        from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
-        # Surface actionable errors instead of generic message
         err_str = str(e).lower()
-        user_msg = None
-        if "face limit" in err_str or "exceeds the" in err_str:
-            user_msg = "Model has too many faces for rigging (max 300K). Please remesh the model first, then try rigging again."
-        elif "input task not found" in err_str or "task not found" in err_str:
-            user_msg = "The source model has expired or is no longer available on Meshy. Please generate a new model or upload a GLB file directly."
-        elif "pose estimation" in err_str:
-            user_msg = "Rigging failed: could not detect a humanoid pose. Make sure the model is a clear bipedal character with visible limbs."
-        elif "400" in err_str and "model_url" in err_str:
-            user_msg = "The model URL is not accessible. Please try uploading the file directly."
-        return jsonify(sanitize_provider_error(
-            provider="meshy", error=e, job_id=internal_job_id,
-            code=MODEL_GENERATION_FAILED,
-            message=user_msg,
-        )), 502
+
+        # Auto-retry with model_url when input_task_id expired on Meshy
+        if ("input task not found" in err_str or "task not found" in err_str) and source.get("input_task_id"):
+            fallback_url = body.get("model_url", "").strip()
+            if fallback_url:
+                print(f"[RIG_SUBMIT] input_task_id expired, retrying with model_url")
+                fallback_source, fallback_err = build_source_payload(
+                    {"model_url": fallback_url}, identity_id=identity_id, prefer="model_url"
+                )
+                if not fallback_err and fallback_source:
+                    try:
+                        resp = create_rigging_task(fallback_source, height_meters=height_meters)
+                        meshy_task_id = resp.get("result") or resp.get("id")
+                        if meshy_task_id:
+                            print(f"[RIG_SUBMIT] model_url fallback succeeded: {meshy_task_id}")
+                            # Skip to the success path below
+                            source = fallback_source
+                        else:
+                            meshy_task_id = None
+                    except Exception as retry_err:
+                        print(f"[RIG_SUBMIT] model_url fallback also failed: {retry_err}")
+                        meshy_task_id = None
+                else:
+                    meshy_task_id = None
+
+                if meshy_task_id:
+                    # Fall through to normal success path (after the except block)
+                    pass
+                else:
+                    release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+                    return jsonify({
+                        "ok": False,
+                        "error": "MODEL_GENERATION_FAILED",
+                        "message": "The source model has expired on Meshy and the fallback URL also failed. Please generate a new model or upload a GLB file directly.",
+                    }), 502
+            else:
+                release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+                return jsonify({
+                    "ok": False,
+                    "error": "MODEL_GENERATION_FAILED",
+                    "message": "The source model has expired or is no longer available on Meshy. Please generate a new model or upload a GLB file directly.",
+                }), 502
+        else:
+            release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+            from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+            user_msg = None
+            if "face limit" in err_str or "exceeds the" in err_str:
+                user_msg = "Model has too many faces for rigging (max 300K). Please remesh the model first, then try rigging again."
+            elif "pose estimation" in err_str:
+                user_msg = "Rigging failed: could not detect a humanoid pose. Make sure the model is a clear bipedal character with visible limbs."
+            elif "400" in err_str and "model_url" in err_str:
+                user_msg = "The model URL is not accessible. Please try uploading the file directly."
+            return jsonify(sanitize_provider_error(
+                provider="meshy", error=e, job_id=internal_job_id,
+                code=MODEL_GENERATION_FAILED,
+                message=user_msg,
+            )), 502
 
     # Credits: do NOT finalize now — rigging is async.
     # Finalize on terminal success in status endpoint; release on failure.
