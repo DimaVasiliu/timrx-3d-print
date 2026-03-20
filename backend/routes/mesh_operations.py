@@ -410,6 +410,16 @@ def mesh_retexture_mod():
 
     enable_pbr = bool(body.get("enable_pbr", False))
 
+    # ── Final source validation BEFORE reserving credits ─────────────────
+    # If after all fallbacks we still have no usable source, fail early
+    # without touching credits.
+    if not source.get("input_task_id") and not source.get("model_url"):
+        return jsonify({
+            "ok": False,
+            "error": "RETEXTURE_SOURCE_INVALID",
+            "message": "No valid source model available. The original model may have expired. Please generate a new model.",
+        }), 400
+
     job_meta = {
         "prompt": original_prompt_text,
         "root_prompt": root_prompt,
