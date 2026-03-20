@@ -124,14 +124,25 @@ GENERAL_ACTION_CODES = {
     "OPENAI_IMAGE",
     "OPENAI_IMAGE_2K",
     "OPENAI_IMAGE_4K",
-    # Google Imagen (same prices as OpenAI tiers)
+    # Google Imagen
     "GEMINI_IMAGE",
     "GEMINI_IMAGE_2K",
     "GEMINI_IMAGE_4K",
-    # Lowercase canonical variants (preferred)
+    # PiAPI Nano Banana (premium)
+    "PIAPI_IMAGE",
+    "PIAPI_IMAGE_2K",
+    "PIAPI_IMAGE_4K",
+    # Lowercase canonical variants — OpenAI (preferred)
     "image_generate",
     "image_generate_2k",
     "image_generate_4k",
+    # Lowercase canonical variants — Gemini
+    "gemini_image_generate",
+    "gemini_image_generate_2k",
+    # Lowercase canonical variants — Nano Banana (premium)
+    "piapi_image_generate",
+    "piapi_image_generate_2k",
+    "piapi_image_generate_4k",
     "text_to_3d_generate",
     "image_to_3d_generate",
     "refine",
