@@ -13,6 +13,7 @@ from backend.services.prompt_enhance_service import (
     enhance_prompt,
     PromptEnhanceError,
 )
+from backend.services.prompt_safety_service import check_prompt_safety
 
 bp = Blueprint("prompt_enhance", __name__)
 
@@ -73,6 +74,19 @@ def prompt_enhance():
             "ok": False,
             "error": "Prompt exceeds 2000 character limit",
         }), 400
+
+    # ── Prompt safety preflight ──
+    from flask import g
+    user_id = getattr(g, "identity_id", None)
+    medium = "video" if mode == "video" else ("image" if mode == "image" else "text")
+    safety = check_prompt_safety(raw_prompt, medium=medium, provider=provider, user_id=user_id)
+    if safety["decision"] in ("block", "warn"):
+        status_code = 451 if safety["decision"] == "block" else 422
+        return jsonify({
+            "ok": False,
+            "error": "prompt_safety",
+            "safety": safety,
+        }), status_code
 
     try:
         enhanced = enhance_prompt(raw_prompt, mode, provider=provider)

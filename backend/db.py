@@ -536,6 +536,13 @@ def ensure_schema() -> None:
             """)
 
         print("[DB] Schema indexes ensured")
+
+        # Ensure prompt-safety strike tracking table
+        try:
+            from backend.services.prompt_safety_service import ensure_safety_schema
+            ensure_safety_schema()
+        except Exception as e:
+            print(f"[DB] Warning: Could not ensure safety schema: {e}")
     except Exception as e:
         # Log but don't fail startup - indexes may already exist or DB user may lack permissions
         print(f"[DB] Warning: Could not ensure schema indexes: {e}")

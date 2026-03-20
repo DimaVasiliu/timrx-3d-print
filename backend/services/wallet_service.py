@@ -279,6 +279,9 @@ class LedgerEntryType:
     # Direct charge (idempotent, used by /api/credits/charge)
     CHARGE = "charge"
 
+    # Prompt safety penalty (auto-deducted after repeated violations)
+    SAFETY_PENALTY = "safety_penalty"
+
     # For backward compatibility with existing code
     GRANT = "grant"
     PURCHASE = "purchase"

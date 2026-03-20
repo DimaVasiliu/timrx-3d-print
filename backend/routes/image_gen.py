@@ -39,6 +39,7 @@ from backend.services.history_service import get_canonical_image_row, save_image
 from backend.services.identity_service import require_identity
 from backend.services.job_service import create_internal_job_row, load_store, save_store
 from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
+from backend.services.prompt_safety_service import check_prompt_safety
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("image_gen", __name__)
@@ -138,6 +139,20 @@ def image_generate_unified():
         err = _validate_4k_provider(req_size, provider)
         if err:
             return err
+
+    # ── Prompt safety preflight ──
+    raw_prompt = (body.get("prompt") or "").strip()
+    if raw_prompt:
+        from flask import g
+        user_id = getattr(g, "identity_id", None)
+        safety = check_prompt_safety(raw_prompt, medium="image", provider=provider, user_id=user_id)
+        if safety["decision"] in ("block", "warn"):
+            status_code = 451 if safety["decision"] == "block" else 422
+            return jsonify({
+                "ok": False,
+                "error": "prompt_safety",
+                "safety": safety,
+            }), status_code
 
     if provider == "nano_banana":
         # Route to PiAPI Nano Banana 2

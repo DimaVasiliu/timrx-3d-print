@@ -60,6 +60,7 @@ from backend.services.pricing_service import (
     get_video_credit_cost,
 )
 from backend.services.video_limits import validate_video_rate_limits
+from backend.services.prompt_safety_service import check_prompt_safety
 from backend.utils.helpers import now_s, log_event
 
 bp = Blueprint("video", __name__)
@@ -198,6 +199,17 @@ def _dispatch_video_job(
     Expects already-normalized provider-specific parameters (callers must
     run normalize_seedance_params or normalize_vertex_params before calling).
     """
+    # ── Prompt safety preflight ──
+    if prompt:
+        safety = check_prompt_safety(prompt, medium="video", provider=provider, user_id=identity_id or None)
+        if safety["decision"] in ("block", "warn"):
+            status_code = 451 if safety["decision"] == "block" else 422
+            return jsonify({
+                "ok": False,
+                "error": "prompt_safety",
+                "safety": safety,
+            }), status_code
+
     # Dynamic provider routing — auto-select cheaper provider under load
     from backend.services.video_limits import select_video_provider
     provider = select_video_provider(provider)
