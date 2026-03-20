@@ -1,1601 +1,622 @@
 """
-Video Generation Routes Blueprint.
-----------------------------------
-Registered under /api/_mod and /api for compatibility.
+Prompt Safety Service  v3 – fast preflight safety check for generation prompts.
 
-Active providers:
-- vertex   (Veo 3.1)       — durations 4/6/8s, aspects 16:9/9:16, resolutions 720p/1080p/4k
-- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 16:9/9:16/4:3/3:4, tiers fast/preview
+Category-bucketed scoring, safe-context reduction, per-category thresholds,
+structured debug logging, provider outcome learning, analytics summary.
 
-Endpoints:
-- POST /video/generate   — Unified start (text2video or image2video) — legacy
-- POST /video/text       — Text → short cinematic clip
-- POST /video/animate    — Image → animated video clip
-- GET  /video/status/<job_id>          — Poll job status (canonical)
-- GET  /video/generate/status/<job_id> — Poll job status (legacy alias)
+Call check_prompt_safety(prompt, medium, provider) for live checks.
+Pass dry_run=True for evaluation without strikes or penalties.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import uuid
-from flask import Blueprint, jsonify, request
+import re
+import time
+from typing import Dict, List, Optional, Tuple
 
-from backend.db import USE_DB, get_conn, Tables
-from backend.middleware import with_session
-from backend.services.async_dispatch import get_executor
-from backend.services.credits_helper import start_paid_job, release_job_credits
-from backend.services.expense_guard import ExpenseGuard
-from backend.services.identity_service import require_identity
-from backend.services.history_service import create_video_record
-from backend.services.job_service import create_internal_job_row, load_store, save_store
-from backend.services.gemini_video_service import (
-    validate_video_params,
-    GeminiValidationError,
+# ─────────────────────────────────────────────────────────────
+# Negation stripping
+# ─────────────────────────────────────────────────────────────
+_NEGATION_RE = re.compile(
+    r"(?:(?:non|not|no|without|never|isn'?t|aren'?t|wasn'?t|weren'?t|don'?t|doesn'?t)"
+    r"[\s\-]+\w+(?:\s+\w+){0,2})",
+    re.IGNORECASE,
 )
-from backend.services.vertex_video_service import check_vertex_resolution
-from backend.services.video_router import (
-    video_router,
-    resolve_video_provider,
-    normalize_provider_name,
+
+def _strip_negations(text: str) -> str:
+    """Remove negated phrases so 'non-threatening' doesn't match 'threatening'."""
+    return _NEGATION_RE.sub(" ", text)
+
+
+# ─────────────────────────────────────────────────────────────
+# Pattern rules:  (regex, category, weight, rule_id)
+# ─────────────────────────────────────────────────────────────
+_RULES_RAW: List[Tuple[str, str, int, str]] = [
+    # ═════════════════════════════════════════════════════════
+    # VIOLENCE – explicit harmful actions against people
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:shoot(?:s|ing)?|shot)\b.*\b(?:person|people|man|woman|officer|soldier|figure|character|victim|body|head|chest|crowd)\b", "violence", 14, "V01_shoot_person"),
+    (r"\b(?:person|people|man|woman|officer|soldier|figure|character|victim)\b.*\b(?:shoot(?:s|ing)?|shot|fire[sd]?\s+(?:at|on|upon))\b", "violence", 14, "V02_person_shot"),
+    (r"\bfiring\s+(?:controlled\s+)?shots?\s+(?:at|into|toward)\b", "violence", 14, "V03_firing_shots_at"),
+    (r"\b(?:shoots?|shoot(?:s|ing)?)\s+(?:multiple|several|many)\s+(?:people|victims|targets)\b", "violence", 16, "V04_mass_shooting"),
+    (r"\bstabb?(?:s|ed|ing)\b.*\b(?:person|people|man|woman|victim|body)\b", "violence", 14, "V05_stab_person"),
+    (r"\b(?:person|man|woman|victim)\b.*\bstabb?(?:s|ed|ing)\b", "violence", 14, "V06_person_stabbed"),
+    (r"\bstabb?(?:s|ed|ing)\s+repeatedly\b", "violence", 16, "V07_stab_repeatedly"),
+    (r"\b(?:kill(?:s|ed|ing)?|murder(?:s|ed|ing)?)\b.*\b(?:person|people|man|woman|victim|officer)\b", "violence", 14, "V08_kill_person"),
+    (r"\b(?:person|man|woman|victim|officer)\b.*\b(?:kill(?:s|ed|ing)?|murder(?:s|ed|ing)?)\b", "violence", 14, "V09_person_killed"),
+    (r"\b(?:execution|execute[sd]?|executing)\b", "violence", 16, "V10_execution"),
+    (r"\b(?:torture[sd]?|torturing)\b", "violence", 16, "V11_torture"),
+    (r"\b(?:decapitat\w+|dismember\w+|disembowel\w+)\b", "violence", 18, "V12_dismember"),
+    (r"\b(?:massacre[sd]?|slaughter(?:s|ed|ing)?)\b", "violence", 16, "V13_massacre"),
+    (r"\b(?:beat(?:s|ing)?|bludgeon\w*)\s+(?:to\s+)?death\b", "violence", 16, "V14_beat_death"),
+    (r"\b(?:strangl\w+|chok(?:e[sd]?|ing)\s+(?:to\s+)?death)\b", "violence", 14, "V15_strangle"),
+    (r"\b(?:gore|gory|goriest)\b", "violence", 12, "V16_gore"),
+    (r"\bblood\s*(?:splatter|spray|pool|gush|spurt|drip|soaked|stained)\b", "violence", 12, "V17_blood_graphic"),
+    (r"\b(?:head\s*shot|kill\s*shot|lethal\s*shot)\b", "violence", 14, "V18_headshot"),
+    (r"\b(?:sniper|assassin)\b.*\b(?:shoot|fire|kill|target)\b", "violence", 12, "V19_sniper_kill"),
+    (r"\b(?:gunfire|gunshot|muzzle\s*flash)\b.*\b(?:hit|strike|wound|drop|fall|kill|impact)\b", "violence", 12, "V20_gunfire_outcome"),
+    (r"\b(?:tactical\s+raid|armed\s+assault|armed\s+attack)\b", "violence", 10, "V21_armed_conflict"),
+    (r"\b(?:firing\s+squad|point[\s-]blank)\b", "violence", 14, "V22_firing_squad"),
+
+    # ═════════════════════════════════════════════════════════
+    # SEXUAL
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:explicit\s+)?(?:sex(?:ual)?\s+(?:act|intercourse|scene|content))\b", "sexual", 16, "S01_sexual_act"),
+    (r"\b(?:pornograph\w+|hardcore\s+porn)\b", "sexual", 16, "S02_porn"),
+    (r"\b(?:nude|naked)\s+(?:scene|body|figure|woman|man|girl|boy)\b", "sexual", 14, "S03_nude_person"),
+    (r"\b(?:genitalia|genital|penis|vagina|erection|orgasm)\b", "sexual", 16, "S04_genitalia"),
+    (r"\b(?:masturbat\w+)\b", "sexual", 16, "S05_masturbation"),
+    (r"\b(?:hentai|rule\s*34)\b", "sexual", 16, "S06_hentai"),
+
+    # ═════════════════════════════════════════════════════════
+    # MINORS  (always block – threshold = 1)
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:child|minor|underage|kid|toddler|infant|baby)\b.*\b(?:sex\w*|nude|naked|erotic|pornograph\w*|explicit)\b", "minors", 30, "M01_minor_sexual"),
+    (r"\b(?:sex\w*|nude|naked|erotic|pornograph\w*)\b.*\b(?:child|minor|underage|kid|toddler|infant|baby)\b", "minors", 30, "M02_sexual_minor"),
+    (r"\b(?:child|minor|underage|kid)\b.*\b(?:torture|murder|gore|execution|kill|stab|shoot)\b", "minors", 25, "M03_minor_violence"),
+    (r"\bpedophil\w*\b", "minors", 30, "M04_pedophilia"),
+    (r"\b(?:loli|shota)\b", "minors", 30, "M05_loli"),
+
+    # ════════════════════���════════════════════════════════════
+    # SELF_HARM  (always block – threshold = 1)
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:suicide|suicidal)\b.*\b(?:method|how\s+to|instruction|guide|step)\b", "self_harm", 20, "H01_suicide_guide"),
+    (r"\b(?:cut(?:ting)?|slit(?:ting)?)\s+(?:wrist|vein|arm)\b", "self_harm", 16, "H02_cutting"),
+    (r"\b(?:hang(?:ing)?\s+(?:my|your|them)self)\b", "self_harm", 16, "H03_hanging"),
+    (r"\b(?:encourage|promot)\w*\s+(?:self[\s-]?harm|suicide)\b", "self_harm", 20, "H04_promote_selfharm"),
+
+    # ═════════════════════════════════════════════════════════
+    # HATE
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:nazi|white\s*supremac\w+|ethnic\s*cleansing|racial\s*purity)\b", "hate", 18, "E01_nazi"),
+    (r"\b(?:heil\s+hitler|sieg\s+heil|1488|fourteen\s*words)\b", "hate", 18, "E02_heil"),
+    (r"\b(?:ISIS|al[\s-]*qaeda|jihad(?:ist)?)\b.*\b(?:praise|glory|support|join)\b", "hate", 18, "E03_terrorist_praise"),
+    (r"\b(?:praise|glorif\w+|celebrat\w+)\b.*\b(?:nazi|hitler|terrorism|terrorist)\b", "hate", 18, "E04_glorify_hate"),
+
+    # ═════════════════════════════════════════════════════════
+    # REAL_PERSON
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:deepfake|face\s*swap)\b.*\b(?:real|actual|celebrity|politician|public\s*figure)\b", "real_person", 16, "R01_deepfake"),
+    (r"\b(?:Trump|Biden|Obama|Putin|Xi\s*Jinping|Zelensky)\b.*\b(?:shoot|kill|murder|dead|nude|naked|sex|bomb|attack|stab|torture|execute)\b", "real_person", 18, "R02_politician_harm"),
+    (r"\b(?:shoot|kill|murder|dead|nude|naked|sex|bomb|attack|stab|torture|execute)\b.*\b(?:Trump|Biden|Obama|Putin|Xi\s*Jinping|Zelensky)\b", "real_person", 18, "R03_harm_politician"),
+    (r"\b(?:Taylor\s*Swift|Beyonce|Ariana\s*Grande|Billie\s*Eilish)\b.*\b(?:nude|naked|sex|pornograph\w*|deepfake)\b", "real_person", 18, "R04_celeb_sexual"),
+    (r"\b(?:nude|naked|sex|pornograph\w*|deepfake)\b.*\b(?:Taylor\s*Swift|Beyonce|Ariana\s*Grande|Billie\s*Eilish)\b", "real_person", 18, "R05_sexual_celeb"),
+    (r"\b(?:famous|real|actual)\s+(?:actor|actress|person|celebrity)\b.*\b(?:commit\w*|violent\s+crime|murder|kill|attack)\b", "real_person", 16, "R06_actor_crime"),
+    (r"\b(?:realistic\s+video)\b.*\b(?:famous|real|actual)\s+(?:actor|actress|person|celebrity)\b.*\b(?:crime|murder|kill|attack|violent)\b", "real_person", 18, "R07_realistic_actor_crime"),
+
+    # ═════════════════════════════════════════════════════════
+    # COPYRIGHT
+    # Exact recreation → block.  Franchise-inspired → warn only.
+    # ═════════════════════════════════════════════════════════
+    # -- Exact recreation (high weight → block) --
+    (r"\b(?:exact|identical|pixel[\s-]*perfect|frame[\s-]*by[\s-]*frame)\s+(?:copy|replica|recreation|reproduction)\b.*\b(?:scene|movie|film|show)\b", "copyright", 16, "C01_exact_copy"),
+    (r"\b(?:recreat\w+|reproduc\w+|replica\w*)\b.*\b(?:copyrighted|trademarked|Disney|Marvel|DC\s*Comics|Warner\s*Bros|Nintendo|Pixar)\b", "copyright", 16, "C02_recreate_brand"),
+    (r"\b(?:Disney|Marvel|DC\s*Comics|Warner\s*Bros|Nintendo|Pixar)\b.*\b(?:exact\s+(?:copy|replica)|recreat\w+|reproduc\w+)\b", "copyright", 16, "C03_brand_recreate"),
+    (r"\b(?:recreat\w*|exact\s+scene)\b.*\b(?:famous\s+(?:superhero|movie|film|show))\b", "copyright", 14, "C04_recreate_famous"),
+    # -- Named character in original costume/style (mid weight → block) --
+    (r"\b(?:Darth\s*Vader|Spider[\s-]*Man|Batman|Superman|Iron[\s-]*Man|Gandalf|Yoda|Pikachu|Mario|Mickey\s*Mouse|Elsa|Woody|Buzz\s*Lightyear)\b.*\b(?:in\s+(?:his|her|their|the)\s+(?:(?:original|iconic|classic|official)\s+)*(?:costume|suit|outfit|armor|style))\b", "copyright", 14, "C05_char_original_costume"),
+    # -- Franchise-inspired (low weight → warn only, never block alone) --
+    (r"\b(?:inspired\s+by|in\s+the\s+style\s+of|reminiscent\s+of)\b.*\b(?:Star\s*Wars|Lord\s+of\s+the\s+Rings|Harry\s*Potter|Game\s+of\s+Thrones|Marvel|DC|Stranger\s+Things)\b", "copyright", 4, "C06_franchise_inspired"),
+    (r"\b(?:looks?\s+like|similar\s+to|resembl\w+)\b.*\b(?:Darth\s*Vader|Spider[\s-]*Man|Batman|Superman|Iron[\s-]*Man|Gandalf|Yoda|Pikachu|Mario)\b", "copyright", 4, "C07_looks_like_character"),
+
+    # ═════════════════════════════════════════════════════════
+    # WEAPONS  (low weight, never blocks alone)
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:holding|brandish\w+|wield\w+|carry\w*)\s+(?:a\s+)?(?:gun|rifle|pistol|sword|knife|weapon|blade|axe|machete)\b", "weapons", 5, "W01_holding_weapon"),
+    (r"\b(?:armed|weaponized)\b", "weapons", 4, "W02_armed"),
+    (r"\b(?:gun|rifle|pistol|firearm|shotgun|revolver)\b", "weapons", 4, "W03_gun_present"),
+    (r"\b(?:fight(?:ing)?|combat|battle)\b.*\b(?:scene|sequence)\b", "weapons", 3, "W04_combat_scene"),
+
+    # ═════════════════════════════════════════════════════════
+    # HORROR  (low weight, never blocks alone)
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:horror|terrif\w+|nightmar\w+)\b.*\b(?:scene|moment|creature)\b", "horror", 4, "HR01_horror_scene"),
+    (r"\bjump\s*scare\b", "horror", 4, "HR02_jumpscare"),
+    (r"\b(?:scream(?:s|ing)?|shriek\w*)\b.*\b(?:terror|fear|horror)\b", "horror", 4, "HR03_scream_terror"),
+    (r"\b(?:demon(?:ic)?|possessed|exorcis\w+|occult|satanic)\b", "horror", 4, "HR04_demonic"),
+    (r"\b(?:ritual\s+sacrifice|blood\s+ritual|dark\s+ritual)\b", "horror", 5, "HR05_ritual"),
+
+    # ═════════════════════════════════════════════════════════
+    # LOW-SIGNAL (tiny scores, never block alone)
+    # ═════════════════════════════════════════════════════════
+    (r"\b(?:blood|bleed(?:s|ing)?)\b", "violence", 3, "LO01_blood"),
+    (r"\b(?:wound(?:ed)?|injur\w+)\b", "violence", 3, "LO02_wound"),
+    (r"\b(?:explosion|explod\w+|detonate|blast)\b", "violence", 3, "LO03_explosion"),
+    (r"\b(?:punch\w*|kick\w*)\b.*\b(?:person|opponent|enemy|face)\b", "violence", 4, "LO04_punch"),
+]
+
+_RULES = [(re.compile(p, re.IGNORECASE), cat, w, rid) for p, cat, w, rid in _RULES_RAW]
+
+
+# ─────────────────────────────────────────────────────────────
+# Safe-context signals
+# ─────────────────────────────────────────────────────────────
+_SAFE_CONTEXT_WORDS = re.compile(
+    r"\b(?:explore|explorer|walk(?:s|ing)?|wander|observe|observing|"
+    r"flashlight|ambient|atmosphere|atmospheric|suspense|suspenseful|"
+    r"corridor|hallway|tunnel|subway|passage|staircase|"
+    r"curiosity|curious|silence|silent|quiet|calm|peaceful|"
+    r"cinematic|camera\s+(?:dolly|pan|track|move|shift|angle)|"
+    r"soft\s+light|warm\s+light|gentle|fading|drifting|"
+    r"footsteps|echoes|reflections|shadows|dust|fog|mist|"
+    r"abandoned|empty|desolate|solitary|lone|lonely|"
+    r"music|ambient\s+music|soundtrack|resolve[sd]?)\b",
+    re.IGNORECASE,
 )
-from backend.services.video_providers.seedance_provider import (
-    normalize_seedance_params,
+
+_HARMFUL_ACTION_VERBS = re.compile(
+    r"\b(?:shoot(?:s|ing)?|shot|fire[sd]?\s+(?:at|on|upon|into)|"
+    r"stab(?:s|bed|bing)?|kill(?:s|ed|ing)?|murder(?:s|ed|ing)?|"
+    r"execut\w+|tortur\w+|slaughter\w*|massacr\w+|"
+    r"decapitat\w+|dismember\w+|disembowel\w+|bludgeon\w*|strangl\w+|"
+    r"attack(?:s|ed|ing)?|assault(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
 )
-from backend.services.video_providers.fal_seedance_provider import (
-    normalize_fal_seedance_params,
-)
-from backend.services.video_providers.vertex_provider import (
-    normalize_vertex_params,
-)
-from backend.services.video_prompts import (
-    normalize_text_prompt,
-    normalize_motion_prompt,
-    sanitize_prompt,
-    get_style_presets,
-    get_motion_presets,
-)
-from backend.services.pricing_service import (
-    get_video_action_code,
-    get_video_credit_cost,
-)
-from backend.services.video_limits import validate_video_rate_limits
-from backend.services.prompt_safety_service import check_prompt_safety, record_provider_rejection
-from backend.utils.helpers import now_s, log_event
 
-bp = Blueprint("video", __name__)
+_SAFE_SCORE_THRESHOLD = 4
+_SAFE_DAMPEN_FACTOR   = 0.3
 
 
-@bp.route("/video/generate", methods=["POST", "OPTIONS"])
-@with_session
-def generate_video():
-    """
-    Legacy unified endpoint: start text2video or image2video.
+# ─────────────────────────────────────────────────────────────
+# Provider / medium strictness multipliers
+# ─────────────────────────────────────────────────────────────
+_PROVIDER_STRICTNESS: Dict[str, float] = {
+    "seedance": 1.3, "fal_seedance": 1.2, "vertex": 1.3, "veo": 1.3,
+    "openai": 1.0, "google": 1.0, "gemini": 1.0, "nano_banana": 1.0,
+    "text": 0.8,
+}
 
-    Delegates to _dispatch_video_job after provider-specific normalization.
-    New code should use POST /video/text or POST /video/animate instead.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
+_MEDIUM_STRICTNESS: Dict[str, float] = {
+    "video": 1.2, "image": 1.0, "text": 0.8, "text_enhancement": 0.8,
+}
 
-    available_providers = video_router.get_available_providers()
-    if not available_providers:
-        return jsonify({
-            "error": "video_not_configured",
-            "message": "No video generation providers are configured",
-            "details": {"hint": "Set GEMINI_API_KEY environment variable"}
-        }), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    body = request.get_json(silent=True) or {}
-
-    provider = normalize_provider_name(body.get("provider"))
-    task = (body.get("task") or "text2video").lower()
-
-    if task not in ("text2video", "image2video"):
-        return jsonify({
-            "error": "invalid_params",
-            "message": "task must be 'text2video' or 'image2video'",
-            "field": "task",
-            "allowed": ["text2video", "image2video"]
-        }), 400
-
-    # Raw parameters from request
-    raw_duration = body.get("duration_sec") or body.get("durationSeconds") or (5 if provider in ("seedance", "fal_seedance") else 6)
-    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "16:9"
-    resolution = body.get("resolution") or "720p"
-    motion = (body.get("motion") or "").strip()
-    negative_prompt = (body.get("negative_prompt") or body.get("negativePrompt") or "").strip()
-    seed = body.get("seed")
-
-    seedance_variant = None
-    seedance_tier = "fast"
-
-    # ── Provider-specific normalization ──
-    if provider == "seedance":
-        sc = normalize_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            seedance_variant=body.get("seedance_variant"),
-        )
-        duration_seconds = sc["duration_seconds"]
-        aspect_ratio = sc["aspect_ratio"]
-        seedance_variant = sc["task_type"]
-        seedance_tier = sc["tier"]
-        resolution = "720p"  # Seedance has no resolution concept
-    elif provider == "fal_seedance":
-        fc = normalize_fal_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = fc["duration_seconds"]
-        aspect_ratio = fc["aspect_ratio"]
-        resolution = fc["resolution"]
-    else:
-        vc = normalize_vertex_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = vc["duration_seconds"]
-        aspect_ratio = vc["aspect_ratio"]
-        resolution = vc["resolution"]
-
-    # Task-specific validation
-    if task == "text2video":
-        prompt = (body.get("prompt") or "").strip()
-        if not prompt:
-            return jsonify({"error": "invalid_params", "message": "prompt is required for text2video", "field": "prompt"}), 400
-        image_data = None
-    else:
-        image_data = body.get("image_data") or body.get("image") or ""
-        if not image_data:
-            return jsonify({"error": "invalid_params", "message": "image_data is required for image2video", "field": "image_data"}), 400
-        prompt = motion or "Animate this image with natural, smooth motion"
-
-    return _dispatch_video_job(
-        identity_id=identity_id or "",
-        task=task,
-        prompt=prompt,
-        image_data=image_data,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration_seconds=duration_seconds,
-        motion=motion,
-        negative_prompt=negative_prompt,
-        seed=seed,
-        provider=provider,
-        seedance_variant=seedance_variant,
-        seedance_tier=seedance_tier,
-    )
+# ─────────────────────────────────────────────────────────────
+# Per-category thresholds (after multiplier)
+# ─────────────────────────────────────────────────────────────
+_CATEGORY_THRESHOLDS: Dict[str, Dict[str, float]] = {
+    "violence":    {"warn_at": 8,  "block_at": 12},
+    "sexual":      {"warn_at": 8,  "block_at": 12},
+    "minors":      {"warn_at": 1,  "block_at": 1},
+    "self_harm":   {"warn_at": 1,  "block_at": 1},
+    "hate":        {"warn_at": 8,  "block_at": 14},
+    "real_person": {"warn_at": 8,  "block_at": 14},
+    "copyright":   {"warn_at": 6,  "block_at": 14},
+    "weapons":     {"warn_at": 8,  "block_at": 999},
+    "horror":      {"warn_at": 10, "block_at": 999},
+}
+_DEFAULT_WARN_AT  = 8
+_DEFAULT_BLOCK_AT = 14
 
 
-def _dispatch_video_job(
-    identity_id: str,
-    task: str,
+# ─────────────────────────────────────────────────────────────
+# Category-specific rewrite suggestions
+# ─────────────────────────────────────────────────────────────
+_REWRITE_HINTS: Dict[str, str] = {
+    "violence":    "Remove explicit harm verbs (shoot, stab, kill) and focus on atmosphere, suspense, or the aftermath.",
+    "sexual":      "Remove explicit nudity and sexual acts. Describe emotion, intimacy, or artistry instead.",
+    "minors":      "Content involving minors in harmful contexts is strictly prohibited and cannot be rewritten.",
+    "self_harm":   "Remove all self-harm references. Reframe around hope, recovery, or resilience.",
+    "hate":        "Remove hate speech and extremist references entirely.",
+    "real_person": "Replace real public figures with fictional characters to avoid deepfake / misuse flags.",
+    "copyright":   "Describe original visual traits (silhouette, color palette, mood) instead of naming the franchise or character.",
+    "weapons":     "De-emphasize weapons. Focus on character emotion and story tension instead.",
+    "horror":      "Soften graphic horror into atmospheric suspense — fog, shadows, mystery.",
+}
+
+# Short category labels for the modal
+_CATEGORY_LABELS: Dict[str, str] = {
+    "violence":    "Explicit violence",
+    "sexual":      "Sexual content",
+    "minors":      "Minor safety",
+    "self_harm":   "Self-harm",
+    "hate":        "Hate / extremism",
+    "real_person": "Real-person misuse",
+    "copyright":   "Copyright concern",
+    "weapons":     "Weapons present",
+    "horror":      "Horror elements",
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# Strike tracking
+# ─────────────────────────────────────────────────────────────
+_strike_cache: Dict[str, list] = {}
+_STRIKE_WINDOW_SEC    = 86400
+_PENALTY_FREE_STRIKES = 2
+_PENALTY_PER_STRIKE   = 2
+_MAX_PENALTY          = 10
+
+def _get_strikes_24h(user_id: str) -> int:
+    if not user_id:
+        return 0
+    cutoff = time.time() - _STRIKE_WINDOW_SEC
+    entries = _strike_cache.get(user_id, [])
+    entries = [e for e in entries if e[0] > cutoff]
+    _strike_cache[user_id] = entries
+    return len(entries)
+
+def _record_strike(user_id: str, decision: str) -> int:
+    if not user_id:
+        return 0
+    _strike_cache.setdefault(user_id, []).append((time.time(), decision))
+    _persist_strike_to_db(user_id, decision, time.time())
+    return _get_strikes_24h(user_id)
+
+def _persist_strike_to_db(user_id, decision, timestamp):
+    try:
+        from backend.db import USE_DB, transaction
+        if not USE_DB: return
+        with transaction() as cur:
+            cur.execute("INSERT INTO timrx_app.safety_strikes (identity_id, decision, created_at) VALUES (%s, %s, to_timestamp(%s))", (user_id, decision, timestamp))
+    except Exception as e:
+        print(f"[SAFETY] Warning: could not persist strike: {e}")
+
+def _load_strikes_from_db(user_id):
+    try:
+        from backend.db import USE_DB, query_all
+        if not USE_DB: return []
+        cutoff = time.time() - _STRIKE_WINDOW_SEC
+        rows = query_all("SELECT EXTRACT(EPOCH FROM created_at) AS ts, decision FROM timrx_app.safety_strikes WHERE identity_id = %s AND created_at > to_timestamp(%s) ORDER BY created_at DESC", (user_id, cutoff))
+        return [(float(r["ts"]), r["decision"]) for r in rows]
+    except Exception as e:
+        print(f"[SAFETY] Warning: could not load strikes from DB: {e}")
+        return []
+
+def _compute_penalty(strike_count):
+    if strike_count <= _PENALTY_FREE_STRIKES: return 0
+    return min((strike_count - _PENALTY_FREE_STRIKES) * _PENALTY_PER_STRIKE, _MAX_PENALTY)
+
+def _apply_credit_penalty(user_id, amount):
+    if amount <= 0 or not user_id: return
+    try:
+        from backend.db import USE_DB
+        if not USE_DB: return
+        from backend.services.wallet_service import WalletService
+        WalletService.add_ledger_entry(identity_id=user_id, entry_type="safety_penalty", delta=-amount, credit_type="general", ref_type="safety", ref_id=None, meta={"penalty_credits": amount, "source": "prompt_safety"})
+        print(f"[SAFETY] Applied {amount} credit penalty to user {user_id}")
+    except Exception as e:
+        print(f"[SAFETY] Warning: could not apply credit penalty: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Provider outcome learning
+# ─────────────────────────────────────────────────────────────
+def record_provider_rejection(
+    provider: str,
+    medium: str,
     prompt: str,
-    image_data: str | None,
-    aspect_ratio: str,
-    resolution: str,
-    duration_seconds: int,
-    motion: str,
-    negative_prompt: str,
-    seed: int | None,
-    style_preset: str | None = None,
-    motion_preset: str | None = None,
-    provider: str = "vertex",
-    seedance_variant: str | None = None,
-    seedance_tier: str = "fast",
-    start_image: str | None = None,
-    end_image: str | None = None,
+    local_decision: str,
+    matched_rules: List[str],
+    cat_scores: Dict[str, float],
+    rejection_code: str = "",
+    rejection_message: str = "",
+    job_id: str = "",
 ):
     """
-    Shared helper: validate, reserve credits, create job row, dispatch async, return response.
-
-    Expects already-normalized provider-specific parameters (callers must
-    run normalize_seedance_params or normalize_vertex_params before calling).
+    Record an upstream provider rejection for later analysis.
+    Call this when a provider rejects a prompt that local safety allowed/warned.
     """
-    # ── Prompt safety preflight ──
-    if prompt:
-        safety = check_prompt_safety(prompt, medium="video", provider=provider, user_id=identity_id or None)
-        if safety["decision"] in ("block", "warn"):
-            status_code = 451 if safety["decision"] == "block" else 422
-            return jsonify({
-                "ok": False,
-                "error": "prompt_safety",
-                "safety": safety,
-            }), status_code
+    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
-    # Dynamic provider routing — auto-select cheaper provider under load
-    from backend.services.video_limits import select_video_provider
-    provider = select_video_provider(provider)
-
-    # Vertex: final validation via gemini_video_service (catches edge cases)
-    if provider == "vertex":
-        try:
-            aspect_ratio, resolution, duration_seconds = validate_video_params(
-                aspect_ratio, resolution, duration_seconds
-            )
-        except GeminiValidationError as e:
-            print(f"[VIDEO] Vertex validation failed: {e.message}")
-            return jsonify({
-                "ok": False,
-                "error": "invalid_params",
-                "message": e.message,
-                "field": e.field,
-                "value": e.value,
-                "allowed": e.allowed,
-            }), 400
-
-        # Pre-flight: reject 4k if Vertex project is not allowlisted
-        resolution_ok, resolution_err = check_vertex_resolution(resolution)
-        if not resolution_ok:
-            print(f"[VIDEO] Vertex resolution check failed: {resolution_err}")
-            return jsonify({
-                "ok": False,
-                "error": "vertex_resolution_not_allowed",
-                "message": resolution_err,
-                "field": "resolution",
-                "value": resolution,
-                "allowed": ["720p", "1080p"],
-            }), 400
-
-    internal_job_id = str(uuid.uuid4())
-
-    # Credit calculation — server is sole authority on action code
-    action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
-    expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier, task=task)
-
+    # Always log — this is the primary signal for tuning
     print(
-        f"[VIDEO] resolved provider={provider} task={task} duration={duration_seconds}s "
-        f"resolution={resolution} action_code={action_key} cost={expected_cost}"
+        f"[SAFETY_REJECTION] provider={provider} medium={medium} "
+        f"local_decision={local_decision} prompt_hash={prompt_hash} "
+        f"rejection_code={rejection_code} matched_rules={json.dumps(matched_rules)} "
+        f"scores={json.dumps({k: round(v, 1) for k, v in cat_scores.items()})} "
+        f"job_id={job_id}"
     )
 
-    if expected_cost <= 0:
-        print(f"[VIDEO] REJECTED: action_key={action_key} resolved to 0 credits provider={provider} duration={duration_seconds}")
-        return jsonify({
-            "ok": False,
-            "error": "unknown_action_code",
-            "message": f"Unknown video action code: {action_key}. Cannot determine cost.",
-        }), 400
-
-    # RATE LIMITS: concurrency, hourly cap, cooldown, spend guardrails
-    rate_error = validate_video_rate_limits(
-        identity_id,
-        provider=provider,
-        duration_seconds=duration_seconds,
-        seedance_tier=seedance_tier,
-    )
-    if rate_error:
-        return rate_error
-
-    print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
-
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {
-            "task": task,
-            "prompt": prompt[:100] if prompt else None,
-            "duration_seconds": duration_seconds,
-            "resolution": resolution,
-            "style_preset": style_preset,
-            "motion_preset": motion_preset,
-            "expected_cost": expected_cost,
-        },
-    )
-    if credit_error:
-        return credit_error
-
-    print(
-        f"[BILLING] reservation created job={internal_job_id} action_code={action_key} "
-        f"cost={expected_cost} reservation_id={reservation_id}"
-    )
-
-    store_meta = {
-        "stage": "video",
-        "created_at": now_s() * 1000,
-        "task": task,
-        "provider": provider,
-        "prompt": prompt,
-        "duration_seconds": duration_seconds,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "motion": motion,
-        "negative_prompt": negative_prompt,
-        "seed": seed,
-        "style_preset": style_preset,
-        "motion_preset": motion_preset,
-        "seedance_variant": seedance_variant,
-        "seedance_tier": seedance_tier if provider == "seedance" else None,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-    }
-
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    # Part 8: Priority queue — derive priority from user tier
-    from backend.services.video_limits import get_job_priority
-    job_priority = get_job_priority(identity_id)
-
-    # FAIL-CLOSED: Job row MUST exist before dispatching upstream provider task.
-    # If the insert fails (e.g. FK constraint on action_code), abort and release credits.
-    job_created = create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider=provider,
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-        priority=str(job_priority),
-        stage="video",
-    )
-    if not job_created:
-        print(f"[VIDEO] CRITICAL: Job row creation failed for {internal_job_id}, aborting dispatch. action_key={action_key}")
-        # Release reserved credits
-        if reservation_id:
-            try:
-                release_job_credits(reservation_id, job_id=internal_job_id, reason="job_row_creation_failed")
-            except Exception as rel_err:
-                print(f"[VIDEO] ERROR releasing reservation {reservation_id}: {rel_err}")
-        # Clean up in-memory store
-        store.pop(internal_job_id, None)
-        save_store(store)
-        return jsonify({
-            "ok": False,
-            "error": "internal_job_creation_failed",
-            "message": "Failed to create internal job record. Credits have been released. Please try again.",
-        }), 500
-
-    # Create a videos row early so history_items.video_id always has a valid FK target.
-    # This row starts as status='queued' and is updated as the job progresses.
-    video_uuid = create_video_record(
-        job_id=internal_job_id,
-        identity_id=identity_id,
-        prompt=prompt,
-        provider=provider,
-        duration_seconds=duration_seconds,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-    )
-    if video_uuid:
-        store_meta["video_uuid"] = video_uuid
-        store[internal_job_id] = store_meta
-        save_store(store)
-        # Also patch the video_uuid into jobs.meta so it can be resolved later
-        if USE_DB:
-            try:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            f"""
-                            UPDATE {Tables.JOBS}
-                            SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
-                            WHERE id::text = %s
-                            """,
-                            (json.dumps({"video_uuid": video_uuid}), internal_job_id),
-                        )
-                    conn.commit()
-            except Exception as e:
-                print(f"[VIDEO] WARNING: Failed to store video_uuid in jobs.meta: {e}")
-    else:
-        print(f"[VIDEO] WARNING: create_video_record failed for job {internal_job_id}, history FK may fail")
-
-    payload = {
-        "task": task,
-        "prompt": prompt,
-        "image_data": image_data,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "duration_seconds": duration_seconds,
-        "motion": motion,
-        "negative_prompt": negative_prompt,
-        "seed": seed,
-        "seedance_variant": seedance_variant,
-    }
-    if start_image:
-        payload["start_image"] = start_image
-    if end_image:
-        payload["end_image"] = end_image
-
-    from backend.services.async_dispatch import dispatch_gemini_video_async
-
-    get_executor().submit(
-        dispatch_gemini_video_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        payload,
-        store_meta,
-    )
-
-    log_event(f"video/{task}:dispatched", {"internal_job_id": internal_job_id})
-
-    # D1: Return fast — skip balance query (frontend caches wallet separately)
-    from backend.services.video_limits import get_estimated_render_time
-    rtime = get_estimated_render_time(provider)
-    return jsonify({
-        "ok": True,
-        "job_id": internal_job_id,
-        "video_id": internal_job_id,
-        "video_uuid": video_uuid,
-        "reservation_id": reservation_id,
-        "status": "queued",
-        "task": task,
-        "params": {
-            "aspect_ratio": aspect_ratio,
-            "resolution": resolution,
-            "duration_seconds": duration_seconds,
-        },
-        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-    })
-
-
-# ── POST /video/text — Text → short cinematic clip ───────────
-@bp.route("/video/text", methods=["POST", "OPTIONS"])
-@with_session
-def video_text():
-    """
-    Generate a short cinematic video clip from a text prompt.
-
-    Provider-specific normalization happens here so _dispatch_video_job
-    receives clean, validated parameters.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    available_providers = video_router.get_available_providers()
-    if not available_providers:
-        return jsonify({"error": "video_not_configured", "message": "No video generation providers are configured"}), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    body = request.get_json(silent=True) or {}
-
-    raw_prompt = (body.get("prompt") or "").strip()
-    if not raw_prompt:
-        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
-
-    provider = normalize_provider_name(body.get("provider"))
-    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
-    aspect_ratio = body.get("aspect_ratio") or "16:9"
-    resolution = body.get("resolution") or "720p"
-    negative_prompt = (body.get("negative_prompt") or "").strip()
-    seed = body.get("seed")
-    style_preset = body.get("style_preset")
-
-    seedance_variant = None
-    seedance_tier = "fast"
-
-    if provider == "seedance":
-        sc = normalize_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            seedance_variant=body.get("seedance_variant"),
-        )
-        duration_seconds = sc["duration_seconds"]
-        aspect_ratio = sc["aspect_ratio"]
-        seedance_variant = sc["task_type"]
-        seedance_tier = sc["tier"]
-        resolution = "720p"
-        prompt = raw_prompt  # No style normalization for Seedance
-    elif provider == "fal_seedance":
-        fc = normalize_fal_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = fc["duration_seconds"]
-        aspect_ratio = fc["aspect_ratio"]
-        resolution = fc["resolution"]
-        prompt = raw_prompt  # No style normalization for fal Seedance
-    else:
-        vc = normalize_vertex_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = vc["duration_seconds"]
-        aspect_ratio = vc["aspect_ratio"]
-        resolution = vc["resolution"]
-        prompt = normalize_text_prompt(raw_prompt, style_preset, duration_seconds)
-
-    # Safety filter: soften content that triggers provider filters
-    prompt = sanitize_prompt(prompt, provider=provider)
-
-    return _dispatch_video_job(
-        identity_id=identity_id or "",
-        task="text2video",
-        prompt=prompt,
-        image_data=None,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration_seconds=duration_seconds,
-        motion="",
-        negative_prompt=negative_prompt,
-        seed=seed,
-        style_preset=style_preset,
-        provider=provider,
-        seedance_variant=seedance_variant,
-        seedance_tier=seedance_tier,
-    )
-
-
-# ── POST /video/animate — Image → animated video clip ────────
-@bp.route("/video/animate", methods=["POST", "OPTIONS"])
-@with_session
-def video_animate():
-    """
-    Animate a single image into a short video clip.
-
-    Provider-specific normalization happens here so _dispatch_video_job
-    receives clean, validated parameters.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    available_providers = video_router.get_available_providers()
-    if not available_providers:
-        return jsonify({"error": "video_not_configured", "message": "No video generation providers are configured"}), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    body = request.get_json(silent=True) or {}
-
-    provider = normalize_provider_name(body.get("provider"))
-    animate_mode = body.get("mode") or "animate_image"
-    # Image Transition (two-image interpolation) is supported by:
-    #   - vertex:       Veo 3.1 first-frame + last-frame conditioning
-    #   - fal_seedance: fal.ai Seedance with end_image_url
-    # Seedance 2.0 via PiAPI does NOT support end_image — no transition.
-    _TRANSITION_PROVIDERS = frozenset({"vertex", "fal_seedance"})
-    is_transition = animate_mode == "image_transition" and provider in _TRANSITION_PROVIDERS
-    # Experimental Morph (Beta): Seedance-only, passes image_urls=[url1, url2]
-    is_experimental_morph = animate_mode == "experimental_morph" and provider == "seedance"
-    is_two_image = is_transition or is_experimental_morph
-
-    # ── Image validation (mode-dependent) ──
-    image_data = ""
-    start_image = ""
-    end_image = ""
-
-    if is_two_image:
-        # Transition mode: require start + end images
-        start_image = body.get("start_image") or body.get("start_image_data") or body.get("start_image_url") or ""
-        end_image = body.get("end_image") or body.get("end_image_data") or body.get("end_image_url") or ""
-
-        _mode_label = "Experimental morph" if is_experimental_morph else "Image transition"
-        if not start_image:
-            return jsonify({"error": "invalid_params", "message": f"{_mode_label} requires both start and end images", "field": "start_image"}), 400
-        if not end_image:
-            return jsonify({"error": "invalid_params", "message": f"{_mode_label} requires both start and end images", "field": "end_image"}), 400
-
-        print(f"[VIDEO] animate mode={'experimental_morph' if is_experimental_morph else 'image_transition'} provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
-    else:
-        # Single-image animate mode
-        image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
-        image_id = body.get("image_id")
-
-        if not image_data and image_id:
-            image_data = _resolve_image_id(image_id, identity_id)
-
-        if not image_data:
-            return jsonify({"error": "invalid_params", "message": "Seedance animate requires one source image" if provider in ("fal_seedance", "seedance") else "image_data, image_url, or image_id is required", "field": "image_data"}), 400
-
-        print(f"[VIDEO] animate mode=animate_image provider={provider} image={'present' if image_data else 'MISSING'}")
-
-    raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
-    raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
-    aspect_ratio = body.get("aspect_ratio") or "16:9"
-    resolution = body.get("resolution") or "720p"
-    negative_prompt = (body.get("negative_prompt") or "").strip()
-    seed = body.get("seed")
-    motion_preset = body.get("motion_preset")
-
-    seedance_variant = None
-    seedance_tier = "fast"
-
-    if provider == "seedance":
-        sc = normalize_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            seedance_variant=body.get("seedance_variant"),
-        )
-        duration_seconds = sc["duration_seconds"]
-        aspect_ratio = sc["aspect_ratio"]
-        seedance_variant = sc["task_type"]
-        seedance_tier = sc["tier"]
-        resolution = "720p"
-        if is_experimental_morph:
-            prompt = raw_user_prompt or "Smooth morph transition between these two images"
-        else:
-            prompt = raw_user_prompt or "Animate this image with natural, smooth motion"
-    elif provider == "fal_seedance":
-        fc = normalize_fal_seedance_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = fc["duration_seconds"]
-        aspect_ratio = fc["aspect_ratio"]
-        resolution = fc["resolution"]
-        prompt = raw_user_prompt or ("Transition between these two images" if is_transition else "Animate this image with natural, smooth motion")
-    else:
-        vc = normalize_vertex_params(
-            duration_seconds=raw_duration,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-        )
-        duration_seconds = vc["duration_seconds"]
-        aspect_ratio = vc["aspect_ratio"]
-        resolution = vc["resolution"]
-        if is_transition:
-            prompt = raw_user_prompt or "Smooth cinematic transition between these two images"
-        else:
-            prompt = normalize_motion_prompt(raw_user_prompt, motion_preset)
-
-    # Safety filter: soften content that triggers provider filters
-    prompt = sanitize_prompt(prompt, provider=provider)
-
-    return _dispatch_video_job(
-        identity_id=identity_id or "",
-        task=_resolve_animate_task(is_transition, is_experimental_morph),
-        prompt=prompt,
-        image_data=image_data,
-        aspect_ratio=aspect_ratio,
-        resolution=resolution,
-        duration_seconds=duration_seconds,
-        motion=prompt,
-        negative_prompt=negative_prompt,
-        seed=seed,
-        motion_preset=motion_preset,
-        provider=provider,
-        seedance_variant=seedance_variant,
-        seedance_tier=seedance_tier,
-        start_image=start_image if is_two_image else None,
-        end_image=end_image if is_two_image else None,
-    )
-
-
-# ── Helper: resolve image_id → image_url from DB ─────────────
-def _resolve_animate_task(is_transition: bool, is_experimental_morph: bool) -> str:
-    """Map animate sub-mode flags to the internal task string."""
-    if is_transition:
-        return "image_transition"
-    if is_experimental_morph:
-        return "experimental_morph"
-    return "image2video"
-
-
-def _resolve_image_id(image_id: str, identity_id: str | None) -> str | None:
-    """Look up an image URL from our images table by image_id, scoped to the requesting user."""
-    if not USE_DB or not image_id or not identity_id:
-        return None
+    # Persist to DB
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT image_url FROM {Tables.IMAGES}
-                    WHERE id::text = %s AND identity_id = %s AND deleted_at IS NULL
-                    LIMIT 1
-                    """,
-                    (image_id, identity_id),
-                )
-                row = cur.fetchone()
-        if row and row.get("image_url"):
-            print(f"[VIDEO] Resolved image_id={image_id} → {row['image_url'][:80]}...")
-            return row["image_url"]
+        from backend.db import USE_DB, transaction
+        if not USE_DB:
+            return
+        with transaction() as cur:
+            cur.execute("""
+                INSERT INTO timrx_app.safety_rejections
+                    (provider, medium, prompt_hash, local_decision, matched_rules,
+                     category_scores, rejection_code, rejection_message, job_id, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """, (
+                provider, medium, prompt_hash, local_decision,
+                json.dumps(matched_rules),
+                json.dumps({k: round(v, 1) for k, v in cat_scores.items()}),
+                rejection_code[:200], rejection_message[:500], job_id,
+            ))
     except Exception as e:
-        print(f"[VIDEO] Error resolving image_id={image_id}: {e}")
-    return None
+        print(f"[SAFETY] Warning: could not persist rejection: {e}")
 
 
-# ── GET /video/presets — Available style & motion presets ─────
-@bp.route("/video/presets", methods=["GET", "OPTIONS"])
-def video_presets():
-    """Return available style and motion presets for the frontend."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-    return jsonify({
-        "ok": True,
-        "style_presets": get_style_presets(),
-        "motion_presets": get_motion_presets(),
-    })
-
-
-# ── GET /video/status/<job_id> — Canonical status endpoint ───
-@bp.route("/video/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
-def video_status_canonical(job_id: str):
-    """Canonical status endpoint (delegates to shared handler)."""
-    return _video_status_handler(job_id)
-
-
-# ── GET /video/generate/status/<job_id> — Legacy alias ───────
-@bp.route("/video/generate/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
-def video_status(job_id: str):
-    """Legacy status endpoint (delegates to shared handler)."""
-    return _video_status_handler(job_id)
-
-
-# ── Live PiAPI re-check helpers for orphaned Seedance jobs ───
-_STALE_THRESHOLD_SECONDS = 10 * 60  # 10 minutes without DB update → stale
-
-
-def _estimate_video_progress(job_row, job_meta, estimated_duration: int) -> int:
-    """Estimate video generation progress from elapsed time (asymptotic to 95%)."""
-    import math
-    from datetime import datetime, timezone
-
-    # Use processing_started_at > dispatched_at > created_at
-    started = job_meta.get("processing_started_at") or job_meta.get("dispatched_at")
-    if not started:
-        created = job_row.get("created_at")
-        if created and hasattr(created, 'timestamp'):
-            started = created.timestamp()
-
-    if not started:
-        return 0
-
-    now = datetime.now(timezone.utc).timestamp()
-    if isinstance(started, (int, float)):
-        elapsed = now - started
-    else:
-        try:
-            elapsed = now - started.timestamp()
-        except Exception:
-            return 0
-
-    if elapsed <= 0 or estimated_duration <= 0:
-        return 0
-
-    # Asymptotic curve: approaches 95% as elapsed -> estimated_duration
-    # progress = 95 * (1 - e^(-2 * elapsed / estimated_duration))
-    ratio = elapsed / estimated_duration
-    progress = int(95 * (1 - math.exp(-2 * ratio)))
-    return max(1, min(progress, 95))
-
-
-def _is_stale_seedance_job(job_row, job_meta) -> bool:
-    """Return True if this looks like a Seedance job whose polling thread died."""
-    provider = job_meta.get("provider", "")
-    if provider != "seedance":
-        return False
-    upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
-    if not upstream_id:
-        return False
-    updated_at = job_row.get("updated_at")
-    if not updated_at:
-        return True
-    from datetime import datetime, timezone
-    if hasattr(updated_at, 'tzinfo') and updated_at.tzinfo is None:
-        updated_at = updated_at.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
-    return age > _STALE_THRESHOLD_SECONDS
-
-
-def _try_live_seedance_check(job_id: str, job_meta: dict, identity_id: str | None):
+# ─────────────────────────────────────────────────────────────
+# Analytics summary
+# ─────────────────────────────────────────────────────────────
+def get_safety_analytics(hours: int = 24) -> Dict:
     """
-    One-shot live check against PiAPI for an orphaned Seedance job.
-
-    If PiAPI says done → claim via atomic CAS, then finalize.
-    If PiAPI says failed → mark failed.
-    If still processing → return None (let normal status response handle it).
-
-    IMPORTANT: Uses try_transition_to_finalizing() as an atomic CAS guard
-    to prevent duplicate finalization if the durable worker, webhook, or
-    rescue system is concurrently finalizing the same job.
+    Aggregate safety data for admin/debug.
+    Returns blocks/warns by category, false-negative candidates,
+    top matched rules, and providers with most rejections.
     """
-    upstream_id = job_meta.get("upstream_id") or job_meta.get("operation_name")
-    if not upstream_id:
-        return None
-
+    result: Dict = {
+        "period_hours": hours,
+        "blocks_by_category": {},
+        "warns_by_category": {},
+        "false_negative_candidates": 0,
+        "top_rejection_providers": {},
+        "top_matched_rules": {},
+        "total_strikes": 0,
+    }
     try:
-        from backend.services.seedance_service import check_seedance_status
-        status_resp = check_seedance_status(upstream_id)
+        from backend.db import USE_DB, query_all
+        if not USE_DB:
+            return result
+
+        # Strikes by decision and category (we don't store category in strikes,
+        # so count by decision type)
+        strikes = query_all("""
+            SELECT decision, COUNT(*) AS cnt
+            FROM timrx_app.safety_strikes
+            WHERE created_at > NOW() - INTERVAL '%s hours'
+            GROUP BY decision
+        """, (hours,))
+        for row in strikes:
+            if row["decision"] == "block":
+                result["blocks_by_category"]["_total"] = row["cnt"]
+            else:
+                result["warns_by_category"]["_total"] = row["cnt"]
+            result["total_strikes"] += row["cnt"]
+
+        # Provider rejections (false-negative candidates)
+        rejections = query_all("""
+            SELECT provider, local_decision, COUNT(*) AS cnt, matched_rules
+            FROM timrx_app.safety_rejections
+            WHERE created_at > NOW() - INTERVAL '%s hours'
+            GROUP BY provider, local_decision, matched_rules
+            ORDER BY cnt DESC
+            LIMIT 20
+        """, (hours,))
+        for row in rejections:
+            prov = row["provider"]
+            result["top_rejection_providers"][prov] = result["top_rejection_providers"].get(prov, 0) + row["cnt"]
+            if row["local_decision"] == "allow":
+                result["false_negative_candidates"] += row["cnt"]
+
+            # Parse matched_rules to count
+            try:
+                rules = json.loads(row.get("matched_rules", "[]"))
+                for r in rules:
+                    result["top_matched_rules"][r] = result["top_matched_rules"].get(r, 0) + row["cnt"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     except Exception as e:
-        print(f"[VIDEO STATUS] Live PiAPI check failed for {job_id}: {e}")
-        return None
+        print(f"[SAFETY] Warning: analytics query failed: {e}")
 
-    status = status_resp.get("status")
+    return result
 
-    if status == "done":
-        video_url = status_resp.get("video_url")
-        if not video_url:
-            return None
 
-        # ── Atomic CAS guard: claim the job for finalization ──
-        # This prevents double-finalization if the durable worker or
-        # rescue system is concurrently processing the same job.
-        from backend.services.job_worker import try_transition_to_finalizing
-        if not try_transition_to_finalizing(job_id):
-            print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI but already finalizing/terminal — skipping")
-            print(f"[SEEDANCE_OBS] event=cas_lost actor=status_endpoint job={job_id}")
-            return None
+# ─────────────────────────────────────────────────────────────
+# Main API
+# ─────────────────────────────────────────────────────────────
+def check_prompt_safety(
+    prompt: str,
+    medium: str = "image",
+    provider: str = "openai",
+    user_id: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict:
+    if not prompt or not prompt.strip():
+        return _allow_result()
 
-        print(f"[VIDEO STATUS] Live check: job {job_id} completed on PiAPI — CAS won, finalizing now.")
-        print(f"[SEEDANCE_OBS] event=cas_won actor=status_endpoint job={job_id}")
+    text = prompt.strip()
+    text_cleaned = _strip_negations(text)
 
-        try:
-            from backend.services.async_dispatch import (
-                _finalize_video_success,
-                load_store,
-            )
-            store = load_store()
-            store_meta = store.get(job_id) or job_meta
-            reservation_id = store_meta.get("reservation_id") or job_meta.get("reservation_id")
+    provider_lower = (provider or "").lower()
+    medium_lower   = (medium or "image").lower()
+    provider_mult  = _PROVIDER_STRICTNESS.get(provider_lower, 1.0)
+    medium_mult    = _MEDIUM_STRICTNESS.get(medium_lower, 1.0)
+    total_mult     = provider_mult * medium_mult
 
-            _finalize_video_success(
-                job_id, identity_id or "", reservation_id,
-                video_url, store_meta, provider_name="seedance",
-            )
+    # Score every rule into per-category buckets
+    cat_scores: Dict[str, float] = {}
+    matched_rules: List[Dict] = []
 
-            return jsonify({
-                "ok": True,
-                "status": "done",
-                "job_id": job_id,
-                "video_url": video_url,
-                "message": "Video ready",
+    for pattern, category, weight, rule_id in _RULES:
+        m = pattern.search(text_cleaned)
+        if m:
+            adjusted = weight * total_mult
+            cat_scores[category] = cat_scores.get(category, 0.0) + adjusted
+            matched_rules.append({
+                "rule": rule_id, "category": category,
+                "weight": weight, "adjusted": round(adjusted, 1),
+                "matched": m.group()[:80],
             })
-        except Exception as e:
-            print(f"[VIDEO STATUS] Live finalize failed for {job_id}: {e}")
-            # Transition back to stalled so the durable worker can reclaim.
-            # WHERE status = 'finalizing' prevents reopening a job that another
-            # thread successfully finalized to 'ready' in the meantime.
-            try:
-                with get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            f"""UPDATE {Tables.JOBS}
-                                SET status = 'stalled', updated_at = NOW(),
-                                    meta = COALESCE(meta, '{{}}'::jsonb)
-                                        || '{{"live_finalize_failed": true}}'::jsonb
-                                WHERE id::text = %s AND status = 'finalizing'""",
-                            (job_id,),
-                        )
-                    conn.commit()
-            except Exception as rollback_err:
-                print(f"[VIDEO STATUS] rollback to stalled failed for {job_id}: {rollback_err}")
-            # Return None — fall through to normal status response so
-            # the frontend sees the actual DB state, not a false "done".
-            return None
 
-    if status == "failed":
-        return _live_check_mark_failed(job_id, job_meta, status_resp)
+    # Safe-context reducer
+    safe_count = len(_SAFE_CONTEXT_WORDS.findall(text_cleaned))
+    has_harmful_verbs = bool(_HARMFUL_ACTION_VERBS.search(text_cleaned))
+    safe_reduced = False
 
-    # Still pending/processing on PiAPI — return None to use normal response
-    return None
+    if safe_count >= _SAFE_SCORE_THRESHOLD and not has_harmful_verbs:
+        for c in ("violence", "horror", "weapons"):
+            if c in cat_scores:
+                cat_scores[c] *= _SAFE_DAMPEN_FACTOR
+                safe_reduced = True
 
+    # Determine decision per category
+    block_cats = set()
+    warn_cats  = set()
+    for cat, score in cat_scores.items():
+        th = _CATEGORY_THRESHOLDS.get(cat, {})
+        if score >= th.get("block_at", _DEFAULT_BLOCK_AT):
+            block_cats.add(cat)
+        elif score >= th.get("warn_at", _DEFAULT_WARN_AT):
+            warn_cats.add(cat)
 
-def _live_check_mark_failed(job_id, job_meta, status_resp):
-    """Handle a live PiAPI check that returned failed."""
-    error_code = status_resp.get("error", "seedance_generation_failed")
-    error_msg = status_resp.get("message", "Seedance generation failed")
-    print(f"[VIDEO STATUS] Live check: job {job_id} failed on PiAPI: {error_code}")
-    try:
-        from backend.services.async_dispatch import update_job_status_failed, ExpenseGuard
-        reservation_id = job_meta.get("reservation_id")
-        if reservation_id:
-            from backend.services.credits_helper import release_job_credits
-            release_job_credits(reservation_id, error_code, job_id)
-        update_job_status_failed(job_id, f"{error_code}: {error_msg}")
-        ExpenseGuard.unregister_active_job(job_id)
-    except Exception as e:
-        print(f"[VIDEO STATUS] Live fail-update error for {job_id}: {e}")
-    return jsonify({
-        "ok": False, "status": "failed", "job_id": job_id,
-        "error": error_code, "message": error_msg,
-    })
+    decision = "block" if block_cats else ("warn" if warn_cats else "allow")
+    triggered_cats = sorted(block_cats | warn_cats)
 
-
-# ── Shared status handler ────────────────────────────────────
-def _video_status_handler(job_id: str):
-    """
-    Get the status of a video generation job.
-
-    Returns:
-        queued      — waiting to start
-        processing  — generating (with progress %)
-        done        — ready with video_url, thumbnail_url
-        failed      — error with message
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    # Try job store first
-    store = load_store()
-    meta = store.get(job_id) or {}
-
-    # Check database for job status
-    if USE_DB:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT id, status, error_message, meta, updated_at
-                        FROM {Tables.JOBS}
-                        WHERE id::text = %s AND identity_id = %s
-                        LIMIT 1
-                        """,
-                        (job_id, identity_id),
-                    )
-                    job = cur.fetchone()
-
-            if job:
-                job_meta = job.get("meta") or {}
-                if isinstance(job_meta, str):
-                    try:
-                        job_meta = __import__('json').loads(job_meta)
-                    except Exception:
-                        job_meta = {}
-
-                if job["status"] == "queued":
-                    from backend.services.video_limits import get_queue_position, get_estimated_render_time
-                    qpos = get_queue_position(job_id)
-                    provider_hint = meta.get("provider") or job_meta.get("provider") or "vertex"
-                    rtime = get_estimated_render_time(provider_hint)
-                    return jsonify({
-                        "ok": True,
-                        "status": "queued",
-                        "job_id": job_id,
-                        "message": f"Queue position #{qpos['queue_position']}",
-                        "progress": 0,
-                        "queue_position": qpos["queue_position"],
-                        "estimated_start_seconds": qpos["estimated_start_seconds"],
-                        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-                    })
-
-                if job["status"] == "quota_queued":
-                    return jsonify({
-                        "ok": True,
-                        "status": "queued",
-                        "job_id": job_id,
-                        "message": "Waiting for provider quota to reset — your video is queued and will be processed automatically.",
-                        "progress": 0,
-                        "quota_queued": True,
-                    })
-
-                # ── Live PiAPI re-check for orphaned Seedance jobs ──
-                # If the backend polling thread died (deploy/crash) and the job
-                # has been stuck for >10 min, check PiAPI directly and finalize.
-                if job["status"] in ("provider_pending", "processing") and _is_stale_seedance_job(job, job_meta):
-                    live_result = _try_live_seedance_check(job_id, job_meta, identity_id)
-                    if live_result:
-                        return live_result
-
-                if job["status"] == "provider_pending":
-                    pending_secs = job_meta.get("pending_seconds", 0)
-                    prov = (meta.get("provider") or job_meta.get("provider") or "vertex").capitalize()
-                    if prov == "Vertex": prov = "Veo"
-                    if pending_secs < 60:
-                        msg = f"Queued with {prov}"
-                    elif pending_secs < 300:
-                        msg = f"{prov} queue busy — your video is still waiting"
-                    else:
-                        msg = f"{prov} queue is slow — still waiting ({pending_secs // 60}m elapsed)"
-                    return jsonify({
-                        "ok": True,
-                        "status": "provider_pending",
-                        "job_id": job_id,
-                        "message": msg,
-                        "progress": 0,
-                        "pending_seconds": pending_secs,
-                        "provider_status": job_meta.get("provider_status", "pending"),
-                    })
-
-                if job["status"] in ("processing", "provider_processing"):
-                    real_progress = meta.get("progress") or job_meta.get("progress") or 0
-                    provider_hint = meta.get("provider") or job_meta.get("provider") or "vertex"
-                    from backend.services.video_limits import get_estimated_render_time
-                    rtime = get_estimated_render_time(provider_hint)
-
-                    # Estimate progress from elapsed time if provider gives 0
-                    progress = real_progress
-                    if progress == 0:
-                        progress = _estimate_video_progress(job, job_meta, rtime["estimated_duration_seconds"])
-
-                    # Format time estimate as minutes if > 90s
-                    lo, hi = rtime['estimated_min_seconds'], rtime['estimated_max_seconds']
-                    if lo >= 90:
-                        time_hint = f"{lo // 60}–{hi // 60} min"
-                    else:
-                        time_hint = f"{lo}–{hi}s"
-
-                    prov_label = (provider_hint or "vertex").capitalize()
-                    if prov_label == "Vertex": prov_label = "Veo"
-                    return jsonify({
-                        "ok": True,
-                        "status": "processing",
-                        "job_id": job_id,
-                        "message": f"{prov_label} rendering (estimated {time_hint})",
-                        "progress": progress,
-                        "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-                    })
-
-                if job["status"] in ("failed", "provider_stalled"):
-                    error_msg = job.get("error_message", "Video generation failed")
-                    error_code = job_meta.get("error_code") or "video_failed"
-
-                    # Fallback: parse error code from "code: message" format
-                    if error_code == "video_failed" and error_msg and ":" in error_msg:
-                        parts = error_msg.split(":", 1)
-                        candidate = parts[0].strip()
-                        if candidate and " " not in candidate:
-                            error_code = candidate
-                            error_msg = parts[1].strip()
-
-                    # Use structured failure_reason from meta if available
-                    failure_reason = job_meta.get("failure_reason") or error_msg
-
-                    # Surface user-friendly message for filtered errors
-                    user_message = job_meta.get("user_message") if error_code == "provider_filtered_third_party" else None
-
-                    # Record upstream rejection for safety tuning
-                    if error_code in ("provider_filtered_content", "provider_filtered_third_party"):
-                        _prompt = meta.get("prompt") or job_meta.get("prompt") or ""
-                        _provider = meta.get("provider") or job_meta.get("provider") or "vertex"
-                        if _prompt:
-                            # Re-run safety check in dry-run to capture what local safety saw
-                            _local = check_prompt_safety(_prompt, medium="video", provider=_provider, dry_run=True)
-                            record_provider_rejection(
-                                provider=_provider, medium="video", prompt=_prompt,
-                                local_decision=_local["decision"],
-                                matched_rules=_local.get("debug", {}).get("matched_rules", []),
-                                cat_scores={k: v for k, v in _local.get("debug", {}).get("scores", {}).items()},
-                                rejection_code=error_code,
-                                rejection_message=failure_reason[:500] if failure_reason else "",
-                                job_id=job_id,
-                            )
-
-                    resp = {
-                        "ok": False,
-                        "status": "failed",
-                        "job_id": job_id,
-                        "error": error_code,
-                        "message": user_message or failure_reason,
-                    }
-                    if user_message:
-                        resp["user_message"] = user_message
-                    if job["status"] == "provider_stalled":
-                        resp["provider_stalled"] = True
-                    return jsonify(resp)
-
-                if job["status"] == "ready":
-                    video_url = meta.get("video_url") or job_meta.get("video_url")
-                    thumbnail_url = meta.get("thumbnail_url") or job_meta.get("thumbnail_url")
-                    # Include new_balance so frontend can update credits display
-                    new_balance = meta.get("new_balance") or job_meta.get("new_balance")
-
-                    response_data = {
-                        "ok": True,
-                        "status": "done",
-                        "job_id": job_id,
-                        "video_id": job_id,
-                        "video_uuid": job_meta.get("video_uuid") or job_id,
-                        "video_url": video_url,
-                        "thumbnail_url": thumbnail_url,
-                        "duration_seconds": meta.get("duration_seconds") or job_meta.get("duration_seconds"),
-                        "resolution": meta.get("resolution") or job_meta.get("resolution"),
-                        "provider": meta.get("provider") or job_meta.get("provider") or "google",
-                    }
-                    # Only include new_balance if present (backwards compatible)
-                    if new_balance is not None:
-                        response_data["new_balance"] = new_balance
-                    return jsonify(response_data)
-
-        except Exception as e:
-            print(f"[VIDEO STATUS] Error checking job {job_id}: {e}")
-
-    # Fallback to job store
-    if meta.get("status") == "done":
-        response_data = {
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "video_id": job_id,
-            "video_url": meta.get("video_url"),
-            "thumbnail_url": meta.get("thumbnail_url"),
-            "duration_seconds": meta.get("duration_seconds"),
-            "resolution": meta.get("resolution"),
-            "provider": meta.get("provider", "google"),
-        }
-        # Include new_balance if present (for frontend credit display)
-        new_balance = meta.get("new_balance")
-        if new_balance is not None:
-            response_data["new_balance"] = new_balance
-        return jsonify(response_data)
-
-    if meta.get("status") in ("failed", "provider_stalled"):
-        error_msg = meta.get("error", "Video generation failed")
-        error_code = meta.get("error_code", "gemini_video_failed")
-        resp = {
-            "ok": False,
-            "status": "failed",
-            "job_id": job_id,
-            "error": error_code,
-            "message": error_msg,
-        }
-        if error_code == "provider_filtered_third_party":
-            resp["user_message"] = error_msg
-        if meta.get("status") == "provider_stalled":
-            resp["provider_stalled"] = True
-        return jsonify(resp)
-
-    if meta.get("status") == "quota_queued":
-        return jsonify({
-            "ok": True,
-            "status": "queued",
-            "job_id": job_id,
-            "progress": 0,
-            "message": "Waiting for provider quota to reset — your video is queued and will be processed automatically.",
-            "quota_queued": True,
-        })
-
-    if meta.get("status") == "provider_pending":
-        pending_secs = meta.get("pending_seconds", 0)
-        msg = "Queued with provider" if pending_secs < 120 else "Provider queue busy — your video is still queued"
-        return jsonify({
-            "ok": True,
-            "status": "provider_pending",
-            "job_id": job_id,
-            "message": msg,
-            "progress": 0,
-            "pending_seconds": pending_secs,
-            "provider_status": meta.get("provider_status", "pending"),
-        })
-
-    if meta.get("status") in ("queued", "processing"):
-        provider_hint = meta.get("provider", "vertex")
-        from backend.services.video_limits import get_estimated_render_time
-        rtime = get_estimated_render_time(provider_hint)
-        real_progress = meta.get("progress", 0)
-        # Estimate progress from elapsed time for store-based fallback
-        progress = real_progress
-        if progress == 0 and meta.get("status") == "processing":
-            import math, time as _time
-            from datetime import datetime, timezone
-            started = meta.get("processing_started_at") or meta.get("dispatched_at") or meta.get("started_at")
-            if started and isinstance(started, (int, float)):
-                elapsed = _time.time() - started
-                est = rtime["estimated_duration_seconds"]
-                if elapsed > 0 and est > 0:
-                    progress = max(1, min(int(95 * (1 - math.exp(-2 * elapsed / est))), 95))
-        return jsonify({
-            "ok": True,
-            "status": meta.get("status"),
-            "job_id": job_id,
-            "progress": progress,
-            "message": "Generating video...",
-            "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-        })
-
-    # Store has an entry but with an unexpected status — treat as in-flight
-    if meta:
-        return jsonify({
-            "ok": True,
-            "status": "processing",
-            "job_id": job_id,
-            "progress": meta.get("progress", 0),
-            "message": "Generating video...",
-        })
-
-    # Last resort: check DB without identity constraint (handles edge cases)
-    if USE_DB:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        f"""
-                        SELECT id, status, error_message, meta
-                        FROM {Tables.JOBS}
-                        WHERE id::text = %s
-                        LIMIT 1
-                        """,
-                        (job_id,),
-                    )
-                    job = cur.fetchone()
-            if job:
-                status = job["status"]
-                if status == "ready":
-                    jm = job.get("meta") or {}
-                    if isinstance(jm, str):
-                        try:
-                            jm = __import__('json').loads(jm)
-                        except Exception:
-                            jm = {}
-                    response_data = {
-                        "ok": True,
-                        "status": "done",
-                        "job_id": job_id,
-                        "video_id": job_id,
-                        "video_url": jm.get("video_url"),
-                        "thumbnail_url": jm.get("thumbnail_url"),
-                    }
-                    # Include new_balance if present
-                    new_balance = jm.get("new_balance")
-                    if new_balance is not None:
-                        response_data["new_balance"] = new_balance
-                    return jsonify(response_data)
-                if status == "failed":
-                    return jsonify({
-                        "ok": False,
-                        "status": "failed",
-                        "job_id": job_id,
-                        "error": "video_failed",
-                        "message": job.get("error_message") or "Video generation failed",
-                    })
-                # queued / processing / other — return in-flight
-                return jsonify({
-                    "ok": True,
-                    "status": status if status in ("queued", "processing") else "processing",
-                    "job_id": job_id,
-                    "progress": 0,
-                    "message": "Generating video...",
-                })
-        except Exception as e:
-            print(f"[VIDEO STATUS] Fallback DB check error for {job_id}: {e}")
-
-    return jsonify({
-        "error": "job_not_found",
-        "message": f"No video job found with ID: {job_id}"
-    }), 404
-
-
-# ── POST /video/admin/process-queue — Admin: trigger queued jobs ──
-@bp.route("/video/admin/process-queue", methods=["POST", "OPTIONS"])
-@with_session
-def video_admin_process_queue():
-    """
-    Admin trigger: immediately attempt to process quota-queued video jobs.
-
-    Returns:
-    {
-        "ok": true,
-        "dispatched": 3,
-        "queue_remaining": 1
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    from backend.services.video_queue import video_queue
-
-    dispatched = video_queue.process_queue_now()
-
-    return jsonify({
-        "ok": True,
-        "dispatched": dispatched,
-        "queue_remaining": video_queue.size,
-    })
-
-
-# ── GET /video/admin/provider-info — Show current video provider config ──
-@bp.route("/video/admin/provider-info", methods=["GET", "OPTIONS"])
-@with_session
-def video_admin_provider_info():
-    """
-    Admin endpoint: Show current video provider configuration.
-
-    Returns:
-    {
-        "ok": true,
-        "video_provider": "vertex",
-        "video_quality": "fast",
-        "vertex_model": "veo-3.1-fast-generate-001",
-        "providers": [
-            {"name": "vertex", "configured": true, "primary": true},
-            {"name": "google", "configured": true, "primary": false}
-        ]
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    from backend.config import config
-
-    providers_info = []
-    available = video_router.get_available_providers()
-    available_names = [p.name for p in available]
-
-    for idx, provider in enumerate(video_router.providers):
-        configured, err = provider.is_configured()
-        providers_info.append({
-            "name": provider.name,
-            "configured": configured,
-            "primary": idx == 0,
-            "error": err if not configured else None,
-        })
-
-    return jsonify({
-        "ok": True,
-        "video_provider": getattr(config, 'VIDEO_PROVIDER', 'vertex'),
-        "video_quality": getattr(config, 'VIDEO_QUALITY', 'fast'),
-        "vertex_model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown'),
-        "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
-        "active_providers": available_names,
-        "providers": providers_info,
-    })
-
-
-# ── GET /video/admin/diagnostics — Lightweight operator dashboard ──
-@bp.route("/video/admin/diagnostics", methods=["GET", "OPTIONS"])
-@with_session
-def video_admin_diagnostics():
-    """
-    Lightweight operator diagnostics for the video pipeline.
-
-    Returns job counts by status, provider health, and recent failures.
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    from backend.db import query_all
-    from backend.config import config
-
-    # Job counts by status (last 24h)
-    status_counts = query_all(f"""
-        SELECT status, COUNT(*) AS cnt
-        FROM {Tables.JOBS}
-        WHERE stage = 'video'
-          AND created_at > NOW() - INTERVAL '24 hours'
-        GROUP BY status
-        ORDER BY cnt DESC
-    """)
-
-    # Job counts by provider (last 24h)
-    provider_counts = query_all(f"""
-        SELECT provider, status, COUNT(*) AS cnt
-        FROM {Tables.JOBS}
-        WHERE stage = 'video'
-          AND created_at > NOW() - INTERVAL '24 hours'
-        GROUP BY provider, status
-        ORDER BY provider, cnt DESC
-    """)
-
-    # Recent failures (last 10)
-    recent_failures = query_all(f"""
-        SELECT id, provider, error_code, error_message, created_at, updated_at
-        FROM {Tables.JOBS}
-        WHERE stage = 'video' AND status = 'failed'
-        ORDER BY updated_at DESC
-        LIMIT 10
-    """)
-
-    # In-flight jobs (not terminal)
-    in_flight = query_all(f"""
-        SELECT id, provider, status, created_at, updated_at
-        FROM {Tables.JOBS}
-        WHERE stage = 'video'
-          AND status NOT IN ('ready', 'failed', 'refunded', 'succeeded',
-                             'abandoned_legacy', 'recovery_blocked', 'ready_unbilled')
-        ORDER BY created_at DESC
-        LIMIT 20
-    """)
-
-    # Provider configuration
-    available = video_router.get_available_providers()
-    providers = []
-    for idx, provider in enumerate(video_router.providers):
-        configured, err = provider.is_configured()
-        providers.append({
-            "name": provider.name,
-            "configured": configured,
-            "primary": idx == 0,
-            "error": err if not configured else None,
-        })
-
-    # Serialise datetimes
-    def _ser(rows):
-        out = []
-        for r in rows:
-            row = dict(r)
-            for k, v in row.items():
-                if hasattr(v, 'isoformat'):
-                    row[k] = v.isoformat()
-            out.append(row)
-        return out
-
-    return jsonify({
-        "ok": True,
-        "status_counts_24h": {r["status"]: r["cnt"] for r in status_counts},
-        "provider_breakdown_24h": _ser(provider_counts),
-        "in_flight_jobs": _ser(in_flight),
-        "recent_failures": _ser(recent_failures),
-        "providers": providers,
-        "config": {
-            "video_provider": getattr(config, 'VIDEO_PROVIDER', 'vertex'),
-            "vertex_model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown'),
-            "vertex_location": getattr(config, 'VERTEX_LOCATION', 'us-central1'),
+    debug_info = {
+        "scores": {k: round(v, 1) for k, v in sorted(cat_scores.items())},
+        "matched_rules": [r["rule"] for r in matched_rules],
+        "matched_details": matched_rules,
+        "safe_context_count": safe_count,
+        "has_harmful_verbs": has_harmful_verbs,
+        "safe_reduced": safe_reduced,
+        "multiplier": round(total_mult, 2),
+        "thresholds_used": {
+            cat: _CATEGORY_THRESHOLDS.get(cat, {"warn_at": _DEFAULT_WARN_AT, "block_at": _DEFAULT_BLOCK_AT})
+            for cat in cat_scores
         },
-    })
-
-
-# ── POST /video/admin/smoke-test — Quick Veo test (no credits) ──
-@bp.route("/video/admin/smoke-test", methods=["POST", "OPTIONS"])
-@with_session
-def video_admin_smoke_test():
-    """
-    Admin smoke test: Start a fast Veo job and return operation name.
-
-    This is for testing the Vertex AI integration without going through
-    the full credit reservation flow. Only available to admins.
-
-    Request body (optional):
-    {
-        "provider": "vertex",           # "vertex" or "aistudio"
-        "prompt": "A cat on a beach"    # Optional, uses default if not provided
     }
 
-    Returns:
-    {
-        "ok": true,
-        "provider": "vertex",
-        "operation_name": "projects/.../operations/...",
-        "model": "veo-3.1-fast-generate-001"
+    # Structured log
+    print(
+        f"[SAFETY] provider={provider_lower} medium={medium_lower} "
+        f"decision={decision} categories={triggered_cats} "
+        f"matched={json.dumps([r['rule'] for r in matched_rules])} "
+        f"scores={json.dumps({k: round(v, 1) for k, v in cat_scores.items()})} "
+        f"safe_ctx={safe_count} harmful_verbs={has_harmful_verbs} "
+        f"reduced={safe_reduced} mult={total_mult:.2f}"
+    )
+
+    if decision == "allow":
+        r = _allow_result()
+        r["debug"] = debug_info
+        return r
+
+    cats = sorted(block_cats) if block_cats else sorted(warn_cats)
+    primary_cat = cats[0] if cats else "violence"
+
+    strike_count = 0
+    penalty = 0
+    penalty_notice = None
+
+    if not dry_run and user_id:
+        if user_id not in _strike_cache:
+            _strike_cache[user_id] = _load_strikes_from_db(user_id)
+        strike_count = _record_strike(user_id, decision)
+        if decision == "block":
+            penalty = _compute_penalty(strike_count)
+            if penalty > 0:
+                _apply_credit_penalty(user_id, penalty)
+                penalty_notice = f"A {penalty}-credit penalty has been applied. Repeated blocked prompts can lead to increasing penalties."
+            elif strike_count >= _PENALTY_FREE_STRIKES:
+                penalty_notice = "Repeated blocked prompts may lead to small credit penalties."
+        elif strike_count >= _PENALTY_FREE_STRIKES:
+            penalty_notice = "Repeated flagged prompts may lead to small credit penalties."
+
+    return {
+        "decision": decision,
+        "categories": cats,
+        "category_label": _CATEGORY_LABELS.get(primary_cat, primary_cat),
+        "message": (_block_message if decision == "block" else _warn_message)(cats),
+        "rewrite_hint": _REWRITE_HINTS.get(primary_cat, _REWRITE_HINTS["violence"]),
+        "strike_count_24h": strike_count,
+        "credit_penalty": penalty,
+        "penalty_notice": penalty_notice,
+        "debug": debug_info,
     }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
 
-    # Check admin access (optional - remove if you want any authenticated user)
-    from backend.config import config
-    # For now, allow any authenticated user to run smoke test
+# ─────────────────────────────────────────────────────────────
+# Response helpers
+# ─────────────────────────────────────────────────────────────
+def _allow_result() -> Dict:
+    return {
+        "decision": "allow", "categories": [], "category_label": "",
+        "message": "", "rewrite_hint": "",
+        "strike_count_24h": 0, "credit_penalty": 0, "penalty_notice": None,
+        "debug": {},
+    }
 
-    body = request.get_json(silent=True) or {}
-    provider_name = (body.get("provider") or "vertex").lower()
-    prompt = body.get("prompt") or "A serene mountain lake at sunrise, calm water reflections, cinematic"
+def _block_message(categories):
+    m = {
+        "minors": "content involving minors in harmful contexts",
+        "violence": "graphic violence or explicit harm",
+        "sexual": "explicit sexual content",
+        "self_harm": "self-harm or suicide promotion",
+        "hate": "hate speech or extremist content",
+        "real_person": "real-person likeness in dangerous or deceptive scenes",
+        "copyright": "likely copyright-infringing recreation",
+    }
+    parts = [m[c] for c in categories if c in m] or ["content that may violate provider safety policies"]
+    return f"This prompt was blocked because it contains {', '.join(parts)}."
 
-    # Get the requested provider
-    provider = video_router.get_provider(provider_name)
-    if not provider:
-        return jsonify({
-            "ok": False,
-            "error": "invalid_provider",
-            "message": f"Unknown provider: {provider_name}",
-            "available": [p.name for p in video_router.providers],
-        }), 400
+def _warn_message(categories):
+    m = {
+        "horror": "intense horror elements",
+        "weapons": "weapons or armed characters",
+        "violence": "borderline violent content",
+        "copyright": "franchise-inspired elements that may trigger moderation",
+        "sexual": "suggestive content",
+        "real_person": "real-person references",
+    }
+    parts = [m[c] for c in categories if c in m] or ["elements that may trigger provider moderation"]
+    return f"This prompt contains {', '.join(parts)}. Some providers may filter this."
 
-    configured, config_err = provider.is_configured()
-    if not configured:
-        return jsonify({
-            "ok": False,
-            "error": "provider_not_configured",
-            "message": f"Provider {provider_name} is not configured: {config_err}",
-        }), 400
 
+# ─────────────────────────────────────────────────────────────
+# DB schema
+# ─────────────────────────────────────────────────────────────
+def ensure_safety_schema():
     try:
-        # Start a short, low-cost video job for testing
-        result = provider.start_text_to_video(
-            prompt=prompt,
-            aspect_ratio="16:9",
-            resolution="720p",
-            duration_seconds=4,  # Shortest duration for quick test
-        )
-
-        operation_name = result.get("operation_name")
-
-        return jsonify({
-            "ok": True,
-            "provider": provider_name,
-            "operation_name": operation_name,
-            "model": getattr(config, 'VERTEX_VEO_MODEL', 'unknown') if provider_name == "vertex" else "veo-3.1-generate-preview",
-            "prompt": prompt,
-            "hint": f"Poll status with: GET /api/_mod/video/admin/smoke-test/status?op={operation_name[:50]}...",
-        })
-
+        from backend.db import USE_DB, transaction
+        if not USE_DB: return
+        with transaction() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timrx_app.safety_strikes (
+                    id            BIGSERIAL PRIMARY KEY,
+                    identity_id   UUID NOT NULL,
+                    decision      TEXT NOT NULL CHECK (decision IN ('block', 'warn')),
+                    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_safety_strikes_identity_time
+                ON timrx_app.safety_strikes (identity_id, created_at DESC)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timrx_app.safety_rejections (
+                    id                BIGSERIAL PRIMARY KEY,
+                    provider          TEXT NOT NULL,
+                    medium            TEXT NOT NULL,
+                    prompt_hash       TEXT NOT NULL,
+                    local_decision    TEXT NOT NULL,
+                    matched_rules     JSONB,
+                    category_scores   JSONB,
+                    rejection_code    TEXT,
+                    rejection_message TEXT,
+                    job_id            TEXT,
+                    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_safety_rejections_provider_time
+                ON timrx_app.safety_rejections (provider, created_at DESC)
+            """)
+        print("[SAFETY] safety schema ensured (strikes + rejections)")
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "smoke_test_failed",
-            "message": str(e),
-            "provider": provider_name,
-        }), 500
-
-
-# ── GET /video/admin/smoke-test/status — Poll smoke test operation ──
-@bp.route("/video/admin/smoke-test/status", methods=["GET", "OPTIONS"])
-@with_session
-def video_admin_smoke_test_status():
-    """
-    Poll a smoke test operation for status.
-
-    Query params:
-    - op: Operation name from smoke test
-    - provider: "vertex" or "aistudio" (default: vertex)
-
-    Returns:
-    {
-        "ok": true,
-        "status": "processing" | "done" | "failed",
-        "progress": 45,
-        "video_url": "..." (if done)
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    operation_name = request.args.get("op")
-    if not operation_name:
-        return jsonify({
-            "ok": False,
-            "error": "missing_param",
-            "message": "Query param 'op' (operation name) is required",
-        }), 400
-
-    provider_name = request.args.get("provider", "vertex").lower()
-    provider = video_router.get_provider(provider_name)
-    if not provider:
-        return jsonify({
-            "ok": False,
-            "error": "invalid_provider",
-            "message": f"Unknown provider: {provider_name}",
-        }), 400
-
-    try:
-        result = provider.check_status(operation_name)
-
-        response = {
-            "ok": True,
-            "provider": provider_name,
-            "status": result.get("status"),
-            "progress": result.get("progress", 0),
-        }
-
-        if result.get("video_url"):
-            response["video_url"] = result["video_url"]
-
-        if result.get("error"):
-            response["error"] = result.get("error")
-            response["message"] = result.get("message")
-
-        return jsonify(response)
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": "status_check_failed",
-            "message": str(e),
-        }), 500
+        print(f"[SAFETY] Warning: could not ensure safety schema: {e}")
