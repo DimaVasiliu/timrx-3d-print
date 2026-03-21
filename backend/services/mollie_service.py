@@ -808,18 +808,12 @@ class MollieService:
         plan_code = metadata.get("plan_code", "unknown")
         credits = metadata.get("credits", "0")
 
-        # Verify ownership - the payment must belong to the requesting identity.
-        # Resolve both sides through merge chain so that a post-merge session
-        # (canonical identity) can still confirm a payment created pre-merge.
-        from backend.services.identity_service import IdentityService
-        canonical_payment_id = IdentityService.resolve_canonical_id(payment_identity_id) if payment_identity_id else None
-        canonical_session_id = IdentityService.resolve_canonical_id(identity_id) if identity_id else None
-
-        if canonical_payment_id != canonical_session_id:
+        # Verify ownership — the payment must belong to the requesting identity.
+        # Each account is independent; no merge-chain resolution needed.
+        if payment_identity_id != identity_id:
             print(
                 f"[MOLLIE] Confirm: Identity mismatch for payment {payment_id}: "
-                f"session={identity_id} (canon={canonical_session_id}), "
-                f"payment={payment_identity_id} (canon={canonical_payment_id})"
+                f"session={identity_id}, payment={payment_identity_id}"
             )
             return {
                 "ok": False,
@@ -1378,16 +1372,8 @@ class MollieService:
         from backend.db import fetch_one, transaction, Tables
         from backend.services.wallet_service import LedgerEntryType, CreditType, get_credit_type_for_plan
         from backend.services.purchase_service import PurchaseStatus, PurchaseService
-        from backend.services.identity_service import IdentityService
-
-        # Resolve to canonical identity in case of merge between checkout and webhook
-        canonical_id = IdentityService.resolve_canonical_id(identity_id)
-        if canonical_id != identity_id:
-            print(
-                f"[PURCHASE] Identity merged since checkout: {identity_id[:8]}... → {canonical_id[:8]}... "
-                f"(payment={provider_payment_id})"
-            )
-            identity_id = canonical_id
+        # Each account is independent — grant credits to the exact identity
+        # that created the checkout. No merge-chain resolution needed.
 
         # Determine credit type based on plan code
         credit_type = get_credit_type_for_plan(plan_code) if plan_code else CreditType.GENERAL
@@ -1505,10 +1491,10 @@ class MollieService:
                 (new_balance, identity_id),
             )
 
-            # NOTE: Email is NOT auto-attached during purchase.
-            # The email is stored in purchase metadata for the receipt only.
-            # User must explicitly use "Secure Your Credits" to attach & verify email.
-            # This prevents the UI from showing "verify code" state when no code was sent.
+            # NOTE: Email is NOT auto-attached during webhook purchase grant.
+            # Checkout requires verified email before billing, so the purchasing
+            # identity already has a verified email. The email in metadata is
+            # for receipt/invoice purposes only.
 
             print(
                 f"[MOLLIE] Purchase recorded: purchase_id={purchase_id}, identity={identity_id}, "

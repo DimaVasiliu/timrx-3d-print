@@ -59,117 +59,6 @@ class MagicCodeService:
     # Restore Safety Check (IDENT-2 hotfix)
     # ─────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def check_restore_safety(
-        session_id: str, target_identity_id: str
-    ) -> Dict[str, Any]:
-        """
-        Determine whether switching this session to target_identity_id is safe.
-
-        Returns dict:
-            safe: bool — True if restore can proceed
-            source_id: str or None — current session's identity
-            reason: str — human-readable explanation
-            stats: dict or None — source identity data stats (when relevant)
-
-        A restore is BLOCKED when the source identity has meaningful data
-        (history, credits, jobs, or purchases) that would be silently
-        abandoned. This prevents data loss until a proper merge service
-        exists (IDENT-1).
-        """
-        try:
-            current_session = query_one(
-                f"SELECT identity_id FROM {Tables.SESSIONS} WHERE id = %s",
-                (session_id,),
-            )
-            if not current_session:
-                # No source session — shouldn't happen, but allow (middleware
-                # will catch downstream)
-                return {"safe": True, "source_id": None, "reason": "no_source_session", "stats": None}
-
-            source_id = str(current_session["identity_id"])
-
-            if source_id == target_identity_id:
-                print(
-                    f"[RESTORE] Same identity — source=target={source_id[:8]}..., safe"
-                )
-                return {"safe": True, "source_id": source_id, "reason": "same_identity", "stats": None}
-
-            # Query source identity data breadth
-            source_stats = query_one(
-                f"""
-                SELECT
-                    COALESCE(w.balance_credits, 0) as balance,
-                    (SELECT COUNT(*) FROM {Tables.HISTORY_ITEMS}
-                     WHERE identity_id = %s AND deleted_at IS NULL) as history_count,
-                    (SELECT COUNT(*) FROM {Tables.JOBS}
-                     WHERE identity_id = %s) as job_count,
-                    (SELECT COUNT(*) FROM {Tables.PURCHASES}
-                     WHERE identity_id = %s AND status = 'paid') as purchase_count,
-                    (SELECT COUNT(*) FROM {Tables.SUBSCRIPTIONS}
-                     WHERE identity_id::text = %s
-                       AND status IN ('active', 'paused')) as active_sub_count
-                FROM {Tables.WALLETS} w
-                WHERE w.identity_id = %s
-                """,
-                (source_id, source_id, source_id, source_id, source_id),
-            )
-
-            if not source_stats:
-                # No wallet row ⇒ identity was never used, safe to abandon
-                print(
-                    f"[RESTORE] No wallet for source {source_id[:8]}..., safe"
-                )
-                return {"safe": True, "source_id": source_id, "reason": "no_wallet", "stats": None}
-
-            stats = {
-                "history": int(source_stats["history_count"]),
-                "jobs": int(source_stats["job_count"]),
-                "balance": int(source_stats["balance"]),
-                "purchases": int(source_stats["purchase_count"]),
-                "active_subscriptions": int(source_stats["active_sub_count"]),
-            }
-
-            has_data = (
-                stats["history"] > 0
-                or stats["jobs"] > 0
-                or stats["balance"] > 0
-                or stats["purchases"] > 0
-                or stats["active_subscriptions"] > 0
-            )
-
-            if has_data:
-                print(
-                    f"[RESTORE] BLOCKED: source {source_id[:8]}... → target "
-                    f"{target_identity_id[:8]}... — source has "
-                    f"history={stats['history']}, jobs={stats['jobs']}, "
-                    f"balance={stats['balance']}, purchases={stats['purchases']}, "
-                    f"subs={stats['active_subscriptions']}"
-                )
-                return {
-                    "safe": False,
-                    "source_id": source_id,
-                    "reason": "source_has_data",
-                    "stats": stats,
-                }
-            else:
-                print(
-                    f"[RESTORE] Safe: source {source_id[:8]}... has no data, "
-                    f"proceeding to target {target_identity_id[:8]}..."
-                )
-                return {"safe": True, "source_id": source_id, "reason": "source_empty", "stats": stats}
-
-        except Exception as err:
-            # Safety check failure must NOT silently allow data loss.
-            # Block the restore and log the error.
-            print(f"[RESTORE] Safety check ERROR — blocking restore as precaution: {err}")
-            return {
-                "safe": False,
-                "source_id": None,
-                "reason": "safety_check_error",
-                "stats": None,
-            }
-
     # ─────────────────────────────────────────────────────────────
     # Request Code (Step 1)
     # ─────────────────────────────────────────────────────────────
@@ -183,15 +72,13 @@ class MagicCodeService:
         Request a magic code for account restore.
 
         Args:
-            email: Email address entered by user (may be a merged alias)
+            email: Email address entered by user
             ip_address: Client IP for rate limiting (optional)
 
         Returns:
             Dict with keys:
               ok: bool
               message: str
-              resolved_email: str or None (canonical email code was sent to, if different)
-              merge_redirected: bool
 
         Rate limits:
         - Max 3 active codes per email
@@ -205,7 +92,7 @@ class MagicCodeService:
 
         # Check if email exists in the system
         identity = query_one(
-            f"SELECT id, email, merged_into_id FROM {Tables.IDENTITIES} WHERE email = %s",
+            f"SELECT id, email FROM {Tables.IDENTITIES} WHERE email = %s",
             (input_email,),
         )
         if not identity:
@@ -216,24 +103,10 @@ class MagicCodeService:
                 "message": "If this email is registered, a code has been sent",
             }
 
-        # Follow merge chain — resolve to canonical identity
+        # Each email/account is independent. Do not follow merge chains
+        # or redirect delivery to a different email. Send code to the
+        # exact email the user entered.
         delivery_email = input_email
-        merge_redirected = False
-        if identity.get("merged_into_id"):
-            from backend.services.identity_service import IdentityService
-            canonical_id = IdentityService.resolve_canonical_id(str(identity["id"]))
-            canonical = query_one(
-                f"SELECT id, email FROM {Tables.IDENTITIES} WHERE id = %s",
-                (canonical_id,),
-            )
-            if canonical and canonical.get("email"):
-                delivery_email = canonical["email"]
-                merge_redirected = True
-                print(
-                    f"[MAGIC_CODE] Restore alias resolved: "
-                    f"{input_email} → {delivery_email} "
-                    f"(source {str(identity['id'])[:8]}... → canonical {canonical_id[:8]}...)"
-                )
 
         # Check rate limits (against input email to prevent abuse via aliases)
         rate_limit_ok, rate_limit_msg = MagicCodeService._check_rate_limits(input_email)
@@ -265,7 +138,7 @@ class MagicCodeService:
             print(f"[MAGIC_CODE] Failed to create code record for {input_email}")
             return {"ok": False, "message": "Failed to create code"}
 
-        # Send email to the DELIVERY address (canonical email)
+        # Send email to the exact address entered
         email_sent = send_magic_code(delivery_email, plain_code)
         if not email_sent:
             print(f"[MAGIC_CODE] Failed to send email to {delivery_email}")
@@ -285,14 +158,10 @@ class MagicCodeService:
             f"(requested via {input_email}), expires in {expiry_minutes} minutes"
         )
 
-        result = {
+        return {
             "ok": True,
             "message": "Code sent to your email",
         }
-        if merge_redirected:
-            result["resolved_email"] = delivery_email
-            result["merge_redirected"] = True
-        return result
 
     @staticmethod
     def _check_rate_limits(email: str) -> Tuple[bool, str]:
@@ -359,24 +228,17 @@ class MagicCodeService:
         if len(code) != 6 or not code.isdigit():
             return (False, None, "Invalid code format", None)
 
-        # Get identity for this email
+        # Get the exact identity that owns this email
         identity = query_one(
-            f"SELECT id, merged_into_id FROM {Tables.IDENTITIES} WHERE email = %s",
+            f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
             (email,),
         )
         if not identity:
             return (False, None, "Invalid email or code", None)
 
-        # Follow merge chain — always link session to canonical identity
+        # Use the exact identity that owns this email. Do not follow
+        # merge chains — each account is independent.
         identity_id = str(identity["id"])
-        if identity.get("merged_into_id"):
-            from backend.services.identity_service import IdentityService
-            canonical_id = IdentityService.resolve_canonical_id(identity_id)
-            print(
-                f"[MAGIC_CODE] Redeem using canonical target: {canonical_id[:8]}... "
-                f"(input email: {email}, source identity: {identity_id[:8]}...)"
-            )
-            identity_id = canonical_id
 
         # Hash the provided code
         code_hash = MagicCodeService.hash_code(code)
@@ -407,85 +269,10 @@ class MagicCodeService:
 
         code_id = str(code_record["id"])
 
-        # ── IDENT-2 safety gate + IDENT-1 auto-merge ────────────
-        # Check BEFORE consuming the code so a blocked restore
-        # preserves the code for a future retry.
-        safety = MagicCodeService.check_restore_safety(session_id, identity_id)
-
-        if not safety["safe"]:
-            source_id = safety.get("source_id")
-            reason = safety.get("reason")
-
-            # Non-data reasons (e.g. safety_check_error) → block immediately
-            if reason != "source_has_data" or not source_id:
-                print(
-                    f"[RESTORE] Restore DENIED (non-mergeable): session {session_id[:8]}...: "
-                    f"reason={reason}, "
-                    f"source={source_id[:8] + '...' if source_id else 'unknown'}, "
-                    f"target={identity_id[:8]}..."
-                )
-                return (
-                    False,
-                    None,
-                    "Restore cannot complete automatically. Please contact support.",
-                    {
-                        "error_code": "RESTORE_BLOCKED_DATA_CONFLICT",
-                        "reason": reason,
-                        "next_step": "contact_support",
-                    },
-                )
-
-            # Source has data → attempt automatic merge (IDENT-1)
-            from backend.services.merge_service import MergeService
-
-            print(
-                f"[RESTORE] Source {source_id[:8]}... has data, "
-                f"attempting auto-merge → target {identity_id[:8]}..."
-            )
-
-            merge_result = MergeService.execute_merge(
-                source_id=source_id,
-                target_id=identity_id,
-                merged_by="system",
-                reason="restore",
-                metadata={
-                    "trigger": "redeem_restore",
-                    "session_id": session_id,
-                    "email": email,
-                    "source_stats": safety.get("stats"),
-                },
-                skip_session_id=session_id,
-            )
-
-            if not merge_result["success"]:
-                blocked = merge_result.get("blocked_reason", "unknown")
-                print(
-                    f"[RESTORE] Auto-merge BLOCKED: {source_id[:8]}... → "
-                    f"{identity_id[:8]}...: {blocked}"
-                )
-                # Do NOT consume the code — user can retry later
-                return (
-                    False,
-                    None,
-                    "Your accounts could not be merged automatically. "
-                    "Please wait for any active jobs to finish or contact support.",
-                    {
-                        "error_code": "RESTORE_MERGE_BLOCKED",
-                        "blocked_reason": blocked,
-                        "next_step": MergeService._suggest_next_step(blocked),
-                    },
-                )
-
-            # Merge succeeded — log summary and continue to session swing
-            print(
-                f"[RESTORE] Auto-merge OK: {source_id[:8]}... → "
-                f"{identity_id[:8]}... | "
-                f"tables={merge_result.get('tables_migrated', {})}, "
-                f"sessions_revoked={merge_result.get('sessions_revoked', 0)}"
-            )
-        # ── End IDENT-2 safety gate + IDENT-1 auto-merge ──────
-
-        # Mark code as consumed and (if session exists) swing session to identity
+        # ── Restore = account switch (no merge) ──────────────────
+        # Consume the code and switch session to the target identity.
+        # The current session's identity (if any) keeps its own data —
+        # no wallet reconciliation, no purchase migration, no merge.
         with transaction() as cur:
             # Mark code as consumed
             cur.execute(
@@ -497,9 +284,7 @@ class MagicCodeService:
                 (code_id,),
             )
 
-            # AUTH-3: Only swing session if one exists.
-            # When called without a session (no cookie), the route handler
-            # creates a fresh session for the target identity directly.
+            # Switch session to the restored identity (account switch, not merge)
             if session_id is not None:
                 try:
                     cur.execute(
@@ -512,9 +297,7 @@ class MagicCodeService:
                         (identity_id, session_id),
                     )
                 except Exception as e:
-                    # Fallback if updated_at column doesn't exist yet (pre-migration)
                     if "updated_at" in str(e):
-                        print(f"[MAGIC_CODE] Warning: updated_at column missing, using fallback query")
                         cur.execute(
                             f"""
                             UPDATE {Tables.SESSIONS}
@@ -527,26 +310,22 @@ class MagicCodeService:
                     else:
                         raise
                 updated_session = fetch_one(cur)
-
                 if not updated_session:
                     raise ValueError(f"Session {session_id} not found")
 
-            # NEW-4: Ensure email + email_verified are consistent.
-            # The code was issued for `email`, so the canonical identity
-            # must end with that exact email and email_verified = TRUE.
+            # Ensure identity is marked as email_verified
             cur.execute(
                 f"""
                 UPDATE {Tables.IDENTITIES}
-                SET email = %s, email_verified = TRUE, last_seen_at = NOW()
+                SET email_verified = TRUE, last_seen_at = NOW()
                 WHERE id = %s
                 """,
-                (email, identity_id),
+                (identity_id,),
             )
 
-        # Invalidate other pending codes for this email
         MagicCodeService.invalidate_codes_for_email(email)
 
-        print(f"[MAGIC_CODE] Successfully restored session for {email}, identity={identity_id}")
+        print(f"[RESTORE] Switched session to identity {identity_id[:8]}... (email: {email})")
         return (True, identity_id, "Account restored successfully", None)
 
     @staticmethod

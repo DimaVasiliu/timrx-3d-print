@@ -387,32 +387,9 @@ class IdentityService:
         return identity
 
     # ─────────────────────────────────────────────────────────────
-    # Merge Resolution
     # ─────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def resolve_canonical_id(identity_id: str, max_hops: int = 3) -> str:
-        """
-        Follow the merged_into_id chain to the canonical (non-merged) identity.
-
-        Returns the original identity_id if the identity is not merged.
-        Follows up to max_hops redirects to guard against cycles.
-        """
-        current_id = identity_id
-        for hop in range(max_hops):
-            row = query_one(
-                f"SELECT id, merged_into_id FROM {Tables.IDENTITIES} WHERE id = %s",
-                (current_id,),
-            )
-            if not row or not row.get("merged_into_id"):
-                break
-            next_id = str(row["merged_into_id"])
-            print(
-                f"[IDENTITY] Merge redirect hop {hop + 1}: "
-                f"{current_id[:8]}... → {next_id[:8]}..."
-            )
-            current_id = next_id
-        return current_id
+    # Merge Audit (admin tooling only — not used by user-facing auth flows)
+    # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def record_merge(
@@ -472,50 +449,41 @@ class IdentityService:
             return None
 
     # ─────────────────────────────────────────────────────────────
-    # Identity Lookups (all follow merged_into_id)
+    # Identity Lookups (direct — do not follow merge chains)
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def get_identity(identity_id: str) -> Optional[Dict[str, Any]]:
         """
         Get an identity by ID.
-        Follows merged_into_id to canonical identity if merged.
+        Returns the exact identity — does not follow merged_into_id.
         Returns None if not found.
         """
-        canonical_id = IdentityService.resolve_canonical_id(identity_id)
         return query_one(
             f"SELECT * FROM {Tables.IDENTITIES} WHERE id = %s",
-            (canonical_id,),
+            (identity_id,),
         )
 
     @staticmethod
     def get_identity_by_email(email: str) -> Optional[Dict[str, Any]]:
         """
         Get an identity by email address.
-        Follows merged_into_id to canonical identity if merged.
+        Returns the exact identity owning that email — does not follow merged_into_id.
         Returns None if not found.
         """
         normalized_email = email.strip().lower()
-        result = query_one(
+        return query_one(
             f"SELECT * FROM {Tables.IDENTITIES} WHERE email = %s",
             (normalized_email,),
         )
-        if result and result.get("merged_into_id"):
-            canonical_id = IdentityService.resolve_canonical_id(str(result["id"]))
-            return query_one(
-                f"SELECT * FROM {Tables.IDENTITIES} WHERE id = %s",
-                (canonical_id,),
-            )
-        return result
 
     @staticmethod
     def get_identity_with_wallet(identity_id: str) -> Optional[Dict[str, Any]]:
         """
         Get identity with wallet balance.
-        Follows merged_into_id to canonical identity if merged.
+        Returns the exact identity — does not follow merged_into_id.
         Returns combined dict with identity and wallet fields.
         """
-        canonical_id = IdentityService.resolve_canonical_id(identity_id)
         return query_one(
             f"""
             SELECT i.*, w.balance_credits
@@ -523,7 +491,7 @@ class IdentityService:
             LEFT JOIN {Tables.WALLETS} w ON w.identity_id = i.id
             WHERE i.id = %s
             """,
-            (canonical_id,),
+            (identity_id,),
         )
 
     # Reasons for email attachment failure (internal use only - never expose to users)
@@ -572,16 +540,20 @@ class IdentityService:
             print(f"[IDENTITY] Email already attached to identity {identity_id}: {normalized_email}")
             return current, False, IdentityService.ATTACH_REASON_ALREADY_ATTACHED
 
-        # Check if this email is already used by another identity
-        existing = IdentityService.get_identity_by_email(normalized_email)
+        # Check if this email is already used by another identity.
+        # Use direct query — do NOT auto-resolve merged_into_id.
+        existing = query_one(
+            f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
+            (normalized_email,),
+        )
         if existing and str(existing["id"]) != identity_id:
             # ANTI-ENUMERATION: Do NOT raise an error or reveal this to the user.
             # Just log internally and return as if successful.
-            # User must use restore/redeem flow to take over the account.
+            # User must use restore/switch flow to access the other account.
             print(
-                f"[IDENTITY] Email attach silently blocked (anti-enumeration): "
-                f"{normalized_email} belongs to identity {existing['id']}, "
-                f"requested by identity {identity_id}"
+                f"[ATTACH] Email belongs to another account: "
+                f"{normalized_email} owned by {str(existing['id'])[:8]}..., "
+                f"requested by {identity_id[:8]}..."
             )
             return current, False, IdentityService.ATTACH_REASON_BELONGS_TO_OTHER
 
@@ -740,10 +712,8 @@ class IdentityService:
         Returns None if session is invalid, expired, or revoked.
         Also updates identity's last_seen_at.
 
-        Merge resolution:
-        - If the session's identity has merged_into_id set, updates the
-          session row in-place to point to the canonical identity and
-          returns canonical identity data. No new session or cookie needed.
+        Returns the exact identity the session points to — does not
+        follow merged_into_id. Each account is independent.
 
         Session renewal (sliding window):
         - If >50% of SESSION_TTL_DAYS has elapsed since session creation,
@@ -770,35 +740,9 @@ class IdentityService:
         if not result:
             return None
 
-        # ── Merge resolution: redirect session to canonical identity ──
-        if result.get("merged_into_id"):
-            source_id = str(result["id"])
-            canonical_id = IdentityService.resolve_canonical_id(source_id)
-            if canonical_id != source_id:
-                # Update session row in-place — no cookie churn
-                execute(
-                    f"UPDATE {Tables.SESSIONS} SET identity_id = %s WHERE id = %s",
-                    (canonical_id, session_id),
-                )
-                print(
-                    f"[SESSION] Merge redirect: session {session_id[:8]}... "
-                    f"moved {source_id[:8]}... → {canonical_id[:8]}..."
-                )
-                # Re-query to get canonical identity data
-                result = query_one(
-                    f"""
-                    SELECT i.*, s.id as session_id, s.expires_at as session_expires_at,
-                           s.created_at as session_created_at
-                    FROM {Tables.SESSIONS} s
-                    JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
-                    WHERE s.id = %s
-                      AND s.revoked_at IS NULL
-                      AND s.expires_at > NOW()
-                    """,
-                    (session_id,),
-                )
-                if not result:
-                    return None
+        # Each account is independent — do not follow merged_into_id.
+        # Legacy merged_into_id values may exist from old merges but are
+        # no longer acted on in user-facing session validation.
 
         # Touch identity in background (don't fail if this fails)
         try:
@@ -965,28 +909,8 @@ class IdentityService:
         if SESSION_DEBUG:
             print(f"[SESSION] Created anonymous session {session_id[:8]}... for new identity {identity_id[:8]}...")
 
-        # ── Fragmentation detection log ──
-        # If this IP+UA already has other identities, log a warning.
-        # This doesn't block anything — it's visibility into potential fragmentation.
-        if ip_hash:
-            try:
-                existing = query_one(
-                    f"""
-                    SELECT COUNT(DISTINCT s.identity_id) as identity_count
-                    FROM {Tables.SESSIONS} s
-                    WHERE s.ip_hash = %s
-                      AND s.identity_id != %s
-                    """,
-                    (ip_hash, identity_id),
-                )
-                count = int(existing["identity_count"]) if existing else 0
-                if count > 0:
-                    print(
-                        f"[IDENTITY] FRAGMENTATION WARNING: new identity {identity_id[:8]}... "
-                        f"created for IP that already has {count} other identity(ies)"
-                    )
-            except Exception:
-                pass  # Non-critical diagnostic
+        # Multiple accounts per IP are normal under the non-merging
+        # multi-account model. No fragmentation warning needed.
 
         return session_id, identity_id, identity
 
@@ -1064,50 +988,11 @@ class IdentityService:
             if SESSION_DEBUG:
                 print(f"[SESSION] Invalid/expired session {cookie_session_id[:8]}..., creating new")
 
-        # Before creating a new identity, check if this IP already has a recent
-        # anonymous identity. Reuse it instead of creating a new one to prevent
-        # fragmentation and free-credit farming.
+        # Each device/browser gets its own anonymous identity.
+        # Multiple accounts on the same IP are normal under the
+        # non-merging multi-account model.
         ip_address = request.remote_addr
         user_agent = request.headers.get("User-Agent", "")
-        ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
-
-        if ip_hash:
-            try:
-                existing = query_one(
-                    f"""
-                    SELECT i.id as identity_id
-                    FROM {Tables.SESSIONS} s
-                    JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
-                    WHERE s.ip_hash = %s
-                      AND i.merged_into_id IS NULL
-                      AND i.email IS NULL
-                      AND s.expires_at > NOW()
-                    ORDER BY s.created_at DESC
-                    LIMIT 1
-                    """,
-                    (ip_hash,),
-                )
-                if existing:
-                    # Reuse identity, but create a fresh session for this browser
-                    reuse_id = str(existing["identity_id"])
-                    new_sid = str(uuid.uuid4())
-                    expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
-                    ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
-                    with transaction() as cur:
-                        cur.execute(
-                            f"""
-                            INSERT INTO {Tables.SESSIONS}
-                            (id, identity_id, created_at, expires_at, ip_hash, user_agent_hash)
-                            VALUES (%s, %s, NOW(), %s, %s, %s)
-                            """,
-                            (new_sid, reuse_id, expires_at, ip_hash, ua_hash),
-                        )
-                    if SESSION_DEBUG:
-                        print(f"[SESSION] Reused identity {reuse_id[:8]}... for IP (anti-fragmentation)")
-                    IdentityService.set_session_cookie(response, new_sid)
-                    return new_sid, reuse_id
-            except Exception:
-                pass  # Fall through to normal creation
 
         # Create new anonymous identity + session atomically
         session_id, identity_id, _ = IdentityService._create_anonymous_session_atomic(
