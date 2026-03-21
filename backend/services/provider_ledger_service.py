@@ -384,7 +384,12 @@ def _empty_month() -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Known providers — mirrors admin_ops_service._PROVIDER_FEATURES
-_KNOWN_PROVIDERS = {"meshy", "openai", "google", "vertex", "seedance", "fal_seedance"}
+_KNOWN_PROVIDERS = {"meshy", "openai", "google", "nano_banana", "vertex", "seedance", "fal_seedance"}
+
+# PiAPI umbrella: nano_banana + seedance share the same external billing account.
+# Balance snapshots should be recorded under provider='piapi' for the shared account.
+# Individual execution metrics stay under their own provider names.
+_PIAPI_UMBRELLA_PROVIDERS = {"nano_banana", "seedance"}
 
 # Thresholds
 _STALE_SNAPSHOT_DAYS = 7          # snapshot older than this → warning
@@ -423,23 +428,32 @@ def get_provider_balances() -> Dict[str, Any]:
             "description": r["description"],
         }
 
-    # 2. Estimated spend per provider since their last snapshot
+    # 2. Estimated spend + credits consumed per provider since their last snapshot
     spend_since = {}
     for prov, snap in snapshots.items():
+        # For PiAPI umbrella snapshots, aggregate across nano_banana + seedance
+        if prov == "piapi":
+            provider_clause = "provider IN ('nano_banana', 'seedance')"
+            params = (snap["recorded_at"],)
+        else:
+            provider_clause = "provider = %s"
+            params = (prov, snap["recorded_at"])
         row = query_one(
             f"""
             SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS spend,
+                   COALESCE(SUM(cost_credits), 0) AS credits,
                    COUNT(*) AS job_count
             FROM {Tables.JOBS}
-            WHERE provider = %s
+            WHERE {provider_clause}
               AND status IN ('succeeded', 'ready')
               AND created_at > %s
             """,
-            (prov, snap["recorded_at"]),
+            params,
         )
         if row:
             spend_since[prov] = {
                 "estimated_spend_gbp": round(float(row["spend"]), 2),
+                "credits_consumed": int(row["credits"]),
                 "job_count": row["job_count"],
             }
 
@@ -506,6 +520,7 @@ def get_provider_balances() -> Dict[str, Any]:
             "last_snapshot_description": snap["description"] if snap else None,
             "days_since_snapshot": days_since,
             "estimated_spend_since_gbp": spend["estimated_spend_gbp"],
+            "credits_consumed_since_snapshot": spend.get("credits_consumed", 0),
             "jobs_since_snapshot": spend["job_count"],
             "estimated_remaining_gbp": estimated_remaining,
             "wallet_alerts_7d": wallet["count"] if wallet else 0,

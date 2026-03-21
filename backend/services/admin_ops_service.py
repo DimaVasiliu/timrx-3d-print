@@ -143,6 +143,18 @@ def get_provider_health() -> Dict[str, Any]:
     """)
     spend_month_map = {r["provider"]: float(r["spend"]) for r in spend_month}
 
+    # 6b. Credits consumed today by provider (user-side credit economy)
+    credits_today = query_all(f"""
+        SELECT provider,
+               COALESCE(SUM(cost_credits), 0) AS credits
+        FROM {Tables.JOBS}
+        WHERE created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
+          AND status IN ('succeeded', 'ready')
+          AND provider IS NOT NULL
+        GROUP BY provider
+    """)
+    credits_today_map = {r["provider"]: int(r["credits"]) for r in credits_today}
+
     # 7. Provider configuration checks
     config_status = _check_provider_configs()
 
@@ -196,6 +208,7 @@ def get_provider_health() -> Dict[str, Any]:
             "top_error_codes": errors_by_provider.get(prov, []),
             "wallet_alert_count_24h": wallet_24h_map.get(prov, 0),
             "active_alerts": alert_info.get("count", 0),
+            "credits_consumed_24h": credits_today_map.get(prov, 0),
             "estimated_spend_today_gbp": round(spend_today_map.get(prov, 0), 2),
             "estimated_spend_month_gbp": round(spend_month_map.get(prov, 0), 2),
         })

@@ -3718,3 +3718,49 @@ def orphan_s3_keys():
     except Exception as e:
         print(f"[ADMIN] S3 keys error: {e}")
         return jsonify({"ok": False, "error": f"S3 key collection failed: {type(e).__name__}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard Summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/dashboard/summary", methods=["GET"])
+@require_admin
+def dashboard_summary():
+    """
+    Unified admin dashboard summary.
+
+    Query params:
+        force  – "true" to bypass 60s cache
+
+    Returns operational, economics, safety, and anomaly data.
+    """
+    force = request.args.get("force", "").lower() == "true"
+    try:
+        from backend.services.admin_dashboard_service import get_dashboard_summary
+        data = get_dashboard_summary(force_refresh=force)
+        return jsonify(data)
+    except Exception as e:
+        print(f"[ADMIN] Dashboard summary error: {e}")
+        return jsonify({"ok": False, "error": f"Dashboard summary failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/safety/summary", methods=["GET"])
+@require_admin
+def safety_summary():
+    """
+    Dedicated safety summary for admin safety tab.
+
+    Query params:
+        hours  – short lookback window (default 24)
+        days   – long lookback window (default 7)
+    """
+    hours = min(int(request.args.get("hours", 24)), 720)
+    days = min(int(request.args.get("days", 7)), 90)
+    try:
+        from backend.services.admin_dashboard_service import get_safety_summary
+        data = get_safety_summary(hours=hours, days=days)
+        return jsonify(data)
+    except Exception as e:
+        print(f"[ADMIN] Safety summary error: {e}")
+        return jsonify({"ok": False, "error": f"Safety summary failed: {type(e).__name__}"}), 500

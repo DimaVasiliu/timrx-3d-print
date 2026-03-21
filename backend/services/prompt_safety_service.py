@@ -316,19 +316,30 @@ def _get_strikes_24h(user_id: str) -> int:
     _strike_cache[user_id] = entries
     return len(entries)
 
-def _record_strike(user_id: str, decision: str) -> int:
+def _record_strike(user_id: str, decision: str,
+                   categories: Optional[List[str]] = None,
+                   matched_rules: Optional[List[str]] = None) -> int:
     if not user_id:
         return 0
     _strike_cache.setdefault(user_id, []).append((time.time(), decision))
-    _persist_strike_to_db(user_id, decision, time.time())
+    _persist_strike_to_db(user_id, decision, time.time(),
+                          categories=categories, matched_rules=matched_rules)
     return _get_strikes_24h(user_id)
 
-def _persist_strike_to_db(user_id, decision, timestamp):
+def _persist_strike_to_db(user_id, decision, timestamp,
+                          categories=None, matched_rules=None):
     try:
         from backend.db import USE_DB, transaction
         if not USE_DB: return
+        cats_json = json.dumps(categories or [])
+        rules_json = json.dumps(matched_rules or [])
         with transaction() as cur:
-            cur.execute("INSERT INTO timrx_app.safety_strikes (identity_id, decision, created_at) VALUES (%s, %s, to_timestamp(%s))", (user_id, decision, timestamp))
+            cur.execute(
+                "INSERT INTO timrx_app.safety_strikes "
+                "(identity_id, decision, categories, matched_rules, created_at) "
+                "VALUES (%s, %s, %s, %s, to_timestamp(%s))",
+                (user_id, decision, cats_json, rules_json, timestamp),
+            )
     except Exception as e:
         print(f"[SAFETY] Warning: could not persist strike: {e}")
 
@@ -342,6 +353,22 @@ def _load_strikes_from_db(user_id):
     except Exception as e:
         print(f"[SAFETY] Warning: could not load strikes from DB: {e}")
         return []
+
+def _get_db_strike_count_24h(user_id: str) -> int:
+    """DB-confirmed 24h strike count — authoritative for penalty decisions."""
+    try:
+        from backend.db import USE_DB, query_one
+        if not USE_DB:
+            return _get_strikes_24h(user_id)  # fallback to cache
+        row = query_one(
+            "SELECT COUNT(*) AS cnt FROM timrx_app.safety_strikes "
+            "WHERE identity_id = %s AND created_at > NOW() - INTERVAL '24 hours'",
+            (user_id,),
+        )
+        return row["cnt"] if row else 0
+    except Exception as e:
+        print(f"[SAFETY] Warning: DB strike count failed, using cache: {e}")
+        return _get_strikes_24h(user_id)
 
 def _compute_penalty(strike_count):
     if strike_count <= _PENALTY_FREE_STRIKES: return 0
@@ -509,7 +536,8 @@ def get_safety_analytics(hours: int = 24) -> Dict:
     """
     Aggregate safety data for admin/debug.
     Returns blocks/warns by category, false-negative candidates,
-    top matched rules, and providers with most rejections.
+    top matched rules, providers with most rejections, penalty totals,
+    and top penalized users.
     """
     result: Dict = {
         "period_hours": hours,
@@ -519,14 +547,18 @@ def get_safety_analytics(hours: int = 24) -> Dict:
         "top_rejection_providers": {},
         "top_matched_rules": {},
         "total_strikes": 0,
+        # New fields for admin dashboard
+        "penalties_applied": 0,
+        "penalty_credits_total": 0,
+        "top_penalized_users": [],
+        "category_breakdown": [],
     }
     try:
-        from backend.db import USE_DB, query_all
+        from backend.db import USE_DB, query_all, query_one
         if not USE_DB:
             return result
 
-        # Strikes by decision and category (we don't store category in strikes,
-        # so count by decision type)
+        # ── Strikes by decision ──
         strikes = query_all("""
             SELECT decision, COUNT(*) AS cnt
             FROM timrx_app.safety_strikes
@@ -540,7 +572,86 @@ def get_safety_analytics(hours: int = 24) -> Dict:
                 result["warns_by_category"]["_total"] = row["cnt"]
             result["total_strikes"] += row["cnt"]
 
-        # Provider rejections (false-negative candidates)
+        # ── Category breakdown from new JSONB columns ──
+        # Gracefully handles rows where categories is still '[]' (pre-migration)
+        cat_rows = query_all("""
+            SELECT cat.value AS category, decision, COUNT(*) AS cnt
+            FROM timrx_app.safety_strikes,
+                 jsonb_array_elements_text(categories) AS cat(value)
+            WHERE created_at > NOW() - INTERVAL '%s hours'
+              AND jsonb_array_length(categories) > 0
+            GROUP BY cat.value, decision
+            ORDER BY cnt DESC
+        """, (hours,))
+        cat_map: Dict[str, Dict] = {}
+        for row in cat_rows:
+            cat = row["category"]
+            if cat not in cat_map:
+                cat_map[cat] = {"category": cat, "blocks": 0, "warns": 0}
+            if row["decision"] == "block":
+                cat_map[cat]["blocks"] += row["cnt"]
+                result["blocks_by_category"][cat] = result["blocks_by_category"].get(cat, 0) + row["cnt"]
+            else:
+                cat_map[cat]["warns"] += row["cnt"]
+                result["warns_by_category"][cat] = result["warns_by_category"].get(cat, 0) + row["cnt"]
+        result["category_breakdown"] = sorted(cat_map.values(), key=lambda x: x["blocks"], reverse=True)
+
+        # ── Top matched rules from new JSONB column ──
+        rule_rows = query_all("""
+            SELECT rule.value AS rule_id, COUNT(*) AS cnt
+            FROM timrx_app.safety_strikes,
+                 jsonb_array_elements_text(matched_rules) AS rule(value)
+            WHERE created_at > NOW() - INTERVAL '%s hours'
+              AND jsonb_array_length(matched_rules) > 0
+            GROUP BY rule.value
+            ORDER BY cnt DESC
+            LIMIT 20
+        """, (hours,))
+        for row in rule_rows:
+            result["top_matched_rules"][row["rule_id"]] = row["cnt"]
+
+        # ── Penalty totals from ledger ──
+        penalty_row = query_one("""
+            SELECT COUNT(*) AS cnt,
+                   COALESCE(ABS(SUM(amount_credits)), 0) AS total
+            FROM timrx_billing.ledger_entries
+            WHERE entry_type = 'safety_penalty'
+              AND created_at >= NOW() - make_interval(hours := %s)
+        """, (hours,))
+        if penalty_row:
+            result["penalties_applied"] = penalty_row["cnt"]
+            result["penalty_credits_total"] = int(penalty_row["total"])
+
+        # ── Top penalized users ──
+        top_users = query_all("""
+            SELECT le.identity_id,
+                   i.email,
+                   COUNT(*) AS penalty_count,
+                   ABS(SUM(le.amount_credits)) AS total_credits
+            FROM timrx_billing.ledger_entries le
+            LEFT JOIN timrx_billing.identities i ON i.id = le.identity_id
+            WHERE le.entry_type = 'safety_penalty'
+              AND le.created_at >= NOW() - make_interval(hours := %s)
+            GROUP BY le.identity_id, i.email
+            ORDER BY total_credits DESC
+            LIMIT 10
+        """, (hours,))
+        for row in top_users:
+            email = row.get("email") or ""
+            # Mask email: show first 2 chars + *** + domain
+            if "@" in email:
+                local, domain = email.split("@", 1)
+                masked = local[:2] + "***@" + domain
+            else:
+                masked = email[:3] + "***" if email else "unknown"
+            result["top_penalized_users"].append({
+                "identity_id": str(row["identity_id"]),
+                "email_masked": masked,
+                "penalty_count": row["penalty_count"],
+                "penalty_credits": int(row["total_credits"]),
+            })
+
+        # ── Provider rejections (false-negative candidates) ──
         rejections = query_all("""
             SELECT provider, local_decision, COUNT(*) AS cnt, matched_rules
             FROM timrx_app.safety_rejections
@@ -555,13 +666,14 @@ def get_safety_analytics(hours: int = 24) -> Dict:
             if row["local_decision"] == "allow":
                 result["false_negative_candidates"] += row["cnt"]
 
-            # Parse matched_rules to count
-            try:
-                rules = json.loads(row.get("matched_rules", "[]"))
-                for r in rules:
-                    result["top_matched_rules"][r] = result["top_matched_rules"].get(r, 0) + row["cnt"]
-            except (json.JSONDecodeError, TypeError):
-                pass
+            # Parse matched_rules to count (fallback for rules not yet in strikes table)
+            if not rule_rows:
+                try:
+                    rules = json.loads(row.get("matched_rules", "[]"))
+                    for r in rules:
+                        result["top_matched_rules"][r] = result["top_matched_rules"].get(r, 0) + row["cnt"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
     except Exception as e:
         print(f"[SAFETY] Warning: analytics query failed: {e}")
@@ -707,11 +819,17 @@ def check_prompt_safety(
 
         # Only record strike if it's NOT a non-human false positive
         if not nonhuman_override:
-            strike_count = _record_strike(user_id, decision)
+            strike_count = _record_strike(
+                user_id, decision,
+                categories=triggered_cats,
+                matched_rules=[r["rule"] for r in matched_rules],
+            )
         else:
             strike_count = _get_strikes_24h(user_id)
 
         if decision == "block" and is_high_confidence:
+            # Use DB-confirmed count for penalty decisions (reliable across workers)
+            strike_count = _get_db_strike_count_24h(user_id)
             penalty = _compute_penalty(strike_count)
             if penalty > 0:
                 _apply_credit_penalty(user_id, penalty)
@@ -786,12 +904,18 @@ def ensure_safety_schema():
                     id            BIGSERIAL PRIMARY KEY,
                     identity_id   UUID NOT NULL,
                     decision      TEXT NOT NULL CHECK (decision IN ('block', 'warn')),
+                    categories    JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    matched_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
                     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_safety_strikes_identity_time
                 ON timrx_app.safety_strikes (identity_id, created_at DESC)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_safety_strikes_categories
+                ON timrx_app.safety_strikes USING gin (categories)
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS timrx_app.safety_rejections (

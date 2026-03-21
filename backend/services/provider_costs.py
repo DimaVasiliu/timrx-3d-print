@@ -44,15 +44,15 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
     "GEMINI_IMAGE_GENERATE_2K":  0.07,
 
     # PiAPI Nano Banana 2 image generation
-    # ESTIMATES — verify against PiAPI billing dashboard.
-    # PiAPI charges per-task; values below are conservative GBP estimates.
-    "PIAPI_IMAGE":              0.04,
-    "PIAPI_IMAGE_2K":           0.06,
-    "PIAPI_IMAGE_4K":           0.10,
+    # Source: PiAPI pricing page — $0.06/0.08/0.12 per image (USD)
+    # Converted at USD/GBP ≈ 0.80 (conservative, update if rate shifts >5%)
+    "PIAPI_IMAGE":              0.048,
+    "PIAPI_IMAGE_2K":           0.064,
+    "PIAPI_IMAGE_4K":           0.096,
     # Long-form codes (match action keys stored in jobs table by image_gen.py):
-    "PIAPI_IMAGE_GENERATE":     0.04,
-    "PIAPI_IMAGE_GENERATE_2K":  0.06,
-    "PIAPI_IMAGE_GENERATE_4K":  0.10,
+    "PIAPI_IMAGE_GENERATE":     0.048,
+    "PIAPI_IMAGE_GENERATE_2K":  0.064,
+    "PIAPI_IMAGE_GENERATE_4K":  0.096,
 }
 
 
@@ -68,24 +68,24 @@ VIDEO_COST_GBP: Dict[Tuple[str, int], float] = {
     ("vertex", 4):            0.30,
     ("vertex", 6):            0.45,
     ("vertex", 8):            0.60,
-    # Seedance Fast (PiAPI)
-    ("seedance_fast", 5):     0.25,
-    ("seedance_fast", 10):    0.50,
-    ("seedance_fast", 15):    0.75,
-    # Seedance Preview (PiAPI)
-    ("seedance_preview", 5):  0.45,
-    ("seedance_preview", 10): 0.90,
-    ("seedance_preview", 15): 1.35,
+    # Seedance 2.0 Fast (PiAPI) — $0.08/sec USD, converted at USD/GBP ≈ 0.80
+    ("seedance_fast", 5):     0.32,
+    ("seedance_fast", 10):    0.64,
+    ("seedance_fast", 15):    0.96,
+    # Seedance 2.0 Preview (PiAPI) — $0.15/sec USD, converted at USD/GBP ≈ 0.80
+    ("seedance_preview", 5):  0.60,
+    ("seedance_preview", 10): 1.20,
+    ("seedance_preview", 15): 1.80,
     # fal Seedance 1.5 Pro
     ("fal_seedance", 5):      0.25,
     ("fal_seedance", 10):     0.50,
 }
 
-# Fallback per-second rates for unknown durations
+# Fallback per-second rates for unknown durations (GBP)
 _VIDEO_FALLBACK_RATE: Dict[str, float] = {
     "vertex":           0.075,
-    "seedance_fast":    0.05,
-    "seedance_preview": 0.09,
+    "seedance_fast":    0.064,   # $0.08/sec × 0.80
+    "seedance_preview": 0.12,    # $0.15/sec × 0.80
     "fal_seedance":     0.05,
 }
 
