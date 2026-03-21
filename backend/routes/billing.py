@@ -943,6 +943,13 @@ def mollie_webhook():
         print("[BILLING] Mollie webhook received without payment ID")
         return jsonify({"ok": False, "error": "Missing payment ID"}), 400
 
+    # Basic validation — Mollie payment IDs start with "tr_".
+    # Reject before making any outbound API call.
+    # Same check as the confirm endpoint.
+    if not isinstance(payment_id, str) or not payment_id.startswith("tr_"):
+        print(f"[BILLING] Mollie webhook rejected: invalid payment_id format: {str(payment_id)[:40]}")
+        return jsonify({"ok": False, "error": "Invalid payment ID format"}), 400
+
     print(f"[BILLING] Mollie webhook received: payment_id={payment_id}")
 
     # Process the webhook

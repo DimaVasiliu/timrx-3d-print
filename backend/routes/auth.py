@@ -28,6 +28,54 @@ bp = Blueprint("auth", __name__)
 
 
 # ─────────────────────────────────────────────────────────────
+# Per-IP rate limiter for email attach endpoint
+# In-process sliding window — no external dependencies.
+# Limits each IP to ATTACH_IP_MAX_REQUESTS within ATTACH_IP_WINDOW_SECS.
+# ─────────────────────────────────────────────────────────────
+
+ATTACH_IP_WINDOW_SECS = 60
+ATTACH_IP_MAX_REQUESTS = 10
+_ip_attach_log = {}  # { ip: [timestamp, ...] }
+_ip_attach_last_cleanup = 0
+
+
+def _check_ip_attach_rate(ip: str) -> bool:
+    """
+    Return True if the IP is within rate limits, False if over.
+    Also piggyback-cleans stale entries every 60 seconds.
+    """
+    global _ip_attach_last_cleanup
+
+    now = time.time()
+    cutoff = now - ATTACH_IP_WINDOW_SECS
+
+    # Periodic cleanup — purge IPs with only stale timestamps (max once per window)
+    if now - _ip_attach_last_cleanup > ATTACH_IP_WINDOW_SECS:
+        stale_ips = [k for k, v in _ip_attach_log.items() if not v or v[-1] < cutoff]
+        for k in stale_ips:
+            del _ip_attach_log[k]
+        _ip_attach_last_cleanup = now
+
+    # Get or create entry for this IP
+    timestamps = _ip_attach_log.get(ip)
+    if timestamps is None:
+        timestamps = []
+        _ip_attach_log[ip] = timestamps
+
+    # Trim expired entries for this IP
+    while timestamps and timestamps[0] < cutoff:
+        timestamps.pop(0)
+
+    # Check limit
+    if len(timestamps) >= ATTACH_IP_MAX_REQUESTS:
+        return False
+
+    # Record this request
+    timestamps.append(now)
+    return True
+
+
+# ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
 
@@ -454,6 +502,16 @@ def attach_email():
         }), 401
 
     ip_address = _get_client_ip()
+
+    # Per-IP rate limit (defense against enumeration across many emails)
+    if not _check_ip_attach_rate(ip_address):
+        print(f"[AUTH] IP rate limited on email/attach: ip={ip_address}")
+        return jsonify({
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many requests. Please try again later.",
+            }
+        }), 429
 
     # Attach email to current identity (unverified)
     # This method is anti-enumeration safe - it returns ok even if email belongs
