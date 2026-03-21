@@ -570,6 +570,50 @@ def create_mollie_checkout():
     # Log plan details (credit_grant is mapped to "credits" key)
     print(f"[BILLING] Plan found: {plan_code} -> {plan.get('credits')} credits @ £{plan.get('price')}")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHECKOUT IDEMPOTENCY: Prevent concurrent double-submit creating two
+    # Mollie payments.  Atomic INSERT claims a 60-second checkout slot.
+    # If another request is already in-flight, return 429.
+    # Same pattern as subscription checkout (see subscription_checkout below).
+    # ══════════════════════════════════════════════════════════════════════════
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    WITH cleanup AS (
+                        DELETE FROM {Tables.CHECKOUT_IDEMPOTENCY}
+                        WHERE identity_id = %s
+                          AND checkout_type = 'one_time'
+                          AND expires_at <= NOW()
+                    )
+                    INSERT INTO {Tables.CHECKOUT_IDEMPOTENCY}
+                        (identity_id, plan_code, checkout_type, expires_at)
+                    VALUES (%s, %s, 'one_time', NOW() + INTERVAL '60 seconds')
+                    ON CONFLICT (identity_id, checkout_type)
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    (g.identity_id, g.identity_id, plan_code),
+                )
+                claimed = cur.fetchone()
+            conn.commit()
+
+        if not claimed:
+            print(
+                f"[BILLING] One-time checkout blocked (concurrent request): "
+                f"identity={g.identity_id} plan={plan_code}"
+            )
+            return jsonify({
+                "ok": False,
+                "error": "checkout_in_progress",
+                "error_code": "CHECKOUT_IN_PROGRESS",
+                "message": "A checkout is already in progress. Please wait.",
+            }), 429
+    except Exception as e:
+        # If table doesn't exist yet, fall through — downstream guards still protect
+        print(f"[BILLING] checkout_idempotency guard failed (non-fatal): {e}")
+
     try:
         result = MollieService.create_checkout(
             identity_id=g.identity_id,
