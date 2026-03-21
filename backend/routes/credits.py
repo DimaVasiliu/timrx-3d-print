@@ -118,7 +118,9 @@ def get_wallet():
         video_reserved = WalletService.get_reserved_credits(g.identity_id, "video")
         video_available = max(0, video_balance - video_reserved)
 
-        # print(f"[CREDITS] Wallet fetch: identity={g.identity_id}, balance={balance}, reserved={reserved}, available={available}, video_balance={video_balance}")
+        # Debug: Log wallet fetch (always for video debugging)
+        print(f"[WALLET] Fetch: identity={g.identity_id[:8]}..., general(bal={balance},res={reserved},avail={available}), "
+              f"video(bal={video_balance},res={video_reserved},avail={video_available})")
 
         return jsonify({
             "ok": True,
@@ -148,6 +150,7 @@ def get_wallet():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/charge", methods=["POST"])
+@no_cache
 @require_session
 def charge_credits():
     """

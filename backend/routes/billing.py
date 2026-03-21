@@ -372,6 +372,7 @@ def get_ledger():
 
 
 @bp.route("/reserve", methods=["POST"])
+@no_cache
 @require_session
 def reserve_credits():
     """
@@ -512,6 +513,7 @@ def reserve_credits():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/checkout", methods=["POST"])
+@no_cache
 @require_verified_email
 def create_mollie_checkout():
     """
@@ -656,19 +658,37 @@ def create_mollie_checkout():
                     (g.identity_id, g.identity_id, plan_code),
                 )
                 claimed = cur.fetchone()
+
+                # If blocked, fetch the remaining TTL so the frontend can show a countdown
+                retry_after = None
+                if not claimed:
+                    cur.execute(
+                        f"""
+                        SELECT GREATEST(0, EXTRACT(EPOCH FROM expires_at - NOW()))::int AS remaining
+                        FROM {Tables.CHECKOUT_IDEMPOTENCY}
+                        WHERE identity_id = %s AND checkout_type = 'one_time'
+                        """,
+                        (g.identity_id,),
+                    )
+                    row = cur.fetchone()
+                    retry_after = row["remaining"] if row else 60
+
             conn.commit()
 
         if not claimed:
             print(
                 f"[BILLING] One-time checkout blocked (concurrent request): "
-                f"identity={g.identity_id} plan={plan_code}"
+                f"identity={g.identity_id} plan={plan_code} retry_after={retry_after}s"
             )
-            return jsonify({
+            resp = jsonify({
                 "ok": False,
                 "error": "checkout_in_progress",
                 "error_code": "CHECKOUT_IN_PROGRESS",
-                "message": "A checkout is already in progress. Please wait.",
-            }), 429
+                "message": "A payment session was started recently. Please wait a moment.",
+                "retry_after_seconds": retry_after,
+            })
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp, 429
     except Exception as e:
         # If table doesn't exist yet, fall through — downstream guards still protect
         print(f"[BILLING] checkout_idempotency guard failed (non-fatal): {e}")
@@ -801,6 +821,7 @@ def confirm_payment():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/checkout/start", methods=["POST"])
+@no_cache
 @require_verified_email
 def create_checkout():
     """
@@ -1387,6 +1408,7 @@ def subscription_payment_methods():
 
 
 @bp.route("/subscriptions/checkout", methods=["POST"])
+@no_cache
 @require_verified_email
 def subscription_checkout():
     """
@@ -1473,17 +1495,36 @@ def subscription_checkout():
                     (g.identity_id, g.identity_id, plan_code),
                 )
                 claimed = cur.fetchone()
+
+                retry_after = None
+                if not claimed:
+                    cur.execute(
+                        f"""
+                        SELECT GREATEST(0, EXTRACT(EPOCH FROM expires_at - NOW()))::int AS remaining
+                        FROM {Tables.CHECKOUT_IDEMPOTENCY}
+                        WHERE identity_id = %s AND checkout_type = 'subscription'
+                        """,
+                        (g.identity_id,),
+                    )
+                    row = cur.fetchone()
+                    retry_after = row["remaining"] if row else 60
+
             conn.commit()
 
         if not claimed:
             print(
                 f"[BILLING] Subscription checkout blocked (concurrent request): "
-                f"identity={g.identity_id} plan={plan_code}"
+                f"identity={g.identity_id} plan={plan_code} retry_after={retry_after}s"
             )
-            return jsonify({
+            resp = jsonify({
+                "ok": False,
                 "error": "checkout_in_progress",
-                "message": "A checkout is already in progress. Please wait.",
-            }), 429
+                "error_code": "CHECKOUT_IN_PROGRESS",
+                "message": "A payment session was started recently. Please wait a moment.",
+                "retry_after_seconds": retry_after,
+            })
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp, 429
     except Exception as e:
         # If table doesn't exist yet, fall through — downstream guards still protect
         print(f"[BILLING] checkout_idempotency guard failed (non-fatal): {e}")
@@ -1902,6 +1943,7 @@ def subscription_summary():
 
 
 @bp.route("/subscriptions/cancel", methods=["POST"])
+@no_cache
 @require_session
 def subscription_cancel():
     """Cancel the current subscription at period end."""

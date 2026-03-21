@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import re
 
-from flask import Flask, g, jsonify
+from flask import Flask, g, jsonify, request
 from flask_cors import CORS
 
 from backend.config import config
@@ -36,6 +36,43 @@ def create_app() -> Flask:
     def _identity_default():
         g.identity_id = None
         g.user_id = None
+
+    # ─────────────────────────────────────────────────────────────
+    # Origin validation for state-changing requests.
+    #
+    # CORS is browser-enforced.  Non-browser clients (curl, scripts)
+    # can bypass it.  This server-side check rejects requests with an
+    # Origin header that is not in ALLOWED_ORIGINS.
+    #
+    # Requests WITHOUT an Origin header are ALLOWED — this covers:
+    #   - non-browser clients (curl, Postman, server-to-server)
+    #   - same-origin requests (some browsers omit Origin)
+    #   - webhook callbacks from payment providers
+    #
+    # Webhook routes are explicitly exempt: Mollie/Stripe call these
+    # from their servers, never from a browser, and may or may not
+    # send an Origin header.
+    # ─────────────────────────────────────────────────────────────
+    @app.before_request
+    def _check_origin():
+        if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            return  # GET/HEAD/OPTIONS are safe
+
+        # Webhook endpoints are called by payment providers, not browsers
+        if request.path.startswith('/api/billing/webhook'):
+            return
+
+        origin = request.headers.get('Origin')
+        if not origin:
+            return  # No Origin header → non-browser client, allow
+
+        # Wildcard CORS config → allow all origins
+        if config.ALLOW_ALL_ORIGINS:
+            return
+
+        if origin not in config.ALLOWED_ORIGINS:
+            print(f"[SECURITY] Origin rejected: origin={origin} path={request.path} method={request.method}")
+            return jsonify({"ok": False, "error": "origin_not_allowed"}), 403
 
     from backend.routes import register_blueprints
 

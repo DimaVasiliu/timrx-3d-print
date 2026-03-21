@@ -76,6 +76,7 @@ def get_me():
 
 
 @bp.route("/email", methods=["POST"])
+@no_cache
 @require_session
 def attach_email():
     """
@@ -202,6 +203,7 @@ def get_ledger():
 
 
 @bp.route("/logout", methods=["POST"])
+@no_cache
 def logout():
     """
     End the current session.

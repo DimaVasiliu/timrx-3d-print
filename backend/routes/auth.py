@@ -19,7 +19,7 @@ from functools import wraps
 
 from flask import Blueprint, request, jsonify, g
 
-from backend.middleware import with_session, with_optional_session, require_session, require_admin
+from backend.middleware import with_session, with_optional_session, require_session, require_admin, no_cache
 from backend.services.magic_code_service import MagicCodeService
 from backend.services.identity_service import IdentityService
 from backend.services.wallet_service import WalletService
@@ -174,6 +174,7 @@ def anti_enumeration(min_secs=_AUTH_MIN_RESPONSE_SECS):
 
 
 @bp.route("/restore/request", methods=["POST"])
+@no_cache
 @anti_enumeration()
 def request_restore():
     """
@@ -250,6 +251,7 @@ def request_restore():
 
 
 @bp.route("/restore/redeem", methods=["POST"])
+@no_cache
 @with_optional_session
 @anti_enumeration()
 def redeem_restore():
@@ -414,6 +416,7 @@ def redeem_restore():
 
 
 @bp.route("/status", methods=["GET"])
+@no_cache
 @with_session
 def auth_status():
     """
@@ -443,6 +446,7 @@ def auth_status():
 
 
 @bp.route("/email/attach", methods=["POST"])
+@no_cache
 @with_session
 @anti_enumeration()
 def attach_email():
@@ -731,6 +735,7 @@ def _handle_verify_merge(code_id, email, source_id, target_id, session_id):
 
 
 @bp.route("/email/verify", methods=["POST"])
+@no_cache
 @require_session
 @anti_enumeration()
 def verify_email():
