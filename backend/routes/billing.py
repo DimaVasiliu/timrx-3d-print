@@ -14,6 +14,8 @@ Handles:
 - GET /api/billing/purchases - Get purchase history
 """
 
+import time
+
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import require_session, require_email, require_verified_email, no_cache
@@ -30,6 +32,53 @@ bp = Blueprint("billing", __name__)
 
 # Cache TTL for pricing data (5 minutes)
 CACHE_TTL_SECONDS = 300
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-identity rate limiter for one-time checkout
+# In-process sliding window — no external dependencies.
+# Limits each identity to CHECKOUT_MAX_PER_MINUTE attempts within the window.
+# This sits ABOVE the idempotency guard: the idempotency guard blocks
+# concurrent duplicate requests; this rate limiter blocks rapid sequential ones.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHECKOUT_RATE_WINDOW_SECS = 60
+CHECKOUT_RATE_MAX_REQUESTS = 5
+_checkout_rate_log = {}   # { identity_id: [timestamp, ...] }
+_checkout_rate_last_cleanup = 0
+
+
+def _check_checkout_rate(identity_id: str) -> bool:
+    """
+    Return True if this identity is within the checkout rate limit.
+    False if over. Piggyback-cleans stale entries periodically.
+    """
+    global _checkout_rate_last_cleanup
+
+    now = time.time()
+    cutoff = now - CHECKOUT_RATE_WINDOW_SECS
+
+    # Periodic cleanup (max once per window)
+    if now - _checkout_rate_last_cleanup > CHECKOUT_RATE_WINDOW_SECS:
+        stale = [k for k, v in _checkout_rate_log.items() if not v or v[-1] < cutoff]
+        for k in stale:
+            del _checkout_rate_log[k]
+        _checkout_rate_last_cleanup = now
+
+    timestamps = _checkout_rate_log.get(identity_id)
+    if timestamps is None:
+        timestamps = []
+        _checkout_rate_log[identity_id] = timestamps
+
+    # Trim expired
+    while timestamps and timestamps[0] < cutoff:
+        timestamps.pop(0)
+
+    if len(timestamps) >= CHECKOUT_RATE_MAX_REQUESTS:
+        return False
+
+    timestamps.append(now)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -501,6 +550,16 @@ def create_mollie_checkout():
             "error": "payment_service_unavailable",
         }), 503
 
+    # Per-identity rate limit (prevents rapid sequential checkout spam)
+    if not _check_checkout_rate(g.identity_id):
+        print(f"[BILLING] Checkout rate limited: identity={g.identity_id}")
+        return jsonify({
+            "ok": False,
+            "error_code": "RATE_LIMITED",
+            "error": "rate_limited",
+            "message": "Too many checkout attempts. Please wait a moment.",
+        }), 429
+
     # Parse and log request body
     data = request.get_json(silent=True)
     if data is None:
@@ -918,41 +977,164 @@ def stripe_webhook():
 # MOLLIE WEBHOOK
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Webhook rate limiter ────────────────────────────────────────────────────
+#
+# THREAT MODEL:
+# An attacker POSTs many different payment_ids to /webhook/mollie.  Each
+# unique ID triggers an outbound GET to Mollie's API (the fetch-back
+# verification model).  The limiter caps outbound API fetches per source IP.
+#
+# KEY DESIGN: count unique payment_ids per IP, not raw requests.
+# Mollie retries the SAME payment_id on non-200 responses.  Retries are
+# harmless — the idempotency guard (processed_webhook_payments table)
+# returns early without any outbound call for already-processed payments.
+# So same-ID retries are always allowed (free pass), and only *new* unique
+# IDs count against the budget.
+#
+# THRESHOLD: 30 unique payment_ids per 60 seconds per IP.
+# Justification:
+#   - Mollie sends 1 webhook per payment × status change (paid/refunded/etc.)
+#   - A busy merchant rarely sees 30 distinct payments resolve in 1 minute
+#   - Mollie may batch-deliver delayed webhooks after their own outages,
+#     so the limit must tolerate short bursts
+#   - An attacker spraying random IDs hits 30 within seconds, then is blocked
+#
+# DEPLOYMENT NOTE: This is an in-process sliding-window limiter.  State lives
+# in a Python dict, NOT shared across gunicorn/uvicorn workers.  With N
+# workers, the effective limit is up to 30 × N unique IDs per IP per minute.
+# For stricter enforcement, an external store (Redis, or Cloudflare/nginx
+# rate limiting) would be needed.  The current approach is a zero-dependency
+# defense-in-depth layer, not a hard guarantee.
+# ────────────────────────────────────────────────────────────────────────────
+
+WEBHOOK_RATE_WINDOW_SECS = 60
+WEBHOOK_RATE_MAX_UNIQUE_IDS = 30
+_webhook_rate_log = {}   # { ip: { payment_id: timestamp, ... } }
+_webhook_rate_last_cleanup = 0
+
+
+def _check_webhook_rate(ip: str, payment_id: str) -> bool:
+    """
+    Return True if this IP+payment_id is within rate limits.
+
+    - Retries of the SAME payment_id from the same IP always pass (free).
+    - Only distinct (new) payment_ids count against the per-IP budget.
+    - Expired entries (older than WEBHOOK_RATE_WINDOW_SECS) are pruned.
+    """
+    global _webhook_rate_last_cleanup
+
+    now = time.time()
+    cutoff = now - WEBHOOK_RATE_WINDOW_SECS
+
+    # Periodic cleanup — purge IPs whose newest entry is stale (max once/window)
+    if now - _webhook_rate_last_cleanup > WEBHOOK_RATE_WINDOW_SECS:
+        stale_ips = [
+            k for k, v in _webhook_rate_log.items()
+            if not v or max(v.values()) < cutoff
+        ]
+        for k in stale_ips:
+            del _webhook_rate_log[k]
+        _webhook_rate_last_cleanup = now
+
+    ids = _webhook_rate_log.get(ip)
+    if ids is None:
+        ids = {}
+        _webhook_rate_log[ip] = ids
+
+    # Same payment_id from same IP → Mollie retry → always allow, refresh ts
+    if payment_id in ids:
+        ids[payment_id] = now
+        return True
+
+    # Trim expired entries for this IP
+    expired = [pid for pid, ts in ids.items() if ts < cutoff]
+    for pid in expired:
+        del ids[pid]
+
+    # Budget check: too many unique IDs from this IP?
+    if len(ids) >= WEBHOOK_RATE_MAX_UNIQUE_IDS:
+        return False
+
+    # Record this new unique payment_id
+    ids[payment_id] = now
+    return True
+
+
+def _get_webhook_ip() -> str:
+    """Get client IP from request, handling reverse proxies."""
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
 @bp.route("/webhook/mollie", methods=["POST"])
 def mollie_webhook():
     """
     Handle Mollie webhook notifications.
 
     Mollie sends a POST with form data containing `id` (payment ID).
-    We fetch the payment details and process if paid.
+    We fetch the payment details from Mollie's API and process if paid.
 
-    No authentication required - Mollie verifies by us fetching payment details.
+    No authentication required — Mollie's security model is fetch-back
+    verification: we only trust data from our own authenticated API call
+    to Mollie, not from the webhook request body.
 
-    Returns 200 OK to acknowledge receipt (even on processing errors,
-    to prevent Mollie from retrying indefinitely).
+    GUARD ORDER (each step blocks before the next runs):
+      1. Parse payment_id from form/JSON body
+      2. Reject missing payment_id                    → 400
+      3. Reject invalid format (must start with tr_)  → 400
+      4. Per-IP rate limit on unique payment_ids       → 429
+      5. MollieService.handle_webhook()               → outbound API call
+         └─ MOLLIE_AVAILABLE check (cheap bool)       → early return if false
+         └─ Idempotency guard (DB)                    → early return if duplicate
+         └─ Fetch payment from Mollie API             → outbound HTTP GET
+         └─ Process payment (grant credits, etc.)
+
+    The rate limit (step 4) is the last cheap check before the expensive
+    outbound call (step 5).  Steps 1-3 are pure validation — they reject
+    garbage before it even reaches the rate limiter.
+
+    Mollie availability (MOLLIE_AVAILABLE) is a module-level bool constant
+    set at import time — zero cost.  It lives inside handle_webhook() rather
+    than in this route handler because it applies to all webhook entry points
+    (direct call, confirm endpoint, etc.), not just this route.
+
+    Returns 200 OK to acknowledge receipt even on processing errors,
+    to prevent Mollie from retrying indefinitely.
     """
-    # Mollie sends payment ID as form data
+    # ── Step 1–2: Extract payment_id ──
     payment_id = request.form.get("id")
-
     if not payment_id:
-        # Try JSON body as fallback
         data = request.get_json(silent=True) or {}
         payment_id = data.get("id")
 
     if not payment_id:
         print("[BILLING] Mollie webhook received without payment ID")
-        return jsonify({"ok": False, "error": "Missing payment ID"}), 400
+        return jsonify({"ok": False, "error": "missing_payment_id"}), 400
 
-    # Basic validation — Mollie payment IDs start with "tr_".
-    # Reject before making any outbound API call.
-    # Same check as the confirm endpoint.
+    # ── Step 3: Format validation ──
+    # Mollie payment IDs always start with "tr_".  Reject before any
+    # further processing to avoid wasting rate-limit budget or outbound
+    # calls on obviously bogus input.
     if not isinstance(payment_id, str) or not payment_id.startswith("tr_"):
-        print(f"[BILLING] Mollie webhook rejected: invalid payment_id format: {str(payment_id)[:40]}")
-        return jsonify({"ok": False, "error": "Invalid payment ID format"}), 400
+        print(f"[BILLING] Mollie webhook rejected: invalid format: {str(payment_id)[:40]}")
+        return jsonify({"ok": False, "error": "invalid_payment_id"}), 400
 
-    print(f"[BILLING] Mollie webhook received: payment_id={payment_id}")
+    # ── Step 4: Per-IP rate limit ──
+    # Counts unique payment_ids per source IP.  Retries of the same ID
+    # are free (Mollie retry pattern).  Blocks spray attacks that would
+    # trigger many outbound Mollie API fetches.
+    webhook_ip = _get_webhook_ip()
+    if not _check_webhook_rate(webhook_ip, payment_id):
+        print(
+            f"[BILLING] Webhook rate limited: ip={webhook_ip} "
+            f"unique_ids_exceeded={WEBHOOK_RATE_MAX_UNIQUE_IDS}/min"
+        )
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
 
-    # Process the webhook
+    # ── Step 5: Process (outbound Mollie API call + credit grant) ──
+    print(f"[BILLING] Mollie webhook processing: payment_id={payment_id}")
     result = MollieService.handle_webhook(payment_id)
 
     if result.get("ok"):
