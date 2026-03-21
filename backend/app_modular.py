@@ -1,6 +1,10 @@
-"""True modular entrypoint.
+"""Canonical 3D backend entrypoint.
 
-This builds a new Flask app and registers all blueprints (core + migrated).
+Use the same Flask app object everywhere:
+- Local dev: ``flask --app app_modular:app run --host 0.0.0.0 --port 5001``
+- Deploy: ``gunicorn app_modular:app``
+
+This module builds the Flask app and registers all blueprints (core + migrated).
 """
 
 from __future__ import annotations
@@ -80,7 +84,7 @@ def create_app() -> Flask:
 
     # ─────────────────────────────────────────────────────────────
     # Legacy compat: /api/wallet (same as /api/credits/wallet)
-    # This matches the legacy app.py route exactly
+    # This matches the legacy app.py.backup route exactly
     # ─────────────────────────────────────────────────────────────
     @app.route("/api/wallet", methods=["GET"])
     def api_wallet_compat():
@@ -181,6 +185,7 @@ def create_app() -> Flask:
 
 
 app = create_app()
+application = app  # WSGI compatibility alias
 
 
 if __name__ == "__main__":

@@ -27,8 +27,15 @@ cd TimrX/Backend/meshy
 # DATABASE_URL=postgresql://...
 # MESHY_API_KEY=...
 
-# Run the server
-python app.py
+# Canonical local entrypoint (same app object used in deploy)
+flask --app app_modular:app run --host 0.0.0.0 --port 5001
+```
+
+Alternative:
+
+```bash
+cd TimrX/Backend/meshy
+python app_modular.py
 ```
 
 ### 2. Run tests against localhost
@@ -121,3 +128,13 @@ Ensure `DATABASE_URL` is set and the database has the required tables:
 - `active_jobs` (for job recovery)
 
 Run `schema.sql` to create tables if needed.
+
+## Canonical Entrypoint
+
+The checked-in runtime entrypoint is:
+
+```bash
+gunicorn app_modular:app
+```
+
+Use `app_modular:app` for deploys, Flask local runs, and any smoke-test setup so all environments target the same Flask app object.
