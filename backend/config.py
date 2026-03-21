@@ -2,6 +2,10 @@
 Configuration module for TimrX Backend.
 Centralizes all environment variables and settings.
 
+DB Role Model:
+- App connects as timrx_admin (DML only, no DDL)
+- postgres is reserved for migrations and admin scripts
+
 Render Compatibility:
 - Handles Render's DATABASE_URL format (postgres:// -> postgresql://)
 - Uses Render's PORT env var
@@ -724,11 +728,23 @@ class Config:
                 warnings.append("DATABASE_URL not set - running without persistence!")
             if not self.EMAIL_CONFIGURED:
                 warnings.append("Email not configured - magic codes and receipts won't send")
+            if not self.ADMIN_AUTH_CONFIGURED:
+                warnings.append("ADMIN_TOKEN / ADMIN_EMAILS not set - admin routes may be inaccessible")
             # Check payment provider based on PAYMENTS_PROVIDER setting
             if self.USE_STRIPE and not self.STRIPE_CONFIGURED:
                 warnings.append("PAYMENTS_PROVIDER includes 'stripe' but Stripe not configured")
             if self.USE_MOLLIE and not self.MOLLIE_CONFIGURED:
                 warnings.append("PAYMENTS_PROVIDER includes 'mollie' but Mollie not configured")
+            if not (self.MESHY_API_KEY or self.OPENAI_API_KEY or self.GEMINI_API_KEY):
+                warnings.append("No generation provider keys configured (MESHY_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY)")
+            if self.VIDEO_PROVIDER == "vertex" and not self.VERTEX_CONFIGURED:
+                warnings.append("VIDEO_PROVIDER=vertex but Vertex AI is not fully configured")
+            if self.VIDEO_PROVIDER == "seedance" and not self.PIAPI_API_KEY:
+                warnings.append("VIDEO_PROVIDER=seedance but PIAPI_API_KEY is not set")
+            if self.MESHY_WEBHOOK_ENABLED and not self.PUBLIC_BASE_URL:
+                warnings.append("MESHY_WEBHOOK_ENABLED=true but PUBLIC_BASE_URL is not set")
+            if self.PIAPI_WEBHOOK_ENABLED and not self.PUBLIC_BASE_URL:
+                warnings.append("PIAPI_WEBHOOK_ENABLED=true but PUBLIC_BASE_URL is not set")
             if not self.ALLOWED_ORIGINS:
                 warnings.append("ALLOWED_ORIGINS not set - CORS will block requests")
             if self.ALLOW_ALL_ORIGINS:

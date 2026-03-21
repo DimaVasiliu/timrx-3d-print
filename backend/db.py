@@ -22,6 +22,7 @@ Usage:
 
 import hashlib
 import os
+import re
 from contextlib import contextmanager
 from typing import Optional, Any, Dict, List, Union
 from datetime import datetime, timezone
@@ -50,6 +51,13 @@ _HAS_DATABASE = bool(_DATABASE_URL)
 _DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 _APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
 _BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
+
+# Fail-closed validation: reject malformed schema names at import time
+_SCHEMA_RE = re.compile(r'^[a-z][a-z0-9_]{0,62}$')
+if not _SCHEMA_RE.match(_APP_SCHEMA):
+    raise ValueError(f"Invalid APP_SCHEMA: {_APP_SCHEMA!r} — must match ^[a-z][a-z0-9_]{{0,62}}$")
+if not _SCHEMA_RE.match(_BILLING_SCHEMA):
+    raise ValueError(f"Invalid BILLING_SCHEMA: {_BILLING_SCHEMA!r} — must match ^[a-z][a-z0-9_]{{0,62}}$")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -133,9 +141,12 @@ def _create_connection():
             connect_timeout=_DB_CONNECT_TIMEOUT,
             row_factory=dict_row,  # Default to dict rows
         )
-        # Set search path for both schemas
+        # Set search path and session safety limits
         with conn.cursor() as cur:
             cur.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public;")
+            cur.execute("SET statement_timeout = '30000';")
+            cur.execute("SET idle_in_transaction_session_timeout = '60000';")
+            cur.execute("SET lock_timeout = '10000';")
         return conn
     except psycopg.OperationalError as e:
         raise DatabaseConnectionError(f"Failed to connect to database: {e}", original_error=e)
@@ -515,9 +526,17 @@ def init_db() -> bool:
 
 def ensure_schema() -> None:
     """
-    Ensure critical schema elements exist.
-    Creates indexes needed for idempotency if they don't exist.
-    Called at app startup after connection is verified.
+    Verify critical schema elements exist at startup.
+
+    All objects here were created via migrations and already exist in
+    production.  The IF NOT EXISTS clauses make every statement a no-op
+    under the normal app role (timrx_admin, which has no CREATE privilege).
+    If the DDL unexpectedly fails (e.g. new deploy before migration), the
+    exception is caught and logged — the app continues without crashing.
+
+    NOTE: If you add a new table or index the app depends on, create it in
+    a numbered migration first, then optionally add an IF NOT EXISTS guard
+    here as a startup sanity check.
     """
     try:
         with transaction() as cur:
@@ -544,7 +563,8 @@ def ensure_schema() -> None:
         except Exception as e:
             print(f"[DB] Warning: Could not ensure safety schema: {e}")
     except Exception as e:
-        # Log but don't fail startup - indexes may already exist or DB user may lack permissions
+        # Log but don't fail startup — under timrx_admin these are no-ops
+        # (objects pre-exist).  Only fires if a migration was missed.
         print(f"[DB] Warning: Could not ensure schema indexes: {e}")
 
 

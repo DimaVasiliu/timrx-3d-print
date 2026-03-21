@@ -21,6 +21,14 @@ from backend.config import config
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    if config.IS_DEV:
+        config.print_summary()
+    config_warnings = config.validate()
+    if config_warnings:
+        print("[CONFIG] Startup configuration warnings:")
+        for warning in config_warnings:
+            print(f"[CONFIG][WARN] {warning}")
+
     # CORS configuration (mirrors monolith behavior)
     if config.ALLOW_ALL_ORIGINS:
         origins = [re.compile(r".*")]

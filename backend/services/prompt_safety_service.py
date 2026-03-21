@@ -579,7 +579,9 @@ def _warn_message(categories):
 
 
 # ─────────────────────────────────────────────────────────────
-# DB schema
+# DB schema — startup sanity check
+# Tables are created by migrations; these IF NOT EXISTS guards
+# are no-ops under timrx_admin (no CREATE privilege on schemas).
 # ─────────────────────────────────────────────────────────────
 def ensure_safety_schema():
     try:

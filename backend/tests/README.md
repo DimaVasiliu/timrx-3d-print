@@ -23,9 +23,8 @@ pip install requests python-dotenv
 ```bash
 cd TimrX/Backend/meshy
 
-# Create/edit .env with required variables
-# DATABASE_URL=postgresql://...
-# MESHY_API_KEY=...
+# Bootstrap local config
+cp .env.example .env
 
 # Canonical local entrypoint (same app object used in deploy)
 flask --app app_modular:app run --host 0.0.0.0 --port 5001
@@ -107,6 +106,30 @@ All tests passed!
 ```
 
 ## Environment Variables
+
+Core local setup:
+
+| Variable | Required? | Description |
+|----------|-----------|-------------|
+| `DATABASE_URL` | Recommended | Enables persistent jobs/history instead of degraded no-DB mode |
+| `ALLOWED_ORIGINS` | Recommended | Keeps local frontend requests working explicitly |
+| `ADMIN_TOKEN` or `ADMIN_EMAILS` | Recommended | Enables admin routes |
+| `MESHY_API_KEY` | Required for Meshy generation | Main 3D generation provider |
+
+Optional feature providers:
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | Enables OpenAI-powered image/text features |
+| `GEMINI_API_KEY` | Enables Gemini-backed image flows |
+| `PIAPI_API_KEY` | Enables Seedance / PiAPI video flows |
+| `GOOGLE_CLOUD_PROJECT` + `GOOGLE_APPLICATION_CREDENTIALS_JSON` | Required if `VIDEO_PROVIDER=vertex` |
+| `MOLLIE_API_KEY` / `STRIPE_SECRET_KEY` | Required only for the payment provider you enable |
+| `EMAIL_ENABLED`, `EMAIL_PROVIDER`, `SES_FROM_EMAIL`, `AWS_*` | Required if you want magic codes / receipts to send |
+
+Service-level defaults and optional flags are documented in [`.env.example`](../.env.example).
+
+Startup validation now warns about missing production-critical config such as database, admin auth, provider keys, payment setup, and webhook base URLs.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
