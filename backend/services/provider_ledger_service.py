@@ -383,12 +383,15 @@ def _empty_month() -> Dict[str, Any]:
 # PROVIDER BALANCE SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known providers — mirrors admin_ops_service._PROVIDER_FEATURES
-_KNOWN_PROVIDERS = {"meshy", "openai", "google", "nano_banana", "vertex", "seedance", "fal_seedance"}
+# Known providers for balance tracking.
+# Note: nano_banana and seedance are excluded here because their shared external
+# billing account is tracked under 'piapi'.  They remain in admin_ops_service
+# _PROVIDER_FEATURES for health monitoring.
+_KNOWN_BALANCE_PROVIDERS = {"meshy", "openai", "google", "piapi", "vertex", "fal_seedance"}
 
 # PiAPI umbrella: nano_banana + seedance share the same external billing account.
 # Balance snapshots should be recorded under provider='piapi' for the shared account.
-# Individual execution metrics stay under their own provider names.
+# Individual execution metrics stay under their own provider names (health only).
 _PIAPI_UMBRELLA_PROVIDERS = {"nano_banana", "seedance"}
 
 # Thresholds
@@ -473,8 +476,65 @@ def get_provider_balances() -> Dict[str, Any]:
         for r in wallet_alerts
     }
 
+    # 3b. PiAPI umbrella breakdown (video vs image, image quality mix)
+    piapi_breakdown = None
+    piapi_snap = snapshots.get("piapi")
+    if piapi_snap:
+        breakdown_rows = query_all(
+            f"""
+            SELECT provider,
+                   action_code,
+                   COUNT(*) AS job_count,
+                   COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_gbp,
+                   COALESCE(SUM(cost_credits), 0) AS credits
+            FROM {Tables.JOBS}
+            WHERE provider IN ('nano_banana', 'seedance')
+              AND status IN ('succeeded', 'ready')
+              AND created_at > %s
+            GROUP BY provider, action_code
+            """,
+            (piapi_snap["recorded_at"],),
+        )
+        video_jobs = 0; video_cost = 0.0; video_credits = 0
+        image_jobs = 0; image_cost = 0.0; image_credits = 0
+        nb_standard = 0; nb_2k = 0; nb_4k = 0
+        for br in breakdown_rows:
+            prov_name = br["provider"]
+            ac = (br.get("action_code") or "").lower()
+            cnt = br["job_count"]
+            cost = float(br["cost_gbp"])
+            creds = int(br["credits"])
+            if prov_name == "seedance":
+                video_jobs += cnt
+                video_cost += cost
+                video_credits += creds
+            elif prov_name == "nano_banana":
+                image_jobs += cnt
+                image_cost += cost
+                image_credits += creds
+                if "4k" in ac:
+                    nb_4k += cnt
+                elif "2k" in ac:
+                    nb_2k += cnt
+                else:
+                    nb_standard += cnt
+        piapi_breakdown = {
+            "video_jobs_since_snapshot": video_jobs,
+            "video_cost_since_gbp": round(video_cost, 2),
+            "video_credits_since_snapshot": video_credits,
+            "image_jobs_since_snapshot": image_jobs,
+            "image_cost_since_gbp": round(image_cost, 2),
+            "image_credits_since_snapshot": image_credits,
+            "nano_banana_standard_count": nb_standard,
+            "nano_banana_2k_count": nb_2k,
+            "nano_banana_4k_count": nb_4k,
+        }
+
     # 4. Build per-provider result
-    all_providers = _KNOWN_PROVIDERS | set(snapshots.keys())
+    # Use balance-specific provider set (excludes nano_banana/seedance individually)
+    all_providers = _KNOWN_BALANCE_PROVIDERS | set(snapshots.keys())
+    # Remove individual umbrella providers — they are covered by 'piapi'
+    all_providers -= _PIAPI_UMBRELLA_PROVIDERS
     providers = []
     action_needed_count = 0
     warning_count = 0
@@ -526,6 +586,13 @@ def get_provider_balances() -> Dict[str, Any]:
             "wallet_alerts_7d": wallet["count"] if wallet else 0,
             "wallet_alert_latest": wallet["latest"] if wallet else None,
         }
+        # Attach PiAPI-specific metadata
+        if prov == "piapi":
+            entry["display_label"] = "PiAPI Account"
+            entry["display_subtitle"] = "Seedance + Nano Banana"
+            entry["is_umbrella"] = True
+            if piapi_breakdown:
+                entry["breakdown"] = piapi_breakdown
         providers.append(entry)
 
     # Sort: action_needed first, then warning, then ok, then unknown
