@@ -333,13 +333,24 @@ def _persist_strike_to_db(user_id, decision, timestamp,
         if not USE_DB: return
         cats_json = json.dumps(categories or [])
         rules_json = json.dumps(matched_rules or [])
-        with transaction() as cur:
-            cur.execute(
-                "INSERT INTO timrx_app.safety_strikes "
-                "(identity_id, decision, categories, matched_rules, created_at) "
-                "VALUES (%s, %s, %s, %s, to_timestamp(%s))",
-                (user_id, decision, cats_json, rules_json, timestamp),
-            )
+        try:
+            with transaction() as cur:
+                cur.execute(
+                    "INSERT INTO timrx_app.safety_strikes "
+                    "(identity_id, decision, categories, matched_rules, created_at) "
+                    "VALUES (%s, %s, %s, %s, to_timestamp(%s))",
+                    (user_id, decision, cats_json, rules_json, timestamp),
+                )
+        except Exception:
+            # Fallback: pre-migration schema without new columns.
+            # Separate transaction since the first one was rolled back.
+            with transaction() as cur:
+                cur.execute(
+                    "INSERT INTO timrx_app.safety_strikes "
+                    "(identity_id, decision, created_at) "
+                    "VALUES (%s, %s, to_timestamp(%s))",
+                    (user_id, decision, timestamp),
+                )
     except Exception as e:
         print(f"[SAFETY] Warning: could not persist strike: {e}")
 
