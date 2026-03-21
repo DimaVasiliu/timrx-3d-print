@@ -29,6 +29,20 @@ def create_app() -> Flask:
         for warning in config_warnings:
             print(f"[CONFIG][WARN] {warning}")
 
+    from backend.db import get_runtime_report, init_db
+
+    try:
+        init_db()
+    except Exception as e:
+        print(f"[APP] Fatal database startup error: {e}")
+        raise
+
+    app.config["DB_RUNTIME_REPORT"] = get_runtime_report()
+    if app.config["DB_RUNTIME_REPORT"]["mode"] == "degraded":
+        print("[APP] Starting 3D backend in degraded mode")
+        for limitation in app.config["DB_RUNTIME_REPORT"]["disabled_capabilities"]:
+            print(f"[APP][DEGRADED] {limitation['id']}: {limitation['summary']}")
+
     # CORS configuration (mirrors monolith behavior)
     if config.ALLOW_ALL_ORIGINS:
         origins = [re.compile(r".*")]
@@ -143,9 +157,7 @@ def create_app() -> Flask:
     # ─────────────────────────────────────────────────────────────
     # Startup seeding: ensure action_costs & plans exist in DB
     # ─────────────────────────────────────────────────────────────
-    from backend.db import USE_DB
-
-    if USE_DB:
+    if app.config["DB_RUNTIME_REPORT"]["ready"]:
         try:
             from backend.services.pricing_service import PricingService
 

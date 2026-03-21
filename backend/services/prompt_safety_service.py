@@ -167,16 +167,75 @@ _SAFE_CONTEXT_WORDS = re.compile(
 )
 
 _HARMFUL_ACTION_VERBS = re.compile(
-    r"\b(?:shoot(?:s|ing)?|shot|fire[sd]?\s+(?:at|on|upon|into)|"
+    r"\b(?:shoot(?:s|ing)|shooting|"  # "shot" removed — matches "macro shot"
+    r"fire[sd]?\s+(?:at|on|upon|into)|"
     r"stab(?:s|bed|bing)?|kill(?:s|ed|ing)?|murder(?:s|ed|ing)?|"
     r"execut\w+|tortur\w+|slaughter\w*|massacr\w+|"
     r"decapitat\w+|dismember\w+|disembowel\w+|bludgeon\w*|strangl\w+|"
     r"attack(?:s|ed|ing)?|assault(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
+# NOTE: "shot" alone was removed from harmful-verb detector because it
+# matches photography terms ("macro shot", "cinematic shot").  The actual
+# violence rules (V01-V02) still match "shot" when combined with human
+# targets, so real violence is still caught.
 
 _SAFE_SCORE_THRESHOLD = 4
 _SAFE_DAMPEN_FACTOR   = 0.3
+
+
+# ─────────────────────────────────────────────────────────────
+# Non-human subject detector
+# If the prompt is about animals / insects / nature / macro photography
+# and contains NO human subject words, zero out violence and sexual scores.
+# ─────────────────────────────────────────────────────────────
+_NONHUMAN_SUBJECTS = re.compile(
+    r"\b(?:spider|insect|beetle|butterfly|moth|ant|bee|wasp|dragonfly|"
+    r"caterpillar|ladybug|mantis|cricket|fly|mosquito|"
+    r"dog|cat|bird|fish|horse|deer|bear|wolf|fox|rabbit|squirrel|"
+    r"lizard|snake|frog|turtle|gecko|chameleon|salamander|"
+    r"owl|eagle|hawk|parrot|penguin|dolphin|whale|shark|octopus|"
+    r"lion|tiger|elephant|giraffe|zebra|gorilla|monkey|"
+    r"animal|wildlife|creature|specimen|organism|"
+    r"flower|plant|moss|lichen|mushroom|fungus|coral|"
+    r"macro\s+(?:shot|photo\w*|lens|detail|close[\s-]?up)|"
+    r"macro\s+photography|close[\s-]?up\s+(?:shot|photo\w*)|"
+    r"water\s+droplet|dew\s+drop|pollen|petal|leaf|leaves|branch|twig)\b",
+    re.IGNORECASE,
+)
+
+_HUMAN_SUBJECTS = re.compile(
+    r"\b(?:person|people|man|woman|girl|boy|child|kid|officer|soldier|"
+    r"figure|character|victim|human|nude|naked|"
+    r"actor|actress|celebrity|politician)\b",
+    re.IGNORECASE,
+)
+# NOTE: "body" was removed from _HUMAN_SUBJECTS — it matches animal body
+# references ("its body", "spider body") causing false positives.
+# "body" only appears in rule patterns where it's already contextual
+# (e.g. "nude body" in S03, "stab.*body" in V05).
+
+# Photography / technical metadata — never risk-relevant
+_PHOTO_METADATA = re.compile(
+    r"\b(?:ultra[\s-]?realistic|hyper[\s-]?detailed|photo[\s-]?realistic|"
+    r"macro|close[\s-]?up|bokeh|depth\s+of\s+field|lens|aperture|"
+    r"8[kK]|4[kK]|HDR|RAW|DSLR|mirrorless|"
+    r"f[\s/]?\d+(?:\.\d+)?|ISO\s*\d+|focal\s+length|"
+    r"studio\s+lighting|natural\s+lighting|golden\s+hour|"
+    r"product\s+photo\w*|stock\s+photo\w*)\b",
+    re.IGNORECASE,
+)
+
+# High-confidence rule prefixes that justify penalties
+_HIGH_CONFIDENCE_RULE_PREFIXES = {
+    "V01", "V02", "V03", "V04", "V05", "V06", "V07", "V08", "V09",
+    "V10", "V11", "V12", "V13", "V14", "V15", "V16", "V17", "V18",
+    "S01", "S02", "S03", "S04", "S05", "S06",
+    "M01", "M02", "M03", "M04", "M05",
+    "H01", "H02", "H03", "H04",
+    "E01", "E02", "E03", "E04",
+    "R01", "R02", "R03", "R04", "R05", "R06", "R07",
+}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -289,13 +348,106 @@ def _compute_penalty(strike_count):
     return min((strike_count - _PENALTY_FREE_STRIKES) * _PENALTY_PER_STRIKE, _MAX_PENALTY)
 
 def _apply_credit_penalty(user_id, amount):
-    if amount <= 0 or not user_id: return
+    """
+    Debit user wallet AND credit platform revenue in a single transaction.
+
+    Both the user debit (ledger_entries) and platform credit (provider_ledger)
+    share the same penalty_ref_id for cross-referencing.
+
+    Idempotency: the ref_id includes a millisecond timestamp + user_id,
+    so each penalty event produces a unique reference.  The wallet service
+    allows negative balance for safety_penalty entries (system-imposed).
+
+    Queryable via:
+        SELECT * FROM timrx_billing.provider_ledger
+        WHERE entry_type = 'safety_penalty_income'
+        ORDER BY created_at DESC;
+    """
+    if amount <= 0 or not user_id:
+        return
     try:
-        from backend.db import USE_DB
-        if not USE_DB: return
-        from backend.services.wallet_service import WalletService
-        WalletService.add_ledger_entry(identity_id=user_id, entry_type="safety_penalty", delta=-amount, credit_type="general", ref_type="safety", ref_id=None, meta={"penalty_credits": amount, "source": "prompt_safety"})
-        print(f"[SAFETY] Applied {amount} credit penalty to user {user_id}")
+        from backend.db import USE_DB, get_conn, fetch_one, Tables
+        if not USE_DB:
+            return
+
+        import uuid
+        penalty_ref_id = f"safety_penalty_{uuid.uuid4().hex[:12]}"
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # ── 1. Debit user wallet (ledger_entries + wallet balance) ──
+                # Lock wallet row
+                cur.execute(f"""
+                    SELECT identity_id, balance_credits
+                    FROM {Tables.WALLETS}
+                    WHERE identity_id = %s
+                    FOR UPDATE
+                """, (user_id,))
+                wallet = fetch_one(cur)
+
+                if not wallet:
+                    print(f"[SAFETY] Warning: wallet not found for {user_id}, skipping penalty")
+                    return
+
+                old_balance = wallet.get("balance_credits", 0) or 0
+                new_balance = old_balance - amount  # allowed to go negative
+
+                # Insert user debit ledger entry
+                cur.execute(f"""
+                    INSERT INTO {Tables.LEDGER_ENTRIES}
+                        (identity_id, entry_type, amount_credits, ref_type, ref_id,
+                         meta, credit_type, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                """, (
+                    user_id,
+                    "safety_penalty",
+                    -amount,
+                    "safety",
+                    penalty_ref_id,
+                    json.dumps({"penalty_credits": amount, "source": "prompt_safety"}),
+                    "general",
+                ))
+
+                # Update wallet balance
+                cur.execute(f"""
+                    UPDATE {Tables.WALLETS}
+                    SET balance_credits = %s, updated_at = NOW()
+                    WHERE identity_id = %s
+                """, (new_balance, user_id))
+
+                # ── 2. Credit platform revenue (provider_ledger) ──
+                cur.execute(f"""
+                    INSERT INTO {Tables.PROVIDER_LEDGER}
+                        (provider, entry_type, amount_gbp, currency, description,
+                         reference, metadata, recorded_by, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """, (
+                    "platform",
+                    "safety_penalty_income",
+                    0,
+                    "CREDITS",
+                    f"Safety penalty: {amount} credits from {user_id}",
+                    penalty_ref_id,
+                    json.dumps({
+                        "source_identity": user_id,
+                        "penalty_credits": amount,
+                        "credit_type": "general",
+                    }),
+                    "system:prompt_safety",
+                ))
+
+            # Both sides committed atomically
+            conn.commit()
+
+        print(
+            f"[SAFETY] Penalty applied: user={user_id} debit=-{amount}cr "
+            f"balance={old_balance}→{new_balance} ref={penalty_ref_id}"
+        )
+        print(
+            f"[SAFETY] Platform revenue recorded: +{amount}cr "
+            f"entry_type=safety_penalty_income ref={penalty_ref_id}"
+        )
+
     except Exception as e:
         print(f"[SAFETY] Warning: could not apply credit penalty: {e}")
 
@@ -465,6 +617,19 @@ def check_prompt_safety(
                 cat_scores[c] *= _SAFE_DAMPEN_FACTOR
                 safe_reduced = True
 
+    # Non-human subject override:
+    # If prompt is about animals/insects/nature/macro and has NO human subjects,
+    # zero out violence and sexual scores entirely.
+    has_nonhuman = bool(_NONHUMAN_SUBJECTS.search(text_cleaned))
+    has_human = bool(_HUMAN_SUBJECTS.search(text_cleaned))
+    nonhuman_override = False
+
+    if has_nonhuman and not has_human and not has_harmful_verbs:
+        for c in ("violence", "sexual", "horror", "weapons"):
+            if c in cat_scores:
+                cat_scores[c] = 0.0
+                nonhuman_override = True
+
     # Determine decision per category
     block_cats = set()
     warn_cats  = set()
@@ -485,6 +650,9 @@ def check_prompt_safety(
         "safe_context_count": safe_count,
         "has_harmful_verbs": has_harmful_verbs,
         "safe_reduced": safe_reduced,
+        "nonhuman_override": nonhuman_override,
+        "has_nonhuman_subject": has_nonhuman,
+        "has_human_subject": has_human,
         "multiplier": round(total_mult, 2),
         "thresholds_used": {
             cat: _CATEGORY_THRESHOLDS.get(cat, {"warn_at": _DEFAULT_WARN_AT, "block_at": _DEFAULT_BLOCK_AT})
@@ -499,8 +667,17 @@ def check_prompt_safety(
         f"matched={json.dumps([r['rule'] for r in matched_rules])} "
         f"scores={json.dumps({k: round(v, 1) for k, v in cat_scores.items()})} "
         f"safe_ctx={safe_count} harmful_verbs={has_harmful_verbs} "
-        f"reduced={safe_reduced} mult={total_mult:.2f}"
+        f"reduced={safe_reduced} nonhuman={nonhuman_override} mult={total_mult:.2f}"
     )
+
+    # False positive warning: log when a block/warn looks suspicious
+    if decision != "allow" and not has_harmful_verbs and (safe_count >= 4 or nonhuman_override):
+        print(
+            f"[SAFETY_WARNING_FALSE_POSITIVE] decision={decision} categories={triggered_cats} "
+            f"safe_ctx={safe_count} nonhuman={nonhuman_override} harmful_verbs=False "
+            f"scores={json.dumps({k: round(v, 1) for k, v in cat_scores.items()})} "
+            f"matched={json.dumps([r['rule'] for r in matched_rules])}"
+        )
 
     if decision == "allow":
         r = _allow_result()
@@ -514,18 +691,34 @@ def check_prompt_safety(
     penalty = 0
     penalty_notice = None
 
+    # Penalty guardrail: only penalize for high-confidence blocks
+    # (explicit violence/sexual/hate/real_person rules, not ambiguous signals)
+    matched_rule_ids = {r["rule"][:3] for r in matched_rules}
+    is_high_confidence = bool(matched_rule_ids & _HIGH_CONFIDENCE_RULE_PREFIXES)
+
+    # If non-human override was active, this prompt should never have been
+    # blocked/warned — do NOT record strikes or apply penalties.
+    if nonhuman_override:
+        is_high_confidence = False
+
     if not dry_run and user_id:
         if user_id not in _strike_cache:
             _strike_cache[user_id] = _load_strikes_from_db(user_id)
-        strike_count = _record_strike(user_id, decision)
-        if decision == "block":
+
+        # Only record strike if it's NOT a non-human false positive
+        if not nonhuman_override:
+            strike_count = _record_strike(user_id, decision)
+        else:
+            strike_count = _get_strikes_24h(user_id)
+
+        if decision == "block" and is_high_confidence:
             penalty = _compute_penalty(strike_count)
             if penalty > 0:
                 _apply_credit_penalty(user_id, penalty)
                 penalty_notice = f"A {penalty}-credit penalty has been applied. Repeated blocked prompts can lead to increasing penalties."
             elif strike_count >= _PENALTY_FREE_STRIKES:
                 penalty_notice = "Repeated blocked prompts may lead to small credit penalties."
-        elif strike_count >= _PENALTY_FREE_STRIKES:
+        elif strike_count >= _PENALTY_FREE_STRIKES and not nonhuman_override:
             penalty_notice = "Repeated flagged prompts may lead to small credit penalties."
 
     return {

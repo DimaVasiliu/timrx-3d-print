@@ -508,10 +508,12 @@ class WalletService:
             new_balance = current_balance + delta
 
             # 2. Check for negative balance (except for certain types)
-            # Allow negative for holds since they're backed by available balance check
+            # Allow negative for holds (backed by available balance check),
+            # admin adjustments, and safety penalties (system-imposed).
             allow_negative_types = {
                 LedgerEntryType.RESERVATION_HOLD,
                 LedgerEntryType.ADMIN_ADJUST,
+                LedgerEntryType.SAFETY_PENALTY,
             }
             if new_balance < 0 and entry_type not in allow_negative_types:
                 raise ValueError(

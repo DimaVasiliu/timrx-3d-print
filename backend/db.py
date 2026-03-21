@@ -102,6 +102,41 @@ class DatabaseIntegrityError(DatabaseError):
 # ─────────────────────────────────────────────────────────────
 USE_DB = bool(_DATABASE_URL and PSYCOPG_AVAILABLE)
 
+_DB_STARTUP_CHECKED = False
+_DB_STARTUP_READY = False
+_DB_STARTUP_REASON = ""
+
+_DEGRADED_MODE_LIMITATIONS = [
+    {
+        "id": "durable_jobs_history",
+        "summary": (
+            "Jobs and history fall back to per-process local storage only where implemented; "
+            "persistence across restarts or multiple workers is disabled."
+        ),
+    },
+    {
+        "id": "background_recovery",
+        "summary": (
+            "Stale-job recovery, durable worker leadership, pricing seeding, and "
+            "operations/rescue loops do not run without a database."
+        ),
+    },
+    {
+        "id": "identity_wallet_billing",
+        "summary": (
+            "Session-backed identity, wallet, purchases, subscriptions, magic-code email "
+            "restore, and payment/webhook reconciliation require the database."
+        ),
+    },
+    {
+        "id": "community_assets_admin_diagnostics",
+        "summary": (
+            "Community routes, DB-backed asset ownership/proxy checks, and admin/auth "
+            "database diagnostics are unavailable."
+        ),
+    },
+]
+
 if PSYCOPG_AVAILABLE:
     print(f"[DB] psycopg3 available, DATABASE_URL configured: {_HAS_DATABASE}, USE_DB: {USE_DB}")
 else:
@@ -462,6 +497,39 @@ def is_available() -> bool:
     return USE_DB
 
 
+def get_runtime_report() -> Dict[str, Any]:
+    """Return a stable, JSON-friendly view of DB runtime mode."""
+    if not _HAS_DATABASE:
+        reason = "DATABASE_URL is not set"
+    elif not PSYCOPG_AVAILABLE:
+        reason = "psycopg3 is not installed"
+    elif _DB_STARTUP_CHECKED and not _DB_STARTUP_READY:
+        reason = _DB_STARTUP_REASON or "Database startup check failed"
+    elif not _DB_STARTUP_CHECKED:
+        reason = "Database startup check has not run yet"
+    else:
+        reason = ""
+
+    degraded = not _DB_STARTUP_READY
+    return {
+        "configured": _HAS_DATABASE,
+        "driver_available": PSYCOPG_AVAILABLE,
+        "enabled": USE_DB,
+        "startup_checked": _DB_STARTUP_CHECKED,
+        "ready": _DB_STARTUP_READY,
+        "mode": "degraded" if degraded else "full",
+        "reason": reason or None,
+        "disabled_capabilities": list(_DEGRADED_MODE_LIMITATIONS) if degraded else [],
+        "notes": (
+            [
+                "Health means the HTTP service is up; DB-backed persistence is not available in degraded mode."
+            ]
+            if degraded
+            else []
+        ),
+    }
+
+
 def verify_connection() -> bool:
     """
     Test database connectivity.
@@ -502,12 +570,19 @@ def init_db() -> bool:
     Raises:
         DatabaseConnectionError: If database is configured but connection fails
     """
+    global _DB_STARTUP_CHECKED, _DB_STARTUP_READY, _DB_STARTUP_REASON
+    _DB_STARTUP_CHECKED = True
+
     if not _HAS_DATABASE:
         print("[DB] DATABASE_URL not set - running without database")
+        _DB_STARTUP_READY = False
+        _DB_STARTUP_REASON = "DATABASE_URL is not set"
         return False
 
     if not PSYCOPG_AVAILABLE:
         print("[DB] psycopg3 not installed - running without database")
+        _DB_STARTUP_READY = False
+        _DB_STARTUP_REASON = "psycopg3 is not installed"
         return False
 
     # Attempt connection
@@ -516,10 +591,14 @@ def init_db() -> bool:
             print("[DB] Database connection verified successfully")
             # Ensure schema indexes exist for idempotency
             ensure_schema()
+            _DB_STARTUP_READY = True
+            _DB_STARTUP_REASON = ""
             return True
         else:
             raise DatabaseConnectionError("Connection test query failed")
     except DatabaseError as e:
+        _DB_STARTUP_READY = False
+        _DB_STARTUP_REASON = str(e)
         print(f"[DB] ERROR: {e}")
         raise
 
@@ -658,6 +737,7 @@ __all__ = [
     # Utilities
     "hash_string",
     "is_available",
+    "get_runtime_report",
     "verify_connection",
     "require_db",
     "init_db",

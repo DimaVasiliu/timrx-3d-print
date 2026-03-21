@@ -31,11 +31,28 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
     "OPENAI_IMAGE":       0.04,
     "OPENAI_IMAGE_2K":    0.08,
     "OPENAI_IMAGE_4K":    0.12,
+    # Long-form codes (match action keys stored in jobs table by image_gen.py):
+    "IMAGE_GENERATE":     0.04,
+    "IMAGE_GENERATE_2K":  0.08,
 
     # Gemini / Google image generation (Imagen 4.0)
     "GEMINI_IMAGE":       0.035,
     "GEMINI_IMAGE_2K":    0.07,
     "GEMINI_IMAGE_4K":    0.10,
+    # Long-form codes (match action keys stored in jobs table by image_gen.py):
+    "GEMINI_IMAGE_GENERATE":     0.035,
+    "GEMINI_IMAGE_GENERATE_2K":  0.07,
+
+    # PiAPI Nano Banana 2 image generation
+    # ESTIMATES — verify against PiAPI billing dashboard.
+    # PiAPI charges per-task; values below are conservative GBP estimates.
+    "PIAPI_IMAGE":              0.04,
+    "PIAPI_IMAGE_2K":           0.06,
+    "PIAPI_IMAGE_4K":           0.10,
+    # Long-form codes (match action keys stored in jobs table by image_gen.py):
+    "PIAPI_IMAGE_GENERATE":     0.04,
+    "PIAPI_IMAGE_GENERATE_2K":  0.06,
+    "PIAPI_IMAGE_GENERATE_4K":  0.10,
 }
 
 

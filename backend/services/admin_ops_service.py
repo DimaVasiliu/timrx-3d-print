@@ -19,6 +19,7 @@ _PROVIDER_FEATURES: Dict[str, str] = {
     "meshy":        "3d",
     "openai":       "image",
     "google":       "image",
+    "nano_banana":  "image",
     "vertex":       "video",
     "seedance":     "video",
     "fal_seedance": "video",
@@ -251,6 +252,16 @@ def _check_provider_configs() -> Dict[str, Dict]:
         }
     except Exception:
         results["google"] = {"configured": False, "error": "check failed"}
+
+    # Nano Banana (PiAPI) — shares PIAPI_API_KEY with Seedance
+    try:
+        import os
+        results["nano_banana"] = {
+            "configured": bool(os.getenv("PIAPI_API_KEY")),
+            "error": None if os.getenv("PIAPI_API_KEY") else "PIAPI_API_KEY not set",
+        }
+    except Exception:
+        results["nano_banana"] = {"configured": False, "error": "check failed"}
 
     # Vertex
     try:

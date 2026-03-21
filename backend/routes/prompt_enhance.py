@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request
 
-from backend.middleware import with_session
+from backend.middleware import require_admin, with_session
 from backend.services.prompt_enhance_service import (
     enhance_prompt,
     PromptEnhanceError,
@@ -171,7 +171,7 @@ def safety_check_dry_run():
 
 
 @bp.route("/safety-analytics", methods=["GET", "OPTIONS"])
-@with_session
+@require_admin
 def safety_analytics():
     """
     Admin/debug endpoint: aggregate safety data.
