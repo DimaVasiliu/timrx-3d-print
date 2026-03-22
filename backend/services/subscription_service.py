@@ -112,10 +112,14 @@ def cron_lock(job_name: str, timeout_minutes: int = 10):
 #   Studio:  20 concurrent jobs, pro priority
 
 SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
-    # ── MONTHLY PLANS ──
+    # ── MONTHLY PLANS — Pricing refactor Mar 2026 ──
+    # VIDEO BRIDGE: Every subscription now includes bonus video credits/month.
+    # video_credits_per_month is granted as CreditType.VIDEO alongside the
+    # general credits_per_month (CreditType.GENERAL).
     "starter_monthly": {
         "name": "Starter",
-        "credits_per_month": 400,
+        "credits_per_month": 300,               # General credits (was 400)
+        "video_credits_per_month": 100,         # Video bridge credits (NEW)
         "price_gbp": 9.99,
         "cadence": "monthly",
         "tier": "starter",
@@ -124,7 +128,8 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
     },
     "creator_monthly": {
         "name": "Creator",
-        "credits_per_month": 1300,
+        "credits_per_month": 800,               # General credits (was 1300)
+        "video_credits_per_month": 300,         # Video bridge credits (NEW)
         "price_gbp": 24.99,
         "cadence": "monthly",
         "tier": "creator",
@@ -133,19 +138,21 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
     },
     "studio_monthly": {
         "name": "Studio",
-        "credits_per_month": 3200,
+        "credits_per_month": 2000,              # General credits (was 3200)
+        "video_credits_per_month": 800,         # Video bridge credits (NEW)
         "price_gbp": 49.99,
         "cadence": "monthly",
         "tier": "studio",
         "max_concurrent_jobs": 20,
         "queue_priority": "pro",
     },
-    # ── YEARLY PLANS (monthly credit distribution) ──
-    # Credits distributed monthly: 400/1300/3200 per month for 12 months
+    # ── YEARLY PLANS (monthly credit distribution) — Pricing refactor Mar 2026 ──
     "starter_yearly": {
         "name": "Starter",
-        "credits_per_month": 400,       # 4800/year ÷ 12 months
-        "credits_total_yearly": 4800,   # Total for UI display
+        "credits_per_month": 300,               # General: 3600/year ÷ 12
+        "video_credits_per_month": 100,         # Video: 1200/year ÷ 12
+        "credits_total_yearly": 3600,           # General total for UI
+        "video_credits_total_yearly": 1200,     # Video total for UI
         "price_gbp": 99.00,
         "cadence": "yearly",
         "tier": "starter",
@@ -154,8 +161,10 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
     },
     "creator_yearly": {
         "name": "Creator",
-        "credits_per_month": 1300,      # 15600/year ÷ 12 months
-        "credits_total_yearly": 15600,
+        "credits_per_month": 800,               # General: 9600/year ÷ 12
+        "video_credits_per_month": 300,         # Video: 3600/year ÷ 12
+        "credits_total_yearly": 9600,
+        "video_credits_total_yearly": 3600,
         "price_gbp": 249.00,
         "cadence": "yearly",
         "tier": "creator",
@@ -164,8 +173,10 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
     },
     "studio_yearly": {
         "name": "Studio",
-        "credits_per_month": 3200,      # 38400/year ÷ 12 months
-        "credits_total_yearly": 38400,
+        "credits_per_month": 2000,              # General: 24000/year ÷ 12
+        "video_credits_per_month": 800,         # Video: 9600/year ÷ 12
+        "credits_total_yearly": 24000,
+        "video_credits_total_yearly": 9600,
         "price_gbp": 499.00,
         "cadence": "yearly",
         "tier": "studio",
@@ -593,38 +604,62 @@ class SubscriptionService:
                             (subscription_id,),
                         )
 
-                    # Add credits via ledger (with credit_type based on plan)
+                    # Add GENERAL credits via ledger
                     # Use stable ref_id hash for idempotency across retries
-                    from backend.services.wallet_service import WalletService, get_credit_type_for_plan
-                    credit_type = get_credit_type_for_plan(sub["plan_code"])
+                    from backend.services.wallet_service import WalletService, CreditType as _CT
                     stable_ref_id = _stable_grant_ref_id(subscription_id, period_start, sub["plan_code"])
+
+                    _grant_meta = {
+                        "subscription_id": subscription_id,
+                        "cycle_id": cycle_id,
+                        "plan_code": sub["plan_code"],
+                        "period_start": period_start.isoformat(),
+                        "period_end": period_end.isoformat(),
+                        "provider_payment_id": provider_payment_id,
+                    }
 
                     WalletService.add_credits(
                         identity_id,
                         credits_amount,
                         entry_type="subscription_grant",
-                        ref_type="subscription_grant",  # Changed from subscription_cycle
-                        ref_id=stable_ref_id,  # Stable hash instead of cycle_id
-                        meta={
-                            "subscription_id": subscription_id,
-                            "cycle_id": cycle_id,
-                            "plan_code": sub["plan_code"],
-                            "period_start": period_start.isoformat(),
-                            "period_end": period_end.isoformat(),
-                            "provider_payment_id": provider_payment_id,
-                        },
-                        credit_type=credit_type,
+                        ref_type="subscription_grant",
+                        ref_id=stable_ref_id,
+                        meta=_grant_meta,
+                        credit_type=_CT.GENERAL,
                     )
 
+                    # ── VIDEO BRIDGE: grant bonus video credits if plan includes them ──
+                    video_credits_amount = plan.get("video_credits_per_month", 0)
+                    if video_credits_amount > 0:
+                        video_ref_id = _stable_grant_ref_id(
+                            subscription_id, period_start, sub["plan_code"] + "_video"
+                        )
+                        WalletService.add_credits(
+                            identity_id,
+                            video_credits_amount,
+                            entry_type="subscription_grant",
+                            ref_type="subscription_grant",
+                            ref_id=video_ref_id,
+                            meta={**_grant_meta, "credit_pool": "video_bridge"},
+                            credit_type=_CT.VIDEO,
+                        )
+
                 conn.commit()
+
+                _video_msg = ""
+                video_credits_amount = plan.get("video_credits_per_month", 0)
+                if video_credits_amount > 0:
+                    _video_msg = f" + {video_credits_amount} video"
                 print(
-                    f"[SUB] Granted {credits_amount} credits for subscription {subscription_id} "
+                    f"[SUB] Granted {credits_amount} general{_video_msg} credits "
+                    f"for subscription {subscription_id} "
                     f"period {period_start.date()} → {period_end.date()} "
                     f"(payment: {provider_payment_id or 'N/A'})"
                 )
                 return {
                     "cycle_id": cycle_id,
                     "credits_granted": credits_amount,
+                    "video_credits_granted": video_credits_amount,
                     "subscription_id": subscription_id,
                     "identity_id": identity_id,
                     "period_start": period_start,

@@ -6,20 +6,22 @@ incrementally without changing the credit/identity pipeline semantics.
 
 CANONICAL ACTION KEYS:
 Use these canonical keys when calling start_paid_job():
-- image_generate          (10c) - OpenAI standard image (1K)
-- image_generate_2k       (15c) - OpenAI 2K image
-- gemini_image_generate   (10c) - Gemini standard image (1K)
-- gemini_image_generate_2k(15c) - Gemini 2K image
-- piapi_image_generate    (15c) - Nano Banana standard image (1K, premium)
-- piapi_image_generate_2k (20c) - Nano Banana 2K image (premium)
+- image_generate          (4c)  - OpenAI standard image (1K)
+- image_generate_2k       (8c)  - OpenAI 2K image
+- image_generate_4k       (12c) - OpenAI 4K image
+- gemini_image_generate   (4c)  - Gemini standard image (1K)
+- gemini_image_generate_2k(8c)  - Gemini 2K image
+- piapi_image_generate    (7c)  - Nano Banana standard image (1K, premium)
+- piapi_image_generate_2k (12c) - Nano Banana 2K image (premium)
+- piapi_image_generate_4k (18c) - Nano Banana 4K image (premium exclusive)
 - text_to_3d_generate  (20c) - Text to 3D preview
 - image_to_3d_generate (30c) - Image to 3D
-- refine               (10c) - Refine 3D model
-- remesh               (10c) - Remesh 3D model
-- retexture            (15c) - Retexture 3D model
-- video_generate       (75c) - Video generation
-- video_text_generate  (75c) - Text to video
-- video_image_animate  (110c) - Image to video
+- refine               (5c)  - Refine 3D model
+- remesh               (5c)  - Remesh 3D model
+- retexture            (4c)  - Retexture 3D model
+- video_generate       (80c) - Video generation
+- video_text_generate  (80c) - Text to video
+- video_image_animate  (80c) - Image to video (equalized)
 
 Legacy aliases are supported for backwards compatibility but will be
 normalized to canonical keys internally.

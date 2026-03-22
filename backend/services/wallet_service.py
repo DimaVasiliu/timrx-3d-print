@@ -69,49 +69,50 @@ VIDEO_ACTION_CODES = {
     "video_text_generate",
     "video_image_animate",
     "gemini_video",
-    # Text-to-Video variants (duration_resolution)
-    "video_text_generate_4s_720p",   # 75 credits
-    "video_text_generate_6s_720p",   # 100 credits
-    "video_text_generate_8s_720p",   # 125 credits
-    "video_text_generate_8s_1080p",  # 150 credits
-    "video_text_generate_8s_4k",     # 200 credits
-    # Image-to-Video variants (duration_resolution)
-    "video_image_animate_4s_720p",   # 110 credits
-    "video_image_animate_6s_720p",   # 140 credits
-    "video_image_animate_8s_720p",   # 170 credits
-    "video_image_animate_8s_1080p",  # 200 credits
-    "video_image_animate_8s_4k",     # 250 credits
-    # Image Transition (two-image, first+last frame) — same pricing as image animate
-    "video_image_transition_4s_720p",   # 110 credits
-    "video_image_transition_6s_720p",   # 140 credits
-    "video_image_transition_8s_720p",   # 170 credits
-    "video_image_transition_8s_1080p",  # 200 credits
-    "video_image_transition_8s_4k",     # 250 credits
-    # Seedance 2.0 — Text-to-Video (Fast / Preview)
-    "seedance_fast_text_generate_5s",       # 80 credits
-    "seedance_fast_text_generate_10s",      # 150 credits
-    "seedance_fast_text_generate_15s",      # 225 credits
-    "seedance_preview_text_generate_5s",    # 125 credits
-    "seedance_preview_text_generate_10s",   # 250 credits
-    "seedance_preview_text_generate_15s",   # 375 credits
-    # Seedance 2.0 — Image-to-Video (same prices as text per tier)
-    "seedance_fast_image_animate_5s",       # 80 credits
-    "seedance_fast_image_animate_10s",      # 150 credits
-    "seedance_fast_image_animate_15s",      # 225 credits
-    "seedance_preview_image_animate_5s",    # 125 credits
-    "seedance_preview_image_animate_10s",   # 250 credits
-    "seedance_preview_image_animate_15s",   # 375 credits
-    # fal Seedance 1.5 Pro
-    "fal_seedance_text_generate_5s",        # 80 credits
-    "fal_seedance_text_generate_10s",       # 150 credits
-    "fal_seedance_text_generate_12s",       # 180 credits
-    "fal_seedance_image_animate_5s",        # 80 credits
-    "fal_seedance_image_animate_10s",       # 150 credits
-    "fal_seedance_image_animate_12s",       # 180 credits
-    # fal Seedance 1.5 Pro — Image Transition
-    "fal_seedance_image_transition_5s",     # 80 credits
-    "fal_seedance_image_transition_10s",    # 150 credits
-    "fal_seedance_image_transition_12s",    # 180 credits
+    # Text-to-Video variants — Vertex 12 c/s (margin-stabilized)
+    "video_text_generate_4s_720p",   # 48 credits
+    "video_text_generate_6s_720p",   # 72 credits
+    "video_text_generate_8s_720p",   # 96 credits
+    "video_text_generate_8s_1080p",  # 120 credits
+    "video_text_generate_8s_4k",     # 156 credits
+    # Image-to-Video variants — equalized with text-to-video
+    "video_image_animate_4s_720p",   # 48 credits
+    "video_image_animate_6s_720p",   # 72 credits
+    "video_image_animate_8s_720p",   # 96 credits
+    "video_image_animate_8s_1080p",  # 120 credits
+    "video_image_animate_8s_4k",     # 156 credits
+    # Image Transition — equalized with text-to-video
+    "video_image_transition_4s_720p",   # 48 credits
+    "video_image_transition_6s_720p",   # 72 credits
+    "video_image_transition_8s_720p",   # 96 credits
+    "video_image_transition_8s_1080p",  # 120 credits
+    "video_image_transition_8s_4k",     # 156 credits
+    # Seedance 2.0 Fast — STANDARD tier (10 c/s)
+    "seedance_fast_text_generate_5s",       # 50 credits
+    "seedance_fast_text_generate_10s",      # 100 credits
+    "seedance_fast_text_generate_15s",      # 150 credits
+    # Seedance 2.0 Preview — PREMIUM tier (16 c/s)
+    "seedance_preview_text_generate_5s",    # 80 credits
+    "seedance_preview_text_generate_10s",   # 160 credits
+    "seedance_preview_text_generate_15s",   # 240 credits
+    # Seedance 2.0 — Image-to-Video (equalized per tier)
+    "seedance_fast_image_animate_5s",       # 50 credits
+    "seedance_fast_image_animate_10s",      # 100 credits
+    "seedance_fast_image_animate_15s",      # 150 credits
+    "seedance_preview_image_animate_5s",    # 80 credits
+    "seedance_preview_image_animate_10s",   # 160 credits
+    "seedance_preview_image_animate_15s",   # 240 credits
+    # fal Seedance 1.5 Pro — BUDGET tier (8–9 c/s)
+    "fal_seedance_text_generate_5s",        # 45 credits
+    "fal_seedance_text_generate_10s",       # 80 credits
+    "fal_seedance_text_generate_12s",       # 95 credits
+    "fal_seedance_image_animate_5s",        # 45 credits
+    "fal_seedance_image_animate_10s",       # 80 credits
+    "fal_seedance_image_animate_12s",       # 95 credits
+    # fal Seedance 1.5 Pro — Image Transition (equalized)
+    "fal_seedance_image_transition_5s",     # 45 credits
+    "fal_seedance_image_transition_10s",    # 80 credits
+    "fal_seedance_image_transition_12s",    # 95 credits
 }
 
 # Action codes that use GENERAL credits (3D + images)
@@ -170,9 +171,9 @@ KNOWN_ACTION_CODES = VIDEO_ACTION_CODES | GENERAL_ACTION_CODES
 
 # Video plan codes — grant VIDEO credits (separate pool, sold separately)
 VIDEO_PLAN_CODES = {
-    "video_starter_300",   # £9.99 → 300 video credits
-    "video_creator_900",   # £29.99 → 900 video credits
-    "video_studio_2000",   # £59.99 → 2000 video credits
+    "video_starter_300",   # £9.99 → 550 video credits  (refactor Mar 2026)
+    "video_creator_900",   # £29.99 → 1800 video credits (refactor Mar 2026)
+    "video_studio_2000",   # £59.99 → 4000 video credits (refactor Mar 2026)
 }
 
 # Plan codes that grant GENERAL credits (one-time purchases)
@@ -182,17 +183,18 @@ GENERAL_PLAN_CODES = {
     "studio_2200",
 }
 
-# Subscription plan codes that grant GENERAL credits (recurring)
+# Subscription plan codes that grant GENERAL + VIDEO credits (recurring)
 # Credit amounts defined in subscription_service.py SUBSCRIPTION_PLANS
+# Video bridge: subscriptions now include bonus video credits per month
 SUBSCRIPTION_PLAN_CODES = {
     # Monthly subscriptions
-    "starter_monthly",   # 400 credits/month
-    "creator_monthly",   # 1300 credits/month
-    "studio_monthly",    # 3200 credits/month
+    "starter_monthly",   # 300 general + 100 video credits/month (refactor Mar 2026)
+    "creator_monthly",   # 800 general + 300 video credits/month (refactor Mar 2026)
+    "studio_monthly",    # 2000 general + 800 video credits/month (refactor Mar 2026)
     # Yearly subscriptions (credits released monthly)
-    "starter_yearly",    # 400 credits/month × 12
-    "creator_yearly",    # 1300 credits/month × 12
-    "studio_yearly",     # 3200 credits/month × 12
+    "starter_yearly",    # 300 general + 100 video credits/month × 12
+    "creator_yearly",    # 800 general + 300 video credits/month × 12
+    "studio_yearly",     # 2000 general + 800 video credits/month × 12
 }
 
 # All known plan codes (union of video + general + subscription)

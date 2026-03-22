@@ -8,22 +8,24 @@ Responsibilities:
 - Normalize action keys to canonical form
 
 CANONICAL ACTION KEYS (use these in new code):
-- image_generate          (10c) - OpenAI standard image (1K)
-- image_generate_2k       (15c) - OpenAI 2K image
-- gemini_image_generate   (10c) - Gemini standard image (1K)
-- gemini_image_generate_2k(15c) - Gemini 2K image
-- piapi_image_generate    (15c) - Nano Banana standard image (1K) — PREMIUM
-- piapi_image_generate_2k (20c) - Nano Banana 2K image — PREMIUM
+- image_generate          (4c)  - OpenAI standard image (1K)
+- image_generate_2k       (8c)  - OpenAI 2K image
+- image_generate_4k       (12c) - OpenAI 4K image
+- gemini_image_generate   (4c)  - Gemini standard image (1K)
+- gemini_image_generate_2k(8c)  - Gemini 2K image
+- piapi_image_generate    (7c)  - Nano Banana standard image (1K) — PREMIUM
+- piapi_image_generate_2k (12c) - Nano Banana 2K image — PREMIUM
+- piapi_image_generate_4k (18c) - Nano Banana 4K image — PREMIUM EXCLUSIVE
 - text_to_3d_generate  (20c) - Text to 3D preview generation
 - image_to_3d_generate (30c) - Image to 3D conversion
-- refine               (10c) - Refine/upscale 3D model
-- remesh               (10c) - Remesh 3D model (same cost as refine)
-- retexture            (15c) - Apply new texture to 3D model
-- rigging              (15c) - Rig a 3D model for animation  [TimrX internal cost; Meshy API charges 5 credits]
-- animation            (10c) - Animate a rigged 3D model     [TimrX internal cost; Meshy API charges 3 credits]
-- video_generate       (75c) - Generic video generation
-- video_text_generate  (75c) - Text-to-video generation
-- video_image_animate  (110c) - Image-to-video animation
+- refine               (6c)  - Refine/upscale 3D model
+- remesh               (6c)  - Remesh 3D model (same cost as refine)
+- retexture            (5c)  - Apply new texture to 3D model
+- rigging              (5c)  - Rig a 3D model for animation
+- animation            (3c)  - Animate a rigged 3D model
+- video_generate       (96c) - Generic video generation (Vertex 8s 720p base)
+- video_text_generate  (96c) - Text-to-video generation
+- video_image_animate  (96c) - Image-to-video (equalized with text-to-video)
 
 LEGACY ALIASES (backwards compatibility only):
 - preview, text-to-3d, text-to-3d-preview -> text_to_3d_generate
@@ -48,17 +50,17 @@ from backend.db import query_one, query_all, execute, Tables
 # Canonical action keys (use these in all new code)
 class CanonicalActions:
     """Canonical action key constants."""
-    # Image generation — OpenAI (default/cheapest tier)
-    IMAGE_GENERATE = "image_generate"                      # OpenAI standard 1K (10c)
-    IMAGE_GENERATE_2K = "image_generate_2k"                # OpenAI 2K (15c)
-    IMAGE_GENERATE_4K = "image_generate_4k"                # OpenAI 4K (20c)
+    # Image generation — OpenAI (standard tier)
+    IMAGE_GENERATE = "image_generate"                      # OpenAI standard 1K (4c)
+    IMAGE_GENERATE_2K = "image_generate_2k"                # OpenAI 2K (8c)
+    IMAGE_GENERATE_4K = "image_generate_4k"                # OpenAI 4K (12c)
     # Image generation — Gemini (same price as OpenAI)
-    GEMINI_IMAGE_GENERATE = "gemini_image_generate"        # Gemini standard 1K (10c)
-    GEMINI_IMAGE_GENERATE_2K = "gemini_image_generate_2k"  # Gemini 2K (15c)
+    GEMINI_IMAGE_GENERATE = "gemini_image_generate"        # Gemini standard 1K (4c)
+    GEMINI_IMAGE_GENERATE_2K = "gemini_image_generate_2k"  # Gemini 2K (8c)
     # Image generation — Nano Banana PREMIUM
-    PIAPI_IMAGE_GENERATE = "piapi_image_generate"          # Nano Banana standard 1K (15c)
-    PIAPI_IMAGE_GENERATE_2K = "piapi_image_generate_2k"    # Nano Banana 2K (20c)
-    PIAPI_IMAGE_GENERATE_4K = "piapi_image_generate_4k"    # Nano Banana 4K (30c) — EXCLUSIVE
+    PIAPI_IMAGE_GENERATE = "piapi_image_generate"          # Nano Banana standard 1K (7c)
+    PIAPI_IMAGE_GENERATE_2K = "piapi_image_generate_2k"    # Nano Banana 2K (12c)
+    PIAPI_IMAGE_GENERATE_4K = "piapi_image_generate_4k"    # Nano Banana 4K (18c) — EXCLUSIVE
     # 3D generation
     TEXT_TO_3D_GENERATE = "text_to_3d_generate"
     IMAGE_TO_3D_GENERATE = "image_to_3d_generate"
@@ -268,79 +270,81 @@ def get_db_action_code_from_canonical(canonical_key: str) -> Optional[str]:
 
 # Default action costs to seed into the database
 DEFAULT_ACTION_COSTS = [
-    # 3D Generation
+    # ── 3D Generation (target ~3–5x markup) ──
     {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
     {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
-    {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
-    {"action_code": "MESHY_RETEXTURE", "cost_credits": 15, "provider": "meshy"},
-    {"action_code": "MESHY_RIGGING", "cost_credits": 15, "provider": "meshy"},
-    {"action_code": "MESHY_ANIMATION", "cost_credits": 10, "provider": "meshy"},
-    # Image Generation — OpenAI (10c / 15c / 20c)
-    {"action_code": "OPENAI_IMAGE", "cost_credits": 10, "provider": "openai"},       # Standard 1K
-    {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 15, "provider": "openai"},    # 2K
-    {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 20, "provider": "openai"},    # 4K
-    # Image Generation — Google Imagen (10c / 15c / 20c — same as OpenAI)
-    {"action_code": "GEMINI_IMAGE", "cost_credits": 10, "provider": "google"},       # Standard 1K
-    {"action_code": "GEMINI_IMAGE_2K", "cost_credits": 15, "provider": "google"},    # 2K
-    {"action_code": "GEMINI_IMAGE_4K", "cost_credits": 20, "provider": "google"},    # 4K
-    # Image Generation — PiAPI Nano Banana PREMIUM (15c / 20c / 30c)
-    {"action_code": "PIAPI_IMAGE", "cost_credits": 15, "provider": "nano_banana"},       # Standard 1K
-    {"action_code": "PIAPI_IMAGE_2K", "cost_credits": 20, "provider": "nano_banana"},    # 2K
-    {"action_code": "PIAPI_IMAGE_4K", "cost_credits": 30, "provider": "nano_banana"},    # 4K — EXCLUSIVE to Nano Banana
-    # Video Generation - Vertex (Veo) variant costs by duration/resolution
-    # Text-to-Video variants
-    {"action_code": "video_text_generate_4s_720p", "cost_credits": 75, "provider": "vertex"},
-    {"action_code": "video_text_generate_6s_720p", "cost_credits": 100, "provider": "vertex"},
-    {"action_code": "video_text_generate_8s_720p", "cost_credits": 125, "provider": "vertex"},
-    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 150, "provider": "vertex"},
-    {"action_code": "video_text_generate_8s_4k", "cost_credits": 200, "provider": "vertex"},
-    # Image-to-Video (animate) variants — premium over text-to-video
-    {"action_code": "video_image_animate_4s_720p", "cost_credits": 110, "provider": "vertex"},
-    {"action_code": "video_image_animate_6s_720p", "cost_credits": 140, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_720p", "cost_credits": 170, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 200, "provider": "vertex"},
-    {"action_code": "video_image_animate_8s_4k", "cost_credits": 250, "provider": "vertex"},
-    # Image Transition (two-image, first+last frame) — same pricing as image animate
-    {"action_code": "video_image_transition_4s_720p", "cost_credits": 110, "provider": "vertex"},
-    {"action_code": "video_image_transition_6s_720p", "cost_credits": 140, "provider": "vertex"},
-    {"action_code": "video_image_transition_8s_720p", "cost_credits": 170, "provider": "vertex"},
-    {"action_code": "video_image_transition_8s_1080p", "cost_credits": 200, "provider": "vertex"},
-    {"action_code": "video_image_transition_8s_4k", "cost_credits": 250, "provider": "vertex"},
-    # ── Seedance 2.0 — Text-to-Video (Fast / Preview) ──
-    {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 80, "provider": "seedance"},
-    {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 150, "provider": "seedance"},
-    {"action_code": "seedance_fast_text_generate_15s", "cost_credits": 225, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_5s", "cost_credits": 125, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_10s", "cost_credits": 250, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_15s", "cost_credits": 375, "provider": "seedance"},
-    # ── Seedance 2.0 — Image-to-Video (same prices as text-to-video per tier) ──
-    {"action_code": "seedance_fast_image_animate_5s", "cost_credits": 80, "provider": "seedance"},
-    {"action_code": "seedance_fast_image_animate_10s", "cost_credits": 150, "provider": "seedance"},
-    {"action_code": "seedance_fast_image_animate_15s", "cost_credits": 225, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 125, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 250, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 375, "provider": "seedance"},
-    # ── fal Seedance 1.5 Pro — Text-to-Video ──
-    {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 80, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 150, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_text_generate_12s", "cost_credits": 180, "provider": "fal_seedance"},
-    # ── fal Seedance 1.5 Pro — Image-to-Video ──
-    {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 80, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 150, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_image_animate_12s", "cost_credits": 180, "provider": "fal_seedance"},
-    # ── fal Seedance 1.5 Pro — Image Transition ──
-    {"action_code": "fal_seedance_image_transition_5s", "cost_credits": 80, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_image_transition_10s", "cost_credits": 150, "provider": "fal_seedance"},
-    {"action_code": "fal_seedance_image_transition_12s", "cost_credits": 180, "provider": "fal_seedance"},
-    # Legacy fallback codes (backward compat — provider label kept generic)
-    {"action_code": "VIDEO_GENERATE", "cost_credits": 75, "provider": "vertex"},
-    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 75, "provider": "vertex"},
-    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 110, "provider": "vertex"},
-    {"action_code": "GEMINI_VIDEO", "cost_credits": 80, "provider": "vertex"},  # Legacy — retained for DB compat only
+    {"action_code": "MESHY_REFINE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_RETEXTURE", "cost_credits": 5, "provider": "meshy"},
+    {"action_code": "MESHY_RIGGING", "cost_credits": 5, "provider": "meshy"},
+    {"action_code": "MESHY_ANIMATION", "cost_credits": 3, "provider": "meshy"},
+    # ── Image Generation — OpenAI (4c / 8c / 12c) ──
+    {"action_code": "OPENAI_IMAGE", "cost_credits": 4, "provider": "openai"},        # Standard 1K
+    {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 8, "provider": "openai"},     # 2K
+    {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 12, "provider": "openai"},    # 4K
+    # ── Image Generation — Google Imagen (4c / 8c / 12c — same as OpenAI) ──
+    {"action_code": "GEMINI_IMAGE", "cost_credits": 4, "provider": "google"},        # Standard 1K
+    {"action_code": "GEMINI_IMAGE_2K", "cost_credits": 8, "provider": "google"},     # 2K
+    {"action_code": "GEMINI_IMAGE_4K", "cost_credits": 12, "provider": "google"},    # 4K
+    # ── Image Generation — PiAPI Nano Banana PREMIUM (7c / 12c / 18c) ──
+    {"action_code": "PIAPI_IMAGE", "cost_credits": 7, "provider": "nano_banana"},        # Standard 1K
+    {"action_code": "PIAPI_IMAGE_2K", "cost_credits": 12, "provider": "nano_banana"},    # 2K
+    {"action_code": "PIAPI_IMAGE_4K", "cost_credits": 18, "provider": "nano_banana"},    # 4K — EXCLUSIVE
+    # ── Video — Vertex (Veo 3.1) — 12 credits/sec (margin-stabilized) ──
+    # All modes equalized: text→video == image→video == transition (API cost identical)
+    # Text-to-Video
+    {"action_code": "video_text_generate_4s_720p", "cost_credits": 48, "provider": "vertex"},
+    {"action_code": "video_text_generate_6s_720p", "cost_credits": 72, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_720p", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_1080p", "cost_credits": 120, "provider": "vertex"},
+    {"action_code": "video_text_generate_8s_4k", "cost_credits": 156, "provider": "vertex"},
+    # Image-to-Video (equalized — same cost as text-to-video)
+    {"action_code": "video_image_animate_4s_720p", "cost_credits": 48, "provider": "vertex"},
+    {"action_code": "video_image_animate_6s_720p", "cost_credits": 72, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_720p", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_1080p", "cost_credits": 120, "provider": "vertex"},
+    {"action_code": "video_image_animate_8s_4k", "cost_credits": 156, "provider": "vertex"},
+    # Image Transition (equalized — same cost as text-to-video)
+    {"action_code": "video_image_transition_4s_720p", "cost_credits": 48, "provider": "vertex"},
+    {"action_code": "video_image_transition_6s_720p", "cost_credits": 72, "provider": "vertex"},
+    {"action_code": "video_image_transition_8s_720p", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "video_image_transition_8s_1080p", "cost_credits": 120, "provider": "vertex"},
+    {"action_code": "video_image_transition_8s_4k", "cost_credits": 156, "provider": "vertex"},
+    # ── Seedance 2.0 Fast — STANDARD tier (10 credits/sec) ──
+    {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 50, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_15s", "cost_credits": 150, "provider": "seedance"},
+    # ── Seedance 2.0 Preview — PREMIUM tier (16 credits/sec) ──
+    {"action_code": "seedance_preview_text_generate_5s", "cost_credits": 80, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_10s", "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_15s", "cost_credits": 240, "provider": "seedance"},
+    # ── Seedance 2.0 — Image-to-Video (equalized with text-to-video per tier) ──
+    {"action_code": "seedance_fast_image_animate_5s", "cost_credits": 50, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_10s", "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_15s", "cost_credits": 150, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 80, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 240, "provider": "seedance"},
+    # ── fal Seedance 1.5 Pro — BUDGET tier (8–9 credits/sec) ──
+    {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 45, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 80, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_text_generate_12s", "cost_credits": 95, "provider": "fal_seedance"},
+    # ── fal Seedance 1.5 Pro — Image-to-Video (equalized) ──
+    {"action_code": "fal_seedance_image_animate_5s", "cost_credits": 45, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_animate_10s", "cost_credits": 80, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_animate_12s", "cost_credits": 95, "provider": "fal_seedance"},
+    # ── fal Seedance 1.5 Pro — Image Transition (equalized) ──
+    {"action_code": "fal_seedance_image_transition_5s", "cost_credits": 45, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_transition_10s", "cost_credits": 80, "provider": "fal_seedance"},
+    {"action_code": "fal_seedance_image_transition_12s", "cost_credits": 95, "provider": "fal_seedance"},
+    # ── Legacy fallback codes (backward compat — Vertex 8s 720p base = 96) ──
+    {"action_code": "VIDEO_GENERATE", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "VIDEO_TEXT_GENERATE", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "VIDEO_IMAGE_ANIMATE", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "GEMINI_VIDEO", "cost_credits": 96, "provider": "vertex"},
     # Lowercase legacy codes
-    {"action_code": "video_generate", "cost_credits": 75, "provider": "vertex"},
-    {"action_code": "video_text_generate", "cost_credits": 75, "provider": "vertex"},
-    {"action_code": "video_image_animate", "cost_credits": 110, "provider": "vertex"},
+    {"action_code": "video_generate", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "video_text_generate", "cost_credits": 96, "provider": "vertex"},
+    {"action_code": "video_image_animate", "cost_credits": 96, "provider": "vertex"},
 ]
 
 
@@ -349,36 +353,40 @@ DEFAULT_ACTION_COSTS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Video credit costs by resolution and duration (must match frontend)
+# Vertex Veo 3.1: 12 credits/sec (margin-stabilized). All modes equalized.
 # 4K requires VERTEX_ALLOW_4K env var — backend rejects if not allowlisted.
 VIDEO_CREDIT_COSTS = {
-    "720p": {4: 75, 6: 100, 8: 125},
-    "1080p": {8: 150},
-    "4k": {8: 200},
+    "720p": {4: 48, 6: 72, 8: 96},
+    "1080p": {8: 120},
+    "4k": {8: 156},
 }
 
-# Image-to-Video / Image Transition costs (premium over text-to-video)
+# Image-to-Video / Image Transition costs — EQUALIZED with text-to-video
+# (API cost is identical across modes for Vertex)
 VIDEO_IMAGE_CREDIT_COSTS = {
-    "720p": {4: 110, 6: 140, 8: 170},
-    "1080p": {8: 200},
-    "4k": {8: 250},
+    "720p": {4: 48, 6: 72, 8: 96},
+    "1080p": {8: 120},
+    "4k": {8: 156},
 }
 
 # Seedance 2.0 credit costs by tier and duration (explicit lookup, DB is authoritative)
+# Fast = STANDARD tier (10 credits/sec), Preview = PREMIUM tier (16 credits/sec)
 SEEDANCE_CREDIT_COSTS = {
-    "fast": {5: 80, 10: 150, 15: 225},
-    "preview": {5: 125, 10: 250, 15: 375},
+    "fast": {5: 50, 10: 100, 15: 150},
+    "preview": {5: 80, 10: 160, 15: 240},
 }
 # Approximate CPS for fallback only (DB values are authoritative)
 SEEDANCE_CREDITS_PER_SEC = {
-    "fast": 16,
-    "preview": 25,
+    "fast": 10,
+    "preview": 16,
 }
 SEEDANCE_VALID_DURATIONS = [5, 10, 15]
 
 # fal Seedance 1.5 Pro credit costs by duration (explicit lookup, DB is authoritative)
-FAL_SEEDANCE_CREDIT_COSTS = {5: 80, 10: 150, 12: 180}
+# BUDGET tier: 8–9 credits/sec
+FAL_SEEDANCE_CREDIT_COSTS = {5: 45, 10: 80, 12: 95}
 # Approximate CPS for fallback only (DB values are authoritative)
-FAL_SEEDANCE_CREDITS_PER_SEC = 16
+FAL_SEEDANCE_CREDITS_PER_SEC = 8
 FAL_SEEDANCE_VALID_DURATIONS = [5, 10, 12]
 
 # Valid durations per resolution (Vertex/Veo constraints)
@@ -470,16 +478,17 @@ def get_video_credit_cost(
     is_image_task = task.lower() not in ("text2video", "text_to_video", "text")
     cost_table = VIDEO_IMAGE_CREDIT_COSTS if is_image_task else VIDEO_CREDIT_COSTS
     resolution_costs = cost_table.get(resolution, {})
-    return resolution_costs.get(duration, 110 if is_image_task else 75)
+    return resolution_costs.get(duration, 96)
 
 
 DEFAULT_PLANS = [
+    # ── General credit packs (one-time) ──
     {
         "code": "starter_250",
         "name": "Starter",
         "description": "Perfect for exploring AI-powered 3D creation.",
         "price_gbp": 7.99,
-        "credit_grant": 250,
+        "credit_grant": 350,          # Pricing refactor Mar 2026 (was 250)
         "includes_priority": False,
     },
     {
@@ -487,7 +496,7 @@ DEFAULT_PLANS = [
         "name": "Creator",
         "description": "For serious creators building their portfolio.",
         "price_gbp": 19.99,
-        "credit_grant": 900,
+        "credit_grant": 1100,         # Pricing refactor Mar 2026 (was 900)
         "includes_priority": False,
     },
     {
@@ -495,32 +504,32 @@ DEFAULT_PLANS = [
         "name": "Studio",
         "description": "Maximum value for professional workflows.",
         "price_gbp": 37.99,
-        "credit_grant": 2200,
+        "credit_grant": 2400,         # Margin stabilization Mar 2026 (was 2600)
         "includes_priority": True,
     },
-    # Video credit packs - Premium rebalance Feb 2026
+    # ── Video credit packs (one-time, separate pool) — Pricing refactor Mar 2026 ──
     {
         "code": "video_starter_300",
         "name": "Video Starter",
-        "description": "Try video generation.",
+        "description": "Get started with AI video generation.",
         "price_gbp": 9.99,
-        "credit_grant": 300,
+        "credit_grant": 550,          # Pricing refactor Mar 2026 (was 300)
         "includes_priority": False,
     },
     {
         "code": "video_creator_900",
         "name": "Video Creator",
-        "description": "Regular content creators.",
+        "description": "Consistent workflow for content creators.",
         "price_gbp": 29.99,
-        "credit_grant": 900,
+        "credit_grant": 1800,         # Pricing refactor Mar 2026 (was 900)
         "includes_priority": False,
     },
     {
         "code": "video_studio_2000",
         "name": "Video Studio",
-        "description": "Heavy use / batches. Priority queue.",
+        "description": "High-volume production. Priority queue.",
         "price_gbp": 59.99,
-        "credit_grant": 2000,
+        "credit_grant": 4000,         # Pricing refactor Mar 2026 (was 2000)
         "includes_priority": True,
     },
 ]
@@ -712,7 +721,7 @@ class PricingService:
 
         # Get action costs for estimates
         costs = PricingService.get_action_costs()
-        image_cost = costs.get("image_generate", 10)          # Standard image (1K, OpenAI tier)
+        image_cost = costs.get("image_generate", 4)           # Standard image (1K, OpenAI tier)
         text_to_3d_cost = costs.get("text_to_3d_generate", 20)
         image_to_3d_cost = costs.get("image_to_3d_generate", 30)
 
@@ -735,15 +744,15 @@ class PricingService:
 
         Example response:
         {
-            "image_generate": 10,
+            "image_generate": 4,
             "text_to_3d_generate": 20,
             "image_to_3d_generate": 30,
-            "refine": 10,
-            "remesh": 10,
-            "retexture": 15,
-            "video_generate": 75,
-            "video_text_generate": 75,
-            "video_image_animate": 110
+            "refine": 6,
+            "remesh": 6,
+            "retexture": 5,
+            "video_generate": 96,
+            "video_text_generate": 96,
+            "video_image_animate": 96
         }
         """
         # Use cache if available
