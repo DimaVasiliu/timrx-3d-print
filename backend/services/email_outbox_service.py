@@ -124,6 +124,7 @@ class EmailOutboxService:
         credits: int,
         amount_gbp: float,
         plan_code: Optional[str] = None,
+        credit_type: str = "general",
     ) -> List[Dict[str, Any]]:
         """
         Queue all emails needed for a purchase (receipt + admin notification).
@@ -140,6 +141,7 @@ class EmailOutboxService:
             credits: Number of credits purchased
             amount_gbp: Amount paid in GBP
             plan_code: Optional plan code for invoice generation
+            credit_type: 'general' or 'video'
 
         Returns:
             List of created outbox rows
@@ -155,6 +157,7 @@ class EmailOutboxService:
             "plan_code": plan_code,
             "credits": credits,
             "amount_gbp": amount_gbp,
+            "credit_type": credit_type,
         }
 
         row = EmailOutboxService.queue_email(
@@ -460,6 +463,7 @@ class EmailOutboxService:
         plan_code = payload.get("plan_code")
         credits = payload.get("credits")
         amount_gbp = payload.get("amount_gbp")
+        credit_type = payload.get("credit_type", "general")
 
         # Try full invoice pipeline first
         try:
@@ -472,6 +476,7 @@ class EmailOutboxService:
                 credits=credits,
                 amount_gbp=amount_gbp,
                 customer_email=to_email,
+                credit_type=credit_type,
             )
             return True, None
         except Exception as inv_err:
@@ -489,6 +494,7 @@ class EmailOutboxService:
             plan_name=payload.get("plan_name"),
             credits=payload.get("credits"),
             amount_gbp=payload.get("amount_gbp"),
+            credit_type=payload.get("credit_type", "general"),
         )
 
         if success:
@@ -505,6 +511,7 @@ class EmailOutboxService:
             plan_name=payload.get("plan_name"),
             credits=payload.get("credits"),
             amount_gbp=payload.get("amount_gbp"),
+            credit_type=payload.get("credit_type", "general"),
         )
 
         if success:

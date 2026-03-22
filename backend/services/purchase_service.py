@@ -528,6 +528,7 @@ class PurchaseService:
                         credits=credits_granted,
                         amount_gbp=amount_gbp,
                         plan_code=plan_code,
+                        credit_type="video" if (plan_code or "").startswith("video_") else "general",
                     )
                     email_queued = True
                 except Exception as queue_err:

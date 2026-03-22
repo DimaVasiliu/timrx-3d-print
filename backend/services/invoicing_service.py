@@ -154,6 +154,7 @@ class InvoicingService:
         credits: int,
         amount_gbp: float,
         customer_email: Optional[str] = None,
+        credit_type: str = "general",
     ) -> Optional[Dict[str, Any]]:
         """
         Create invoice + receipt rows for a purchase.
@@ -211,7 +212,7 @@ class InvoicingService:
                         """,
                         (
                             invoice_id,
-                            f"{plan_name} — {credits:,} Credits",
+                            f"{plan_name} — {credits:,} {'Video Credits' if credit_type == 'video' else 'General Credits'}",
                             amount_gbp,
                             amount_gbp,
                         ),
@@ -752,6 +753,7 @@ class InvoicingService:
         credits: int,
         amount_gbp: float,
         customer_email: Optional[str] = None,
+        credit_type: str = "general",
     ) -> Optional[Dict[str, Any]]:
         """
         Full invoice pipeline: create DB rows → PDFs → S3 → email.
@@ -775,6 +777,7 @@ class InvoicingService:
                 credits=credits,
                 amount_gbp=amount_gbp,
                 customer_email=customer_email,
+                credit_type=credit_type,
             )
 
             if not result:

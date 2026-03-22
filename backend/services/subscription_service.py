@@ -1111,6 +1111,7 @@ class SubscriptionService:
                     credits_granted=plan["credits_per_month"],
                     is_first_grant=True,
                     next_credit_date=next_credit_date,
+                    video_credits_granted=plan.get("video_credits_per_month", 0),
                 )
 
                 # Log credits granted event
@@ -1393,6 +1394,7 @@ class SubscriptionService:
                                 is_first_grant=False,
                                 next_credit_date=next_credit,
                                 remaining_months=remaining_months,
+                                video_credits_granted=plan.get("video_credits_per_month", 0),
                             )
 
                         # Log event
@@ -2239,8 +2241,9 @@ class SubscriptionService:
         is_first_grant: bool,
         next_credit_date: datetime,
         remaining_months: Optional[int] = None,
+        video_credits_granted: int = 0,
     ) -> bool:
-        """Send email notification when credits are delivered."""
+        """Send email notification when credits are delivered (both pools)."""
         try:
             from backend.emailer import send_credits_delivered_email
             return send_credits_delivered_email(
@@ -2250,6 +2253,7 @@ class SubscriptionService:
                 is_first_grant=is_first_grant,
                 next_credit_date=next_credit_date,
                 remaining_months=remaining_months,
+                video_credits_granted=video_credits_granted,
             )
         except ImportError:
             print(f"[SUB] send_credits_delivered_email not available")

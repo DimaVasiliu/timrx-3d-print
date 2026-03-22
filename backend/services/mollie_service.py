@@ -991,6 +991,7 @@ class MollieService:
                             credits=credits,
                             amount_gbp=amount_gbp,
                             customer_email=customer_email,
+                            credit_type="video" if (plan_code or "").startswith("video_") else "general",
                         )
                     except Exception as inv_err:
                         print(f"[MOLLIE] WARNING: Invoice pipeline failed for payment {payment_id}: {inv_err}")
@@ -1002,6 +1003,7 @@ class MollieService:
                                 plan_name=plan_name,
                                 credits=credits,
                                 amount_gbp=amount_gbp,
+                                credit_type="video" if (plan_code or "").startswith("video_") else "general",
                             )
                         except Exception as email_err:
                             print(f"[MOLLIE] WARNING: Fallback email also failed: {email_err} (credits already granted)")
@@ -1639,6 +1641,7 @@ class MollieService:
                 plan_info = SUBSCRIPTION_PLANS.get(plan_code, {})
                 plan_name = plan_info.get("name", plan_code)
                 credits_per_month = plan_info.get("credits_per_month", 0)
+                video_credits_per_month = plan_info.get("video_credits_per_month", 0)
                 price_gbp = plan_info.get("price_gbp", 0)
 
                 send_subscription_confirmation(
@@ -1648,6 +1651,7 @@ class MollieService:
                     credits_per_month=credits_per_month,
                     price_gbp=price_gbp,
                     cadence=cadence,
+                    video_credits_per_month=video_credits_per_month,
                 )
                 print(f"[MOLLIE] Subscription confirmation email sent to {customer_email}")
 
@@ -1918,6 +1922,7 @@ class MollieService:
                     from backend.emailer import send_subscription_confirmation, notify_admin
                     plan_name = plan.get("name", plan_code)
                     credits_per_month = plan.get("credits_per_month", 0)
+                    video_credits_per_month = plan.get("video_credits_per_month", 0)
                     price_gbp = plan.get("price_gbp", 0)
 
                     send_subscription_confirmation(
@@ -1927,6 +1932,7 @@ class MollieService:
                         credits_per_month=credits_per_month,
                         price_gbp=price_gbp,
                         cadence=cadence,
+                        video_credits_per_month=video_credits_per_month,
                     )
 
                     # Admin notification
@@ -2158,6 +2164,7 @@ class MollieService:
                     credits_granted=plan.get("credits_per_month", 0),
                     is_first_grant=False,
                     next_credit_date=computed_next_credit,
+                    video_credits_granted=plan.get("video_credits_per_month", 0),
                 )
 
             # Log event

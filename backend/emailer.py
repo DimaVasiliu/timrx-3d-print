@@ -435,8 +435,9 @@ def send_purchase_receipt(
     plan_name: str,
     credits: int,
     amount_gbp: float,
+    credit_type: str = "general",
 ) -> bool:
-    """Send a purchase confirmation receipt."""
+    """Send a purchase confirmation receipt. credit_type: 'general' or 'video'."""
     from datetime import datetime, timezone
 
     subject = f"TimrX Receipt - {plan_name}"
@@ -445,12 +446,15 @@ def send_purchase_receipt(
     # Load logo for inline CID embedding
     logo_bytes = _load_logo()
 
+    # Determine credit type label
+    pool_label = "video credits" if credit_type == "video" else "general credits"
+
     # Build body HTML using helper functions
     amount_display = render_amount_display(f"{amount_gbp:.2f}", "GBP", f"Paid {paid_date}")
 
     summary_card = render_detail_card([
         (plan_name, f"&pound;{amount_gbp:.2f}"),
-        ("Credits added", f"{credits:,}"),
+        (f"{pool_label.title()} added", f"{credits:,}"),
         ("Amount paid", f"&pound;{amount_gbp:.2f}"),
     ], header="Summary")
 
@@ -465,7 +469,7 @@ def send_purchase_receipt(
             <tr>
                 <td style="padding-top:24px;">
                     <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
-                        Your credits are now available in your account.
+                        Your {pool_label} are now available in your account.
                     </p>
                 </td>
             </tr>
@@ -486,10 +490,10 @@ Paid: {paid_date}
 
 Summary:
   {plan_name}: £{amount_gbp:.2f}
-  Credits added: {credits:,}
+  {pool_label.title()} added: {credits:,}
   Amount paid: £{amount_gbp:.2f}
 
-Your credits are now available in your account.
+Your {pool_label} are now available in your account.
 
 ---
 TimrX - 3D Print Hub
@@ -667,12 +671,14 @@ def send_payment_received(
     plan_name: str,
     credits: int,
     amount_gbp: float,
+    credit_type: str = "general",
 ) -> bool:
     """
     Send a minimal "Payment Received" confirmation email (HTML only, no PDFs).
 
     This is used as a fallback when invoice/receipt PDF generation fails,
     ensuring the buyer always receives immediate confirmation.
+    credit_type: 'general' or 'video'.
     """
     from datetime import datetime, timezone
 
@@ -681,6 +687,9 @@ def send_payment_received(
 
     # Load logo for inline CID embedding
     logo_bytes = _load_logo()
+
+    # Determine credit type label
+    pool_label = "video credits" if credit_type == "video" else "general credits"
 
     # Build body HTML with success message
     body_html = f'''
@@ -691,7 +700,7 @@ def send_payment_received(
                         &#10003; Payment Successful
                     </p>
                     <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
-                        Your {credits:,} credits have been added to your account.
+                        Your {credits:,} {pool_label} have been added to your account.
                     </p>
                 </td>
             </tr>
@@ -707,7 +716,7 @@ def send_payment_received(
                         <strong>Amount:</strong> &pound;{amount_gbp:.2f}
                     </p>
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
-                        <strong>Credits:</strong> {credits:,}
+                        <strong>{pool_label.title()}:</strong> {credits:,}
                     </p>
                     <p style="margin:0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
                         <strong>Date:</strong> {paid_date}
@@ -718,7 +727,7 @@ def send_payment_received(
                 <td style="padding-top:16px;">
                     <p style="margin:0;font-size:13px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">
                         Your full invoice and receipt will be sent separately.
-                        Your credits are available immediately.
+                        Your {pool_label} are available immediately.
                     </p>
                 </td>
             </tr>
@@ -738,10 +747,10 @@ Thank you for your purchase! Your payment has been confirmed.
 
 Plan: {plan_name}
 Amount: £{amount_gbp:.2f}
-Credits: {credits:,}
+{pool_label.title()}: {credits:,}
 Date: {paid_date}
 
-Your credits have been added to your account and are available immediately.
+Your {pool_label} have been added to your account and are available immediately.
 Your full invoice and receipt will be sent separately.
 
 ---
@@ -926,6 +935,7 @@ def send_subscription_confirmation(
     credits_per_month: int,
     price_gbp: float,
     cadence: str = "monthly",
+    video_credits_per_month: int = 0,
 ) -> bool:
     """
     Send a subscription confirmation email to the user.
@@ -948,14 +958,29 @@ def send_subscription_confirmation(
         price_display = f"£{price_gbp:.2f}/month"
         next_billing = "in 30 days"
 
+    # Build credits description for dual pool
+    if video_credits_per_month > 0:
+        credits_line = f"{credits_per_month:,} general + {video_credits_per_month:,} video per month"
+        banner_text = f"Your first {credits_per_month:,} general and {video_credits_per_month:,} video credits have been added."
+        period_text = f"You'll receive {credits_per_month:,} general and {video_credits_per_month:,} video credits at the start of each billing period."
+    else:
+        credits_line = f"{credits_per_month:,} per month"
+        banner_text = f"Your first {credits_per_month:,} credits have been added to your account."
+        period_text = f"You'll receive {credits_per_month:,} credits at the start of each billing period."
+
     # Build subscription summary card
-    summary_card = render_detail_card([
-        ("Plan", plan_name),
-        ("Credits", f"{credits_per_month:,} per month"),
+    summary_rows = [("Plan", plan_name)]
+    if video_credits_per_month > 0:
+        summary_rows.append(("General credits", f"{credits_per_month:,} / month"))
+        summary_rows.append(("Video credits", f"{video_credits_per_month:,} / month"))
+    else:
+        summary_rows.append(("Credits", credits_line))
+    summary_rows.extend([
         ("Billing", price_display),
         ("Started", start_date),
         ("Next billing", next_billing),
-    ], header="Subscription Details")
+    ])
+    summary_card = render_detail_card(summary_rows, header="Subscription Details")
 
     # Success banner
     success_banner = f'''
@@ -966,7 +991,7 @@ def send_subscription_confirmation(
                         &#10003; Subscription Active
                     </p>
                     <p style="margin:0;font-size:14px;color:#166534;font-family:Arial,Helvetica,sans-serif;">
-                        Your first {credits_per_month:,} credits have been added to your account.
+                        {banner_text}
                     </p>
                 </td>
             </tr>
@@ -984,7 +1009,7 @@ def send_subscription_confirmation(
             <tr>
                 <td style="padding-top:24px;">
                     <p style="margin:0 0 8px 0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
-                        Your subscription is now active. You'll receive {credits_per_month:,} credits at the start of each billing period.
+                        Your subscription is now active. {period_text}
                     </p>
                     <p style="margin:0;font-size:14px;line-height:1.6;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
                         You can manage your subscription anytime from your account settings.
@@ -1007,12 +1032,12 @@ Welcome to {plan_name}! Your subscription is now active.
 
 Subscription Details:
   Plan: {plan_name}
-  Credits: {credits_per_month:,} per month
+  Credits: {credits_line}
   Billing: {price_display}
   Started: {start_date}
   Next billing: {next_billing}
 
-Your first {credits_per_month:,} credits have been added to your account.
+{banner_text}
 
 You can manage your subscription anytime from your account settings.
 
@@ -1052,11 +1077,13 @@ def send_credits_delivered_email(
     is_first_grant: bool,
     next_credit_date,  # datetime
     remaining_months: Optional[int] = None,
+    video_credits_granted: int = 0,
 ) -> bool:
     """
     Send email notification when monthly credits are delivered.
 
     Sent on each credit allocation for both monthly and yearly plans.
+    credits_granted = general credits, video_credits_granted = video credits.
     """
     from datetime import datetime, timezone
 
@@ -1068,7 +1095,13 @@ def send_credits_delivered_email(
     except Exception:
         plan_name = plan_code.replace("_", " ").title()
 
-    subject = f"Your {credits_granted:,} TimrX Credits Are Ready"
+    # Build credit description for dual pool
+    if video_credits_granted > 0:
+        total_display = f"{credits_granted:,} general + {video_credits_granted:,} video"
+        subject = f"Your TimrX Credits Are Ready — {total_display}"
+    else:
+        total_display = f"{credits_granted:,}"
+        subject = f"Your {credits_granted:,} TimrX Credits Are Ready"
 
     # Load logo for inline CID embedding
     logo_bytes = _load_logo()
@@ -1080,11 +1113,13 @@ def send_credits_delivered_email(
         next_date_str = str(next_credit_date)[:10]
 
     # Build summary rows
-    summary_rows = [
-        ("Plan", plan_name),
-        ("Credits delivered", f"{credits_granted:,}"),
-        ("Next delivery", next_date_str),
-    ]
+    summary_rows = [("Plan", plan_name)]
+    if video_credits_granted > 0:
+        summary_rows.append(("General credits", f"{credits_granted:,}"))
+        summary_rows.append(("Video credits", f"{video_credits_granted:,}"))
+    else:
+        summary_rows.append(("Credits delivered", f"{credits_granted:,}"))
+    summary_rows.append(("Next delivery", next_date_str))
 
     if remaining_months is not None:
         summary_rows.append(("Months remaining", f"{remaining_months}"))
@@ -1094,10 +1129,10 @@ def send_credits_delivered_email(
     # Success banner
     if is_first_grant:
         banner_title = "Welcome! Your first credits are ready"
-        banner_text = f"Your subscription is now active with {credits_granted:,} credits."
+        banner_text = f"Your subscription is now active with {total_display} credits."
     else:
         banner_title = "Monthly credits delivered"
-        banner_text = f"Your {credits_granted:,} credits for this month have been added."
+        banner_text = f"Your {total_display} credits for this month have been added."
 
     success_banner = f'''
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f0fdf4;border:1px solid #86efac;border-radius:8px;margin-bottom:20px;">
