@@ -135,7 +135,7 @@ def create_seedance_task(
         wh_cfg: Dict[str, str] = {"endpoint": webhook_url}
         if webhook_secret:
             wh_cfg["secret"] = webhook_secret
-        body["config"] = {"webhook_config": wh_cfg, "service_mode": "public"}
+        body["config"] = {"webhook_config": wh_cfg}
 
     print(f"[Seedance] operating in poll-first mode (webhook optional, sent={bool(webhook_url)})")
 
