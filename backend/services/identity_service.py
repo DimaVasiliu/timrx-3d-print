@@ -958,7 +958,6 @@ class IdentityService:
             print(f"[SESSION] Failed to create session for {identity_id[:8]}...: {e}")
             return None
 
-    @staticmethod
     # Bootstrap cookie name (stable browser-scoped token for anonymous dedupe)
     BOOTSTRAP_COOKIE_NAME = "timrx_bid"
 
