@@ -29,6 +29,7 @@ import re
 from flask import Response, jsonify, g
 
 from backend.db import (
+    get_conn,
     transaction,
     fetch_one,
     fetch_all,
@@ -958,50 +959,172 @@ class IdentityService:
             return None
 
     @staticmethod
+    # Bootstrap cookie name (stable browser-scoped token for anonymous dedupe)
+    BOOTSTRAP_COOKIE_NAME = "timrx_bid"
+
+    @staticmethod
+    def _read_bootstrap_id(request) -> Optional[str]:
+        """Read the timrx_bid bootstrap cookie. Returns None if absent/invalid."""
+        bid = request.cookies.get(IdentityService.BOOTSTRAP_COOKIE_NAME)
+        if bid and len(bid) == 36:  # UUID format
+            return bid
+        return None
+
+    @staticmethod
+    def _set_bootstrap_cookie(response, bid: str):
+        """Set the timrx_bid bootstrap cookie. Long-lived, httponly, not auth."""
+        is_prod = config.IS_PROD
+        response.set_cookie(
+            IdentityService.BOOTSTRAP_COOKIE_NAME,
+            bid,
+            max_age=60 * 60 * 24 * 365,  # 1 year
+            httponly=True,
+            secure=is_prod,
+            samesite="None" if is_prod else "Lax",
+            path="/",
+            domain=config.SESSION_COOKIE_DOMAIN if is_prod else None,
+        )
+
+    @staticmethod
     def get_or_create_session(request, response) -> Tuple[str, str]:
         """
         Get existing session or create new anonymous identity + session.
         Sets the session cookie on the response if new.
 
-        Concurrency-safe: creates identity + wallet + session in one transaction.
+        Concurrency-safe: uses a browser-scoped bootstrap token (timrx_bid cookie)
+        and a PostgreSQL advisory lock keyed on that token. Parallel requests from
+        the same browser after logout create at most ONE anonymous session.
+
+        Flow:
+        1. Check existing session cookie → if valid, return it
+        2. Read timrx_bid cookie (or mint a new one)
+        3. Acquire advisory lock on hash(bid)
+        4. Check if a recent session already exists for this bid → reuse
+        5. Otherwise create identity + wallet + session inside the lock
+        6. Set both timrx_sid and timrx_bid cookies
 
         Returns (session_id, identity_id).
-
-        Usage in a route:
-            @app.route("/api/me")
-            def get_me():
-                session_id, identity_id = IdentityService.get_or_create_session(request, response)
-                identity = IdentityService.get_identity(identity_id)
-                return jsonify(identity)
         """
-        # Try to get existing session from cookie
+        import hashlib
+
+        # ── Step 1: Try existing session cookie ──
         cookie_session_id = IdentityService.get_session_id_from_request(request)
 
         if cookie_session_id:
-            # Validate existing session
             identity = IdentityService.validate_session(cookie_session_id)
             if identity:
-                # Session is valid, return existing
                 return cookie_session_id, str(identity["id"])
 
-            # Session invalid/expired - do NOT reuse cookie value, create fresh
             if SESSION_DEBUG:
-                print(f"[SESSION] Invalid/expired session {cookie_session_id[:8]}..., creating new")
+                print(f"[SESSION] Invalid/expired session {cookie_session_id[:8]}..., will bootstrap")
 
-        # Each device/browser gets its own anonymous identity.
-        # Multiple accounts on the same IP are normal under the
-        # non-merging multi-account model.
-        ip_address = request.remote_addr
+        # ── Step 2: Read or mint bootstrap ID ──
+        bid = IdentityService._read_bootstrap_id(request)
+        bid_minted = False
+        if not bid:
+            bid = str(uuid.uuid4())
+            bid_minted = True
+            print(f"[BOOTSTRAP] Minted new bid={bid[:8]}...")
+        else:
+            if SESSION_DEBUG:
+                print(f"[BOOTSTRAP] Existing bid={bid[:8]}...")
+
+        # ── Step 3-5: Advisory lock + check-then-create ──
+        lock_key = int(hashlib.sha256(f"bid:{bid}".encode()).hexdigest()[:15], 16)
+
+        ip_address = request.remote_addr or ""
         user_agent = request.headers.get("User-Agent", "")
+        ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
+        ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
 
-        # Create new anonymous identity + session atomically
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    # Advisory lock: serializes all anonymous bootstraps for this bid
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+
+                    # Check for recent session with this bootstrap token (30s window)
+                    cur.execute(
+                        f"""
+                        SELECT s.id AS session_id, s.identity_id
+                        FROM {Tables.SESSIONS} s
+                        WHERE s.bootstrap_token = %s
+                          AND s.revoked_at IS NULL
+                          AND s.expires_at > NOW()
+                          AND s.created_at > NOW() - INTERVAL '30 seconds'
+                        ORDER BY s.created_at DESC
+                        LIMIT 1
+                        """,
+                        (bid,),
+                    )
+                    recent = cur.fetchone()
+
+                    if recent:
+                        session_id = str(recent["session_id"])
+                        identity_id = str(recent["identity_id"])
+                        print(f"[BOOTSTRAP] Reused session={session_id[:8]}... for bid={bid[:8]}... (dedupe)")
+                        IdentityService.set_session_cookie(response, session_id)
+                        if bid_minted:
+                            IdentityService._set_bootstrap_cookie(response, bid)
+                        conn.commit()
+                        return session_id, identity_id
+
+                    # No recent session — create inside the lock
+                    session_id = str(uuid.uuid4())
+                    expires_at = now_utc() + timedelta(days=config.SESSION_TTL_DAYS)
+                    initial_balance = config.FREE_CREDITS_ON_SIGNUP
+
+                    # 1. Identity
+                    cur.execute(
+                        f"""INSERT INTO {Tables.IDENTITIES} (email, email_verified, created_at, last_seen_at)
+                        VALUES (NULL, FALSE, NOW(), NOW()) RETURNING *""",
+                    )
+                    identity = fetch_one(cur)
+                    if not identity:
+                        raise DatabaseError("Failed to create identity")
+                    identity_id = str(identity["id"])
+
+                    # 2. Wallet
+                    cur.execute(
+                        f"""INSERT INTO {Tables.WALLETS} (identity_id, balance_credits, updated_at)
+                        VALUES (%s, %s, NOW())""",
+                        (identity_id, initial_balance),
+                    )
+
+                    # 3. Welcome credits ledger
+                    if initial_balance > 0:
+                        cur.execute(
+                            f"""INSERT INTO {Tables.LEDGER_ENTRIES}
+                            (identity_id, entry_type, amount_credits, ref_type, meta, created_at)
+                            VALUES (%s, %s, %s, %s, %s, NOW())""",
+                            (identity_id, "grant", initial_balance, "signup", '{"reason": "welcome_credits"}'),
+                        )
+
+                    # 4. Session (with bootstrap_token for future dedupe)
+                    cur.execute(
+                        f"""INSERT INTO {Tables.SESSIONS}
+                        (id, identity_id, created_at, expires_at, ip_hash, user_agent_hash, bootstrap_token)
+                        VALUES (%s, %s, NOW(), %s, %s, %s, %s) RETURNING *""",
+                        (session_id, identity_id, expires_at, ip_hash, ua_hash, bid),
+                    )
+
+                conn.commit()  # Commits all + releases advisory lock
+
+            print(f"[BOOTSTRAP] Created session={session_id[:8]}... identity={identity_id[:8]}... bid={bid[:8]}...")
+            IdentityService.set_session_cookie(response, session_id)
+            IdentityService._set_bootstrap_cookie(response, bid)
+            return session_id, identity_id
+
+        except Exception as e:
+            print(f"[BOOTSTRAP] Dedupe bootstrap failed ({type(e).__name__}: {e}), falling back to atomic create")
+
+        # Fallback: original non-deduped create (no worse than before)
         session_id, identity_id, _ = IdentityService._create_anonymous_session_atomic(
             ip_address, user_agent
         )
-
-        # Set cookie on response
+        print(f"[BOOTSTRAP] Fallback created session={session_id[:8]}... identity={identity_id[:8]}...")
         IdentityService.set_session_cookie(response, session_id)
-
+        IdentityService._set_bootstrap_cookie(response, bid)
         return session_id, identity_id
 
     @staticmethod
