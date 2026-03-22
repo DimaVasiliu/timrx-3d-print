@@ -39,38 +39,61 @@ DEFAULT_RESOLUTION = "720p"
 
 def _ensure_public_image_url(image_data: str) -> str:
     """
-    Ensure image_data is a public URL suitable for fal.ai image_url.
+    Ensure image_data is a publicly accessible URL suitable for fal.ai image_url.
 
     If image_data is a base64 data URI, upload it to S3 first and return
-    the public URL. If it's already an http(s) URL, return as-is.
+    a presigned URL. If it's already an http(s) URL but points to our private
+    S3 bucket, convert it to a presigned URL. Otherwise return as-is.
 
-    fal.ai requires image_url to be a publicly accessible URL.
+    fal.ai requires image_url to be publicly downloadable.
     """
+    from backend.services.s3_service import presign_s3_key, upload_base64_to_s3
+    from backend.config import config as app_config
+
     if not image_data:
         return image_data
 
-    # Already a public URL — pass through
+    # Already a URL — check if it's our private S3 bucket
     if image_data.startswith("http://") or image_data.startswith("https://"):
-        print(f"[FAL_SEEDANCE] image-to-video input type=url")
+        bucket = getattr(app_config, "AWS_BUCKET_MODELS", "")
+        if bucket and bucket in image_data:
+            try:
+                key = image_data.split(f"{bucket}.s3.", 1)[1]
+                key = key.split(".amazonaws.com/", 1)[1]
+                presigned = presign_s3_key(key, expires_in=3600)
+                if presigned:
+                    print(f"[FAL_SEEDANCE] presigned private S3 URL for fal access")
+                    return presigned
+            except (IndexError, Exception) as e:
+                print(f"[FAL_SEEDANCE] WARNING: failed to presign S3 URL: {e}")
+        print(f"[FAL_SEEDANCE] image-to-video input type=url (external)")
         return image_data
 
-    # Base64 data URI — upload to S3 first
+    # Base64 data URI — upload to S3, then presign
     if image_data.startswith("data:"):
         print(f"[FAL_SEEDANCE] image-to-video input type=base64 ({len(image_data) // 1024}KB) -> uploading to S3")
         try:
-            from backend.services.s3_service import upload_base64_to_s3
             result = upload_base64_to_s3(
                 data_url=image_data,
                 prefix="video-input",
                 name="fal_seedance_ref",
                 user_id="fal_seedance",
             )
+            s3_key = None
             if isinstance(result, dict):
+                s3_key = result.get("key", "")
                 url = result.get("url", "")
             else:
                 url = str(result)
+
+            if s3_key:
+                presigned = presign_s3_key(s3_key, expires_in=3600)
+                if presigned:
+                    print(f"[FAL_SEEDANCE] image uploaded + presigned for fal access")
+                    return presigned
+
             if url:
-                print(f"[FAL_SEEDANCE] image uploaded to S3: {url[:80]}...")
+                print(f"[FAL_SEEDANCE] WARNING: could not presign, returning raw URL: {url[:80]}...")
                 return url
             else:
                 print("[FAL_SEEDANCE] WARNING: S3 upload returned empty URL, falling back to raw data")
