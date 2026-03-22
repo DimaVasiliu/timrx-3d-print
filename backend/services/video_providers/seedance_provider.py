@@ -210,9 +210,15 @@ class SeedanceProvider:
         # PiAPI requires image_urls to be publicly accessible URLs.
         # If the client sent a base64 data URI, upload to S3 first.
         public_url = _ensure_public_image_url(image_data) if image_data else None
+
+        # Ensure prompt references the image per PiAPI docs (@image1 syntax)
+        i2v_prompt = prompt
+        if public_url and "@image1" not in i2v_prompt:
+            i2v_prompt = f"@image1 {prompt}"
+
         try:
             return create_seedance_task(
-                prompt=prompt,
+                prompt=i2v_prompt,
                 duration=clean["duration_seconds"],
                 aspect_ratio=clean["aspect_ratio"],
                 image_urls=[public_url] if public_url else None,
@@ -229,17 +235,17 @@ class SeedanceProvider:
 
     def start_experimental_morph(self, start_image: str, end_image: str, prompt: str, **params) -> Dict[str, Any]:
         """
-        EXPERIMENTAL: Start two-image morph via Seedance.
+        Two-image morph/transition via Seedance.
 
-        Passes image_urls=[start_url, end_url] — two reference images in the
-        existing list field. PiAPI documentation only describes single-image
-        usage; behavior with two URLs is undocumented and may:
-          - Use only the first image (ignoring the second)
-          - Use both as multi-reference context
-          - Error out on some task types
+        Passes image_urls=[start_url, end_url] and ensures the prompt
+        references them using PiAPI's @image1 / @image2 syntax (which PiAPI
+        converts to the upstream ByteDance 【@图片N】 format).
 
-        This is NOT true first-to-last-frame interpolation. Results are
-        unpredictable. Billed at the same rate as image animate.
+        PiAPI supports up to 9 reference images. For morph, we use exactly 2:
+          @image1 = start frame
+          @image2 = end frame
+
+        Billed at the same rate as image animate.
         """
         clean = normalize_seedance_params(
             duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
@@ -254,14 +260,21 @@ class SeedanceProvider:
         if not start_url or not end_url:
             raise RuntimeError("experimental_morph requires two valid images")
 
+        # PiAPI requires @image1/@image2 references in the prompt for
+        # multi-image input. Without these markers the API rejects the request.
+        morph_prompt = prompt
+        if "@image1" not in morph_prompt and "@image2" not in morph_prompt:
+            morph_prompt = f"@image1 smoothly transitions into @image2. {prompt}"
+
         print(
-            f"[SEEDANCE] experimental_morph: passing image_urls=[start, end] "
-            f"tier={clean['tier']} duration={clean['duration_seconds']}s"
+            f"[SEEDANCE] morph: image_urls=[start, end] "
+            f"tier={clean['tier']} duration={clean['duration_seconds']}s "
+            f"prompt_has_refs={'@image' in prompt}"
         )
 
         try:
             return create_seedance_task(
-                prompt=prompt,
+                prompt=morph_prompt,
                 duration=clean["duration_seconds"],
                 aspect_ratio=clean["aspect_ratio"],
                 image_urls=[start_url, end_url],
