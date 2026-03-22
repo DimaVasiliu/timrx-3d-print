@@ -287,18 +287,14 @@ def history_mod():
 
                         items.append(item)
 
-                    # Diagnostic: log rig/animate items specifically
+                    # Summary: count rig/animate items (per-item logging removed for production)
+                    stage_counts = {}
                     for item in items:
                         stage = (item.get("stage") or "").lower()
                         if stage in ("rig", "animate", "animation"):
-                            thumb = item.get("thumbnail_url")
-                            thumb_src = "s3" if (isinstance(thumb, str) and "s3.amazonaws" in thumb) else ("data" if (isinstance(thumb, str) and thumb.startswith("data:")) else ("url" if thumb else "none"))
-                            title_src = "h.title" if r.get("title") else ("m.title" if r.get("m_title") else "derived")
-                            print(
-                                f"[History][{stage}] id={item['id'][:12]}... "
-                                f"title={repr(item.get('title','')[:40])} title_src={title_src} "
-                                f"thumb={thumb_src} model_id={item.get('model_id','none')[:12] if item.get('model_id') else 'none'}"
-                            )
+                            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                    if stage_counts:
+                        print(f"[History] Rig/animate items: {stage_counts}")
 
                     save_history_store(items)
                 except Exception as e:
@@ -459,7 +455,7 @@ def history_mod():
                                         video_id = item.get("video_id")
                                         if not video_id:
                                             # Failed videos have no video record — skip to avoid XOR constraint violation
-                                            print(f"[History][mod] Skipping video item {item_id} — no video_id (status={status})")
+                                            # Skipped: video item without video_id (counted in summary)
                                             skipped_items.append({"client_id": str(item_id), "reason": "no_video_id"})
                                             continue
 
@@ -474,10 +470,10 @@ def history_mod():
                                             from backend.services.history_service import resolve_video_uuid
                                             resolved = resolve_video_uuid(str(video_id), identity_id)
                                             if resolved:
-                                                print(f"[History][mod] Resolved job_id={video_id} -> video_uuid={resolved}")
+                                                # Resolved job_id → video_uuid (counted in summary)
                                                 video_id = resolved
                                             else:
-                                                print(f"[History][mod] Skipping video item {item_id} — video_id={video_id} not in videos table (FK would fail)")
+                                                # Skipped: video_id not in videos table (counted in summary)
                                                 skipped_items.append({"client_id": str(item_id), "reason": "video_id_not_in_videos"})
                                                 continue
                                     else:
@@ -492,7 +488,7 @@ def history_mod():
                                                 skip_reason = "xor_violation"
                                             else:
                                                 skip_reason = "missing_asset_reference"
-                                            print(f"[History][mod] Skipping item {item_id} - reason: {skip_reason}")
+                                            # Skipped: asset validation (counted in summary)
                                             skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
                                             continue
 
