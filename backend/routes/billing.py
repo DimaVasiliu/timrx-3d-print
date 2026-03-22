@@ -253,56 +253,63 @@ def get_action_costs():
         import traceback
         traceback.print_exc()
         # Return hardcoded fallback if DB fails (must match DEFAULT_ACTION_COSTS in pricing_service.py)
+        # Last updated: March 2026 pricing refactor
         return jsonify({
             "ok": True,
             "action_costs": [
                 # 3D generation
                 {"action_key": "text_to_3d_generate", "credits": 20},
                 {"action_key": "image_to_3d_generate", "credits": 30},
-                {"action_key": "refine", "credits": 10},
-                {"action_key": "remesh", "credits": 10},
-                {"action_key": "retexture", "credits": 15},
-                # Image generation — OpenAI/Gemini tier
-                {"action_key": "image_generate", "credits": 10},
-                {"action_key": "image_generate_2k", "credits": 15},
-                {"action_key": "gemini_image_generate", "credits": 10},
-                {"action_key": "gemini_image_generate_2k", "credits": 15},
-                # Image generation — Nano Banana premium tier
-                {"action_key": "piapi_image_generate", "credits": 15},
-                {"action_key": "piapi_image_generate_2k", "credits": 20},
-                {"action_key": "piapi_image_generate_4k", "credits": 30},
-                # Video generation - base costs (minimum)
-                {"action_key": "video_generate", "credits": 75},
-                {"action_key": "video_text_generate", "credits": 75},
-                {"action_key": "video_image_animate", "credits": 110},
-                # Veo Text-to-Video variant costs (duration x resolution)
-                {"action_key": "video_text_generate_4s_720p", "credits": 75},
-                {"action_key": "video_text_generate_6s_720p", "credits": 100},
-                {"action_key": "video_text_generate_8s_720p", "credits": 125},
-                {"action_key": "video_text_generate_8s_1080p", "credits": 150},
-                {"action_key": "video_text_generate_8s_4k", "credits": 200},
-                # Veo Image-to-Video variant costs (premium over text-to-video)
-                {"action_key": "video_image_animate_4s_720p", "credits": 110},
-                {"action_key": "video_image_animate_6s_720p", "credits": 140},
-                {"action_key": "video_image_animate_8s_720p", "credits": 170},
-                {"action_key": "video_image_animate_8s_1080p", "credits": 200},
-                {"action_key": "video_image_animate_8s_4k", "credits": 250},
-                # Veo Image Transition (same pricing as image animate)
-                {"action_key": "video_image_transition_4s_720p", "credits": 110},
-                {"action_key": "video_image_transition_6s_720p", "credits": 140},
-                {"action_key": "video_image_transition_8s_720p", "credits": 170},
-                {"action_key": "video_image_transition_8s_1080p", "credits": 200},
-                {"action_key": "video_image_transition_8s_4k", "credits": 250},
-                # fal Seedance 1.5 Pro
-                {"action_key": "fal_seedance_text_generate_5s", "credits": 80},
-                {"action_key": "fal_seedance_text_generate_10s", "credits": 150},
-                {"action_key": "fal_seedance_text_generate_12s", "credits": 180},
-                {"action_key": "fal_seedance_image_animate_5s", "credits": 80},
-                {"action_key": "fal_seedance_image_animate_10s", "credits": 150},
-                {"action_key": "fal_seedance_image_animate_12s", "credits": 180},
-                {"action_key": "fal_seedance_image_transition_5s", "credits": 80},
-                {"action_key": "fal_seedance_image_transition_10s", "credits": 150},
-                {"action_key": "fal_seedance_image_transition_12s", "credits": 180},
+                {"action_key": "refine", "credits": 6},
+                {"action_key": "remesh", "credits": 6},
+                {"action_key": "retexture", "credits": 5},
+                {"action_key": "rigging", "credits": 5},
+                {"action_key": "animation", "credits": 3},
+                # Image generation — OpenAI/Gemini (4c / 8c — no 4K)
+                {"action_key": "image_generate", "credits": 4},
+                {"action_key": "image_generate_2k", "credits": 8},
+                {"action_key": "gemini_image_generate", "credits": 4},
+                {"action_key": "gemini_image_generate_2k", "credits": 8},
+                # Image generation — Nano Banana premium (7c / 12c / 18c)
+                {"action_key": "piapi_image_generate", "credits": 7},
+                {"action_key": "piapi_image_generate_2k", "credits": 12},
+                {"action_key": "piapi_image_generate_4k", "credits": 18},
+                # Video — Vertex Veo 3.1 (12 c/s, equalized across all modes)
+                {"action_key": "video_generate", "credits": 96},
+                {"action_key": "video_text_generate", "credits": 96},
+                {"action_key": "video_image_animate", "credits": 96},
+                {"action_key": "video_text_generate_4s_720p", "credits": 48},
+                {"action_key": "video_text_generate_6s_720p", "credits": 72},
+                {"action_key": "video_text_generate_8s_720p", "credits": 96},
+                {"action_key": "video_text_generate_8s_1080p", "credits": 120},
+                {"action_key": "video_text_generate_8s_4k", "credits": 156},
+                {"action_key": "video_image_animate_4s_720p", "credits": 48},
+                {"action_key": "video_image_animate_6s_720p", "credits": 72},
+                {"action_key": "video_image_animate_8s_720p", "credits": 96},
+                {"action_key": "video_image_animate_8s_1080p", "credits": 120},
+                {"action_key": "video_image_animate_8s_4k", "credits": 156},
+                {"action_key": "video_image_transition_4s_720p", "credits": 48},
+                {"action_key": "video_image_transition_6s_720p", "credits": 72},
+                {"action_key": "video_image_transition_8s_720p", "credits": 96},
+                {"action_key": "video_image_transition_8s_1080p", "credits": 120},
+                {"action_key": "video_image_transition_8s_4k", "credits": 156},
+                # Seedance 2.0 (Fast 10 c/s, Preview 16 c/s)
+                {"action_key": "seedance_fast_text_generate_5s", "credits": 50},
+                {"action_key": "seedance_fast_text_generate_10s", "credits": 100},
+                {"action_key": "seedance_fast_text_generate_15s", "credits": 150},
+                {"action_key": "seedance_preview_text_generate_5s", "credits": 80},
+                {"action_key": "seedance_preview_text_generate_10s", "credits": 160},
+                {"action_key": "seedance_preview_text_generate_15s", "credits": 240},
+                # fal Seedance 1.5 Pro (8 c/s)
+                {"action_key": "fal_seedance_text_generate_5s", "credits": 45},
+                {"action_key": "fal_seedance_text_generate_10s", "credits": 80},
+                {"action_key": "fal_seedance_text_generate_12s", "credits": 95},
+                {"action_key": "fal_seedance_image_animate_5s", "credits": 45},
+                {"action_key": "fal_seedance_image_animate_10s", "credits": 80},
+                {"action_key": "fal_seedance_image_animate_12s", "credits": 95},
+                {"action_key": "fal_seedance_image_transition_5s", "credits": 45},
+                {"action_key": "fal_seedance_image_transition_10s", "credits": 80},
+                {"action_key": "fal_seedance_image_transition_12s", "credits": 95},
             ],
         })
 

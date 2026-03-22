@@ -10,7 +10,6 @@ Responsibilities:
 CANONICAL ACTION KEYS (use these in new code):
 - image_generate          (4c)  - OpenAI standard image (1K)
 - image_generate_2k       (8c)  - OpenAI 2K image
-- image_generate_4k       (12c) - OpenAI 4K image
 - gemini_image_generate   (4c)  - Gemini standard image (1K)
 - gemini_image_generate_2k(8c)  - Gemini 2K image
 - piapi_image_generate    (7c)  - Nano Banana standard image (1K) — PREMIUM
@@ -50,10 +49,9 @@ from backend.db import query_one, query_all, execute, Tables
 # Canonical action keys (use these in all new code)
 class CanonicalActions:
     """Canonical action key constants."""
-    # Image generation — OpenAI (standard tier)
+    # Image generation — OpenAI (standard tier, no 4K)
     IMAGE_GENERATE = "image_generate"                      # OpenAI standard 1K (4c)
     IMAGE_GENERATE_2K = "image_generate_2k"                # OpenAI 2K (8c)
-    IMAGE_GENERATE_4K = "image_generate_4k"                # OpenAI 4K (12c)
     # Image generation — Gemini (same price as OpenAI)
     GEMINI_IMAGE_GENERATE = "gemini_image_generate"        # Gemini standard 1K (4c)
     GEMINI_IMAGE_GENERATE_2K = "gemini_image_generate_2k"  # Gemini 2K (8c)
@@ -78,11 +76,10 @@ class CanonicalActions:
 
 # Canonical key -> DB action code mapping
 CANONICAL_TO_DB = {
-    # Image generation — OpenAI (10c / 15c / 20c)
+    # Image generation — OpenAI (4c / 8c — no 4K)
     CanonicalActions.IMAGE_GENERATE: "OPENAI_IMAGE",
     CanonicalActions.IMAGE_GENERATE_2K: "OPENAI_IMAGE_2K",
-    CanonicalActions.IMAGE_GENERATE_4K: "OPENAI_IMAGE_4K",
-    # Image generation — Gemini (10c / 15c)
+    # Image generation — Gemini (4c / 8c — no 4K)
     CanonicalActions.GEMINI_IMAGE_GENERATE: "GEMINI_IMAGE",
     CanonicalActions.GEMINI_IMAGE_GENERATE_2K: "GEMINI_IMAGE_2K",
     # Image generation — Nano Banana PREMIUM (15c / 20c / 30c)
@@ -115,7 +112,7 @@ ALIAS_TO_CANONICAL = {
     "nano-image": CanonicalActions.IMAGE_GENERATE,
     # Tiered image aliases
     "image-2k": CanonicalActions.IMAGE_GENERATE_2K,
-    "image-4k": CanonicalActions.IMAGE_GENERATE_4K,
+    "image-4k": CanonicalActions.PIAPI_IMAGE_GENERATE_4K,  # 4K is Nano Banana exclusive
 
     # Text-to-3D aliases
     "preview": CanonicalActions.TEXT_TO_3D_GENERATE,
@@ -280,11 +277,11 @@ DEFAULT_ACTION_COSTS = [
     # ── Image Generation — OpenAI (4c / 8c / 12c) ──
     {"action_code": "OPENAI_IMAGE", "cost_credits": 4, "provider": "openai"},        # Standard 1K
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 8, "provider": "openai"},     # 2K
-    {"action_code": "OPENAI_IMAGE_4K", "cost_credits": 12, "provider": "openai"},    # 4K
+    # OPENAI_IMAGE_4K removed — OpenAI does not support 4K in this product
     # ── Image Generation — Google Imagen (4c / 8c / 12c — same as OpenAI) ──
     {"action_code": "GEMINI_IMAGE", "cost_credits": 4, "provider": "google"},        # Standard 1K
     {"action_code": "GEMINI_IMAGE_2K", "cost_credits": 8, "provider": "google"},     # 2K
-    {"action_code": "GEMINI_IMAGE_4K", "cost_credits": 12, "provider": "google"},    # 4K
+    # GEMINI_IMAGE_4K removed — Gemini does not support 4K in this product
     # ── Image Generation — PiAPI Nano Banana PREMIUM (7c / 12c / 18c) ──
     {"action_code": "PIAPI_IMAGE", "cost_credits": 7, "provider": "nano_banana"},        # Standard 1K
     {"action_code": "PIAPI_IMAGE_2K", "cost_credits": 12, "provider": "nano_banana"},    # 2K

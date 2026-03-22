@@ -124,11 +124,11 @@ GENERAL_ACTION_CODES = {
     "MESHY_RETEXTURE",
     "OPENAI_IMAGE",
     "OPENAI_IMAGE_2K",
-    "OPENAI_IMAGE_4K",
+    # OPENAI_IMAGE_4K removed — OpenAI does not support 4K
     # Google Imagen
     "GEMINI_IMAGE",
     "GEMINI_IMAGE_2K",
-    "GEMINI_IMAGE_4K",
+    # GEMINI_IMAGE_4K removed — Gemini does not support 4K
     # PiAPI Nano Banana (premium)
     "PIAPI_IMAGE",
     "PIAPI_IMAGE_2K",
@@ -136,7 +136,7 @@ GENERAL_ACTION_CODES = {
     # Lowercase canonical variants — OpenAI (preferred)
     "image_generate",
     "image_generate_2k",
-    "image_generate_4k",
+    # image_generate_4k removed — 4K is Nano Banana exclusive (piapi_image_generate_4k)
     # Lowercase canonical variants — Gemini
     "gemini_image_generate",
     "gemini_image_generate_2k",

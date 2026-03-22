@@ -8,7 +8,6 @@ CANONICAL ACTION KEYS:
 Use these canonical keys when calling start_paid_job():
 - image_generate          (4c)  - OpenAI standard image (1K)
 - image_generate_2k       (8c)  - OpenAI 2K image
-- image_generate_4k       (12c) - OpenAI 4K image
 - gemini_image_generate   (4c)  - Gemini standard image (1K)
 - gemini_image_generate_2k(8c)  - Gemini 2K image
 - piapi_image_generate    (7c)  - Nano Banana standard image (1K, premium)

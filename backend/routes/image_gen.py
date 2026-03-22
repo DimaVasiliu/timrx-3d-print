@@ -47,10 +47,10 @@ bp = Blueprint("image_gen", __name__)
 
 # ── Provider-aware image action key mapping ──────────────────
 # Each provider has its own DB action code with distinct pricing:
-#   OpenAI:      image_generate (4c), image_generate_2k (8c), image_generate_4k (12c)
-#   Gemini:      gemini_image_generate (4c), gemini_image_generate_2k (8c), gemini_image_generate_4k (12c)
+#   OpenAI:      image_generate (4c), image_generate_2k (8c) — no 4K
+#   Gemini:      gemini_image_generate (4c), gemini_image_generate_2k (8c) — no 4K
 #   Nano Banana: piapi_image_generate (7c), piapi_image_generate_2k (12c), piapi_image_generate_4k (18c)
-# NOTE: 4K is EXCLUSIVE to Nano Banana. OpenAI/Gemini do NOT support 4K.
+# NOTE: 4K is EXCLUSIVE to Nano Banana. OpenAI/Gemini only support Standard + 2K.
 _IMAGE_ACTION_BY_PROVIDER_SIZE = {
     "openai": {
         "1K": "image_generate",
