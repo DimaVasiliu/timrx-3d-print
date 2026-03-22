@@ -3764,3 +3764,30 @@ def safety_summary():
     except Exception as e:
         print(f"[ADMIN] Safety summary error: {e}")
         return jsonify({"ok": False, "error": f"Safety summary failed: {type(e).__name__}"}), 500
+
+
+# ── Revenue & Margin Analytics ──────────────────────────────────────────────
+
+@bp.route("/margin-analytics", methods=["GET"])
+@require_admin
+def margin_analytics():
+    """
+    Revenue & margin analytics dashboard.
+
+    Query params:
+        days: Lookback period (default 30, max 365)
+
+    Returns:
+        overview: total/period revenue, cost, profit, margin %
+        by_product: margin breakdown by image/video/3D
+        by_provider: cost breakdown by provider
+        by_user: top 30 users by spend with revenue/cost/margin
+        alerts: users below 40% margin with >£0.50 cost
+    """
+    days = min(int(request.args.get("days", 30)), 365)
+    try:
+        data = AdminService.get_margin_analytics(days=days)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Margin analytics error: {e}")
+        return jsonify({"ok": False, "error": f"Margin analytics failed: {type(e).__name__}"}), 500

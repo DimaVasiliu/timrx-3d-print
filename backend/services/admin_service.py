@@ -1446,3 +1446,194 @@ class IdentityInspectionService:
             "conflicts": conflicts,
             "safe_to_merge": len([c for c in conflicts if c["severity"] == "BLOCKER"]) == 0,
         }
+
+    # ─────────────────────────────────────────────────────────────
+    # Revenue & Margin Analytics
+    # ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_margin_analytics(days: int = 30) -> Dict[str, Any]:
+        """
+        Calculate revenue, cost, and margin analytics.
+
+        Uses:
+        - purchases.amount_gbp for revenue
+        - jobs.estimated_provider_cost_gbp for cost
+        - jobs.action_code / provider for breakdowns
+        """
+        from decimal import Decimal
+
+        def _dec(v):
+            return float(v) if v is not None else 0.0
+
+        # ── Overview: total revenue, cost, margin ──
+        revenue_row = query_one(f"""
+            SELECT COALESCE(SUM(amount_gbp), 0) AS total
+            FROM {Tables.PURCHASES}
+            WHERE status = 'completed'
+        """)
+        total_revenue = _dec(revenue_row["total"]) if revenue_row else 0.0
+
+        cost_row = query_one(f"""
+            SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS total
+            FROM {Tables.JOBS}
+            WHERE status IN ('completed', 'succeeded', 'ready', 'done')
+        """)
+        total_cost = _dec(cost_row["total"]) if cost_row else 0.0
+
+        overall_margin = ((total_revenue - total_cost) / total_revenue * 100) if total_revenue > 0 else 0.0
+
+        # ── Revenue in period ──
+        period_revenue_row = query_one(f"""
+            SELECT COALESCE(SUM(amount_gbp), 0) AS total
+            FROM {Tables.PURCHASES}
+            WHERE status = 'completed'
+              AND created_at >= NOW() - INTERVAL '{int(days)} days'
+        """)
+        period_revenue = _dec(period_revenue_row["total"]) if period_revenue_row else 0.0
+
+        period_cost_row = query_one(f"""
+            SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS total
+            FROM {Tables.JOBS}
+            WHERE status IN ('completed', 'succeeded', 'ready', 'done')
+              AND created_at >= NOW() - INTERVAL '{int(days)} days'
+        """)
+        period_cost = _dec(period_cost_row["total"]) if period_cost_row else 0.0
+
+        period_margin = ((period_revenue - period_cost) / period_revenue * 100) if period_revenue > 0 else 0.0
+
+        # ── Margin by product category ──
+        product_rows = query_all(f"""
+            SELECT
+                CASE
+                    WHEN action_code ILIKE '%%image%%' OR action_code ILIKE '%%piapi%%' OR action_code ILIKE '%%openai_image%%' OR action_code ILIKE '%%gemini_image%%'
+                        THEN 'image'
+                    WHEN action_code ILIKE '%%video%%' OR action_code ILIKE '%%seedance%%' OR action_code ILIKE '%%fal_seedance%%'
+                        THEN 'video'
+                    WHEN action_code ILIKE '%%meshy%%' OR action_code ILIKE '%%3d%%' OR action_code ILIKE '%%refine%%' OR action_code ILIKE '%%retexture%%' OR action_code ILIKE '%%remesh%%' OR action_code ILIKE '%%rig%%' OR action_code ILIKE '%%animat%%'
+                        THEN '3d'
+                    ELSE 'other'
+                END AS category,
+                COUNT(*) AS jobs,
+                COALESCE(SUM(cost_credits), 0) AS credits_used,
+                COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_gbp
+            FROM {Tables.JOBS}
+            WHERE status IN ('completed', 'succeeded', 'ready', 'done')
+              AND created_at >= NOW() - INTERVAL '{int(days)} days'
+            GROUP BY category
+            ORDER BY cost_gbp DESC
+        """)
+
+        by_product = []
+        for row in product_rows:
+            cat = row["category"]
+            cost = _dec(row["cost_gbp"])
+            credits_used = int(row["credits_used"])
+            jobs = int(row["jobs"])
+            # Estimate revenue from credits: credits_used × avg revenue per credit
+            # avg_rev_per_credit = period_revenue / total_credits_spent_in_period (if available)
+            by_product.append({
+                "category": cat,
+                "jobs": jobs,
+                "credits_used": credits_used,
+                "cost_gbp": round(cost, 2),
+                "cost_per_job": round(cost / jobs, 4) if jobs > 0 else 0,
+            })
+
+        # ── Margin by provider ──
+        provider_rows = query_all(f"""
+            SELECT
+                provider,
+                COUNT(*) AS jobs,
+                COALESCE(SUM(cost_credits), 0) AS credits_used,
+                COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_gbp
+            FROM {Tables.JOBS}
+            WHERE status IN ('completed', 'succeeded', 'ready', 'done')
+              AND created_at >= NOW() - INTERVAL '{int(days)} days'
+              AND provider IS NOT NULL
+            GROUP BY provider
+            ORDER BY cost_gbp DESC
+        """)
+
+        by_provider = [{
+            "provider": row["provider"],
+            "jobs": int(row["jobs"]),
+            "credits_used": int(row["credits_used"]),
+            "cost_gbp": round(_dec(row["cost_gbp"]), 2),
+            "cost_per_job": round(_dec(row["cost_gbp"]) / int(row["jobs"]), 4) if int(row["jobs"]) > 0 else 0,
+        } for row in provider_rows]
+
+        # ── Top users by spend (cost) ──
+        user_rows = query_all(f"""
+            SELECT
+                j.identity_id,
+                i.email,
+                COUNT(*) AS jobs,
+                COALESCE(SUM(j.cost_credits), 0) AS credits_used,
+                COALESCE(SUM(j.estimated_provider_cost_gbp), 0) AS cost_gbp
+            FROM {Tables.JOBS} j
+            LEFT JOIN {Tables.IDENTITIES} i ON i.id = j.identity_id
+            WHERE j.status IN ('completed', 'succeeded', 'ready', 'done')
+              AND j.created_at >= NOW() - INTERVAL '{int(days)} days'
+            GROUP BY j.identity_id, i.email
+            ORDER BY cost_gbp DESC
+            LIMIT 30
+        """)
+
+        # Get revenue per user from purchases
+        user_revenue = {}
+        rev_rows = query_all(f"""
+            SELECT identity_id, COALESCE(SUM(amount_gbp), 0) AS revenue
+            FROM {Tables.PURCHASES}
+            WHERE status = 'completed'
+            GROUP BY identity_id
+        """)
+        for rr in rev_rows:
+            user_revenue[str(rr["identity_id"])] = _dec(rr["revenue"])
+
+        by_user = []
+        for row in user_rows:
+            uid = str(row["identity_id"])
+            cost = _dec(row["cost_gbp"])
+            rev = user_revenue.get(uid, 0.0)
+            margin = ((rev - cost) / rev * 100) if rev > 0 else (0.0 if cost == 0 else -100.0)
+            by_user.append({
+                "identity_id": uid,
+                "email": row["email"] or uid[:8],
+                "jobs": int(row["jobs"]),
+                "credits_used": int(row["credits_used"]),
+                "revenue_gbp": round(rev, 2),
+                "cost_gbp": round(cost, 2),
+                "profit_gbp": round(rev - cost, 2),
+                "margin_pct": round(margin, 1),
+            })
+
+        # ── Risk alerts ──
+        alerts = []
+        for u in by_user:
+            if u["margin_pct"] < 40 and u["cost_gbp"] > 0.50:
+                alerts.append({
+                    "email": u["email"],
+                    "margin_pct": u["margin_pct"],
+                    "cost_gbp": u["cost_gbp"],
+                    "revenue_gbp": u["revenue_gbp"],
+                    "severity": "critical" if u["margin_pct"] < 20 else "warning",
+                })
+
+        return {
+            "overview": {
+                "total_revenue_gbp": round(total_revenue, 2),
+                "total_cost_gbp": round(total_cost, 2),
+                "total_profit_gbp": round(total_revenue - total_cost, 2),
+                "overall_margin_pct": round(overall_margin, 1),
+                "period_days": days,
+                "period_revenue_gbp": round(period_revenue, 2),
+                "period_cost_gbp": round(period_cost, 2),
+                "period_profit_gbp": round(period_revenue - period_cost, 2),
+                "period_margin_pct": round(period_margin, 1),
+            },
+            "by_product": by_product,
+            "by_provider": by_provider,
+            "by_user": by_user,
+            "alerts": alerts,
+        }
