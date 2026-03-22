@@ -273,6 +273,27 @@ def _dispatch_video_job(
     if rate_error:
         return rate_error
 
+    # DAILY QUOTA CHECK: per-user, per-provider (BEFORE credit reservation)
+    try:
+        from backend.services.video_quota_service import check_quota, resolve_quota_key
+        quota_key = resolve_quota_key(provider, seedance_tier)
+        quota = check_quota(identity_id, quota_key)
+        if not quota["allowed"]:
+            print(f"[VIDEO] Quota blocked: {identity_id[:8]}… {quota_key} {quota['used_today']}/{quota['limit']}")
+            return jsonify({
+                "ok": False,
+                "error": "DAILY_QUOTA_EXCEEDED",
+                "message": f"You've reached your daily {quota['provider_name']} limit ({quota['limit']} per day). Resets at midnight UTC.",
+                "provider": quota["provider_key"],
+                "provider_name": quota["provider_name"],
+                "limit": quota["limit"],
+                "used_today": quota["used_today"],
+                "resets_at": quota["resets_at"],
+            }), 429
+    except Exception as quota_err:
+        # Fail open — don't block users if quota service has issues
+        print(f"[VIDEO] Quota check error (allowing): {quota_err}")
+
     print(f"[VIDEO] Reserving credits: action_code={action_key} cost={expected_cost} duration={duration_seconds}s resolution={resolution}")
 
     reservation_id, credit_error = start_paid_job(
@@ -358,6 +379,14 @@ def _dispatch_video_job(
             "error": "internal_job_creation_failed",
             "message": "Failed to create internal job record. Credits have been released. Please try again.",
         }), 500
+
+    # INCREMENT DAILY QUOTA — job was successfully created, provider slot consumed
+    try:
+        from backend.services.video_quota_service import increment_quota, resolve_quota_key
+        quota_key = resolve_quota_key(provider, seedance_tier)
+        increment_quota(identity_id, quota_key)
+    except Exception as qi_err:
+        print(f"[VIDEO] Quota increment error (non-blocking): {qi_err}")
 
     # Create a videos row early so history_items.video_id always has a valid FK target.
     # This row starts as status='queued' and is updated as the job progresses.

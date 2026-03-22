@@ -3791,3 +3791,40 @@ def margin_analytics():
     except Exception as e:
         print(f"[ADMIN] Margin analytics error: {e}")
         return jsonify({"ok": False, "error": f"Margin analytics failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/video-quota", methods=["GET"])
+@require_admin
+def video_quota_report():
+    """
+    Daily video quota usage report.
+
+    Query params:
+        date: ISO date (default: today UTC)
+        limit: max users (default 50)
+
+    Returns:
+        date, limits config, users with per-provider usage
+    """
+    date_str = request.args.get("date")
+    row_limit = min(int(request.args.get("limit", 50)), 200)
+    try:
+        from backend.services.video_quota_service import get_daily_quota_report
+        data = get_daily_quota_report(usage_date=date_str, limit=row_limit)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Video quota report error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/video-quota/user/<identity_id>", methods=["GET"])
+@require_admin
+def video_quota_user(identity_id):
+    """Get quota summary for a specific user today."""
+    try:
+        from backend.services.video_quota_service import get_user_quota_summary
+        data = get_user_quota_summary(identity_id)
+        return jsonify({"ok": True, "quotas": data})
+    except Exception as e:
+        print(f"[ADMIN] User quota error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500

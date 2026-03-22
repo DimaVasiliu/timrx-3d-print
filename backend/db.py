@@ -473,6 +473,7 @@ class Tables:
     PAYMENT_DISPUTES = f"{_BILLING_SCHEMA}.payment_disputes"
     PROCESSED_WEBHOOK_PAYMENTS = f"{_BILLING_SCHEMA}.processed_webhook_payments"
     CHECKOUT_IDEMPOTENCY = f"{_BILLING_SCHEMA}.checkout_idempotency"
+    VIDEO_DAILY_USAGE = f"{_BILLING_SCHEMA}.video_daily_usage"
 
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
