@@ -80,13 +80,14 @@ _pool_lock = threading.Lock()
 
 def _configure_pooled_conn(conn):
     """Configure session settings for a pooled connection.
-    Called once when the connection is first created by the pool."""
-    with conn.cursor() as cur:
-        cur.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public")
-        cur.execute("SET statement_timeout = '30000'")
-        cur.execute("SET idle_in_transaction_session_timeout = '60000'")
-        cur.execute("SET lock_timeout = '10000'")
-    conn.commit()
+    Called once when the connection is first created by the pool.
+    Runs in autocommit so SETs are immediate and cannot be rolled back."""
+    conn.autocommit = True
+    conn.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public")
+    conn.execute("SET statement_timeout = '30000'")
+    conn.execute("SET idle_in_transaction_session_timeout = '60000'")
+    conn.execute("SET lock_timeout = '10000'")
+    conn.autocommit = False
 
 
 def _get_pool():
@@ -115,6 +116,7 @@ def _get_pool():
                     "row_factory": dict_row,
                 },
                 configure=_configure_pooled_conn,
+                check=_ConnectionPool.check_connection,
             )
             print(
                 f"[DB] Connection pool created: min={_DB_POOL_MIN_SIZE} "
@@ -238,6 +240,15 @@ def now_utc_iso() -> str:
 # ─────────────────────────────────────────────────────────────
 # Connection Management
 # ─────────────────────────────────────────────────────────────
+def _safe_rollback(conn):
+    """Attempt rollback; silently ignore if the connection is broken.
+    Prevents secondary exceptions when rolling back a dead SSL connection."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 def _create_connection():
     """
     Create a new database connection.
@@ -337,7 +348,7 @@ def transaction():
             yield cur
         conn.commit()
     except psycopg.errors.UniqueViolation as e:
-        conn.rollback()
+        _safe_rollback(conn)
         constraint = getattr(e.diag, 'constraint_name', None)
         raise DatabaseIntegrityError(
             f"Unique constraint violation: {e}",
@@ -345,7 +356,7 @@ def transaction():
             original_error=e
         )
     except psycopg.errors.ForeignKeyViolation as e:
-        conn.rollback()
+        _safe_rollback(conn)
         constraint = getattr(e.diag, 'constraint_name', None)
         raise DatabaseIntegrityError(
             f"Foreign key violation: {e}",
@@ -353,7 +364,7 @@ def transaction():
             original_error=e
         )
     except psycopg.errors.CheckViolation as e:
-        conn.rollback()
+        _safe_rollback(conn)
         constraint = getattr(e.diag, 'constraint_name', None)
         raise DatabaseIntegrityError(
             f"Check constraint violation: {e}",
@@ -361,10 +372,10 @@ def transaction():
             original_error=e
         )
     except psycopg.Error as e:
-        conn.rollback()
+        _safe_rollback(conn)
         raise DatabaseQueryError(f"Database error: {e}", original_error=e)
-    except Exception as e:
-        conn.rollback()
+    except Exception:
+        _safe_rollback(conn)
         raise
     finally:
         if pool is not None:
