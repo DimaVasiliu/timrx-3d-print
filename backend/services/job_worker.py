@@ -299,7 +299,7 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
     provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
 
     try:
-        with get_conn() as conn:
+        with get_conn("job_worker_claim") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -384,7 +384,7 @@ def _release_claim(job_id: str):
     if not USE_DB:
         return
     try:
-        with get_conn() as conn:
+        with get_conn("job_worker_release") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -433,7 +433,7 @@ def _update_heartbeat(job_id: str):
     if not USE_DB:
         return
     try:
-        with get_conn() as conn:
+        with get_conn("job_worker_heartbeat") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -1566,7 +1566,7 @@ def _transition_job(
             WHERE id::text = %s
         """
 
-        with get_conn() as conn:
+        with get_conn("job_transition") as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
             conn.commit()
@@ -1685,7 +1685,7 @@ def detect_stalled_jobs():
     provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
 
     try:
-        with get_conn() as conn:
+        with get_conn("ops_stall_detect") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -1750,7 +1750,7 @@ def run_stale_sweep():
     details = []
 
     try:
-        with get_conn() as conn:
+        with get_conn("ops_sweep") as conn:
             with conn.cursor() as cur:
                 # 1. Queued/dispatched too long (never reached provider or got stuck)
                 dispatched_age = _cfg.STALE_DISPATCHED_AGE_S

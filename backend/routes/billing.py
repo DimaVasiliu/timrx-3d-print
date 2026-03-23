@@ -1790,7 +1790,7 @@ def subscription_summary():
     # Get any subscription (active, cancelled, pending_payment, suspended)
     sub = None
     try:
-        with get_conn() as conn:
+        with get_conn("billing_sub_summary") as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""

@@ -96,7 +96,7 @@ def community_feed_mod():
                 "AND (h.payload->>'animation_glb_url') != ''"
             )
 
-        with get_conn() as conn:
+        with get_conn("community_feed") as conn:
             cursor = _cur(conn)
 
             # COUNT — always LEFT JOIN history_items so type_filter can reference h
@@ -266,7 +266,7 @@ def community_share_mod():
             if not display_name:
                 return jsonify({"ok": False, "error": {"code": "MISSING_FIELD", "message": "display_name is required"}}), 400
 
-            with get_conn() as conn:
+            with get_conn("community_share") as conn:
                 cursor = _cur(conn)
 
                 if asset_type == "model":
@@ -332,7 +332,7 @@ def community_react(post_id: str):
                 return jsonify({"ok": False, "error": {"code": "INVALID_REACTION",
                     "message": f"reaction must be one of {VALID_REACTIONS}"}}), 400
 
-            with get_conn() as conn:
+            with get_conn("community_react") as conn:
                 cursor = _cur(conn)
 
                 # Verify post exists
@@ -416,7 +416,7 @@ def community_tip():
                 return jsonify({"ok": False, "error": {"code": "INVALID_AMOUNT",
                     "message": f"amount must be one of {TIP_AMOUNTS}"}}), 400
 
-            with get_conn() as conn:
+            with get_conn("community_tip_lookup") as conn:
                 cursor = _cur(conn)
 
                 # Look up post and creator
@@ -473,7 +473,7 @@ def community_tip():
                 return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Tip failed."}}), 500
 
             # Record in tips table
-            with get_conn() as conn:
+            with get_conn("community_tip_record") as conn:
                 cursor = _cur(conn)
                 cursor.execute("""
                     INSERT INTO timrx_app.community_tips
@@ -517,7 +517,7 @@ def community_delete_mod(post_id: str):
             return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE"}}), 503
 
         try:
-            with get_conn() as conn:
+            with get_conn("community_delete") as conn:
                 cursor = _cur(conn)
                 cursor.execute("""
                     UPDATE timrx_app.community_posts

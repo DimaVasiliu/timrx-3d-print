@@ -61,6 +61,9 @@ _DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1"
 _DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
 _DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
 _DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "30"))  # seconds to wait for a connection
+_DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "300"))  # seconds before recycling a connection
+_DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "120"))  # seconds idle before closing excess connections
+_DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "false").lower() in ("true", "1", "yes")  # per-borrow SELECT 1 (DISABLED by default — causes pool churn)
 _APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
 _BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
 
@@ -81,6 +84,92 @@ if not _SCHEMA_RE.match(_BILLING_SCHEMA):
 _pool = None
 _pool_init_attempted = False
 _pool_lock = threading.Lock()
+
+# ─── Pool diagnostics ─────────────────────────────────────────
+# Env vars:
+#   DB_POOL_TRACE=true          — enable tagged checkout/return logging
+#   DB_POOL_TRACE_SLOW_MS=2000  — warn threshold for long-held connections
+#   DB_POOL_STATS_INTERVAL=30   — seconds between periodic pool stats log
+# ──────────────────────────────────────────────────────────────
+import time as _time
+
+_POOL_TRACE = os.getenv("DB_POOL_TRACE", "false").lower() in ("true", "1", "yes")
+_POOL_TRACE_SLOW_MS = int(os.getenv("DB_POOL_TRACE_SLOW_MS", "2000"))
+_POOL_STATS_INTERVAL = int(os.getenv("DB_POOL_STATS_INTERVAL", "30"))
+
+# Counters (lock-free atomics aren't needed — slight imprecision is fine)
+_pool_borrows = 0
+_pool_returns = 0
+_pool_last_stats_at = 0.0
+
+
+def _pool_trace_checkout(source: str):
+    """Log tagged pool checkout. Only logs if DB_POOL_TRACE=true."""
+    global _pool_borrows
+    _pool_borrows += 1
+    if _POOL_TRACE and source:
+        s = _quick_pool_avail()
+        print(
+            f"[DB][POOL] CHECKOUT source={source} pid={os.getpid()} "
+            f"thread={threading.current_thread().name} "
+            f"avail={s} borrows={_pool_borrows}"
+        )
+
+
+def _pool_trace_return(source: str, t0: float):
+    """Log tagged pool return + warn if held too long."""
+    global _pool_returns
+    _pool_returns += 1
+    held_ms = int((_time.monotonic() - t0) * 1000)
+    if source and held_ms >= _POOL_TRACE_SLOW_MS:
+        print(
+            f"[DB][POOL][WARN] source={source} pid={os.getpid()} "
+            f"thread={threading.current_thread().name} held_ms={held_ms}"
+        )
+    elif _POOL_TRACE and source:
+        print(
+            f"[DB][POOL] RETURN  source={source} pid={os.getpid()} "
+            f"thread={threading.current_thread().name} held_ms={held_ms}"
+        )
+
+
+def _pool_trace_timeout(source: str):
+    """Log full diagnostics on PoolTimeout."""
+    stats = pool_stats()
+    print(
+        f"[DB][POOL][TIMEOUT] source={source or 'untagged'} pid={os.getpid()} "
+        f"thread={threading.current_thread().name} "
+        f"borrows={_pool_borrows} returns={_pool_returns} "
+        f"leaked={_pool_borrows - _pool_returns} stats={stats}"
+    )
+
+
+def _quick_pool_avail() -> str:
+    """Quick pool_available string for trace lines (no exception risk)."""
+    try:
+        return str(_pool.get_stats().get("pool_available", "?")) if _pool else "no_pool"
+    except Exception:
+        return "?"
+
+
+def _maybe_log_pool_stats():
+    """Log pool stats periodically (every DB_POOL_STATS_INTERVAL seconds)."""
+    global _pool_last_stats_at
+    if not _pool or not _POOL_TRACE:
+        return
+    now = _time.monotonic()
+    if now - _pool_last_stats_at < _POOL_STATS_INTERVAL:
+        return
+    _pool_last_stats_at = now
+    stats = pool_stats()
+    print(
+        f"[DB][POOL] pid={os.getpid()} thread={threading.current_thread().name} "
+        f"pool_size={stats.get('pool_size', '?')} "
+        f"pool_available={stats.get('pool_available', '?')} "
+        f"requests_waiting={stats.get('requests_waiting', '?')} "
+        f"borrows={_pool_borrows} returns={_pool_returns} "
+        f"leaked={_pool_borrows - _pool_returns}"
+    )
 
 
 def _configure_pooled_conn(conn):
@@ -113,21 +202,33 @@ def _get_pool():
             return None
         _pool_init_attempted = True
         try:
+            # check=check_connection does SELECT 1 on EVERY borrow.
+            # With autocommit=False this starts a transaction, and when the
+            # check finds a dead connection it triggers discard + async
+            # replace + backoff sleep — creating a death-spiral under load.
+            # Disabled by default; set DB_POOL_CHECK=true to re-enable.
+            _check_cb = _ConnectionPool.check_connection if _DB_POOL_CHECK else None
+
             _pool = _ConnectionPool(
                 conninfo=_DATABASE_URL,
                 min_size=_DB_POOL_MIN_SIZE,
                 max_size=_DB_POOL_MAX_SIZE,
                 timeout=_DB_POOL_TIMEOUT,
+                max_lifetime=_DB_POOL_MAX_LIFETIME,
+                max_idle=_DB_POOL_MAX_IDLE,
                 kwargs={
                     "connect_timeout": _DB_CONNECT_TIMEOUT,
                     "row_factory": dict_row,
                 },
                 configure=_configure_pooled_conn,
-                check=_ConnectionPool.check_connection,
+                check=_check_cb,
             )
             print(
                 f"[DB] Connection pool ACTIVE: min={_DB_POOL_MIN_SIZE} "
                 f"max={_DB_POOL_MAX_SIZE} timeout={_DB_POOL_TIMEOUT}s "
+                f"max_lifetime={_DB_POOL_MAX_LIFETIME}s "
+                f"max_idle={_DB_POOL_MAX_IDLE}s "
+                f"check={'SELECT1' if _DB_POOL_CHECK else 'DISABLED'} "
                 f"pid={os.getpid()}"
             )
             return _pool
@@ -141,13 +242,19 @@ def pool_stats() -> dict:
     if _pool is None:
         return {"pooling": False}
     try:
+        raw = _pool.get_stats()
         return {
             "pooling": True,
             "pool_min": _pool.min_size,
             "pool_max": _pool.max_size,
-            "pool_size": _pool.get_stats().get("pool_size", -1),
-            "pool_available": _pool.get_stats().get("pool_available", -1),
-            "requests_waiting": _pool.get_stats().get("requests_waiting", -1),
+            "pool_size": raw.get("pool_size", -1),
+            "pool_available": raw.get("pool_available", -1),
+            "requests_waiting": raw.get("requests_waiting", -1),
+            "connections_lost": raw.get("connections_lost", 0),
+            "returns_bad": raw.get("returns_bad", 0),
+            "borrows": _pool_borrows,
+            "returns": _pool_returns,
+            "leaked": _pool_borrows - _pool_returns,
             "pid": os.getpid(),
         }
     except Exception:
@@ -304,10 +411,14 @@ def _create_connection():
 
 
 @contextmanager
-def get_conn():
+def get_conn(source: str = ""):
     """
     Context manager for database connections.
     Connection is NOT auto-committed - caller must commit explicitly or use transaction().
+
+    Args:
+        source: Optional tag for pool tracing (e.g. "job_worker_claim").
+                Only logged when DB_POOL_TRACE=true. Zero overhead when empty.
 
     When pool is enabled, uses pool.connection() which returns the connection
     to the pool in a clean state on exit (auto-commit on success, auto-rollback
@@ -320,7 +431,7 @@ def get_conn():
         DatabaseConnectionError: If connection fails
 
     Usage:
-        with get_conn() as conn:
+        with get_conn("wallet_fetch") as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM users")
                 rows = cur.fetchall()
@@ -328,8 +439,18 @@ def get_conn():
     """
     pool = _get_pool()
     if pool is not None:
-        with pool.connection() as conn:
-            yield conn
+        t0 = _time.monotonic()
+        _pool_trace_checkout(source)
+        _maybe_log_pool_stats()
+        try:
+            with pool.connection() as conn:
+                yield conn
+        except Exception as exc:
+            if "PoolTimeout" in type(exc).__name__:
+                _pool_trace_timeout(source)
+            raise
+        finally:
+            _pool_trace_return(source, t0)
     else:
         conn = _create_connection()
         try:
@@ -382,11 +503,14 @@ def _run_transaction(conn):
 
 
 @contextmanager
-def transaction():
+def transaction(source: str = ""):
     """
     Context manager for database transactions.
     Automatically commits on success, rolls back on exception.
     Yields a cursor with dict_row factory.
+
+    Args:
+        source: Optional tag for pool tracing (e.g. "identity_validate").
 
     When pool is enabled, wraps pool.connection() so the connection always
     returns to the pool in a clean IDLE state. When pool is disabled (default),
@@ -399,17 +523,26 @@ def transaction():
         DatabaseIntegrityError: On constraint violations
 
     Usage:
-        with transaction() as cur:
+        with transaction("billing_checkout") as cur:
             cur.execute("INSERT INTO users (name) VALUES (%s) RETURNING *", ("John",))
             user = fetch_one(cur)
-            cur.execute("INSERT INTO wallets (user_id) VALUES (%s)", (user["id"],))
         # Auto-committed here if no exception
     """
     pool = _get_pool()
     if pool is not None:
-        with pool.connection() as conn:
-            with _run_transaction(conn) as cur:
-                yield cur
+        t0 = _time.monotonic()
+        _pool_trace_checkout(source)
+        _maybe_log_pool_stats()
+        try:
+            with pool.connection() as conn:
+                with _run_transaction(conn) as cur:
+                    yield cur
+        except Exception as exc:
+            if "PoolTimeout" in type(exc).__name__:
+                _pool_trace_timeout(source)
+            raise
+        finally:
+            _pool_trace_return(source, t0)
     else:
         conn = _create_connection()
         try:
@@ -496,7 +629,7 @@ def fetch_scalar(cur) -> Any:
 # ─────────────────────────────────────────────────────────────
 # Standalone Query Helpers (open their own transaction)
 # ─────────────────────────────────────────────────────────────
-def query_one(sql: str, params: tuple = None) -> Optional[Dict[str, Any]]:
+def query_one(sql: str, params: tuple = None, source: str = "") -> Optional[Dict[str, Any]]:
     """
     Execute a query and return one row as dict.
     Opens its own transaction.
@@ -507,12 +640,12 @@ def query_one(sql: str, params: tuple = None) -> Optional[Dict[str, Any]]:
     Usage:
         user = query_one("SELECT * FROM users WHERE id = %s", (user_id,))
     """
-    with transaction() as cur:
+    with transaction(source) as cur:
         cur.execute(sql, params or ())
         return fetch_one(cur)
 
 
-def query_all(sql: str, params: tuple = None) -> List[Dict[str, Any]]:
+def query_all(sql: str, params: tuple = None, source: str = "") -> List[Dict[str, Any]]:
     """
     Execute a query and return all rows as list of dicts.
     Opens its own transaction.
@@ -523,12 +656,12 @@ def query_all(sql: str, params: tuple = None) -> List[Dict[str, Any]]:
     Usage:
         users = query_all("SELECT * FROM users WHERE active = true")
     """
-    with transaction() as cur:
+    with transaction(source) as cur:
         cur.execute(sql, params or ())
         return fetch_all(cur)
 
 
-def execute(sql: str, params: tuple = None) -> int:
+def execute(sql: str, params: tuple = None, source: str = "") -> int:
     """
     Execute a statement and return affected row count.
     Opens its own transaction.
@@ -540,12 +673,12 @@ def execute(sql: str, params: tuple = None) -> int:
         count = execute("DELETE FROM sessions WHERE expires_at < %s", (now_utc(),))
         print(f"Deleted {count} expired sessions")
     """
-    with transaction() as cur:
+    with transaction(source) as cur:
         cur.execute(sql, params or ())
         return cur.rowcount
 
 
-def execute_returning(sql: str, params: tuple = None) -> Optional[Dict[str, Any]]:
+def execute_returning(sql: str, params: tuple = None, source: str = "") -> Optional[Dict[str, Any]]:
     """
     Execute an INSERT/UPDATE with RETURNING clause.
     Opens its own transaction.
@@ -559,12 +692,12 @@ def execute_returning(sql: str, params: tuple = None) -> Optional[Dict[str, Any]
             ("John",)
         )
     """
-    with transaction() as cur:
+    with transaction(source) as cur:
         cur.execute(sql, params or ())
         return fetch_one(cur)
 
 
-def execute_returning_all(sql: str, params: tuple = None) -> List[Dict[str, Any]]:
+def execute_returning_all(sql: str, params: tuple = None, source: str = "") -> List[Dict[str, Any]]:
     """
     Execute an INSERT/UPDATE with RETURNING clause, return all rows.
     Opens its own transaction.
@@ -578,7 +711,7 @@ def execute_returning_all(sql: str, params: tuple = None) -> List[Dict[str, Any]
             (cutoff_date,)
         )
     """
-    with transaction() as cur:
+    with transaction(source) as cur:
         cur.execute(sql, params or ())
         return fetch_all(cur)
 
@@ -800,7 +933,7 @@ def ensure_schema() -> None:
 # ─────────────────────────────────────────────────────────────
 # Batch Operations
 # ─────────────────────────────────────────────────────────────
-def execute_many(sql: str, params_list: List[tuple]) -> int:
+def execute_many(sql: str, params_list: List[tuple], source: str = "") -> int:
     """
     Execute a statement with multiple parameter sets.
     Opens its own transaction.
@@ -817,7 +950,7 @@ def execute_many(sql: str, params_list: List[tuple]) -> int:
     if not params_list:
         return 0
 
-    with transaction() as cur:
+    with transaction(source) as cur:
         cur.executemany(sql, params_list)
         return cur.rowcount
 

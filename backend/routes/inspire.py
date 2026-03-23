@@ -486,7 +486,7 @@ def inspire_feed() -> Response:
         if mix_mode not in ("balanced", "sequential"):
             mix_mode = "balanced"
 
-        with get_conn() as conn:
+        with get_conn("inspire_feed") as conn:
             cursor = conn.cursor(row_factory=dict_row)
 
             # Get prompt of the day

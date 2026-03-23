@@ -1037,7 +1037,7 @@ class IdentityService:
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
 
         try:
-            with get_conn() as conn:
+            with get_conn("identity_bootstrap") as conn:
                 with conn.cursor() as cur:
                     # Advisory lock: serializes all anonymous bootstraps for this bid
                     cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
@@ -1227,4 +1227,3 @@ def require_identity() -> tuple[str | None, Response | None]:
         }),
         401,
     )
-
