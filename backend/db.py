@@ -23,6 +23,7 @@ Usage:
 import hashlib
 import os
 import re
+import threading
 from contextlib import contextmanager
 from typing import Optional, Any, Dict, List, Union
 from datetime import datetime, timezone
@@ -35,6 +36,13 @@ except ImportError:
     psycopg = None
     dict_row = None
     PSYCOPG_AVAILABLE = False
+
+try:
+    from psycopg_pool import ConnectionPool as _ConnectionPool
+    _POOL_AVAILABLE = True
+except ImportError:
+    _ConnectionPool = None
+    _POOL_AVAILABLE = False
 
 # NOTE: Do NOT import config at module level - causes circular imports!
 # Use _get_config() for lazy access inside functions.
@@ -49,6 +57,9 @@ def _get_config():
 _DATABASE_URL = os.getenv("DATABASE_URL", "")
 _HAS_DATABASE = bool(_DATABASE_URL)
 _DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+_DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
+_DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
+_DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
 _APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
 _BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
 
@@ -58,6 +69,79 @@ if not _SCHEMA_RE.match(_APP_SCHEMA):
     raise ValueError(f"Invalid APP_SCHEMA: {_APP_SCHEMA!r} — must match ^[a-z][a-z0-9_]{{0,62}}$")
 if not _SCHEMA_RE.match(_BILLING_SCHEMA):
     raise ValueError(f"Invalid BILLING_SCHEMA: {_BILLING_SCHEMA!r} — must match ^[a-z][a-z0-9_]{{0,62}}$")
+
+
+# ─────────────────────────────────────────────────────────────
+# Connection Pool (opt-in, disabled by default)
+# Set DB_POOL_ENABLED=true to activate.
+# _create_connection() is NEVER pooled — used by job_worker.py
+# for the advisory lock, which requires a dedicated long-lived connection.
+# ─────────────────────────────────────────────────────────────
+_pool = None
+_pool_init_attempted = False
+_pool_lock = threading.Lock()
+
+
+def _configure_pooled_conn(conn):
+    """Configure session settings for a new pooled connection.
+    Runs in autocommit so SETs are immediate and survive rollbacks."""
+    conn.autocommit = True
+    conn.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public")
+    conn.execute("SET statement_timeout = '30000'")
+    conn.execute("SET idle_in_transaction_session_timeout = '60000'")
+    conn.execute("SET lock_timeout = '10000'")
+    conn.autocommit = False
+
+
+def _get_pool():
+    """Get or create the connection pool. Returns None if pooling is disabled."""
+    global _pool, _pool_init_attempted
+    if not _DB_POOL_ENABLED:
+        return None
+    if _pool is not None:
+        return _pool
+    if _pool_init_attempted:
+        return None
+    if not _POOL_AVAILABLE or not _DATABASE_URL or not PSYCOPG_AVAILABLE:
+        return None
+
+    with _pool_lock:
+        if _pool is not None:
+            return _pool
+        if _pool_init_attempted:
+            return None
+        _pool_init_attempted = True
+        try:
+            _pool = _ConnectionPool(
+                conninfo=_DATABASE_URL,
+                min_size=_DB_POOL_MIN_SIZE,
+                max_size=_DB_POOL_MAX_SIZE,
+                kwargs={
+                    "connect_timeout": _DB_CONNECT_TIMEOUT,
+                    "row_factory": dict_row,
+                },
+                configure=_configure_pooled_conn,
+                check=_ConnectionPool.check_connection,
+            )
+            print(
+                f"[DB] Connection pool ACTIVE: min={_DB_POOL_MIN_SIZE} "
+                f"max={_DB_POOL_MAX_SIZE}"
+            )
+            return _pool
+        except Exception as e:
+            print(f"[DB] Pool init failed: {e} — using direct connections")
+            return None
+
+
+def close_pool():
+    """Close the connection pool (for clean shutdown)."""
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.close()
+        except Exception:
+            pass
+        _pool = None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -204,6 +288,12 @@ def get_conn():
     Context manager for database connections.
     Connection is NOT auto-committed - caller must commit explicitly or use transaction().
 
+    When pool is enabled, uses pool.connection() which returns the connection
+    to the pool in a clean state on exit (auto-commit on success, auto-rollback
+    on exception via psycopg3's Connection context manager).
+
+    When pool is disabled (default), opens and closes a direct connection.
+
     Raises:
         DatabaseNotConfiguredError: If database is not configured
         DatabaseConnectionError: If connection fails
@@ -213,39 +303,27 @@ def get_conn():
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM users")
                 rows = cur.fetchall()
-            conn.commit()  # Must commit explicitly!
+            conn.commit()
     """
-    conn = _create_connection()
-    try:
-        yield conn
-    finally:
+    pool = _get_pool()
+    if pool is not None:
+        with pool.connection() as conn:
+            yield conn
+    else:
+        conn = _create_connection()
         try:
-            conn.close()
-        except Exception:
-            pass
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @contextmanager
-def transaction():
-    """
-    Context manager for database transactions.
-    Automatically commits on success, rolls back on exception.
-    Yields a cursor with dict_row factory.
-
-    Raises:
-        DatabaseNotConfiguredError: If database is not configured
-        DatabaseConnectionError: If connection fails
-        DatabaseQueryError: If a query fails
-        DatabaseIntegrityError: On constraint violations
-
-    Usage:
-        with transaction() as cur:
-            cur.execute("INSERT INTO users (name) VALUES (%s) RETURNING *", ("John",))
-            user = fetch_one(cur)
-            cur.execute("INSERT INTO wallets (user_id) VALUES (%s)", (user["id"],))
-        # Auto-committed here if no exception
-    """
-    conn = _create_connection()
+def _run_transaction(conn):
+    """Internal: execute a transaction with error mapping.
+    Handles commit on success, safe rollback + exception wrapping on failure."""
     try:
         with conn.cursor() as cur:
             yield cur
@@ -280,11 +358,47 @@ def transaction():
     except Exception:
         _safe_rollback(conn)
         raise
-    finally:
+
+
+@contextmanager
+def transaction():
+    """
+    Context manager for database transactions.
+    Automatically commits on success, rolls back on exception.
+    Yields a cursor with dict_row factory.
+
+    When pool is enabled, wraps pool.connection() so the connection always
+    returns to the pool in a clean IDLE state. When pool is disabled (default),
+    opens and closes a direct connection.
+
+    Raises:
+        DatabaseNotConfiguredError: If database is not configured
+        DatabaseConnectionError: If connection fails
+        DatabaseQueryError: If a query fails
+        DatabaseIntegrityError: On constraint violations
+
+    Usage:
+        with transaction() as cur:
+            cur.execute("INSERT INTO users (name) VALUES (%s) RETURNING *", ("John",))
+            user = fetch_one(cur)
+            cur.execute("INSERT INTO wallets (user_id) VALUES (%s)", (user["id"],))
+        # Auto-committed here if no exception
+    """
+    pool = _get_pool()
+    if pool is not None:
+        with pool.connection() as conn:
+            with _run_transaction(conn) as cur:
+                yield cur
+    else:
+        conn = _create_connection()
         try:
-            conn.close()
-        except Exception:
-            pass
+            with _run_transaction(conn) as cur:
+                yield cur
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────
@@ -599,6 +713,12 @@ def init_db() -> bool:
     try:
         if verify_connection():
             print("[DB] Database connection verified successfully")
+            # Initialize connection pool if enabled
+            pool = _get_pool()
+            if pool is not None:
+                print(f"[DB] Pool mode: ENABLED (min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
+            else:
+                print("[DB] Pool mode: DISABLED — using direct connections")
             # Ensure schema indexes exist for idempotency
             ensure_schema()
             _DB_STARTUP_READY = True
@@ -752,5 +872,6 @@ __all__ = [
     "require_db",
     "init_db",
     "ensure_schema",
+    "close_pool",
     "sql_in_clause",
 ]
