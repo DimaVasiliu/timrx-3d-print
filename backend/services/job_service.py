@@ -489,12 +489,17 @@ class JobService:
     def get_active_jobs_for_identity(
         identity_id: str,
         limit: int = 50,
+        max_age_hours: int = 2,
     ) -> list:
         """
-        Get all active (queued/pending/processing) jobs for an identity.
+        Get genuinely active jobs for an identity (for frontend recovery).
 
-        Used for job recovery on page load - allows frontend to reconnect
-        to jobs that are still running.
+        Only returns jobs that are:
+        - In an active status (queued/pending/processing/dispatched/
+          provider_pending/provider_processing)
+        - Created within max_age_hours (default 2h) — older jobs whose
+          provider tasks have expired are excluded
+        - NOT in terminal/stalled/blocked states
 
         Returns:
             List of job dicts with status, progress, and result info
@@ -507,11 +512,15 @@ class JobService:
                    progress, result_refs, created_at, updated_at
             FROM {Tables.JOBS}
             WHERE identity_id = %s
-              AND status IN ('queued', 'pending', 'processing')
+              AND status IN (
+                  'queued', 'pending', 'processing',
+                  'dispatched', 'provider_pending', 'provider_processing'
+              )
+              AND created_at > NOW() - INTERVAL '%s hours'
             ORDER BY created_at DESC
             LIMIT %s
             """,
-            (identity_id, limit),
+            (identity_id, max_age_hours, limit),
         )
 
         result = []

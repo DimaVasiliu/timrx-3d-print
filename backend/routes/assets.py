@@ -22,7 +22,7 @@ from backend.config import (
     PROXY_ALLOWED_HOSTS,
 )
 from backend.db import USE_DB, get_conn, dict_row, Tables
-from backend.middleware import with_session
+from backend.middleware import with_session, with_optional_session
 from backend.services.identity_service import require_identity
 
 bp = Blueprint("assets", __name__)
@@ -107,7 +107,7 @@ def _host_is_allowed(host: str) -> bool:
 
 
 @bp.route("/proxy-glb", methods=["GET", "OPTIONS", "HEAD"])
-@with_session
+@with_optional_session
 def proxy_glb_mod():
     """
     Proxy GLB files with ownership verification.
