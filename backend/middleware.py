@@ -175,6 +175,7 @@ def with_session(f):
     """
     Decorator that ensures a session exists.
     Creates anonymous identity + session if none exists.
+    Skips session logic entirely for OPTIONS (CORS preflight).
 
     Sets on g:
         - g.session_id: The session ID
@@ -187,6 +188,8 @@ def with_session(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
@@ -298,6 +301,7 @@ def require_session(f):
     Decorator that requires a valid session.
     Returns 401 if no valid session exists.
     Does NOT create anonymous sessions.
+    Skips auth for OPTIONS (CORS preflight).
 
     Sets on g:
         - g.session_id: The session ID
@@ -306,6 +310,8 @@ def require_session(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         # Lazy imports to avoid circular import at module load time
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
@@ -371,11 +377,14 @@ def require_email(f):
     """
     Decorator that requires a valid session with an attached email.
     Returns 401 if no session, 403 if no email attached.
+    Skips auth for OPTIONS (CORS preflight).
 
     Use for endpoints that require email (e.g., purchases).
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         # Lazy imports to avoid circular import at module load time
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
@@ -421,6 +430,7 @@ def require_verified_email(f):
     """
     Decorator that requires a valid session with a VERIFIED email.
     Returns 401 if no session, 403 if no email or email not verified.
+    Skips auth for OPTIONS (CORS preflight).
 
     Use for paid actions (checkout, subscriptions) that require verified email.
 
@@ -431,6 +441,8 @@ def require_verified_email(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
         # Lazy imports to avoid circular import at module load time
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
