@@ -19,7 +19,7 @@ from backend.services.credits_helper import finalize_job_credits, get_current_ba
 from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
 from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed
-from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task
+from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.utils.helpers import log_event, log_status_summary, now_s
 
@@ -220,6 +220,10 @@ def mesh_remesh_status_mod(job_id: str):
     try:
         ms = mesh_get(f"/openapi/v1/remesh/{job_id}")
         log_event("mesh/remesh/status:meshy-resp[mod]", ms)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: remesh job_id={job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({"status": "failed", "error": "TASK_EXPIRED", "message": "This generation has expired on the provider."}), 200
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
@@ -733,6 +737,10 @@ def mesh_retexture_status_mod(job_id: str):
     try:
         ms = mesh_get(f"/openapi/v1/retexture/{job_id}")
         log_event("mesh/retexture/status:meshy-resp[mod]", ms)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: retexture job_id={job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({"status": "failed", "error": "TASK_EXPIRED", "message": "This generation has expired on the provider."}), 200
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502

@@ -29,6 +29,11 @@ MESHY_STATUS_MAP = {
 }
 
 
+class MeshyTaskNotFoundError(RuntimeError):
+    """Raised when Meshy returns 404 for a task that no longer exists."""
+    pass
+
+
 def _filter_model_urls(urls: Any) -> dict:
     """Filter model URLs dict to only include glb and obj formats."""
     if not isinstance(urls, dict):
@@ -62,8 +67,47 @@ def mesh_get(path: str) -> dict:
     url = f"{MESHY_API_BASE.rstrip('/')}{path}"
     r = requests.get(url, headers=_auth_headers(), timeout=60)
     if not r.ok:
-        raise RuntimeError(f"GET {path} -> {r.status_code}: {r.text[:500]}")
+        detail = f"GET {path} -> {r.status_code}: {r.text[:500]}"
+        if r.status_code == 404:
+            raise MeshyTaskNotFoundError(detail)
+        raise RuntimeError(detail)
     return r.json()
+
+
+def terminalize_expired_meshy_job(job_id: str, identity_id: str | None = None):
+    """
+    Mark a Meshy job as failed when the provider returns 404 (task expired/deleted).
+    Releases any held credit reservation. Idempotent — safe to call multiple times.
+    """
+    try:
+        from backend.db import USE_DB, execute
+        from backend.db import Tables
+        if not USE_DB:
+            return
+        # Only update if still in an active status (idempotent)
+        updated = execute(
+            f"""
+            UPDATE {Tables.JOBS}
+            SET status = 'failed',
+                error_message = 'Provider task expired (Meshy 404)',
+                finished_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+              AND status IN ('queued', 'pending', 'processing',
+                             'dispatched', 'provider_pending', 'provider_processing')
+            """,
+            (job_id,),
+        )
+        if updated:
+            print(f"[MESHY] Terminalized expired job {job_id}")
+            # Release credit reservation
+            try:
+                from backend.services.credits_helper import refund_failed_job
+                refund_failed_job(job_id)
+            except Exception as e:
+                print(f"[MESHY] Refund for expired job {job_id} failed: {e}")
+    except Exception as e:
+        print(f"[MESHY] terminalize_expired_meshy_job error for {job_id}: {e}")
 
 
 def _task_containers(ms: dict) -> list[dict]:

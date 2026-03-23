@@ -37,7 +37,7 @@ from backend.services.job_service import (
     save_store,
     verify_job_ownership,
 )
-from backend.services.meshy_service import mesh_get, mesh_post, normalize_status
+from backend.services.meshy_service import mesh_get, mesh_post, normalize_status, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.history_service import get_canonical_model_row
 from backend.utils.helpers import clamp_int, log_event, log_status_summary, normalize_license, now_s
@@ -571,6 +571,10 @@ def text_to_3d_status_mod(job_id: str):
     try:
         ms = mesh_get(f"/openapi/v2/text-to-3d/{meshy_job_id}")
         log_event("text-to-3d/status:meshy-resp[mod]", ms)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: text-to-3d job_id={job_id} meshy_id={meshy_job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({"status": "failed", "error": "TASK_EXPIRED", "message": "This generation has expired on the provider."}), 200
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
