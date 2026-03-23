@@ -399,27 +399,31 @@ def _release_claim(job_id: str):
                 )
             conn.commit()
 
-        # Post-commit verification: read next_poll_at on a SEPARATE connection
-        # to confirm it survived the release transaction.
-        with get_conn() as conn2:
-            with conn2.cursor() as cur2:
-                cur2.execute(
-                    f"SELECT next_poll_at, NOW() AS db_now, claimed_by, status "
-                    f"FROM {Tables.JOBS} WHERE id::text = %s",
-                    (job_id,),
-                )
-                verify = cur2.fetchone()
-        if verify:
-            npa = verify["next_poll_at"]
-            db_now = verify["db_now"]
-            delta = f"{npa - db_now}" if npa and db_now else "N/A"
-            print(
-                f"[JOB][DEBUG] _release_claim job={job_id} "
-                f"next_poll_at={npa} db_now={db_now} delta={delta} "
-                f"claimed_by={verify['claimed_by']} status={verify['status']}"
-            )
-        else:
-            print(f"[JOB][DEBUG] _release_claim job={job_id} — row not found in verification read")
+        # NOTE: Debug verification query removed to reduce pool pressure.
+        # The release UPDATE above is sufficient — if it committed, the
+        # claim is released. Re-enable temporarily via RELEASE_CLAIM_DEBUG=true
+        # if next_poll_at debugging is needed again.
+        if os.getenv("RELEASE_CLAIM_DEBUG", "").lower() in ("true", "1"):
+            try:
+                with get_conn() as conn2:
+                    with conn2.cursor() as cur2:
+                        cur2.execute(
+                            f"SELECT next_poll_at, NOW() AS db_now, claimed_by, status "
+                            f"FROM {Tables.JOBS} WHERE id::text = %s",
+                            (job_id,),
+                        )
+                        verify = cur2.fetchone()
+                if verify:
+                    npa = verify["next_poll_at"]
+                    db_now = verify["db_now"]
+                    delta = f"{npa - db_now}" if npa and db_now else "N/A"
+                    print(
+                        f"[JOB][DEBUG] _release_claim job={job_id} "
+                        f"next_poll_at={npa} db_now={db_now} delta={delta} "
+                        f"claimed_by={verify['claimed_by']} status={verify['status']}"
+                    )
+            except Exception:
+                pass
     except Exception as e:
         print(f"[JOB] Release claim error for {job_id}: {e}")
 
@@ -1964,14 +1968,26 @@ def recover_stale_jobs():
 _ops_thread: Optional[threading.Thread] = None
 
 
+def is_leader() -> bool:
+    """Check if this process holds the advisory lock (is the job worker leader).
+
+    Safe to call from any thread. Returns True if `_leader_conn` is alive,
+    meaning _acquire_leader_lock() succeeded in this process.
+    """
+    return _leader_conn is not None
+
+
 def start_operations_loop():
     """
     Start the unified background operations thread.
 
     Runs three periodic tasks at independent intervals:
     1. Stall detection (every sweep interval) — catches expired heartbeats
+       → runs on ALL workers (lightweight, idempotent)
     2. Stale sweep (every sweep interval) — catches age-threshold stuck jobs
+       → runs ONLY on the leader (heavier, DB-mutating)
     3. Rescue (every rescue interval) — recovers late-completed upstream jobs
+       → runs ONLY on the leader (heaviest, multi-connection)
 
     Config-driven via config.STALE_SWEEP_* and config.RESCUE_*.
     Replaces the old start_stall_detector().
@@ -1993,33 +2009,52 @@ def start_operations_loop():
     # How many sweep cycles per rescue cycle
     rescue_every_n = max(1, rescue_interval // sweep_interval)
 
+    # Allow override: OPS_LEADER_ONLY=false to restore old behavior (all workers)
+    leader_only = os.getenv("OPS_LEADER_ONLY", "true").lower() not in ("false", "0", "no")
+    pid = os.getpid()
+
     def _loop():
         cycle = 0
-        print(f"[OPS] operations loop started sweep_interval={sweep_interval}s "
+        # Wait briefly for the worker thread to attempt leader election
+        # before deciding whether to run heavy ops.
+        _worker_stop.wait(timeout=5)
+
+        print(f"[OPS] operations loop started pid={pid} sweep_interval={sweep_interval}s "
               f"sweep_enabled={sweep_enabled} rescue_enabled={rescue_enabled} "
-              f"rescue_every={rescue_every_n} cycles ({rescue_interval}s)")
+              f"rescue_every={rescue_every_n} cycles ({rescue_interval}s) "
+              f"leader_only={leader_only} is_leader={is_leader()}")
 
         while not _worker_stop.is_set():
             cycle += 1
+            _am_leader = is_leader()
 
-            # -- Stall detection (always runs, lightweight) --
+            # -- Pool diagnostics (every 10 cycles ≈ 10min at 60s interval) --
+            if cycle % 10 == 1:
+                try:
+                    from backend.db import pool_stats
+                    stats = pool_stats()
+                    print(f"[OPS][POOL] cycle={cycle} pid={pid} leader={_am_leader} {stats}")
+                except Exception:
+                    pass
+
+            # -- Stall detection (always runs on all workers, lightweight) --
             try:
                 detect_stalled_jobs()
             except Exception as e:
                 print(f"[OPS] stall detection error: {e}")
 
-            # -- Stale sweep --
-            if sweep_enabled:
+            # -- Stale sweep (leader only when leader_only=true) --
+            if sweep_enabled and (_am_leader or not leader_only):
                 try:
                     run_stale_sweep()
                 except Exception as e:
                     print(f"[OPS] stale sweep error: {e}")
 
-            # -- Rescue pass --
-            if rescue_enabled and cycle % rescue_every_n == 0:
+            # -- Rescue pass (leader only when leader_only=true) --
+            if rescue_enabled and cycle % rescue_every_n == 0 and (_am_leader or not leader_only):
                 try:
                     from backend.services.job_rescue import rescue_late_completed_jobs
-                    print(f"[OPS] rescue pass starting lookback={rescue_lookback}h max={rescue_max}")
+                    print(f"[OPS] rescue pass starting pid={pid} lookback={rescue_lookback}h max={rescue_max}")
                     result = rescue_late_completed_jobs(
                         hours=rescue_lookback,
                         dry_run=False,

@@ -60,6 +60,7 @@ _DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 _DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
 _DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
 _DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "30"))  # seconds to wait for a connection
 _APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
 _BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
 
@@ -116,6 +117,7 @@ def _get_pool():
                 conninfo=_DATABASE_URL,
                 min_size=_DB_POOL_MIN_SIZE,
                 max_size=_DB_POOL_MAX_SIZE,
+                timeout=_DB_POOL_TIMEOUT,
                 kwargs={
                     "connect_timeout": _DB_CONNECT_TIMEOUT,
                     "row_factory": dict_row,
@@ -125,12 +127,31 @@ def _get_pool():
             )
             print(
                 f"[DB] Connection pool ACTIVE: min={_DB_POOL_MIN_SIZE} "
-                f"max={_DB_POOL_MAX_SIZE}"
+                f"max={_DB_POOL_MAX_SIZE} timeout={_DB_POOL_TIMEOUT}s "
+                f"pid={os.getpid()}"
             )
             return _pool
         except Exception as e:
             print(f"[DB] Pool init failed: {e} — using direct connections")
             return None
+
+
+def pool_stats() -> dict:
+    """Return current pool statistics for diagnostics. Safe to call anytime."""
+    if _pool is None:
+        return {"pooling": False}
+    try:
+        return {
+            "pooling": True,
+            "pool_min": _pool.min_size,
+            "pool_max": _pool.max_size,
+            "pool_size": _pool.get_stats().get("pool_size", -1),
+            "pool_available": _pool.get_stats().get("pool_available", -1),
+            "requests_waiting": _pool.get_stats().get("requests_waiting", -1),
+            "pid": os.getpid(),
+        }
+    except Exception:
+        return {"pooling": True, "error": "stats_unavailable"}
 
 
 def close_pool():
