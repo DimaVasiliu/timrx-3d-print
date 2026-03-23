@@ -2576,9 +2576,20 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     or payload.get("preview_task_id")
                 )
                 if source_task_id:
-                    # This is a derived model — look up source's lineage_origin_id.
-                    # source_task_id may be an internal UUID OR a Meshy upstream task ID,
-                    # so we check history_items directly AND via models.upstream_job_id.
+                    # This is a derived model — look up the parent history item
+                    # to inherit its lineage_origin_id.
+                    #
+                    # source_task_id may be:
+                    #   - An internal TimrX job UUID (used by text-to-3d/refine)
+                    #   - A Meshy provider task ID (used by retexture/remesh)
+                    #
+                    # We search:
+                    #   1. history_items.id = source_task_id (direct match)
+                    #   2. payload fields (original_job_id, source_task_id, preview_task_id)
+                    #   3. models.upstream_job_id = source_task_id (Meshy task ID on model)
+                    #   4. jobs.upstream_job_id = source_task_id → resolve to jobs.id →
+                    #      match history_items by that internal UUID (bridges Meshy→internal)
+                    src = str(source_task_id)
                     cur.execute(
                         f"""
                         SELECT lineage_origin_id, id FROM {Tables.HISTORY_ITEMS}
@@ -2590,20 +2601,29 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                SELECT id FROM {Tables.MODELS}
                                WHERE upstream_job_id = %s
                            )
+                           OR id::text IN (
+                               SELECT id::text FROM {Tables.JOBS}
+                               WHERE upstream_job_id = %s
+                           )
                         ORDER BY created_at ASC
                         LIMIT 1
                         """,
-                        (str(source_task_id), str(source_task_id),
-                         str(source_task_id), str(source_task_id),
-                         str(source_task_id)),
+                        (src, src, src, src, src, src),
                     )
                     source_row = cur.fetchone()
                     if source_row:
+                        # Canonical lineage: always use the root history_items.id,
+                        # never a job id, model id, or Meshy task id.
                         lineage_origin_id = source_row.get("lineage_origin_id") or source_row.get("id")
+
+                    parent_id = str(source_row["id"]) if source_row else None
+                    parent_lineage = str(source_row["lineage_origin_id"]) if source_row and source_row.get("lineage_origin_id") else None
                     print(
-                        f"[LINEAGE] type={job_type} source_task_id={source_task_id} "
+                        f"[LINEAGE] type={job_type} source_task_id={src} "
                         f"source_found={'yes' if source_row else 'no'} "
-                        f"lineage_origin_id={lineage_origin_id}"
+                        f"parent_history_id={parent_id} "
+                        f"parent_lineage_origin_id={parent_lineage} "
+                        f"resolved_root_id={lineage_origin_id}"
                     )
 
                 cur.execute(

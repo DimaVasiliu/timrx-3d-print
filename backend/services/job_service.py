@@ -1803,49 +1803,67 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
 
 def resolve_meshy_job_id(input_id: str) -> str:
     """
-    Resolve a TimrX internal job ID to the upstream Meshy task ID.
+    Resolve any identifier to the upstream Meshy provider task ID.
 
     The input could be:
-    - A Meshy task ID (already the upstream ID) -> return as-is
-    - A TimrX internal job UUID -> look up upstream_job_id in jobs table
-    - A history item UUID -> look up original_job_id in payload
+    - A Meshy task ID (already correct) → return as-is
+    - A TimrX internal job UUID → look up upstream_job_id via jobs/models/history
+
+    Per Meshy docs, every operation creates a brand new provider task ID.
+    This function ensures we always send the Meshy task ID, never an
+    internal TimrX UUID.
     """
     if not input_id:
         return input_id
 
-    # Check local store first - if entry has upstream_job_id, use that
+    # 1. Check local in-memory store (fast, but per-worker and volatile)
     store = load_store()
     if input_id in store:
         entry = store[input_id]
-        # Check if this entry has a pointer to the upstream Meshy job ID
         upstream = entry.get("upstream_job_id") or entry.get("meshy_task_id") or entry.get("original_job_id")
         if upstream and upstream != input_id:
-            print(f"[Resolve] Found upstream in store: {input_id} -> {upstream}")
+            print(f"[Resolve] store: {input_id} -> {upstream}")
             return upstream
-        # If no upstream, input_id might itself be a Meshy task ID
         return input_id
 
     if USE_DB:
         try:
             with get_conn() as conn:
                 with conn.cursor(row_factory=dict_row) as cur:
-                    # First check timrx_billing.jobs table for upstream_job_id
+                    # 2. jobs table: input is internal job UUID → get upstream_job_id
                     cur.execute(
-                        """
+                        f"""
                         SELECT upstream_job_id
-                        FROM timrx_billing.jobs
+                        FROM {Tables.JOBS}
                         WHERE id::text = %s AND upstream_job_id IS NOT NULL
                         LIMIT 1
                         """,
                         (input_id,),
                     )
-                    job_row = cur.fetchone()
-                    if job_row and job_row.get("upstream_job_id"):
-                        upstream = job_row["upstream_job_id"]
-                        print(f"[Resolve] Found upstream in jobs table: {input_id} -> {upstream}")
-                        return upstream
+                    row = cur.fetchone()
+                    if row and row.get("upstream_job_id"):
+                        print(f"[Resolve] jobs: {input_id} -> {row['upstream_job_id']}")
+                        return row["upstream_job_id"]
 
-                    # Then check history_items payload for original_job_id
+                    # 3. models table: input is internal job UUID used as model upstream
+                    #    (text-to-3d saves model.upstream_job_id = internal UUID)
+                    cur.execute(
+                        f"""
+                        SELECT j.upstream_job_id
+                        FROM {Tables.JOBS} j
+                        INNER JOIN {Tables.MODELS} m ON m.upstream_job_id = j.id::text
+                        WHERE m.upstream_job_id = %s
+                          AND j.upstream_job_id IS NOT NULL
+                        LIMIT 1
+                        """,
+                        (input_id,),
+                    )
+                    row = cur.fetchone()
+                    if row and row.get("upstream_job_id"):
+                        print(f"[Resolve] models→jobs: {input_id} -> {row['upstream_job_id']}")
+                        return row["upstream_job_id"]
+
+                    # 4. history_items payload: look for upstream references
                     cur.execute(
                         f"""
                         SELECT payload->>'original_job_id' as original_job_id,
@@ -1859,14 +1877,14 @@ def resolve_meshy_job_id(input_id: str) -> str:
                     )
                     row = cur.fetchone()
                     if row:
-                        original_id = row.get("original_job_id") or row.get("job_id_field") or row.get("preview_task_id")
-                        if original_id and original_id != input_id:
-                            print(f"[Resolve] Found upstream in history_items: {input_id} -> {original_id}")
-                            return original_id
+                        candidate = row.get("original_job_id") or row.get("job_id_field") or row.get("preview_task_id")
+                        if candidate and candidate != input_id:
+                            print(f"[Resolve] history: {input_id} -> {candidate}")
+                            return candidate
         except Exception as e:
-            print(f"[Resolve] Error looking up original job ID: {e}")
+            print(f"[Resolve] Error: {e}")
 
-    # No mapping found - assume input_id is already a Meshy task ID
+    # No mapping found — assume input_id is already a Meshy task ID
     return input_id
 
 

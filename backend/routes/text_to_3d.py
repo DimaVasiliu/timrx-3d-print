@@ -198,60 +198,60 @@ def text_to_3d_refine_mod():
         return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
     preview_task_id = resolve_meshy_job_id(preview_task_id_input)
-    print(f"[Refine][mod] Resolved preview_task_id: {preview_task_id_input} -> {preview_task_id}")
 
-    # Validate that we have a proper Meshy task ID
-    # If the input looked like an internal UUID but wasn't resolved, fail early
-    def _looks_like_internal_uuid(val: str) -> bool:
-        # Internal UUIDs are hyphenated, Meshy task IDs are also UUIDs but may differ
-        # If we received a UUID and it wasn't resolved to something different, it's likely missing
-        import re
-        return bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', val))
+    # If resolution returned a different value, it found the Meshy upstream ID
+    resolved = preview_task_id != preview_task_id_input
+    print(
+        f"[REFINE_RESOLVE] incoming={preview_task_id_input} "
+        f"resolved={'yes' if resolved else 'no'} "
+        f"meshy_preview_id={preview_task_id}"
+    )
 
-    # If the input is a UUID and resolution returned the same value, the upstream ID is missing
-    if _looks_like_internal_uuid(preview_task_id_input) and preview_task_id == preview_task_id_input:
-        # Check if this might be a Meshy task ID directly (could be valid)
-        # Check in-memory store first, then DB (store is per-worker, may miss cross-worker jobs)
-        store = load_store()
-        store_entry = store.get(preview_task_id_input) or {}
-        found_in_store = store_entry.get("glb_url") or store_entry.get("status") == "done"
+    # If resolution returned the same value (no upstream mapping found),
+    # the input might be an internal TimrX job UUID. Try one more DB lookup
+    # to find the Meshy task ID via the jobs table.
+    if not resolved and USE_DB:
+        try:
+            from backend.db import get_conn, Tables
+            from psycopg.rows import dict_row
+            with get_conn() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    # Direct jobs lookup: input is internal UUID → get upstream
+                    cur.execute(
+                        f"SELECT upstream_job_id FROM {Tables.JOBS} WHERE id::text = %s AND upstream_job_id IS NOT NULL LIMIT 1",
+                        (preview_task_id_input,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        preview_task_id = row["upstream_job_id"]
+                        resolved = True
+                        print(f"[REFINE_RESOLVE] fallback jobs lookup: {preview_task_id_input} -> {preview_task_id}")
+                    else:
+                        # Input might be a Meshy task ID that's valid on the provider side
+                        # Verify it exists as an upstream_job_id somewhere
+                        cur.execute(
+                            f"""
+                            SELECT 1 FROM {Tables.JOBS} WHERE upstream_job_id = %s
+                            UNION ALL
+                            SELECT 1 FROM {Tables.MODELS} WHERE upstream_job_id = %s
+                            LIMIT 1
+                            """,
+                            (preview_task_id_input, preview_task_id_input),
+                        )
+                        if cur.fetchone():
+                            print(f"[REFINE_RESOLVE] input is already a valid Meshy task ID: {preview_task_id_input}")
+                            resolved = True
+                        else:
+                            print(f"[REFINE_RESOLVE] FAILED: no upstream mapping for {preview_task_id_input}")
+        except Exception as e:
+            print(f"[REFINE_RESOLVE] fallback error: {e}")
 
-        # If not in store, check DB — the job may have been handled by a different worker
-        found_in_db = False
-        if not found_in_store:
-            try:
-                from backend.db import USE_DB, get_conn, Tables
-                from psycopg.rows import dict_row
-                if USE_DB:
-                    with get_conn() as conn:
-                        with conn.cursor(row_factory=dict_row) as cur:
-                            cur.execute(
-                                f"""
-                                SELECT 1 FROM {Tables.JOBS}
-                                WHERE upstream_job_id = %s AND status IN ('ready', 'completed', 'done')
-                                UNION
-                                SELECT 1 FROM {Tables.MODELS}
-                                WHERE upstream_job_id = %s
-                                UNION
-                                SELECT 1 FROM {Tables.HISTORY_ITEMS}
-                                WHERE payload->>'original_job_id' = %s AND status = 'finished'
-                                LIMIT 1
-                                """,
-                                (preview_task_id_input, preview_task_id_input, preview_task_id_input),
-                            )
-                            found_in_db = cur.fetchone() is not None
-                if found_in_db:
-                    print(f"[Refine][mod] preview_task_id {preview_task_id_input} not in store but found in DB (cross-worker)")
-            except Exception as e:
-                print(f"[Refine][mod] DB fallback check failed: {e}")
-
-        if not found_in_store and not found_in_db:
-            print(f"[Refine][mod] ERROR: Could not resolve preview_task_id {preview_task_id_input} to Meshy task ID (not in store or DB)")
-            return jsonify({
-                "ok": False,
-                "error": "Preview task ID not found or not yet ready. Ensure the preview completed successfully before refining.",
-                "code": "PREVIEW_TASK_NOT_FOUND",
-            }), 400
+    if not resolved:
+        return jsonify({
+            "ok": False,
+            "error": "Preview task ID not found or not yet ready. Ensure the preview completed successfully before refining.",
+            "code": "PREVIEW_TASK_NOT_FOUND",
+        }), 400
 
     store = load_store()
     preview_meta = get_job_metadata(preview_task_id_input, store)
