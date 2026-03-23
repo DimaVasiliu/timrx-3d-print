@@ -33,7 +33,7 @@ from flask import jsonify
 
 # In-memory caches (sufficient for single-instance deployment)
 _idempotency_cache: Dict[str, Tuple[float, dict]] = {}  # key -> (timestamp, response)
-_active_jobs: Dict[str, float] = {}  # job_id -> start_time
+_active_jobs: Dict[str, Tuple[float, Optional[str]]] = {}  # job_id -> (start_time, identity_id)
 
 # Cache TTLs
 IDEMPOTENCY_TTL = 3600  # 1 hour
@@ -88,7 +88,7 @@ def _cleanup_caches():
         del _idempotency_cache[k]
 
     # Clean active jobs
-    expired_jobs = [k for k, ts in _active_jobs.items() if now - ts > ACTIVE_JOB_TTL]
+    expired_jobs = [k for k, (ts, _) in _active_jobs.items() if now - ts > ACTIVE_JOB_TTL]
     for k in expired_jobs:
         del _active_jobs[k]
 
@@ -184,15 +184,16 @@ class ExpenseGuard:
                 maximum=config.MAX_IMAGES_PER_REQUEST,
             )
 
-        # Concurrent job limit (tier-based)
+        # Concurrent job limit (per-identity, tier-based)
         _cleanup_caches()
         max_concurrent = ExpenseGuard.get_max_concurrent_for_identity(identity_id)
-        if len(_active_jobs) >= max_concurrent:
+        user_active = sum(1 for _, (_, uid) in _active_jobs.items() if uid == identity_id)
+        if user_active >= max_concurrent:
             return _make_error(
                 "TOO_MANY_JOBS",
-                f"Too many jobs in progress ({len(_active_jobs)}). Wait for current jobs to complete.",
+                f"Too many jobs in progress ({user_active}). Wait for current jobs to complete.",
                 429,
-                active_jobs=len(_active_jobs),
+                active_jobs=user_active,
                 maximum=max_concurrent,
             )
 
@@ -223,15 +224,16 @@ class ExpenseGuard:
                 maximum=config.MAX_VIDEO_SECONDS,
             )
 
-        # Concurrent job limit (tier-based)
+        # Concurrent job limit (per-identity, tier-based)
         _cleanup_caches()
         max_concurrent = ExpenseGuard.get_max_concurrent_for_identity(identity_id)
-        if len(_active_jobs) >= max_concurrent:
+        user_active = sum(1 for _, (_, uid) in _active_jobs.items() if uid == identity_id)
+        if user_active >= max_concurrent:
             return _make_error(
                 "TOO_MANY_JOBS",
-                f"Too many jobs in progress ({len(_active_jobs)}). Wait for current jobs to complete.",
+                f"Too many jobs in progress ({user_active}). Wait for current jobs to complete.",
                 429,
-                active_jobs=len(_active_jobs),
+                active_jobs=user_active,
                 maximum=max_concurrent,
             )
 
@@ -298,10 +300,10 @@ class ExpenseGuard:
         _idempotency_cache[idempotency_key] = (time.time(), response)
 
     @staticmethod
-    def register_active_job(job_id: str):
-        """Register a job as active (for concurrent limit tracking)."""
+    def register_active_job(job_id: str, identity_id: Optional[str] = None):
+        """Register a job as active (for per-identity concurrent limit tracking)."""
         _cleanup_caches()
-        _active_jobs[job_id] = time.time()
+        _active_jobs[job_id] = (time.time(), identity_id)
 
     @staticmethod
     def unregister_active_job(job_id: str):
@@ -310,7 +312,7 @@ class ExpenseGuard:
 
     @staticmethod
     def get_active_job_count() -> int:
-        """Get count of currently active jobs."""
+        """Get count of currently active jobs (all identities)."""
         _cleanup_caches()
         return len(_active_jobs)
 
@@ -318,9 +320,14 @@ class ExpenseGuard:
     def get_status() -> dict:
         """Get current guardrail status for debugging/display."""
         _cleanup_caches()
+        per_identity: Dict[str, int] = {}
+        for _, (_, uid) in _active_jobs.items():
+            key = uid or "__anon__"
+            per_identity[key] = per_identity.get(key, 0) + 1
         return {
             "enabled": config.ENABLED,
             "active_jobs": len(_active_jobs),
+            "active_jobs_per_identity": per_identity,
             "max_concurrent_jobs": config.MAX_CONCURRENT_JOBS,
             "idempotency_cache_size": len(_idempotency_cache),
             "limits": {

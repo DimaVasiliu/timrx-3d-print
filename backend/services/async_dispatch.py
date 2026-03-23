@@ -11,6 +11,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 import json
+import os
 import time
 from typing import Optional
 
@@ -50,7 +51,8 @@ from backend.services.piapi_nano_banana_service import (
 # image pipeline depending on video dependencies at import time
 
 # Shared executor for background tasks
-_background_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="job_worker")
+_dispatch_max_workers = int(os.getenv("DISPATCH_MAX_WORKERS", "12"))
+_background_executor = ThreadPoolExecutor(max_workers=_dispatch_max_workers, thread_name_prefix="job_worker")
 
 
 def get_executor() -> ThreadPoolExecutor:

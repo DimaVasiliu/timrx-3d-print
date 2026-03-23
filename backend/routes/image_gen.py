@@ -282,8 +282,8 @@ def _handle_nano_banana_image_generate(body: dict):
         status="queued",
     )
 
-    # Register active job for concurrent limit tracking
-    ExpenseGuard.register_active_job(internal_job_id)
+    # Register active job for per-identity concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
 
     # Dispatch async — PiAPI task creation + polling happens in background thread
     get_executor().submit(
@@ -428,8 +428,8 @@ def _handle_gemini_image_generate(body: dict):
         status="queued",
     )
 
-    # Register active job for concurrent limit tracking
-    ExpenseGuard.register_active_job(internal_job_id)
+    # Register active job for per-identity concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
 
     # Dispatch async - Gemini API call happens in background thread
     get_executor().submit(
@@ -561,8 +561,8 @@ def _handle_openai_image_generate(body: dict):
         status="queued",
     )
 
-    # Register active job for concurrent limit tracking
-    ExpenseGuard.register_active_job(internal_job_id)
+    # Register active job for per-identity concurrent limit tracking
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
 
     get_executor().submit(
         _dispatch_openai_image_async,
