@@ -78,13 +78,29 @@ def terminalize_expired_meshy_job(job_id: str, identity_id: str | None = None):
     """
     Mark a Meshy job as failed when the provider returns 404 (task expired/deleted).
     Releases any held credit reservation. Idempotent — safe to call multiple times.
+
+    job_id may be either the internal UUID (jobs.id) or the Meshy task ID
+    (jobs.upstream_job_id). We match on both columns to handle either case.
     """
     try:
-        from backend.db import USE_DB, execute
+        from backend.db import USE_DB, execute, query_one
         from backend.db import Tables
         if not USE_DB:
             return
-        # Only update if still in an active status (idempotent)
+        # Find the job by either id or upstream_job_id
+        row = query_one(
+            f"""
+            SELECT id::text AS internal_id FROM {Tables.JOBS}
+            WHERE (id::text = %s OR upstream_job_id = %s)
+              AND status IN ('queued', 'pending', 'processing',
+                             'dispatched', 'provider_pending', 'provider_processing')
+            LIMIT 1
+            """,
+            (job_id, job_id),
+        )
+        if not row:
+            return  # Already terminal or not found
+        internal_id = row["internal_id"]
         updated = execute(
             f"""
             UPDATE {Tables.JOBS}
@@ -96,16 +112,15 @@ def terminalize_expired_meshy_job(job_id: str, identity_id: str | None = None):
               AND status IN ('queued', 'pending', 'processing',
                              'dispatched', 'provider_pending', 'provider_processing')
             """,
-            (job_id,),
+            (internal_id,),
         )
         if updated:
-            print(f"[MESHY] Terminalized expired job {job_id}")
-            # Release credit reservation
+            print(f"[MESHY] Terminalized expired job {internal_id} (lookup={job_id})")
             try:
                 from backend.services.credits_helper import refund_failed_job
-                refund_failed_job(job_id)
+                refund_failed_job(internal_id)
             except Exception as e:
-                print(f"[MESHY] Refund for expired job {job_id} failed: {e}")
+                print(f"[MESHY] Refund for expired job {internal_id} failed: {e}")
     except Exception as e:
         print(f"[MESHY] terminalize_expired_meshy_job error for {job_id}: {e}")
 
