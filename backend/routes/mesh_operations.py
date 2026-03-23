@@ -18,7 +18,7 @@ from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
-from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed
+from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed, _update_job_status_ready
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -294,6 +294,20 @@ def mesh_remesh_status_mod(job_id: str):
             if s3_result.get("db_ok") is False:
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
+
+            # Transition jobs.status → 'ready' so completed remesh jobs
+            # are excluded from /api/jobs/active on next reload
+            try:
+                int_job = meta.get("internal_job_id")
+                if int_job:
+                    _update_job_status_ready(
+                        int_job,
+                        upstream_job_id=job_id,
+                        model_id=s3_result.get("model_id"),
+                        glb_url=s3_result.get("glb_url"),
+                    )
+            except Exception as e:
+                print(f"[mesh/remesh] job status→ready failed: {e}")
 
     # If DB has the finalized model, prefer S3 URLs for frontend rendering.
     if USE_DB and identity_id:
@@ -826,6 +840,20 @@ def mesh_retexture_status_mod(job_id: str):
             if s3_result.get("db_ok") is False:
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
+
+            # Transition jobs.status → 'ready' so completed retexture jobs
+            # are excluded from /api/jobs/active on next reload
+            try:
+                int_job = meta.get("internal_job_id")
+                if int_job:
+                    _update_job_status_ready(
+                        int_job,
+                        upstream_job_id=job_id,
+                        model_id=s3_result.get("model_id"),
+                        glb_url=s3_result.get("glb_url"),
+                    )
+            except Exception as e:
+                print(f"[mesh/retexture] job status→ready failed: {e}")
 
     # If DB has the finalized model, prefer S3 URLs for frontend rendering.
     if USE_DB and identity_id:
