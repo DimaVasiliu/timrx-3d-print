@@ -2576,29 +2576,35 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     or payload.get("preview_task_id")
                 )
                 if source_task_id:
-                    # This is a derived model - look up source's lineage_origin_id
+                    # This is a derived model — look up source's lineage_origin_id.
+                    # source_task_id may be an internal UUID OR a Meshy upstream task ID,
+                    # so we check history_items directly AND via models.upstream_job_id.
                     cur.execute(
                         f"""
                         SELECT lineage_origin_id, id FROM {Tables.HISTORY_ITEMS}
                         WHERE id::text = %s
                            OR payload->>'original_job_id' = %s
                            OR payload->>'source_task_id' = %s
+                           OR payload->>'preview_task_id' = %s
+                           OR model_id IN (
+                               SELECT id FROM {Tables.MODELS}
+                               WHERE upstream_job_id = %s
+                           )
                         ORDER BY created_at ASC
                         LIMIT 1
                         """,
-                        (str(source_task_id), str(source_task_id), str(source_task_id)),
+                        (str(source_task_id), str(source_task_id),
+                         str(source_task_id), str(source_task_id),
+                         str(source_task_id)),
                     )
                     source_row = cur.fetchone()
                     if source_row:
-                        # Use source's lineage_origin_id, or fall back to source's id if not set
                         lineage_origin_id = source_row.get("lineage_origin_id") or source_row.get("id")
-                    if job_type in ("rig", "animate"):
-                        print(
-                            f"[LINEAGE] save type={job_type} "
-                            f"source_task_id={source_task_id} "
-                            f"source_found={'yes' if source_row else 'no'} "
-                            f"lineage_origin_id={lineage_origin_id}"
-                        )
+                    print(
+                        f"[LINEAGE] type={job_type} source_task_id={source_task_id} "
+                        f"source_found={'yes' if source_row else 'no'} "
+                        f"lineage_origin_id={lineage_origin_id}"
+                    )
 
                 cur.execute(
                     f"""
