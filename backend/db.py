@@ -713,10 +713,9 @@ def init_db() -> bool:
     try:
         if verify_connection():
             print("[DB] Database connection verified successfully")
-            # Initialize connection pool if enabled
-            pool = _get_pool()
-            if pool is not None:
-                print(f"[DB] Pool mode: ENABLED (min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
+            # Log pool mode — pool itself is created lazily on first use
+            if _DB_POOL_ENABLED and _POOL_AVAILABLE:
+                print(f"[DB] Pool mode: ENABLED (lazy init, min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
             else:
                 print("[DB] Pool mode: DISABLED — using direct connections")
             # Ensure schema indexes exist for idempotency
