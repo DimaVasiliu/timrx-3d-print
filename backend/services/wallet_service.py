@@ -316,6 +316,7 @@ class WalletService:
             WHERE identity_id = %s
             """,
             (identity_id,),
+            source="wallet_fetch",
         )
 
     @staticmethod
@@ -442,6 +443,7 @@ class WalletService:
             GROUP BY credit_type
             """,
             (identity_id,),
+            source="wallet_reserved",
         )
         result = {"general": 0, "video": 0}
         for row in rows:

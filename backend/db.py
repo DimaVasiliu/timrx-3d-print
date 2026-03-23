@@ -97,22 +97,30 @@ _POOL_TRACE = os.getenv("DB_POOL_TRACE", "false").lower() in ("true", "1", "yes"
 _POOL_TRACE_SLOW_MS = int(os.getenv("DB_POOL_TRACE_SLOW_MS", "2000"))
 _POOL_STATS_INTERVAL = int(os.getenv("DB_POOL_STATS_INTERVAL", "30"))
 
-# Counters (lock-free atomics aren't needed — slight imprecision is fine)
+# Counters — borrows is incremented INSIDE pool.connection() (after the
+# connection is actually acquired), not before, so leaked count is accurate.
 _pool_borrows = 0
 _pool_returns = 0
 _pool_last_stats_at = 0.0
 
+# Active borrows tracker: maps thread-name -> (source, t0) for currently
+# held connections. Used to snapshot who's holding what on timeout.
+_pool_active: Dict[str, tuple] = {}
+_pool_active_lock = threading.Lock()
+
 
 def _pool_trace_checkout(source: str):
-    """Log tagged pool checkout. Only logs if DB_POOL_TRACE=true."""
+    """Log tagged pool checkout. Only logs if DB_POOL_TRACE=true and source is set."""
     global _pool_borrows
     _pool_borrows += 1
-    if _POOL_TRACE and source:
+    tname = threading.current_thread().name
+    with _pool_active_lock:
+        _pool_active[tname] = (source or "untagged", _time.monotonic())
+    if _POOL_TRACE:
         s = _quick_pool_avail()
         print(
-            f"[DB][POOL] CHECKOUT source={source} pid={os.getpid()} "
-            f"thread={threading.current_thread().name} "
-            f"avail={s} borrows={_pool_borrows}"
+            f"[DB][POOL] CHECKOUT source={source or 'untagged'} pid={os.getpid()} "
+            f"thread={tname} avail={s} borrows={_pool_borrows}"
         )
 
 
@@ -120,28 +128,41 @@ def _pool_trace_return(source: str, t0: float):
     """Log tagged pool return + warn if held too long."""
     global _pool_returns
     _pool_returns += 1
+    tname = threading.current_thread().name
+    with _pool_active_lock:
+        _pool_active.pop(tname, None)
     held_ms = int((_time.monotonic() - t0) * 1000)
-    if source and held_ms >= _POOL_TRACE_SLOW_MS:
+    if held_ms >= _POOL_TRACE_SLOW_MS:
         print(
-            f"[DB][POOL][WARN] source={source} pid={os.getpid()} "
-            f"thread={threading.current_thread().name} held_ms={held_ms}"
+            f"[DB][POOL][WARN] source={source or 'untagged'} pid={os.getpid()} "
+            f"thread={tname} held_ms={held_ms}"
         )
-    elif _POOL_TRACE and source:
+    elif _POOL_TRACE:
         print(
-            f"[DB][POOL] RETURN  source={source} pid={os.getpid()} "
-            f"thread={threading.current_thread().name} held_ms={held_ms}"
+            f"[DB][POOL] RETURN  source={source or 'untagged'} pid={os.getpid()} "
+            f"thread={tname} held_ms={held_ms}"
         )
 
 
 def _pool_trace_timeout(source: str):
-    """Log full diagnostics on PoolTimeout."""
+    """Log full diagnostics on PoolTimeout including who's holding connections."""
     stats = pool_stats()
+    with _pool_active_lock:
+        now = _time.monotonic()
+        holders = {
+            t: (src, int((now - t0) * 1000))
+            for t, (src, t0) in _pool_active.items()
+        }
     print(
         f"[DB][POOL][TIMEOUT] source={source or 'untagged'} pid={os.getpid()} "
         f"thread={threading.current_thread().name} "
         f"borrows={_pool_borrows} returns={_pool_returns} "
         f"leaked={_pool_borrows - _pool_returns} stats={stats}"
     )
+    if holders:
+        print(f"[DB][POOL][TIMEOUT] active_holders={holders}")
+    else:
+        print(f"[DB][POOL][TIMEOUT] active_holders=NONE (all returned but pool still empty)")
 
 
 def _quick_pool_avail() -> str:
@@ -162,13 +183,20 @@ def _maybe_log_pool_stats():
         return
     _pool_last_stats_at = now
     stats = pool_stats()
+    with _pool_active_lock:
+        now2 = _time.monotonic()
+        holders = {
+            t: (src, int((now2 - t0) * 1000))
+            for t, (src, t0) in _pool_active.items()
+        }
     print(
         f"[DB][POOL] pid={os.getpid()} thread={threading.current_thread().name} "
         f"pool_size={stats.get('pool_size', '?')} "
         f"pool_available={stats.get('pool_available', '?')} "
         f"requests_waiting={stats.get('requests_waiting', '?')} "
         f"borrows={_pool_borrows} returns={_pool_returns} "
-        f"leaked={_pool_borrows - _pool_returns}"
+        f"leaked={_pool_borrows - _pool_returns} "
+        f"holders={holders if holders else 'none'}"
     )
 
 
@@ -439,18 +467,22 @@ def get_conn(source: str = ""):
     """
     pool = _get_pool()
     if pool is not None:
-        t0 = _time.monotonic()
-        _pool_trace_checkout(source)
         _maybe_log_pool_stats()
         try:
             with pool.connection() as conn:
-                yield conn
+                # Trace AFTER pool.connection() succeeds — the connection is
+                # actually held now. This keeps leaked count accurate (no
+                # false +1 while waiting in the pool queue).
+                t0 = _time.monotonic()
+                _pool_trace_checkout(source or "get_conn")
+                try:
+                    yield conn
+                finally:
+                    _pool_trace_return(source or "get_conn", t0)
         except Exception as exc:
             if "PoolTimeout" in type(exc).__name__:
-                _pool_trace_timeout(source)
+                _pool_trace_timeout(source or "get_conn")
             raise
-        finally:
-            _pool_trace_return(source, t0)
     else:
         conn = _create_connection()
         try:
@@ -530,19 +562,20 @@ def transaction(source: str = ""):
     """
     pool = _get_pool()
     if pool is not None:
-        t0 = _time.monotonic()
-        _pool_trace_checkout(source)
         _maybe_log_pool_stats()
         try:
             with pool.connection() as conn:
-                with _run_transaction(conn) as cur:
-                    yield cur
+                t0 = _time.monotonic()
+                _pool_trace_checkout(source or "transaction")
+                try:
+                    with _run_transaction(conn) as cur:
+                        yield cur
+                finally:
+                    _pool_trace_return(source or "transaction", t0)
         except Exception as exc:
             if "PoolTimeout" in type(exc).__name__:
-                _pool_trace_timeout(source)
+                _pool_trace_timeout(source or "transaction")
             raise
-        finally:
-            _pool_trace_return(source, t0)
     else:
         conn = _create_connection()
         try:

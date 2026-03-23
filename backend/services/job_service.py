@@ -543,6 +543,7 @@ class JobService:
             LIMIT %s
             """,
             (identity_id, max_age_hours, limit),
+            source="jobs_active",
         )
 
         # Also fix any jobs we just excluded — transition them to 'ready'

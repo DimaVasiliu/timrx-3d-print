@@ -493,6 +493,7 @@ class IdentityService:
             WHERE i.id = %s
             """,
             (identity_id,),
+            source="identity_with_wallet",
         )
 
     # Reasons for email attachment failure (internal use only - never expose to users)
@@ -617,6 +618,7 @@ class IdentityService:
             count = execute(
                 f"UPDATE {Tables.IDENTITIES} SET last_seen_at = NOW() WHERE id = %s",
                 (identity_id,),
+                source="identity_touch",
             )
             return count > 0
         except DatabaseError:
@@ -698,6 +700,7 @@ class IdentityService:
         execute(
             f"UPDATE {Tables.SESSIONS} SET expires_at = %s WHERE id = %s",
             (new_expiry, session_id),
+            source="identity_session_renew",
         )
         # Always log renewal so it's observable in production
         print(
@@ -736,6 +739,7 @@ class IdentityService:
               AND s.expires_at > NOW()
             """,
             (session_id,),
+            source="identity_validate_session",
         )
 
         if not result:

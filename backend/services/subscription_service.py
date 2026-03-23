@@ -284,7 +284,7 @@ class SubscriptionService:
         if not USE_DB:
             return None
         try:
-            with get_conn() as conn:
+            with get_conn("billing_sub_me") as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"""
