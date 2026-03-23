@@ -494,39 +494,65 @@ class JobService:
         """
         Get genuinely active jobs for an identity (for frontend recovery).
 
-        Only returns jobs that are:
-        - In an active status (queued/pending/processing/dispatched/
+        Meshy task lifecycle (from docs):
+          PENDING → IN_PROGRESS → SUCCEEDED | FAILED | CANCELED
+        Each Meshy operation (text-to-3d, refine, retexture, remesh, rig,
+        animate) creates a brand new provider task with its own task ID.
+        Terminal states: SUCCEEDED, FAILED, CANCELED.
+
+        A job is genuinely active only if:
+        - Its DB status is non-terminal (queued/pending/processing/dispatched/
           provider_pending/provider_processing)
-        - Created within max_age_hours (default 2h) — older jobs whose
-          provider tasks have expired are excluded
-        - NOT in terminal/stalled/blocked states
+        - It was created within max_age_hours
+        - It does NOT already have a finalized model/image in the DB
+          (defensive: catches jobs whose status wasn't properly transitioned)
 
         Returns:
             List of job dicts with status, progress, and result info
         """
         jobs = query_all(
             f"""
-            SELECT id, identity_id, provider, action_code, status,
-                   cost_credits, reservation_id, upstream_job_id,
-                   prompt, meta, error_message, job_type, stage,
-                   progress, result_refs, created_at, updated_at
-            FROM {Tables.JOBS}
-            WHERE identity_id = %s
-              AND status IN (
+            SELECT j.id, j.identity_id, j.provider, j.action_code, j.status,
+                   j.cost_credits, j.reservation_id, j.upstream_job_id,
+                   j.prompt, j.meta, j.error_message, j.job_type, j.stage,
+                   j.progress, j.result_refs, j.created_at, j.updated_at
+            FROM {Tables.JOBS} j
+            WHERE j.identity_id = %s
+              AND j.status IN (
                   'queued', 'pending', 'processing',
                   'dispatched', 'provider_pending', 'provider_processing'
               )
-              AND created_at > NOW() - INTERVAL '%s hours'
-            ORDER BY created_at DESC
+              AND j.created_at > NOW() - INTERVAL '%s hours'
+              -- Defensive: exclude jobs that already have a finalized asset
+              -- (catches status-transition bugs where job completed but
+              --  status was never updated to 'ready')
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.MODELS} m
+                  WHERE m.upstream_job_id = j.upstream_job_id
+                    AND m.upstream_job_id IS NOT NULL
+                    AND m.status = 'ready'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {Tables.HISTORY_ITEMS} h
+                  WHERE (h.id::text = j.id::text
+                     OR h.payload->>'original_job_id' = j.id::text
+                     OR h.payload->>'original_job_id' = j.upstream_job_id)
+                    AND h.status = 'finished'
+              )
+            ORDER BY j.created_at DESC
             LIMIT %s
             """,
             (identity_id, max_age_hours, limit),
         )
 
+        # Also fix any jobs we just excluded — transition them to 'ready'
+        # so they don't need the defensive check on future queries
+        if jobs is not None:
+            _auto_fix_stuck_processing_jobs(identity_id)
+
         result = []
         for job in jobs:
             formatted = JobService._format_job(job)
-            # Add extra fields for frontend
             formatted["job_type"] = job.get("job_type")
             formatted["stage"] = job.get("stage")
             formatted["progress"] = job.get("progress", 0)
@@ -1267,6 +1293,38 @@ class JobService:
             "frontend_resume_id": frontend_resume_id,
             "resume_strategy": resume_strategy,
         }
+
+# --- Auto-fix: transition stuck processing jobs that have finalized assets ---
+
+def _auto_fix_stuck_processing_jobs(identity_id: str):
+    """
+    Find jobs stuck in 'processing' that already have a finalized model/history
+    and transition them to 'ready'. This handles the case where the status
+    handler completed the Meshy work (saved model, finalized credits) but
+    failed to update jobs.status. Runs as a background repair on each
+    /api/jobs/active call — idempotent, only touches the current user's jobs.
+    """
+    try:
+        updated = execute(
+            f"""
+            UPDATE {Tables.JOBS} j
+            SET status = 'ready', updated_at = NOW()
+            WHERE j.identity_id = %s
+              AND j.status IN ('processing', 'pending')
+              AND j.upstream_job_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM {Tables.MODELS} m
+                  WHERE m.upstream_job_id = j.upstream_job_id
+                    AND m.status = 'ready'
+              )
+            """,
+            (identity_id,),
+        )
+        if updated:
+            print(f"[JOBS] Auto-fixed {updated} stuck processing job(s) for identity={identity_id[:8]}...")
+    except Exception as e:
+        print(f"[JOBS] Auto-fix stuck jobs error: {e}")
+
 
 # --- Phase 7: Job store helpers (standalone) ---
 
