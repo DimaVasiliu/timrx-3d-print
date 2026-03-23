@@ -69,23 +69,22 @@ def dispatch_meshy_text_to_3d_async(
     store_meta: dict,
 ):
     start_time = time.time()
-    # print(f"[ASYNC] Starting Meshy text-to-3d dispatch for job {internal_job_id}")
-    # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=text-to-3d reservation_id={reservation_id}")
+    stage = store_meta.get("stage", "preview")
+    print(f"[TEXT-TO-3D] Starting dispatch job={internal_job_id} stage={stage} reservation={reservation_id}")
 
     try:
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         meshy_task_id = resp.get("result")
-
         duration_ms = int((time.time() - start_time) * 1000)
-        # print(f"[ASYNC] Meshy returned task_id={meshy_task_id} for job {internal_job_id} in {duration_ms}ms")
-        # print(f"[JOB] provider_done job_id={internal_job_id} duration_ms={duration_ms} upstream_id={meshy_task_id} status=accepted")
 
         if not meshy_task_id:
-            print(f"[ASYNC] ERROR: No task_id from Meshy for job {internal_job_id}")
+            print(f"[TEXT-TO-3D] ERROR: Meshy returned no task_id job={internal_job_id} duration={duration_ms}ms")
             if reservation_id:
                 release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             update_job_status_failed(internal_job_id, "3D model generation failed. Please try again.")
             return
+
+        print(f"[TEXT-TO-3D] Provider accepted job={internal_job_id} meshy_task={meshy_task_id} duration={duration_ms}ms")
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
@@ -98,16 +97,14 @@ def dispatch_meshy_text_to_3d_async(
         save_active_job_to_db(
             meshy_task_id,
             "text-to-3d",
-            store_meta.get("stage", "preview"),
+            stage,
             store_meta,
             identity_id,
         )
 
-        # print(f"[ASYNC] Job {internal_job_id} dispatched successfully, meshy_task_id={meshy_task_id}")
-
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
-        print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        print(f"[TEXT-TO-3D] FAILED job={internal_job_id} stage={stage} duration={duration_ms}ms error={e}")
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_job_error_message
@@ -122,15 +119,18 @@ def dispatch_meshy_refine_async(
     store_meta: dict,
 ):
     start_time = time.time()
-    # print(f"[ASYNC] Starting Meshy refine dispatch for job {internal_job_id}")
-    # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=refine reservation_id={reservation_id}")
+    preview_id = payload.get("preview_task_id", "?")
+    print(f"[REFINE] Starting dispatch job={internal_job_id} preview={preview_id} reservation={reservation_id}")
 
     try:
         # Meshy has eventual consistency: a just-completed preview may not be
-        # found for refine for a few seconds.  Retry once after a short delay.
+        # queryable for refine for several seconds.  Retry with increasing delays.
         resp = None
         last_err = None
-        for attempt in range(2):
+        retry_delays = [3, 5, 8]  # seconds between retries
+        max_attempts = 1 + len(retry_delays)
+
+        for attempt in range(max_attempts):
             try:
                 resp = mesh_post("/openapi/v2/text-to-3d", payload)
                 break
@@ -138,25 +138,27 @@ def dispatch_meshy_refine_async(
                 last_err = e
                 err_lower = str(e).lower()
                 is_not_found = "preview task not found" in err_lower or "task not found" in err_lower
-                if is_not_found and attempt == 0:
-                    print(f"[ASYNC] Meshy refine: preview not found, retrying in 3s (job={internal_job_id})")
-                    time.sleep(3)
+                if is_not_found and attempt < len(retry_delays):
+                    delay = retry_delays[attempt]
+                    print(f"[REFINE] Preview not found on attempt {attempt + 1}/{max_attempts}, retrying in {delay}s (job={internal_job_id})")
+                    time.sleep(delay)
                     continue
                 raise
 
         if resp is None:
-            raise last_err or RuntimeError("Refine dispatch failed")
+            raise last_err or RuntimeError("Refine dispatch failed after retries")
 
         meshy_task_id = resp.get("result")
-
         duration_ms = int((time.time() - start_time) * 1000)
 
         if not meshy_task_id:
-            print(f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} error=refine_returned_no_task_id")
+            print(f"[REFINE] ERROR: Meshy returned no task_id job={internal_job_id} duration={duration_ms}ms")
             if reservation_id:
                 release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
             update_job_status_failed(internal_job_id, "3D model generation failed. Please try again.")
             return
+
+        print(f"[REFINE] Provider accepted job={internal_job_id} meshy_task={meshy_task_id} duration={duration_ms}ms")
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
@@ -174,22 +176,14 @@ def dispatch_meshy_refine_async(
             identity_id,
         )
 
-        # print(
-        #     f"[ASYNC] Refine job {internal_job_id} dispatched successfully, "
-        #     f"meshy_task_id={meshy_task_id}"
-        # )
-
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         err_text = str(e)
-        print(
-            f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} "
-            f"action=refine duration_ms={duration_ms} error={err_text}"
-        )
+        print(f"[REFINE] FAILED job={internal_job_id} duration={duration_ms}ms error={err_text}")
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_job_error_message
-        update_job_status_failed(internal_job_id, sanitize_job_error_message(err_text) or "Generation failed. Please try again.")
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(err_text) or "Refine failed. Please try again.")
 
 
 def dispatch_meshy_image_to_3d_async(
@@ -2554,3 +2548,5 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+

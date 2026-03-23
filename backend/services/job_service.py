@@ -1186,9 +1186,69 @@ class JobService:
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _resolve_resume_fields(job: Dict[str, Any]) -> tuple:
+        """
+        Determine the canonical resume identity for a job.
+
+        Returns (provider_job_id, frontend_resume_id, resume_strategy).
+
+        The resume_strategy tells the frontend which watcher to use.
+        The frontend_resume_id is the exact ID to poll with.
+
+        Routes that return meshy_task_id to the frontend (retexture, remesh,
+        rig, animate) need the upstream ID for polling because their status
+        handlers pass it directly to the Meshy API. Routes that return
+        internal_job_id (text-to-3d, image-to-3d, video) resolve the
+        upstream ID internally in their status handlers.
+        """
+        provider = (job.get("provider") or "").lower()
+        action = (job.get("action_code") or "").lower()
+        stage = (job.get("stage") or "").lower()
+        upstream = job.get("upstream_job_id")
+        internal_id = str(job["id"])
+
+        provider_job_id = upstream or None
+
+        # Determine resume_strategy from stage first (most reliable), then action_code
+        if stage == "texture" or "retexture" in action:
+            resume_strategy = "meshy_retexture"
+        elif stage == "remesh" or ("remesh" in action) or ("upscale" in action):
+            resume_strategy = "meshy_remesh"
+        elif stage == "rig" or "rigging" in action:
+            resume_strategy = "meshy_rig"
+        elif stage in ("animate", "animation") or "animation" in action:
+            resume_strategy = "meshy_animation"
+        elif stage == "refine" or "refine" in action:
+            resume_strategy = "meshy_refine"
+        elif stage == "image3d" or "image_to_3d" in action:
+            resume_strategy = "meshy_image_to_3d"
+        elif stage == "preview" or "text_to_3d" in action:
+            resume_strategy = "meshy_text_to_3d"
+        elif stage == "video" or "video" in action or "seedance" in action:
+            resume_strategy = "video"
+        elif "image" in action and "3d" not in action:
+            resume_strategy = "image"
+        else:
+            resume_strategy = "meshy_text_to_3d"  # safe default for meshy provider
+
+        # Determine frontend_resume_id: which ID does the status endpoint expect?
+        # Routes whose status handlers pass the URL param directly to the Meshy API
+        # need the upstream (provider) task ID. Others resolve internally.
+        uses_upstream_id = upstream and resume_strategy in (
+            "meshy_retexture", "meshy_remesh", "meshy_rig", "meshy_animation",
+        )
+        frontend_resume_id = upstream if uses_upstream_id else internal_id
+
+        return provider_job_id, frontend_resume_id, resume_strategy
+
+    @staticmethod
     def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
-        """Format job for API response."""
+        """Format job for API response with canonical resume contract."""
+        provider_job_id, frontend_resume_id, resume_strategy = (
+            JobService._resolve_resume_fields(job)
+        )
         return {
+            # Existing fields (preserved for compatibility)
             "id": str(job["id"]),
             "identity_id": str(job["identity_id"]),
             "provider": job["provider"],
@@ -1202,6 +1262,10 @@ class JobService:
             "error_message": job.get("error_message"),
             "created_at": job["created_at"].isoformat() if job.get("created_at") else None,
             "updated_at": job["updated_at"].isoformat() if job.get("updated_at") else None,
+            # Canonical resume contract (frontend should prefer these)
+            "provider_job_id": provider_job_id,
+            "frontend_resume_id": frontend_resume_id,
+            "resume_strategy": resume_strategy,
         }
 
 # --- Phase 7: Job store helpers (standalone) ---
