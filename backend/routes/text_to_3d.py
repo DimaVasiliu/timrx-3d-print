@@ -628,16 +628,20 @@ def text_to_3d_status_mod(job_id: str):
                 out["db_errors"] = s3_result.get("db_errors")
 
             reservation_id = meta.get("reservation_id")
-            internal_job_id = meta.get("internal_job_id")
+            # internal_job_id from store meta, or from the DB job row if store
+            # was lost (worker restart / cross-worker status poll)
+            internal_job_id = (
+                meta.get("internal_job_id")
+                or (str(internal_job["id"]) if internal_job else None)
+            )
             user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
             if reservation_id:
-                # Use internal_job_id (not upstream job_id) for credit finalization tracking
                 finalize_job_credits(reservation_id, internal_job_id or job_id, user_id)
 
             if internal_job_id:
                 _update_job_status_ready(
                     internal_job_id,
-                    upstream_job_id=job_id,
+                    upstream_job_id=meshy_job_id,
                     model_id=s3_result.get("model_id"),
                     glb_url=s3_result.get("glb_url"),
                 )

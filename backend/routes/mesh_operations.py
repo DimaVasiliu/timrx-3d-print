@@ -296,9 +296,15 @@ def mesh_remesh_status_mod(job_id: str):
                 out["db_errors"] = s3_result.get("db_errors")
 
             # Transition jobs.status → 'ready' so completed remesh jobs
-            # are excluded from /api/jobs/active on next reload
+            # are excluded from /api/jobs/active on next reload.
+            # Resolve internal_job_id from store or DB (store may be
+            # empty after worker restart).
             try:
                 int_job = meta.get("internal_job_id")
+                if not int_job and USE_DB:
+                    from backend.db import query_one, Tables as _T
+                    _row = query_one(f"SELECT id::text AS jid FROM {_T.JOBS} WHERE upstream_job_id = %s LIMIT 1", (job_id,))
+                    int_job = _row["jid"] if _row else None
                 if int_job:
                     _update_job_status_ready(
                         int_job,
@@ -842,9 +848,15 @@ def mesh_retexture_status_mod(job_id: str):
                 out["db_errors"] = s3_result.get("db_errors")
 
             # Transition jobs.status → 'ready' so completed retexture jobs
-            # are excluded from /api/jobs/active on next reload
+            # are excluded from /api/jobs/active on next reload.
+            # Resolve internal_job_id from store or DB (store may be
+            # empty after worker restart).
             try:
                 int_job = meta.get("internal_job_id")
+                if not int_job and USE_DB:
+                    from backend.db import query_one, Tables as _T
+                    _row = query_one(f"SELECT id::text AS jid FROM {_T.JOBS} WHERE upstream_job_id = %s LIMIT 1", (job_id,))
+                    int_job = _row["jid"] if _row else None
                 if int_job:
                     _update_job_status_ready(
                         int_job,
