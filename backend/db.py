@@ -283,9 +283,13 @@ def _create_connection():
 def get_conn():
     """
     Context manager for database connections.
-    Connection is NOT auto-committed - caller must commit explicitly or use transaction().
 
-    Uses the connection pool when available, falls back to direct connections.
+    Pooled path: uses pool.connection() which auto-commits on clean exit
+    and auto-rolls-back on exception, ensuring connections always return
+    to the pool in a clean IDLE state.
+
+    Direct path (no pool): caller manages commit/rollback. Connection is
+    closed on exit.
 
     Raises:
         DatabaseNotConfiguredError: If database is not configured
@@ -296,15 +300,12 @@ def get_conn():
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM users")
                 rows = cur.fetchall()
-            conn.commit()  # Must commit explicitly!
+            conn.commit()
     """
     pool = _get_pool()
     if pool is not None:
-        conn = pool.getconn()
-        try:
+        with pool.connection() as conn:
             yield conn
-        finally:
-            pool.putconn(conn)
     else:
         conn = _create_connection()
         try:
@@ -317,32 +318,10 @@ def get_conn():
 
 
 @contextmanager
-def transaction():
-    """
-    Context manager for database transactions.
-    Automatically commits on success, rolls back on exception.
-    Yields a cursor with dict_row factory.
-
-    Uses the connection pool when available, falls back to direct connections.
-
-    Raises:
-        DatabaseNotConfiguredError: If database is not configured
-        DatabaseConnectionError: If connection fails
-        DatabaseQueryError: If a query fails
-        DatabaseIntegrityError: On constraint violations
-
-    Usage:
-        with transaction() as cur:
-            cur.execute("INSERT INTO users (name) VALUES (%s) RETURNING *", ("John",))
-            user = fetch_one(cur)
-            cur.execute("INSERT INTO wallets (user_id) VALUES (%s)", (user["id"],))
-        # Auto-committed here if no exception
-    """
-    pool = _get_pool()
-    if pool is not None:
-        conn = pool.getconn()
-    else:
-        conn = _create_connection()
+def _run_transaction(conn):
+    """Execute a transaction on the given connection.
+    Handles commit on success, safe rollback + exception mapping on failure.
+    Internal helper — callers use transaction() instead."""
     try:
         with conn.cursor() as cur:
             yield cur
@@ -377,10 +356,44 @@ def transaction():
     except Exception:
         _safe_rollback(conn)
         raise
-    finally:
-        if pool is not None:
-            pool.putconn(conn)
-        else:
+
+
+@contextmanager
+def transaction():
+    """
+    Context manager for database transactions.
+    Automatically commits on success, rolls back on exception.
+    Yields a cursor with dict_row factory.
+
+    Pooled path: wraps pool.connection() so the connection always returns
+    to the pool in a clean IDLE state, even on error or dead connection.
+
+    Direct path (no pool): connection is closed on exit.
+
+    Raises:
+        DatabaseNotConfiguredError: If database is not configured
+        DatabaseConnectionError: If connection fails
+        DatabaseQueryError: If a query fails
+        DatabaseIntegrityError: On constraint violations
+
+    Usage:
+        with transaction() as cur:
+            cur.execute("INSERT INTO users (name) VALUES (%s) RETURNING *", ("John",))
+            user = fetch_one(cur)
+            cur.execute("INSERT INTO wallets (user_id) VALUES (%s)", (user["id"],))
+        # Auto-committed here if no exception
+    """
+    pool = _get_pool()
+    if pool is not None:
+        with pool.connection() as conn:
+            with _run_transaction(conn) as cur:
+                yield cur
+    else:
+        conn = _create_connection()
+        try:
+            with _run_transaction(conn) as cur:
+                yield cur
+        finally:
             try:
                 conn.close()
             except Exception:
