@@ -1143,6 +1143,37 @@ def history_item_update_mod(item_id: str):
                             if video_id:
                                 cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE video_id = %s AND identity_id = %s", (video_id, identity_id))
 
+                            # Mark linked jobs as deleted_by_user so recovery never revives them
+                            if model_id:
+                                # Find jobs via model's upstream_job_id
+                                cur.execute(
+                                    f"""
+                                    SELECT j.id::text AS job_id, j.reservation_id::text AS reservation_id
+                                    FROM {Tables.JOBS} j
+                                    INNER JOIN {Tables.MODELS} m ON j.upstream_job_id = m.upstream_job_id
+                                    WHERE m.id = %s AND j.identity_id = %s
+                                      AND j.status NOT IN ('ready', 'succeeded', 'failed', 'refunded', 'ready_unbilled', 'deleted_by_user')
+                                    """,
+                                    (model_id, identity_id),
+                                )
+                                model_orphaned_jobs = cur.fetchall() or []
+                                if model_orphaned_jobs:
+                                    job_ids = [oj["job_id"] for oj in model_orphaned_jobs]
+                                    placeholders = ",".join(["%s"] * len(job_ids))
+                                    cur.execute(
+                                        f"""
+                                        UPDATE {Tables.JOBS}
+                                        SET status = 'deleted_by_user',
+                                            completed_at = COALESCE(completed_at, NOW()),
+                                            meta = COALESCE(meta, '{{}}'::jsonb) || '{{"deleted_by_user": true}}'::jsonb,
+                                            updated_at = NOW()
+                                        WHERE id::text IN ({placeholders})
+                                        """,
+                                        tuple(job_ids),
+                                    )
+                                    print(f"[DELETE] marked {len(model_orphaned_jobs)} linked job(s) as deleted_by_user for model_id={model_id}")
+                                    orphaned_jobs.extend(model_orphaned_jobs)
+
                             if model_id:
                                 cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s AND identity_id = %s", (model_id, identity_id))
                             if image_id:
@@ -1158,10 +1189,10 @@ def history_item_update_mod(item_id: str):
                                     """,
                                     (str(video_id),),
                                 )
-                                orphaned_jobs = cur.fetchall() or []
+                                video_orphaned_jobs = cur.fetchall() or []
 
                                 # Mark linked jobs as deleted_by_user so rescue never revives them
-                                if orphaned_jobs:
+                                if video_orphaned_jobs:
                                     cur.execute(
                                         f"""
                                         UPDATE {Tables.JOBS}
@@ -1174,14 +1205,15 @@ def history_item_update_mod(item_id: str):
                                         """,
                                         (str(video_id),),
                                     )
-                                    print(f"[DELETE] marked {len(orphaned_jobs)} linked job(s) as deleted_by_user for video_id={video_id}")
+                                    print(f"[DELETE] marked {len(video_orphaned_jobs)} linked job(s) as deleted_by_user for video_id={video_id}")
+                                    orphaned_jobs.extend(video_orphaned_jobs)
 
                                 cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s AND identity_id = %s", (video_id, identity_id))
                         conn.commit()
                         db_ok = True
 
                         # Release held credits for orphaned jobs (after commit, best-effort)
-                        if video_id and orphaned_jobs:
+                        if orphaned_jobs:
                             from backend.services.credits_helper import release_job_credits
                             from backend.services.video_errors import ErrorCategory
                             for oj in orphaned_jobs:
