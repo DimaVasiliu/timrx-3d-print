@@ -22,11 +22,17 @@ Note: All service imports are lazy (inside functions) to avoid circular import i
 """
 
 import os
+import time as _time
 from functools import wraps
 from flask import request, g, jsonify, make_response
 
 # Debug flag for verbose session logging (set SESSION_DEBUG=1 to enable)
 SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
+
+# Bootstrap circuit-breaker: if the pool can't serve a connection within
+# this many seconds, return a lightweight "retry later" response instead
+# of queueing more bootstrap attempts that pile on the pool.
+_BOOTSTRAP_TIMEOUT = float(os.getenv("BOOTSTRAP_TIMEOUT", "5"))
 
 # NOTE: Do NOT import IdentityService, config, or db at module level!
 # These cause circular imports. Import them lazily inside functions.
@@ -128,6 +134,68 @@ def _maybe_refresh_cookie(identity, session_id, result):
 
 
 # ─────────────────────────────────────────────────────────────
+# Bootstrap with circuit-breaker + single-flight
+# ─────────────────────────────────────────────────────────────
+
+_BOOTSTRAP_RETRY_RESPONSE = (
+    jsonify({
+        "ok": False,
+        "error": {
+            "code": "BOOTSTRAP_BUSY",
+            "message": "Server is starting up. Please retry in a moment.",
+        },
+        "retry_after": 2,
+    }),
+    503,
+    {"Retry-After": "2"},
+)
+
+
+def _do_bootstrap():
+    """
+    Run anonymous bootstrap with circuit-breaker and single-flight.
+    Returns (session_id, identity_id, cookie_response) on success.
+    Raises _BootstrapBusy if the pool can't serve within BOOTSTRAP_TIMEOUT.
+    """
+    from backend.services.identity_service import _bootstrap_single_flight
+
+    IdentityService = _get_identity_service()
+    cookie_response = make_response()
+
+    t0 = _time.monotonic()
+    try:
+        session_id, identity_id = _bootstrap_single_flight(
+            request, cookie_response, IdentityService.get_or_create_session,
+        )
+    except Exception as e:
+        elapsed_ms = int((_time.monotonic() - t0) * 1000)
+        # If it looks like a pool timeout, trip the circuit breaker
+        if "PoolTimeout" in type(e).__name__ or "timeout" in str(e).lower():
+            print(
+                f"[BOOTSTRAP][BREAKER] pool unavailable elapsed_ms={elapsed_ms} "
+                f"path={request.path} — returning 503"
+            )
+            raise _BootstrapBusy() from e
+        raise
+
+    elapsed_ms = int((_time.monotonic() - t0) * 1000)
+    print(f"[BOOTSTRAP] completed elapsed_ms={elapsed_ms} sid={session_id[:8]}... iid={identity_id[:8]}...")
+
+    # Fetch wallet + seed the process cache for concurrent followers
+    identity_with_wallet = IdentityService.get_identity_with_wallet(identity_id)
+    if identity_with_wallet:
+        from backend.services.identity_service import _session_cache_put
+        _session_cache_put(session_id, identity_with_wallet)
+
+    return session_id, identity_id, identity_with_wallet, cookie_response
+
+
+class _BootstrapBusy(Exception):
+    """Raised when bootstrap can't get a DB connection in time."""
+    pass
+
+
+# ─────────────────────────────────────────────────────────────
 # Session/Auth Middleware Decorators
 # ─────────────────────────────────────────────────────────────
 
@@ -137,15 +205,14 @@ def with_session(f):
     Creates anonymous identity + session if none exists.
     Skips session logic entirely for OPTIONS (CORS preflight).
 
-    Sets on g:
-        - g.session_id, g.identity_id, g.identity
+    If bootstrap can't get a DB connection quickly, returns a lightweight
+    503 with Retry-After instead of cascading more pool pressure.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
             return f(*args, **kwargs)
 
-        IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
         try:
@@ -155,28 +222,17 @@ def with_session(f):
                 result = f(*args, **kwargs)
                 return _maybe_refresh_cookie(identity, session_id, result)
 
-            # No valid session — create anonymous identity + session
-            # Single-flight gate: if 5 concurrent requests arrive without
-            # cookies, only one actually bootstraps; the rest wait and reuse.
-            from backend.services.identity_service import _bootstrap_single_flight
-            cookie_response = make_response()
-            session_id, identity_id = _bootstrap_single_flight(
-                request, cookie_response, IdentityService.get_or_create_session,
-            )
+            # No valid session — bootstrap anonymous identity
+            try:
+                session_id, identity_id, identity_with_wallet, cookie_response = _do_bootstrap()
+            except _BootstrapBusy:
+                return _BOOTSTRAP_RETRY_RESPONSE
 
             g.session_id = session_id
             g.identity_id = identity_id
-            # Fetch wallet for the new identity — this will be cached in
-            # the process session cache for followers to reuse.
-            identity_with_wallet = IdentityService.get_identity_with_wallet(identity_id)
             g.identity = identity_with_wallet
             g._identity_resolved = True
             g._identity_source = "bootstrap"
-            # Seed the process cache so concurrent followers get a hit
-            # on get_current_identity → validate_session for this session
-            if identity_with_wallet:
-                from backend.services.identity_service import _session_cache_put
-                _session_cache_put(session_id, identity_with_wallet)
 
             result = f(*args, **kwargs)
             resp = _ensure_response(result)
