@@ -388,6 +388,38 @@ def get_conn(source: str = ""):
 
 
 @contextmanager
+def get_conn_resilient(source: str = ""):
+    """
+    Pool-first, direct-fallback connection context manager.
+
+    Tries the pool first. If it fails with a transient error (PoolTimeout,
+    SSL, connection closed), transparently opens a direct connection instead.
+    Use this for read endpoints that should survive pool storms without
+    waiting the full pool timeout + separate fallback.
+    """
+    pool = _get_pool()
+    if pool is not None:
+        try:
+            with pool.connection() as conn:
+                yield conn
+                return
+        except Exception as e:
+            if is_transient_db_error(e):
+                print(f"[DB][FALLBACK] get_conn_resilient pool failed, using direct source={source}: {type(e).__name__}")
+            else:
+                raise
+    # Direct fallback (or pool disabled)
+    conn = _create_connection()
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@contextmanager
 def get_conn_direct(source: str = ""):
     """
     Context manager that ALWAYS creates a fresh direct connection (never pooled).

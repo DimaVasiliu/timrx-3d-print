@@ -13,7 +13,7 @@ import uuid
 
 from flask import Blueprint, jsonify, request, g
 
-from backend.db import USE_DB, get_conn, dict_row, Tables
+from backend.db import USE_DB, get_conn, get_conn_resilient, dict_row, Tables, is_transient_db_error
 from backend.middleware import with_session
 from backend.services.history_service import (
     _local_history_id,
@@ -65,7 +65,7 @@ def history_mod():
 
             if USE_DB:
                 try:
-                    with get_conn() as conn:
+                    with get_conn_resilient("history") as conn:
                         with conn.cursor(row_factory=dict_row) as cur:
                             # Single optimized query with LEFT JOINs to avoid N+1 problem
                             # This replaces the previous per-item get_canonical_model_row/get_canonical_image_row calls
@@ -298,9 +298,9 @@ def history_mod():
 
                     save_history_store(items)
                 except Exception as e:
-                    from backend.db import is_transient_db_error
                     if is_transient_db_error(e):
-                        print(f"[History][DEGRADED] pool/SSL error, returning empty: {type(e).__name__}: {e}")
+                        # Both pool AND direct connection failed — truly degraded
+                        print(f"[History][DEGRADED] pool+direct both failed, returning empty: {type(e).__name__}: {e}")
                     else:
                         print(f"[History][mod] DB read failed (returning local/empty): {e}")
                         import traceback

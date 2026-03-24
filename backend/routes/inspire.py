@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional
 
 from flask import Blueprint, jsonify, request, Response
 
-from backend.db import USE_DB, get_conn, dict_row
+from backend.db import USE_DB, get_conn, get_conn_resilient, dict_row
 
 # Debug: confirm module loads
 print("[INSPIRE] Module loaded successfully")
@@ -486,7 +486,7 @@ def inspire_feed() -> Response:
         if mix_mode not in ("balanced", "sequential"):
             mix_mode = "balanced"
 
-        with get_conn("inspire_feed") as conn:
+        with get_conn_resilient("inspire_feed") as conn:
             cursor = conn.cursor(row_factory=dict_row)
 
             # Get prompt of the day
