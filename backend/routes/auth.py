@@ -316,9 +316,10 @@ def redeem_restore():
             }
         }), 400
 
-    # AUTH-3: Get session ID from middleware — may be None if no cookie existed.
-    # @with_optional_session validates without creating throwaway identities.
+    # AUTH-3: Get session ID from middleware — may be None if no cookie existed
+    # or if session lookup failed (pool timeout, SSL error — fail-open).
     session_id = g.session_id  # None if no existing session
+    print(f"[RESTORE][REDEEM] proceeding session_id={'present' if session_id else 'none'} email={email[:3]}***")
 
     # Verify the code and link session (handles session_id=None safely)
     success, identity_id, message, _detail = MagicCodeService.redeem_restore(

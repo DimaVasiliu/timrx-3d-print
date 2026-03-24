@@ -83,6 +83,39 @@ def _resolve_identity():
     return identity, session_id
 
 
+def _resolve_identity_safe():
+    """
+    Like _resolve_identity(), but fail-open on DB/pool errors.
+
+    Used by with_optional_session for paths like restore/redeem where
+    failing to look up the current session must NOT block the operation.
+    Returns (None, None) and sets g fields to None on any DB error.
+    """
+    try:
+        return _resolve_identity()
+    except Exception as e:
+        # Extract session_id from cookie without DB (pure cookie parse)
+        IdentityService = _get_identity_service()
+        raw_sid = None
+        try:
+            raw_sid = IdentityService.get_session_id_from_request(request)
+        except Exception:
+            pass
+
+        print(
+            f"[MIDDLEWARE][SAFE-SESSION] session lookup failed-open "
+            f"path={request.path} "
+            f"sid={'present' if raw_sid else 'none'} "
+            f"reason={type(e).__name__}: {e}"
+        )
+
+        g.session_id = None
+        g.identity_id = None
+        g.identity = None
+        g._identity_resolved = True
+        return None, None
+
+
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
@@ -255,27 +288,25 @@ def with_session(f):
 def with_optional_session(f):
     """
     Decorator that validates an existing session but NEVER creates one.
-    If no valid session, sets g fields to None and lets the handler proceed.
+    If no valid session OR if session lookup fails (DB timeout, pool exhaustion,
+    SSL error), sets g fields to None and lets the handler proceed.
+
+    This is fail-open by design: used on restore/redeem and similar paths
+    where blocking on a DB error would be worse than proceeding without
+    a session.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
-        DatabaseError = _get_database_error()
+        # Use the safe variant that catches DB errors and returns (None, None)
+        # instead of raising. This ensures restore/redeem never blocks on pool.
+        identity, session_id = _resolve_identity_safe()
 
-        try:
-            identity, session_id = _resolve_identity()
+        if identity:
+            result = f(*args, **kwargs)
+            return _maybe_refresh_cookie(identity, session_id, result)
 
-            if identity:
-                result = f(*args, **kwargs)
-                return _maybe_refresh_cookie(identity, session_id, result)
-
-            # No valid session — proceed without one
-            return f(*args, **kwargs)
-
-        except DatabaseError as e:
-            print(f"[MIDDLEWARE] Database error in with_optional_session: {e}")
-            return jsonify({
-                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
-            }), 500
+        # No valid session (or lookup failed) — proceed without one
+        return f(*args, **kwargs)
 
     return decorated
 
