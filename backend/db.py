@@ -369,35 +369,17 @@ def _create_connection():
 @contextmanager
 def get_conn(source: str = ""):
     """
-    Context manager for database connections (uses pool if available).
-    Connection is NOT auto-committed - caller must commit explicitly or use transaction().
-    """
-    pool = _get_pool()
-    if pool is not None:
-        with pool.connection() as conn:
-            yield conn
-    else:
-        conn = _create_connection()
-        try:
-            yield conn
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
-@contextmanager
-def get_conn_resilient(source: str = ""):
-    """
     Pool-first, direct-fallback connection context manager.
 
-    Tries to borrow from the pool. If the pool CHECKOUT fails with a
+    Tries to borrow from the pool.  If the pool CHECKOUT fails with a
     transient error (PoolTimeout, SSL on idle connection), opens a fresh
-    direct connection instead. If the pool checkout succeeds, the caller
+    direct connection instead.  If the pool checkout succeeds, the caller
     gets that pooled connection normally.
 
-    This covers the main failure mode: pool full of dead SSL connections.
+    Connection is NOT auto-committed — caller must commit explicitly
+    or use transaction().
+
+    This covers the main failure mode: pool full or dead SSL connections.
     If a query fails mid-execution on a connection that was healthy at
     checkout, that error propagates to the caller (and the pool discards
     the broken connection automatically).
@@ -412,7 +394,7 @@ def get_conn_resilient(source: str = ""):
             from_pool = True
         except Exception as e:
             if is_transient_db_error(e):
-                print(f"[DB][FALLBACK] pool checkout failed, using direct source={source}: {type(e).__name__}")
+                print(f"[DB][FALLBACK] get_conn pool checkout failed, using direct source={source}: {type(e).__name__}")
                 conn = None
             else:
                 raise
@@ -421,7 +403,16 @@ def get_conn_resilient(source: str = ""):
         try:
             yield conn
         finally:
-            pool.putconn(conn)
+            # Return connection to pool.  putconn handles broken connections
+            # (discards them instead of poisoning the pool).
+            try:
+                pool.putconn(conn)
+            except Exception:
+                # Pool closed or connection already detached — close directly
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     else:
         # Direct connection (pool failed or disabled)
         conn = _create_connection()
@@ -432,6 +423,12 @@ def get_conn_resilient(source: str = ""):
                 conn.close()
             except Exception:
                 pass
+
+
+# get_conn_resilient is now an alias — get_conn has the same fallback
+# behaviour.  Kept so existing imports (history, inspire, billing,
+# subscription_service) continue to resolve without any code changes.
+get_conn_resilient = get_conn
 
 
 @contextmanager

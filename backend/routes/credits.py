@@ -122,22 +122,24 @@ def get_wallet():
             return jsonify(payload)
 
     try:
-        balance = WalletService.get_balance(identity_id)
-        reserved = WalletService.get_reserved_credits(identity_id)
-        available = max(0, balance - reserved)
+        balances = WalletService.get_all_balances(identity_id)
+        reserved = WalletService.get_all_reserved_credits(identity_id)
 
-        video_balance = WalletService.get_balance(identity_id, "video")
-        video_reserved = WalletService.get_reserved_credits(identity_id, "video")
+        balance = balances["general"]
+        video_balance = balances["video"]
+        reserved_general = reserved["general"]
+        video_reserved = reserved["video"]
+        available = max(0, balance - reserved_general)
         video_available = max(0, video_balance - video_reserved)
 
-        print(f"[WALLET] Fetch: identity={identity_id[:8]}..., general(bal={balance},res={reserved},avail={available}), "
+        print(f"[WALLET] Fetch: identity={identity_id[:8]}..., general(bal={balance},res={reserved_general},avail={available}), "
               f"video(bal={video_balance},res={video_reserved},avail={video_available})")
 
         payload = {
             "ok": True,
             "identity_id": identity_id,
             "credits_balance": balance,
-            "reserved_credits": reserved,
+            "reserved_credits": reserved_general,
             "available_credits": available,
             "video_credits_balance": video_balance,
             "video_reserved_credits": video_reserved,

@@ -1288,6 +1288,7 @@ def history_item_update_mod(item_id: str):
                 db_errors: list[dict[str, str]] = []
                 if USE_DB:
                     try:
+                        # ── Phase 1: short DB read (fetch existing row) ──
                         with get_conn() as conn:
                             with conn.cursor(row_factory=dict_row) as cur:
                                 cur.execute(
@@ -1300,52 +1301,58 @@ def history_item_update_mod(item_id: str):
                                     (str(item_id), str(item_id), str(item_id), identity_id),
                                 )
                                 row = cur.fetchone()
-                                if not row:
-                                    return jsonify({"error": "Item not found or access denied"}), 404
+                        # Connection returned to pool here — not held during S3 I/O.
 
-                                existing = row["payload"] if row["payload"] else {}
-                                existing.update(updates)
-                                actual_id = row["id"]
+                        if not row:
+                            return jsonify({"error": "Item not found or access denied"}), 404
 
-                                item_type = updates.get("type") or updates.get("item_type")
-                                status = updates.get("status")
-                                stage = updates.get("stage")
-                                title = updates.get("title")
-                                if isinstance(title, str):
-                                    title_norm = title.strip().lower()
-                                    if title_norm in ("", "untitled", "(untitled)"):
-                                        title = None
-                                prompt = updates.get("prompt")
-                                thumbnail_url = updates.get("thumbnail_url")
-                                glb_url = updates.get("glb_url")
-                                image_url = updates.get("image_url")
-                                video_url = updates.get("video_url")
+                        existing = row["payload"] if row["payload"] else {}
+                        existing.update(updates)
+                        actual_id = row["id"]
 
-                                provider = "google" if item_type == "video" else ("openai" if item_type == "image" else "meshy")
-                                s3_user_id = identity_id
-                                if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
-                                    thumbnail_url = ensure_s3_url_for_data_uri(
-                                        thumbnail_url,
-                                        "thumbnails",
-                                        f"thumbnails/{s3_user_id}/{actual_id}",
-                                        user_id=identity_id,
-                                        name="thumbnail",
-                                        provider=provider,
-                                    )
-                                    updates["thumbnail_url"] = thumbnail_url
-                                if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
-                                    image_url = ensure_s3_url_for_data_uri(
-                                        image_url,
-                                        "images",
-                                        f"images/{s3_user_id}/{actual_id}",
-                                        user_id=identity_id,
-                                        name="image",
-                                        provider=provider,
-                                    )
-                                    updates["image_url"] = image_url
-                                existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url", "video_url"}})
+                        item_type = updates.get("type") or updates.get("item_type")
+                        status = updates.get("status")
+                        stage = updates.get("stage")
+                        title = updates.get("title")
+                        if isinstance(title, str):
+                            title_norm = title.strip().lower()
+                            if title_norm in ("", "untitled", "(untitled)"):
+                                title = None
+                        prompt = updates.get("prompt")
+                        thumbnail_url = updates.get("thumbnail_url")
+                        glb_url = updates.get("glb_url")
+                        image_url = updates.get("image_url")
+                        video_url = updates.get("video_url")
 
-                                title_to_set = title
+                        # ── Phase 2: S3 uploads (NO DB connection held) ──
+                        provider = "google" if item_type == "video" else ("openai" if item_type == "image" else "meshy")
+                        s3_user_id = identity_id
+                        if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
+                            thumbnail_url = ensure_s3_url_for_data_uri(
+                                thumbnail_url,
+                                "thumbnails",
+                                f"thumbnails/{s3_user_id}/{actual_id}",
+                                user_id=identity_id,
+                                name="thumbnail",
+                                provider=provider,
+                            )
+                            updates["thumbnail_url"] = thumbnail_url
+                        if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
+                            image_url = ensure_s3_url_for_data_uri(
+                                image_url,
+                                "images",
+                                f"images/{s3_user_id}/{actual_id}",
+                                user_id=identity_id,
+                                name="image",
+                                provider=provider,
+                            )
+                            updates["image_url"] = image_url
+                        existing.update({k: v for k, v in updates.items() if k in {"thumbnail_url", "image_url", "video_url"}})
+
+                        # ── Phase 3: short DB write (UPDATE + COMMIT) ──
+                        title_to_set = title
+                        with get_conn() as conn:
+                            with conn.cursor(row_factory=dict_row) as cur:
                                 cur.execute(
                                     f"""UPDATE {Tables.HISTORY_ITEMS}
                                        SET item_type = COALESCE(%s, item_type),
@@ -1376,7 +1383,7 @@ def history_item_update_mod(item_id: str):
                                     ),
                                 )
                             conn.commit()
-                            db_ok = True
+                        db_ok = True
                     except Exception as e:
                         log_db_continue("history_item_update", e)
                         db_errors.append({"op": "history_item_update", "error": str(e)})
