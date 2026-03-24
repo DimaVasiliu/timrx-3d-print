@@ -35,8 +35,53 @@ Ledger entry types:
 
 from typing import Optional, Dict, Any, List
 import json
+import threading as _threading
+import time as _time
 
 from backend.db import fetch_one, fetch_all, transaction, query_one, query_all, Tables
+
+# ── Shared wallet cache (per identity_id, 5-second TTL) ──────────────
+# Both /api/me and /api/credits/wallet call get_wallet() and
+# get_all_reserved_credits().  Without this cache, each endpoint
+# independently hits the DB.  During startup bursts (bootstrap +
+# visibility refresh), the same wallet data is fetched 3-4 times
+# within seconds.  The cache absorbs the duplicates.
+#
+# Thread-safe: 4 Gunicorn threads + 12 dispatch threads can hit
+# these concurrently.  A lock guards the check-timestamp-read
+# sequence so no thread sees a half-written entry.
+_wallet_cache_lock = _threading.Lock()
+_wallet_row_cache: dict = {}   # identity_id -> (monotonic_ts, wallet_row_or_None)
+_reserved_cache: dict = {}     # identity_id -> (monotonic_ts, {"general": int, "video": int})
+_WALLET_SVC_CACHE_TTL = 5      # seconds
+
+def _get_cached_wallet(identity_id: str):
+    with _wallet_cache_lock:
+        cached = _wallet_row_cache.get(identity_id)
+        if cached and (_time.monotonic() - cached[0]) < _WALLET_SVC_CACHE_TTL:
+            return cached[1]
+    return ...  # sentinel: cache miss (distinct from None = no wallet row)
+
+def _set_cached_wallet(identity_id: str, row):
+    with _wallet_cache_lock:
+        _wallet_row_cache[identity_id] = (_time.monotonic(), row)
+
+def _get_cached_reserved(identity_id: str):
+    with _wallet_cache_lock:
+        cached = _reserved_cache.get(identity_id)
+        if cached and (_time.monotonic() - cached[0]) < _WALLET_SVC_CACHE_TTL:
+            return cached[1]
+    return None
+
+def _set_cached_reserved(identity_id: str, data: dict):
+    with _wallet_cache_lock:
+        _reserved_cache[identity_id] = (_time.monotonic(), data)
+
+def invalidate_wallet_cache(identity_id: str):
+    """Clear cached wallet data for an identity after a balance change."""
+    with _wallet_cache_lock:
+        _wallet_row_cache.pop(identity_id, None)
+        _reserved_cache.pop(identity_id, None)
 
 
 class CreditType:
@@ -307,8 +352,13 @@ class WalletService:
         """
         Get wallet for identity.
         Returns wallet record with balance_credits, balance_video_credits, and updated_at.
+        Uses a 5-second shared cache to absorb rapid-fire calls from
+        /api/me + /api/credits/wallet + post-generation refreshes.
         """
-        return query_one(
+        cached = _get_cached_wallet(identity_id)
+        if cached is not ...:
+            return cached
+        row = query_one(
             f"""
             SELECT identity_id, balance_credits, balance_video_credits,
                    reserved_video_credits, updated_at
@@ -318,6 +368,8 @@ class WalletService:
             (identity_id,),
             source="wallet_fetch",
         )
+        _set_cached_wallet(identity_id, row)
+        return row
 
     @staticmethod
     def get_or_create_wallet(identity_id: str) -> Optional[Dict[str, Any]]:
@@ -432,7 +484,11 @@ class WalletService:
     def get_all_reserved_credits(identity_id: str) -> Dict[str, int]:
         """
         Get all reserved credits for an identity, split by credit type.
+        Uses shared cache (5s TTL) to absorb duplicate calls.
         """
+        cached = _get_cached_reserved(identity_id)
+        if cached is not None:
+            return cached
         rows = query_all(
             f"""
             SELECT credit_type, COALESCE(SUM(cost_credits), 0) as total
@@ -449,6 +505,7 @@ class WalletService:
         for row in rows:
             ct = row.get("credit_type", "general")
             result[ct] = int(row.get("total", 0) or 0)
+        _set_cached_reserved(identity_id, result)
         return result
 
     # ─────────────────────────────────────────────────────────────
@@ -552,6 +609,9 @@ class WalletService:
                 f"[WALLET] Ledger entry: identity={identity_id}, type={entry_type}, "
                 f"credit_type={credit_type}, delta={delta:+d}, balance: {current_balance} -> {new_balance}"
             )
+
+            # Invalidate cached wallet data so the next read gets fresh balances
+            invalidate_wallet_cache(identity_id)
 
             return ledger_entry
 

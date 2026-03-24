@@ -959,6 +959,30 @@ def ensure_schema() -> None:
                 CREATE INDEX IF NOT EXISTS idx_history_identity_type_created
                 ON {_APP_SCHEMA}.history_items (identity_id, item_type, created_at DESC, id DESC)
             """)
+            # JSONB expression indexes for PATCH/POST item lookup:
+            # WHERE identity_id = X AND payload->>'original_id' = Y
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_payload_original_id
+                ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_id'))
+                WHERE payload->>'original_id' IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_payload_job_id
+                ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'job_id'))
+                WHERE payload->>'job_id' IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_payload_original_job_id
+                ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_job_id'))
+                WHERE payload->>'original_job_id' IS NOT NULL
+            """)
+            # Credit reservations: covers get_all_reserved_credits() query
+            # WHERE identity_id = X AND status = 'held' AND expires_at > NOW()
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_reservations_identity_held
+                ON {_BILLING_SCHEMA}.credit_reservations (identity_id, status, expires_at)
+                WHERE status = 'held'
+            """)
 
         print("[DB] Schema indexes ensured")
 
@@ -995,6 +1019,28 @@ def _ensure_schema_direct() -> None:
                 cur.execute(f"""
                     CREATE INDEX IF NOT EXISTS idx_history_identity_type_created
                     ON {_APP_SCHEMA}.history_items (identity_id, item_type, created_at DESC, id DESC)
+                """)
+                # JSONB expression indexes for PATCH/POST item lookup
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_payload_original_id
+                    ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_id'))
+                    WHERE payload->>'original_id' IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_payload_job_id
+                    ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'job_id'))
+                    WHERE payload->>'job_id' IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_payload_original_job_id
+                    ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_job_id'))
+                    WHERE payload->>'original_job_id' IS NOT NULL
+                """)
+                # Credit reservations: covers get_all_reserved_credits() query
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_reservations_identity_held
+                    ON {_BILLING_SCHEMA}.credit_reservations (identity_id, status, expires_at)
+                    WHERE status = 'held'
                 """)
             conn.commit()
             print("[DB] Schema indexes ensured")

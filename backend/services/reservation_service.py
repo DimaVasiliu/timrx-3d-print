@@ -322,6 +322,10 @@ class ReservationService:
             new_reserved = current_reserved + cost_credits
             new_available = balance - new_reserved
 
+            # Invalidate wallet cache — reserved credits just changed
+            from backend.services.wallet_service import invalidate_wallet_cache
+            invalidate_wallet_cache(identity_id)
+
             return {
                 "reservation": ReservationService._format_reservation(reservation),
                 "balance": balance,
@@ -451,6 +455,10 @@ class ReservationService:
 
             provider = _derive_provider_from_action_code(action_code)
 
+            # Invalidate wallet cache — balance just changed
+            from backend.services.wallet_service import invalidate_wallet_cache
+            invalidate_wallet_cache(identity_id)
+
             return {
                 "reservation": ReservationService._format_reservation(updated),
                 "balance": new_balance,
@@ -548,6 +556,10 @@ class ReservationService:
             #     f"[RESERVATION] Released: id={reservation_id}, reason={reason}, "
             #     f"credits={cost_credits} returned to available"
             # )
+
+            # Invalidate wallet cache — reserved credits changed
+            from backend.services.wallet_service import invalidate_wallet_cache
+            invalidate_wallet_cache(identity_id)
 
             return {
                 "reservation": ReservationService._format_reservation(updated),
