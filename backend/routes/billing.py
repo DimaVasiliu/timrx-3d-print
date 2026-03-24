@@ -15,6 +15,7 @@ Handles:
 """
 
 import time
+import threading as _threading
 
 from flask import Blueprint, request, jsonify, g, make_response
 
@@ -27,6 +28,30 @@ from backend.services.expense_guard import ExpenseGuard
 from backend.services.purchase_service import PurchaseService
 from backend.services.mollie_service import MollieService, MollieCreateError
 from backend.services.subscription_service import SubscriptionService
+
+# ── Subscription summary cache (per identity_id, 60-second TTL) ──────
+# Subscription status only changes on user actions (subscribe, cancel,
+# payment webhook).  The summary endpoint is called on every page load
+# at T+5s — caching avoids a DB query + correlated subqueries each time.
+_sub_summary_cache_lock = _threading.Lock()
+_sub_summary_cache: dict = {}  # identity_id -> (monotonic_ts, response_dict)
+_SUB_SUMMARY_CACHE_TTL = 60    # seconds
+
+def _get_cached_sub_summary(identity_id: str):
+    with _sub_summary_cache_lock:
+        cached = _sub_summary_cache.get(identity_id)
+        if cached and (time.monotonic() - cached[0]) < _SUB_SUMMARY_CACHE_TTL:
+            return cached[1]
+    return None
+
+def _set_sub_summary_cache(identity_id: str, data: dict):
+    with _sub_summary_cache_lock:
+        _sub_summary_cache[identity_id] = (time.monotonic(), data)
+
+def invalidate_subscription_cache(identity_id: str):
+    """Clear cached subscription summary after a subscription change."""
+    with _sub_summary_cache_lock:
+        _sub_summary_cache.pop(identity_id, None)
 
 bp = Blueprint("billing", __name__)
 
@@ -1787,6 +1812,11 @@ def subscription_summary():
     """
     from backend.services.subscription_service import SUBSCRIPTION_PLANS
 
+    # Short-circuit: return cached response if fresh (60s TTL)
+    _cached_summary = _get_cached_sub_summary(g.identity_id)
+    if _cached_summary is not None:
+        return jsonify(_cached_summary)
+
     # Get any subscription (active, cancelled, pending_payment, suspended)
     # Pool-first with direct fallback, then degraded-safe on total failure
     _sub_sql = f"""
@@ -1826,10 +1856,9 @@ def subscription_summary():
         return jsonify({"ok": False, "error": "internal_error"}), 500
 
     if not sub:
-        return jsonify({
-            "ok": True,
-            "has_subscription": False,
-        })
+        _no_sub = {"ok": True, "has_subscription": False}
+        _set_sub_summary_cache(g.identity_id, _no_sub)
+        return jsonify(_no_sub)
 
     # Map DB status to user-friendly status
     db_status = sub.get("status")
@@ -1926,7 +1955,7 @@ def subscription_summary():
         f"billing_next_charge={billing_next_charge}"
     )
 
-    return jsonify({
+    response_data = {
         "ok": True,
         "has_subscription": True,
         "status": display_status,
@@ -1949,7 +1978,12 @@ def subscription_summary():
         "last_payment_status": sub.get("last_payment_status"),
         "last_payment_at": sub["last_payment_at"].isoformat() if sub.get("last_payment_at") else None,
         "suspend_reason": sub.get("suspend_reason"),
-    })
+    }
+
+    # Cache the response for 60s — subscription status rarely changes
+    _set_sub_summary_cache(g.identity_id, response_data)
+
+    return jsonify(response_data)
 
 
 @bp.route("/subscriptions/cancel", methods=["POST"])
@@ -1981,6 +2015,7 @@ def subscription_cancel():
 
     ok = SubscriptionService.cancel_subscription_with_email(sub_id)
     if ok:
+        invalidate_subscription_cache(g.identity_id)
         return jsonify({
             "ok": True,
             "message": "Subscription cancelled. You'll keep access until the end of your billing period.",

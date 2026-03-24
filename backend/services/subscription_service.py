@@ -377,6 +377,11 @@ class SubscriptionService:
                     row = cur.fetchone()
                 conn.commit()
                 print(f"[SUB] Created subscription {row['id']} for {identity_id} plan={plan_code} email={customer_email}")
+                try:
+                    from backend.routes.billing import invalidate_subscription_cache
+                    invalidate_subscription_cache(identity_id)
+                except Exception:
+                    pass
                 return row
         except Exception as e:
             print(f"[SUB] Error creating subscription: {e}")
@@ -404,12 +409,18 @@ class SubscriptionService:
                             current_period_end = COALESCE(%s, current_period_end),
                             updated_at = NOW()
                         WHERE id::text = %s
-                        RETURNING id
+                        RETURNING id, identity_id
                         """,
                         (provider_subscription_id, period_start, period_end, subscription_id),
                     )
                     row = cur.fetchone()
                 conn.commit()
+                if row:
+                    try:
+                        from backend.routes.billing import invalidate_subscription_cache
+                        invalidate_subscription_cache(str(row["identity_id"]))
+                    except Exception:
+                        pass
                 return row is not None
         except Exception as e:
             print(f"[SUB] Error activating subscription {subscription_id}: {e}")
@@ -1853,7 +1864,7 @@ class SubscriptionService:
                             failure_count = COALESCE(failure_count, 0) + 1,
                             updated_at = NOW()
                         WHERE id::text = %s AND status = 'active'
-                        RETURNING id, customer_email, plan_code, failure_count
+                        RETURNING id, identity_id, customer_email, plan_code, failure_count
                         """,
                         (subscription_id,),
                     )
@@ -1861,6 +1872,12 @@ class SubscriptionService:
                 conn.commit()
 
             if sub:
+                try:
+                    from backend.routes.billing import invalidate_subscription_cache
+                    invalidate_subscription_cache(str(sub["identity_id"]))
+                except Exception:
+                    pass
+
                 # Send payment failed email
                 customer_email = sub.get("customer_email")
                 if customer_email:
@@ -2039,6 +2056,11 @@ class SubscriptionService:
                         next_billing_date=updated_sub["current_period_end"],
                     )
 
+                try:
+                    from backend.routes.billing import invalidate_subscription_cache
+                    invalidate_subscription_cache(str(sub["identity_id"]))
+                except Exception:
+                    pass
                 return {
                     "ok": True,
                     "status": "renewed",
