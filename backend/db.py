@@ -428,28 +428,20 @@ def get_conn(source: str = ""):
             yield conn
         finally:
             # Clean up transaction state so the pool doesn't have to.
-            # Without this, connections returned while INTRANS cause
-            # psycopg_pool to log "rolling back returned connection"
-            # and spend an extra server round-trip inside putconn().
             _ensure_idle(conn)
-            # Verify the connection is still in autocommit mode.
-            # A prior transaction() that failed to restore autocommit
-            # could have left it in non-autocommit mode, which would
-            # cause the NEXT borrower's queries to open implicit txns.
+            # Best-effort: restore autocommit mode for the next borrower.
             try:
                 if not conn.autocommit:
                     conn.autocommit = True
             except Exception:
-                # Broken — discard instead of poisoning the pool.
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return
+                pass  # broken conn — putconn will discard it
+            # ALWAYS return via putconn so the pool can free the slot.
+            # putconn detects broken/closed connections and discards them
+            # instead of reusing them.  Skipping putconn leaks the slot
+            # permanently, eventually exhausting the pool.
             try:
                 pool.putconn(conn)
             except Exception:
-                # Pool closed or connection already detached — close directly
                 try:
                     conn.close()
                 except Exception:
@@ -567,23 +559,17 @@ def transaction(source: str = ""):
             # but defensive _ensure_idle catches edge cases (e.g. commit
             # itself raising after partial flush).
             _ensure_idle(conn)
-            # Restore autocommit before returning to pool so the next
-            # borrower (likely a read-only get_conn) stays IDLE.
-            # If restoring autocommit fails, the connection is broken or
-            # wedged — do NOT return it to the pool (it would cause
-            # INTRANS warnings on the next checkout).  Close it directly.
+            # Best-effort: restore autocommit for the next borrower.
             try:
                 conn.autocommit = True
             except Exception:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return  # skip putconn — connection is dead
+                pass  # broken conn — putconn will discard it
+            # ALWAYS return via putconn so the pool can free the slot.
+            # putconn detects broken/closed connections and discards them.
+            # Skipping putconn leaks the slot permanently.
             try:
                 pool.putconn(conn)
             except Exception:
-                # Pool closed or connection already detached — close directly
                 try:
                     conn.close()
                 except Exception:
