@@ -78,13 +78,17 @@ def history_mod():
             # Pagination parameters
             limit = request.args.get("limit", type=int, default=100)
             offset = request.args.get("offset", type=int, default=0)
+            item_type_filter = request.args.get("type", type=str, default="all").lower().strip()
             limit = min(max(1, limit), 500)  # Clamp to 1-500
             offset = max(0, offset)
+            # Validate type filter
+            if item_type_filter not in ("all", "model", "image", "video"):
+                item_type_filter = "all"
 
-            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, offset={offset}")
+            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, offset={offset}, type={item_type_filter}")
 
             # Check per-identity cache (avoids repeated 3s+ DB/fallback fetches)
-            _hcache_key = f"{identity_id}:{limit}:{offset}"
+            _hcache_key = f"{identity_id}:{item_type_filter}:{limit}:{offset}"
             _hcached = _history_cache.get(_hcache_key)
             _cached_has_more = False
             if _hcached:
@@ -133,12 +137,16 @@ def history_mod():
                             h.payload->>'original_id', h.payload->>'original_job_id'
                         ) IS NOT NULL))
                     WHERE h.identity_id = %s
+                      {("AND h.item_type = %s" if item_type_filter != "all" else "")}
                     ORDER BY h.created_at DESC, h.id DESC
                     LIMIT %s OFFSET %s
                 """
                 # Fetch one extra row to detect whether more pages exist,
                 # without a separate COUNT query.
-                _hparams = (identity_id, limit + 1, offset)
+                if item_type_filter != "all":
+                    _hparams = (identity_id, item_type_filter, limit + 1, offset)
+                else:
+                    _hparams = (identity_id, limit + 1, offset)
 
                 def _fetch_history(conn_getter):
                     with conn_getter as c:
@@ -360,6 +368,7 @@ def history_mod():
             return jsonify({
                 "ok": True,
                 "items": items,
+                "type": item_type_filter,
                 "limit": limit,
                 "offset": offset,
                 "count": len(items),
