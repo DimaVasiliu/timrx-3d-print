@@ -21,6 +21,7 @@ from backend.services.history_service import get_canonical_model_row
 from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed, _update_job_status_ready
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.s3_service import save_finished_job_to_normalized_db
+from backend.services.status_cache import get_cached_status, cache_status
 from backend.utils.helpers import log_event, log_status_summary, now_s
 
 bp = Blueprint("mesh_operations", __name__)
@@ -210,6 +211,11 @@ def mesh_remesh_status_mod(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
+
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
     if not ownership["found"]:
@@ -335,6 +341,7 @@ def mesh_remesh_status_mod(job_id: str):
         except Exception as e:
             print(f"[mesh/remesh][mod] DB lookup for finalized model failed: {e}")
 
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
     return jsonify(out)
 
 
@@ -747,6 +754,11 @@ def mesh_retexture_status_mod(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
+
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
     if not ownership["found"]:
@@ -887,4 +899,5 @@ def mesh_retexture_status_mod(job_id: str):
         except Exception as e:
             print(f"[mesh/retexture][mod] DB lookup for finalized model failed: {e}")
 
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
     return jsonify(out)

@@ -27,6 +27,14 @@ from backend.middleware import require_session, with_session
 # Short TTL cache for /jobs/active — avoids pool pressure for repeated polls
 _jobs_active_cache: dict = {}  # identity_id -> (result_list, monotonic_ts)
 _JOBS_CACHE_TTL = 10  # seconds
+
+
+def invalidate_jobs_active_cache(identity_id: str):
+    """Invalidate the jobs/active cache for an identity.
+    Call after job create, complete, cancel, or callback."""
+    _jobs_active_cache.pop(identity_id, None)
+
+
 from backend.services.job_service import (
     JobService,
     JobStatus,
@@ -126,6 +134,7 @@ def start_job_idempotent():
             )
             result["was_existing"] = False
 
+        invalidate_jobs_active_cache(g.identity_id)
         return jsonify({
             "ok": True,
             "job_id": result["job_id"],
@@ -272,6 +281,7 @@ def create_job():
             payload=payload,
         )
 
+        invalidate_jobs_active_cache(g.identity_id)
         return jsonify({
             "ok": True,
             "job_id": result["job_id"],
@@ -552,6 +562,7 @@ def complete_job(job_id):
             success=success,
             error_message=error_message,
         )
+        invalidate_jobs_active_cache(g.identity_id)
 
         # Get updated wallet balance
         wallet = WalletService.get_wallet(g.identity_id)
@@ -689,6 +700,7 @@ def cancel_job(job_id):
             reason=reason,
             force=force,
         )
+        invalidate_jobs_active_cache(g.identity_id)
 
         # Get updated wallet balance
         wallet = WalletService.get_wallet(g.identity_id)
@@ -810,6 +822,11 @@ def job_callback():
                 "found": False,
             })
 
+        # Invalidate cache for the job's owner
+        job_identity = result.get("job", {}).get("identity_id")
+        if job_identity:
+            invalidate_jobs_active_cache(job_identity)
+
         return jsonify({
             "ok": True,
             "job": result["job"],
@@ -919,39 +936,30 @@ def get_active_jobs():
             if _time.monotonic() - _cached_ts < _JOBS_CACHE_TTL:
                 return jsonify({"ok": True, "jobs": _cached_jobs})
 
-        # Try new JobService method first (from timrx_billing.jobs)
+        # Primary path: new JobService (covers all active jobs)
+        primary_ok = False
         jobs = []
         try:
             jobs = JobService.get_active_jobs_for_identity(identity_id) or []
-            if jobs:
-                _jobs_active_cache[identity_id] = (jobs, _time.monotonic())
-                return jsonify({"ok": True, "jobs": jobs})
+            primary_ok = True
         except Exception as e:
             print(f"[JOBS] get_active_jobs_for_identity failed: {e}")
 
-        # Fall back to legacy active_jobs table
+        if primary_ok:
+            # Primary succeeded — cache and return (even if empty).
+            # No need for legacy fallback; all jobs are in the new system.
+            _jobs_active_cache[identity_id] = (jobs, _time.monotonic())
+            return jsonify({"ok": True, "jobs": jobs})
+
+        # Primary failed — fall back to legacy active_jobs table
         try:
             legacy_jobs = get_active_jobs_from_db(identity_id) or []
         except Exception as e:
             print(f"[JOBS][DEGRADED] legacy active_jobs query failed: {e}")
             legacy_jobs = []
 
-        # Merge and deduplicate
-        seen_ids = set()
-        merged = []
-        for job in jobs:
-            job_id = job.get("id") or job.get("job_id")
-            if job_id and job_id not in seen_ids:
-                seen_ids.add(job_id)
-                merged.append(job)
-        for job in legacy_jobs:
-            job_id = job.get("job_id")
-            if job_id and job_id not in seen_ids:
-                seen_ids.add(job_id)
-                merged.append(job)
-
-        _jobs_active_cache[identity_id] = (merged, _time.monotonic())
-        return jsonify({"ok": True, "jobs": merged})
+        _jobs_active_cache[identity_id] = (legacy_jobs, _time.monotonic())
+        return jsonify({"ok": True, "jobs": legacy_jobs})
 
     except Exception as e:
         # Return stale cache if available, otherwise empty

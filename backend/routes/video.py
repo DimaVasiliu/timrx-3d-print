@@ -62,6 +62,7 @@ from backend.services.pricing_service import (
 from backend.services.video_limits import validate_video_rate_limits
 from backend.services.prompt_safety_service import check_prompt_safety, record_provider_rejection
 from backend.utils.helpers import now_s, log_event
+from backend.services.status_cache import get_cached_status, cache_status
 
 bp = Blueprint("video", __name__)
 
@@ -949,6 +950,11 @@ def _video_status_handler(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
 
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
+
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
@@ -1155,6 +1161,7 @@ def _video_status_handler(job_id: str):
         new_balance = meta.get("new_balance")
         if new_balance is not None:
             response_data["new_balance"] = new_balance
+        cache_status(job_id, response_data, is_terminal=True)
         return jsonify(response_data)
 
     if meta.get("status") in ("failed", "provider_stalled"):
@@ -1171,6 +1178,7 @@ def _video_status_handler(job_id: str):
             resp["user_message"] = error_msg
         if meta.get("status") == "provider_stalled":
             resp["provider_stalled"] = True
+        cache_status(job_id, resp, is_terminal=True)
         return jsonify(resp)
 
     if meta.get("status") == "quota_queued":
@@ -1267,15 +1275,18 @@ def _video_status_handler(job_id: str):
                     new_balance = jm.get("new_balance")
                     if new_balance is not None:
                         response_data["new_balance"] = new_balance
+                    cache_status(job_id, response_data, is_terminal=True)
                     return jsonify(response_data)
                 if status == "failed":
-                    return jsonify({
+                    _fail_resp = {
                         "ok": False,
                         "status": "failed",
                         "job_id": job_id,
                         "error": "video_failed",
                         "message": job.get("error_message") or "Video generation failed",
-                    })
+                    }
+                    cache_status(job_id, _fail_resp, is_terminal=True)
+                    return jsonify(_fail_resp)
                 # queued / processing / other — return in-flight
                 return jsonify({
                     "ok": True,

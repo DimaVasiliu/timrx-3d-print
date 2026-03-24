@@ -29,6 +29,7 @@ from backend.services.job_service import (
 from backend.services.history_service import get_canonical_model_row
 from backend.services.meshy_service import mesh_get, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.s3_service import save_finished_job_to_normalized_db
+from backend.services.status_cache import get_cached_status, cache_status
 from backend.utils.helpers import log_event, log_status_summary, now_s
 
 bp = Blueprint("image_to_3d", __name__)
@@ -135,6 +136,11 @@ def image_to_3d_status_mod(job_id: str):
     log_event("image-to-3d/status:incoming[mod]", {"job_id": job_id})
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     identity_id = g.identity_id
     meshy_job_id = job_id
@@ -317,6 +323,7 @@ def image_to_3d_status_mod(job_id: str):
         if internal_job_id:
             _update_job_status_failed(internal_job_id, error_msg)
 
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
     return jsonify(out)
 
 
@@ -428,6 +435,11 @@ def multi_image_to_3d_status_mod(job_id: str):
     log_event("multi-image-to-3d/status:incoming[mod]", {"job_id": job_id})
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     identity_id = g.identity_id
     meshy_job_id = job_id
@@ -604,4 +616,5 @@ def multi_image_to_3d_status_mod(job_id: str):
         if internal_job_id:
             _update_job_status_failed(internal_job_id, error_msg)
 
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
     return jsonify(out)

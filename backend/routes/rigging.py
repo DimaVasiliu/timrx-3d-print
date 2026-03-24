@@ -39,6 +39,7 @@ from backend.services.job_service import (
     verify_job_ownership_detailed,
 )
 from backend.services.meshy_service import build_source_payload, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.status_cache import get_cached_status, cache_status
 from backend.services.rigging_service import (
     create_rigging_task,
     get_rigging_task,
@@ -355,6 +356,11 @@ def rig_status(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
+
     import time as _time
     _t0 = _time.monotonic()
 
@@ -398,8 +404,9 @@ def rig_status(job_id: str):
         f"own={_elapsed_own}ms meshy={_elapsed_meshy}ms src={ownership.get('source','?')}"
     )
 
-    # For non-final states, return immediately — no S3 work, no heavy logging
+    # For non-final states, cache and return immediately — no S3 work, no heavy logging
     if out["status"] not in ("done", "failed"):
+        cache_status(job_id, out, is_terminal=False)
         return jsonify(out)
 
     # ── Async credit handling (same pattern as retexture/remesh) ──
@@ -474,6 +481,7 @@ def rig_status(job_id: str):
         except Exception as e:
             print(f"[ASSET_SAVE] ERROR rig job={job_id} error={e}")
 
+    cache_status(job_id, out, is_terminal=True)
     return jsonify(out)
 
 
@@ -658,6 +666,11 @@ def rig_animate_status(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
+
     import time as _time
     _t0 = _time.monotonic()
 
@@ -700,8 +713,9 @@ def rig_animate_status(job_id: str):
         f"own={_elapsed_own}ms meshy={_elapsed_meshy}ms src={ownership.get('source','?')}"
     )
 
-    # For non-final states, return immediately
+    # For non-final states, cache and return immediately
     if out["status"] not in ("done", "failed"):
+        cache_status(job_id, out, is_terminal=False)
         return jsonify(out)
 
     # ── Async credit handling ──
@@ -776,6 +790,7 @@ def rig_animate_status(job_id: str):
         except Exception as e:
             print(f"[ASSET_SAVE] ERROR anim job={job_id} error={e}")
 
+    cache_status(job_id, out, is_terminal=True)
     return jsonify(out)
 
 

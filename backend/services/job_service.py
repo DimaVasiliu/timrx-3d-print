@@ -21,6 +21,7 @@ Job Statuses:
 """
 
 import os
+import time
 import uuid
 import json
 import requests
@@ -547,9 +548,14 @@ class JobService:
         )
 
         # Also fix any jobs we just excluded — transition them to 'ready'
-        # so they don't need the defensive check on future queries
+        # so they don't need the defensive check on future queries.
+        # Throttled to once per 60s per identity to avoid unnecessary writes.
         if jobs is not None:
-            _auto_fix_stuck_processing_jobs(identity_id)
+            _now = time.monotonic()
+            _last = _auto_fix_last_run.get(identity_id, 0)
+            if _now - _last > _AUTO_FIX_INTERVAL_S:
+                _auto_fix_stuck_processing_jobs(identity_id)
+                _auto_fix_last_run[identity_id] = _now
 
         result = []
         for job in jobs:
@@ -1296,6 +1302,10 @@ class JobService:
         }
 
 # --- Auto-fix: transition stuck processing jobs that have finalized assets ---
+# Throttled to once per 60s per identity — avoids unnecessary UPDATE on every /jobs/active call
+_auto_fix_last_run: dict = {}   # identity_id -> monotonic timestamp
+_AUTO_FIX_INTERVAL_S = 60
+
 
 def _auto_fix_stuck_processing_jobs(identity_id: str):
     """
