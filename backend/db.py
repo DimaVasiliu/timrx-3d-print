@@ -61,7 +61,7 @@ _DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 _DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
 _DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
 _DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
-_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "30"))
+_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "5"))  # 5s — fail fast to direct fallback
 _DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "120"))   # recycle before Render kills
 _DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "30"))            # close idle fast
 _DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "false").lower() in ("true", "1", "yes")  # OFF — open=True + max_lifetime=120 handles staleness; check adds a roundtrip per borrow
@@ -104,10 +104,13 @@ _TRANSIENT_PATTERNS = (
 
 
 def is_transient_db_error(exc: BaseException) -> bool:
-    """Return True if exc is a transport/SSL/connection error (not a SQL logic error).
-    These are safe to retry on a fresh connection."""
+    """Return True if exc is a transport/SSL/connection/pool error (not a SQL logic error).
+    These are safe to retry on a fresh direct connection."""
     if not PSYCOPG_AVAILABLE:
         return False
+    # PoolTimeout: pool couldn't serve a connection in time
+    if _POOL_AVAILABLE and isinstance(exc, _pool_timeout_class()):
+        return True
     # psycopg.OperationalError covers most transport errors
     if isinstance(exc, psycopg.OperationalError):
         return True
@@ -117,6 +120,15 @@ def is_transient_db_error(exc: BaseException) -> bool:
     # Check message text for SSL/transport patterns
     msg = str(exc).lower()
     return any(p in msg for p in _TRANSIENT_PATTERNS)
+
+
+def _pool_timeout_class():
+    """Return PoolTimeout class or a dummy that never matches."""
+    try:
+        from psycopg_pool import PoolTimeout
+        return PoolTimeout
+    except ImportError:
+        return type(None)  # never matches isinstance
 
 
 def _configure_pooled_conn(conn):

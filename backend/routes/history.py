@@ -298,9 +298,13 @@ def history_mod():
 
                     save_history_store(items)
                 except Exception as e:
-                    print(f"[History][mod] DB read failed (returning local/empty): {e}")
-                    import traceback
-                    traceback.print_exc()
+                    from backend.db import is_transient_db_error
+                    if is_transient_db_error(e):
+                        print(f"[History][DEGRADED] pool/SSL error, returning empty: {type(e).__name__}: {e}")
+                    else:
+                        print(f"[History][mod] DB read failed (returning local/empty): {e}")
+                        import traceback
+                        traceback.print_exc()
                     # Fall through to return local history or empty array
 
             # If DB wasn't used or failed, try local history

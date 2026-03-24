@@ -590,6 +590,21 @@ def inspire_feed() -> Response:
         return response
 
     except Exception as e:
+        from backend.db import is_transient_db_error
+        if is_transient_db_error(e):
+            # Pool sick or SSL churn — return empty feed instead of 500.
+            # Frontend will show no inspire cards, which is better than an error page.
+            print(f"[INSPIRE][DEGRADED] returning empty feed: {type(e).__name__}: {e}")
+            response = jsonify({
+                "ok": True,
+                "prompt_of_the_day": None,
+                "cards": [],
+                "total": 0,
+                "total_available": 0,
+                "source": "inspire_degraded",
+            })
+            response.headers["Content-Type"] = "application/json"
+            return response
         print(f"[INSPIRE] Error in feed: {e}")
         import traceback
         traceback.print_exc()
