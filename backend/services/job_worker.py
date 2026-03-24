@@ -243,7 +243,7 @@ def _worker_loop():
     from backend.db import is_transient_db_error
 
     consecutive_db_errors = 0
-    MAX_DB_BACKOFF = 10  # seconds
+    MAX_DB_BACKOFF = 30  # seconds — back off hard to protect user-facing pool slots
 
     try:
         while not _worker_stop.is_set():

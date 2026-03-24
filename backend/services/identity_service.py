@@ -1022,7 +1022,9 @@ class IdentityService:
         ip_hash = IdentityService.hash_for_storage(ip_address) if ip_address else None
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
 
-        with transaction() as cur:
+        # Direct connection — bootstrap fallback must not depend on pool
+        from backend.db import transaction_direct
+        with transaction_direct("bootstrap_fallback_direct") as cur:
             # 1. Create identity
             cur.execute(
                 f"""
@@ -1101,7 +1103,10 @@ class IdentityService:
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
 
         try:
-            with transaction() as cur:
+            # Direct connection — restore/redeem session creation must not
+            # depend on pool health
+            from backend.db import transaction_direct
+            with transaction_direct("auth_create_session_direct") as cur:
                 cur.execute(
                     f"""
                     INSERT INTO {Tables.SESSIONS}
@@ -1203,7 +1208,10 @@ class IdentityService:
         ua_hash = IdentityService.hash_for_storage(user_agent) if user_agent else None
 
         try:
-            with get_conn("identity_bootstrap") as conn:
+            # Direct connection (not pooled) — bootstrap must work even when
+            # the pool is full of dead SSL connections or under contention.
+            from backend.db import get_conn_direct
+            with get_conn_direct("bootstrap_direct") as conn:
                 with conn.cursor() as cur:
                     # Advisory lock: serializes all anonymous bootstraps for this bid
                     cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))

@@ -357,15 +357,8 @@ def _create_connection():
 @contextmanager
 def get_conn(source: str = ""):
     """
-    Context manager for database connections.
+    Context manager for database connections (uses pool if available).
     Connection is NOT auto-committed - caller must commit explicitly or use transaction().
-
-    Args:
-        source: Optional tag for logging on transient errors.
-
-    Raises:
-        DatabaseNotConfiguredError: If database is not configured
-        DatabaseConnectionError: If connection fails
     """
     pool = _get_pool()
     if pool is not None:
@@ -380,6 +373,25 @@ def get_conn(source: str = ""):
                 conn.close()
             except Exception:
                 pass
+
+
+@contextmanager
+def get_conn_direct(source: str = ""):
+    """
+    Context manager that ALWAYS creates a fresh direct connection (never pooled).
+
+    Use for auth-critical paths (bootstrap, restore/redeem) that must not
+    depend on pool health. The connection is opened, used, and closed
+    within this block — no pool threads, no shared state.
+    """
+    conn = _create_connection()
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @contextmanager
@@ -425,12 +437,9 @@ def _run_transaction(conn):
 @contextmanager
 def transaction(source: str = ""):
     """
-    Context manager for database transactions.
+    Context manager for database transactions (uses pool if available).
     Automatically commits on success, rolls back on exception.
     Yields a cursor with dict_row factory.
-
-    Args:
-        source: Optional tag for logging on transient errors.
     """
     pool = _get_pool()
     if pool is not None:
@@ -447,6 +456,25 @@ def transaction(source: str = ""):
                 conn.close()
             except Exception:
                 pass
+
+
+@contextmanager
+def transaction_direct(source: str = ""):
+    """
+    Transaction that ALWAYS uses a fresh direct connection (never pooled).
+
+    Use for auth-critical paths (bootstrap, restore/redeem) that must work
+    even when the pool is full of dead SSL connections.
+    """
+    conn = _create_connection()
+    try:
+        with _run_transaction(conn) as cur:
+            yield cur
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────
