@@ -496,16 +496,34 @@ def _run_transaction(conn):
 @contextmanager
 def transaction(source: str = ""):
     """
-    Context manager for database transactions (uses pool if available).
+    Context manager for database transactions.
+    Pool-first with direct-fallback on transient checkout errors.
     Automatically commits on success, rolls back on exception.
     Yields a cursor with dict_row factory.
     """
     pool = _get_pool()
+    conn = None
+    from_pool = False
+
     if pool is not None:
-        with pool.connection() as conn:
+        try:
+            conn = pool.getconn(timeout=_DB_POOL_TIMEOUT)
+            from_pool = True
+        except Exception as e:
+            if is_transient_db_error(e):
+                print(f"[DB][TX_FALLBACK] pool checkout failed, using direct source={source}: {type(e).__name__}")
+                conn = None
+            else:
+                raise
+
+    if conn is not None and from_pool:
+        try:
             with _run_transaction(conn) as cur:
                 yield cur
+        finally:
+            pool.putconn(conn)
     else:
+        # Direct connection (pool failed or disabled)
         conn = _create_connection()
         try:
             with _run_transaction(conn) as cur:

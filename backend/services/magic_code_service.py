@@ -120,26 +120,37 @@ class MagicCodeService:
         # Hash IP for storage (privacy)
         ip_hash = hash_string(ip_address) if ip_address else None
 
-        # Store code under the INPUT email so redeem can find it by what the user typed
+        # Store code under the INPUT email so redeem can find it by what the user typed.
+        # transaction() has pool→direct fallback built in, so this works even
+        # when the pool is sick.
         expiry_minutes = config.MAGIC_CODE_EXPIRY_MINUTES
-        with transaction() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {Tables.MAGIC_CODES}
-                (email, code_hash, expires_at, attempts, consumed, ip_hash, created_at)
-                VALUES (%s, %s, NOW() + %s * INTERVAL '1 minute', 0, FALSE, %s, NOW())
-                RETURNING id
-                """,
-                (input_email, code_hash, expiry_minutes, ip_hash),
-            )
-            code_record = fetch_one(cur)
+        try:
+            with transaction("restore_create_code") as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO {Tables.MAGIC_CODES}
+                    (email, code_hash, expires_at, attempts, consumed, ip_hash, created_at)
+                    VALUES (%s, %s, NOW() + %s * INTERVAL '1 minute', 0, FALSE, %s, NOW())
+                    RETURNING id
+                    """,
+                    (input_email, code_hash, expiry_minutes, ip_hash),
+                )
+                code_record = fetch_one(cur)
+        except Exception as db_err:
+            print(f"[RESTORE][DB_FAIL] code creation failed for {input_email}: {type(db_err).__name__}: {db_err}")
+            return {"ok": False, "message": "Service temporarily unavailable. Please try again in a moment."}
 
         if not code_record:
             print(f"[MAGIC_CODE] Failed to create code record for {input_email}")
             return {"ok": False, "message": "Failed to create code"}
 
         # Send email to the exact address entered
-        email_sent = send_magic_code(delivery_email, plain_code)
+        try:
+            email_sent = send_magic_code(delivery_email, plain_code)
+        except Exception as email_err:
+            print(f"[RESTORE][EMAIL_FAIL] SES send failed for {delivery_email}: {type(email_err).__name__}: {email_err}")
+            email_sent = False
+
         if not email_sent:
             print(f"[MAGIC_CODE] Failed to send email to {delivery_email}")
             return {
@@ -150,13 +161,10 @@ class MagicCodeService:
         # Notify admin (optional, non-blocking)
         try:
             notify_restore_request(delivery_email)
-        except Exception as email_err:
-            print(f"[MAGIC_CODE] WARNING: Admin notification failed: {email_err}")
+        except Exception as notify_err:
+            print(f"[MAGIC_CODE] WARNING: Admin notification failed: {notify_err}")
 
-        print(
-            f"[MAGIC_CODE] Code sent to {delivery_email} "
-            f"(requested via {input_email}), expires in {expiry_minutes} minutes"
-        )
+        print(f"[RESTORE][OK] Code sent to {delivery_email} expires_in={expiry_minutes}m")
 
         return {
             "ok": True,
@@ -273,7 +281,7 @@ class MagicCodeService:
         # Consume the code and switch session to the target identity.
         # The current session's identity (if any) keeps its own data —
         # no wallet reconciliation, no purchase migration, no merge.
-        with transaction() as cur:
+        with transaction("restore_redeem") as cur:
             # Mark code as consumed
             cur.execute(
                 f"""
