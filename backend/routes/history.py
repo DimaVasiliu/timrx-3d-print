@@ -11,9 +11,14 @@ from __future__ import annotations
 import json
 import uuid
 
+import time as _time
 from flask import Blueprint, jsonify, request, g
 
 from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, Tables, is_transient_db_error
+
+# Short TTL per-identity cache for history GET — avoids repeated heavy JOIN
+_history_cache = {}  # identity_id -> (rows_list, monotonic_ts)
+_HISTORY_CACHE_TTL = 15  # seconds
 from backend.middleware import with_session
 from backend.services.history_service import (
     _local_history_id,
@@ -63,7 +68,17 @@ def history_mod():
 
             print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, offset={offset}")
 
-            if USE_DB:
+            # Check per-identity cache (avoids repeated 3s+ DB/fallback fetches)
+            _hcache_key = f"{identity_id}:{limit}:{offset}"
+            _hcached = _history_cache.get(_hcache_key)
+            if _hcached:
+                _hc_items, _hc_ts = _hcached
+                if _time.monotonic() - _hc_ts < _HISTORY_CACHE_TTL:
+                    items = _hc_items
+                    db_source = True
+                    print(f"[History][CACHE_HIT] {len(items)} items")
+
+            if USE_DB and not db_source:
                 _hsql = f"""
                     SELECT
                         h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
@@ -281,10 +296,17 @@ def history_mod():
                         print(f"[History] Rig/animate items: {stage_counts}")
 
                     save_history_store(items)
+                    # Cache the enriched items for short-TTL reuse
+                    _history_cache[_hcache_key] = (items, _time.monotonic())
                 except Exception as e:
                     if is_transient_db_error(e):
-                        # Both pool AND direct connection failed — truly degraded
-                        print(f"[History][DEGRADED] pool+direct both failed, returning empty: {type(e).__name__}: {e}")
+                        # Try stale cache before degrading to empty
+                        if _hcached:
+                            items = _hcached[0]
+                            db_source = True
+                            print(f"[History][STALE_OK] returning {len(items)} cached items: {type(e).__name__}")
+                        else:
+                            print(f"[History][DEGRADED] pool+direct both failed, returning empty: {type(e).__name__}: {e}")
                     else:
                         print(f"[History][mod] DB read failed (returning local/empty): {e}")
                         import traceback
