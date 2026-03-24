@@ -156,13 +156,27 @@ def with_session(f):
                 return _maybe_refresh_cookie(identity, session_id, result)
 
             # No valid session — create anonymous identity + session
+            # Single-flight gate: if 5 concurrent requests arrive without
+            # cookies, only one actually bootstraps; the rest wait and reuse.
+            from backend.services.identity_service import _bootstrap_single_flight
             cookie_response = make_response()
-            session_id, identity_id = IdentityService.get_or_create_session(request, cookie_response)
+            session_id, identity_id = _bootstrap_single_flight(
+                request, cookie_response, IdentityService.get_or_create_session,
+            )
 
             g.session_id = session_id
             g.identity_id = identity_id
-            g.identity = IdentityService.get_identity_with_wallet(identity_id)
+            # Fetch wallet for the new identity — this will be cached in
+            # the process session cache for followers to reuse.
+            identity_with_wallet = IdentityService.get_identity_with_wallet(identity_id)
+            g.identity = identity_with_wallet
             g._identity_resolved = True
+            g._identity_source = "bootstrap"
+            # Seed the process cache so concurrent followers get a hit
+            # on get_current_identity → validate_session for this session
+            if identity_with_wallet:
+                from backend.services.identity_service import _session_cache_put
+                _session_cache_put(session_id, identity_with_wallet)
 
             result = f(*args, **kwargs)
             resp = _ensure_response(result)

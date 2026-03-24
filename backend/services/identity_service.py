@@ -89,6 +89,107 @@ def _session_cache_invalidate(session_id: str):
     """Remove a session from cache (on revoke, merge, etc.)."""
     _session_cache.pop(session_id, None)
 
+
+# ─── Single-flight bootstrap gate ────────────────────────────
+# When a new browser lands (no cookies), 4-6 concurrent requests all try
+# to create an anonymous session simultaneously. Each mints its own bid,
+# so the DB advisory lock can't dedupe them.
+#
+# This in-process gate ensures only ONE thread actually runs bootstrap
+# for a given browser fingerprint (IP + User-Agent). Other threads wait
+# for the result and reuse the session_id + identity_id.
+#
+# The gate entry expires after 10s (covers the slowest possible bootstrap
+# + cold connection). Max 200 entries to bound memory.
+
+_BOOTSTRAP_GATE_TTL = 10  # seconds
+_bootstrap_gate: Dict[str, _threading.Event] = {}   # fingerprint -> Event
+_bootstrap_results: Dict[str, tuple] = {}            # fingerprint -> (session_id, identity_id, expires_at)
+_bootstrap_gate_lock = _threading.Lock()
+
+
+def _bootstrap_fingerprint(request) -> str:
+    """Derive a short key from IP + User-Agent to group concurrent no-cookie requests."""
+    ip = request.remote_addr or ""
+    ua = request.headers.get("User-Agent", "")[:80]
+    return hashlib.sha256(f"{ip}|{ua}".encode()).hexdigest()[:16]
+
+
+def _bootstrap_single_flight(request, response, create_fn):
+    """
+    Single-flight wrapper around create_fn (get_or_create_session).
+
+    If another thread is already bootstrapping for the same fingerprint,
+    wait for its result instead of creating a second session.
+
+    Returns (session_id, identity_id).
+    """
+    fp = _bootstrap_fingerprint(request)
+
+    with _bootstrap_gate_lock:
+        # Check if a recent bootstrap result exists (another thread just finished)
+        cached = _bootstrap_results.get(fp)
+        if cached:
+            sid, iid, exp = cached
+            if exp > _time.monotonic():
+                from backend.services.identity_service import IdentityService
+                IdentityService.set_session_cookie(response, sid)
+                print(f"[BOOTSTRAP] single-flight cache hit fp={fp} sid={sid[:8]}...")
+                return sid, iid
+
+        # Check if another thread is currently bootstrapping
+        event = _bootstrap_gate.get(fp)
+        if event is not None:
+            # Another thread is running bootstrap — wait for it
+            pass  # will wait outside the lock
+        else:
+            # We are the leader — create the event for others to wait on
+            event = _threading.Event()
+            _bootstrap_gate[fp] = event
+            event = None  # signal to ourselves: we are the leader
+
+    if event is not None:
+        # We are a follower — wait for the leader to finish
+        leader_event = None
+        with _bootstrap_gate_lock:
+            leader_event = _bootstrap_gate.get(fp)
+        if leader_event:
+            leader_event.wait(timeout=_BOOTSTRAP_GATE_TTL)
+
+        # Leader finished — check for result
+        with _bootstrap_gate_lock:
+            cached = _bootstrap_results.get(fp)
+        if cached:
+            sid, iid, exp = cached
+            if exp > _time.monotonic():
+                from backend.services.identity_service import IdentityService
+                IdentityService.set_session_cookie(response, sid)
+                print(f"[BOOTSTRAP] single-flight follower reused fp={fp} sid={sid[:8]}...")
+                return sid, iid
+
+        # Fallback: leader failed or timed out, run our own bootstrap
+        print(f"[BOOTSTRAP] single-flight follower fallback fp={fp}")
+        return create_fn(request, response)
+
+    # We are the leader — actually run bootstrap
+    try:
+        sid, iid = create_fn(request, response)
+        with _bootstrap_gate_lock:
+            _bootstrap_results[fp] = (sid, iid, _time.monotonic() + _SESSION_CACHE_TTL)
+            # Evict old results
+            now = _time.monotonic()
+            expired = [k for k, (_, _, exp) in _bootstrap_results.items() if exp <= now]
+            for k in expired:
+                del _bootstrap_results[k]
+        return sid, iid
+    finally:
+        # Signal followers and clean up the gate
+        with _bootstrap_gate_lock:
+            evt = _bootstrap_gate.pop(fp, None)
+        if evt:
+            evt.set()
+
+
 # Production safety warning (one-time at startup)
 if SESSION_DEBUG and config.IS_PROD:
     print(
