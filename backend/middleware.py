@@ -137,18 +137,22 @@ def _maybe_refresh_cookie(identity, session_id, result):
 # Bootstrap with circuit-breaker + single-flight
 # ─────────────────────────────────────────────────────────────
 
-_BOOTSTRAP_RETRY_RESPONSE = (
-    jsonify({
-        "ok": False,
-        "error": {
-            "code": "BOOTSTRAP_BUSY",
-            "message": "Server is starting up. Please retry in a moment.",
-        },
-        "retry_after": 2,
-    }),
-    503,
-    {"Retry-After": "2"},
-)
+def _bootstrap_retry_response():
+    """Build 503 response for when bootstrap can't get a DB connection.
+    Must be a function, not a module-level constant, because jsonify()
+    requires Flask application context which doesn't exist at import time."""
+    return (
+        jsonify({
+            "ok": False,
+            "error": {
+                "code": "BOOTSTRAP_BUSY",
+                "message": "Server is starting up. Please retry in a moment.",
+            },
+            "retry_after": 2,
+        }),
+        503,
+        {"Retry-After": "2"},
+    )
 
 
 def _do_bootstrap():
@@ -226,7 +230,7 @@ def with_session(f):
             try:
                 session_id, identity_id, identity_with_wallet, cookie_response = _do_bootstrap()
             except _BootstrapBusy:
-                return _BOOTSTRAP_RETRY_RESPONSE
+                return _bootstrap_retry_response()
 
             g.session_id = session_id
             g.identity_id = identity_id

@@ -740,32 +740,36 @@ def init_db() -> bool:
         return False
 
     try:
-        # Eagerly open the pool and wait for min_size connections.
-        # This runs inside create_app() which executes per Gunicorn worker
-        # (after fork), so each worker gets its own pool with live connections.
-        pool = _get_pool()
-        if pool is not None:
-            try:
-                pool.open(wait=True, timeout=_DB_CONNECT_TIMEOUT)
-                print(
-                    f"[DB] Pool warmed: {_DB_POOL_MIN_SIZE} connections ready "
-                    f"pid={os.getpid()}"
-                )
-            except Exception as e:
-                print(f"[DB] Pool warm failed (will create on demand): {e}")
+        # Verify connectivity with a DIRECT connection (not pooled).
+        # create_app() runs in the Gunicorn master process before fork.
+        # If we use the pool here, its background threads start in the
+        # master and die on fork, causing "couldn't stop thread" errors.
+        # The pool stays dormant until the first request hits the worker.
+        try:
+            conn = _create_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                row = cur.fetchone()
+            conn.close()
+            if not row or row.get("ok") != 1:
+                raise DatabaseConnectionError("Connection test query failed")
+        except DatabaseConnectionError:
+            raise
+        except Exception as e:
+            raise DatabaseConnectionError(f"Startup connection test failed: {e}", original_error=e)
 
-        if verify_connection():
-            print("[DB] Database connection verified successfully")
-            if _DB_POOL_ENABLED and _POOL_AVAILABLE:
-                print(f"[DB] Pool mode: ENABLED (min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
-            else:
-                print("[DB] Pool mode: DISABLED — using direct connections")
-            ensure_schema()
-            _DB_STARTUP_READY = True
-            _DB_STARTUP_REASON = ""
-            return True
+        print("[DB] Database connection verified successfully")
+        if _DB_POOL_ENABLED and _POOL_AVAILABLE:
+            print(f"[DB] Pool mode: ENABLED (will open on first request, min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
         else:
-            raise DatabaseConnectionError("Connection test query failed")
+            print("[DB] Pool mode: DISABLED — using direct connections")
+
+        # Run schema checks with a direct connection too
+        _ensure_schema_direct()
+
+        _DB_STARTUP_READY = True
+        _DB_STARTUP_REASON = ""
+        return True
     except DatabaseError as e:
         _DB_STARTUP_READY = False
         _DB_STARTUP_REASON = str(e)
@@ -774,7 +778,7 @@ def init_db() -> bool:
 
 
 def ensure_schema() -> None:
-    """Verify critical schema elements exist at startup."""
+    """Verify critical schema elements exist at startup (uses pool)."""
     try:
         with transaction() as cur:
             cur.execute("""
@@ -788,6 +792,36 @@ def ensure_schema() -> None:
             """)
 
         print("[DB] Schema indexes ensured")
+
+        try:
+            from backend.services.prompt_safety_service import ensure_safety_schema
+            ensure_safety_schema()
+        except Exception as e:
+            print(f"[DB] Warning: Could not ensure safety schema: {e}")
+    except Exception as e:
+        print(f"[DB] Warning: Could not ensure schema indexes: {e}")
+
+
+def _ensure_schema_direct() -> None:
+    """Verify critical schema elements using a direct connection (no pool).
+    Safe to call in the Gunicorn master before fork."""
+    try:
+        conn = _create_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_provider_payment
+                    ON timrx_billing.purchases(provider, provider_payment_id)
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
+                    ON timrx_billing.purchases (provider, payment_id)
+                    WHERE payment_id IS NOT NULL
+                """)
+            conn.commit()
+            print("[DB] Schema indexes ensured")
+        finally:
+            conn.close()
 
         try:
             from backend.services.prompt_safety_service import ensure_safety_schema
