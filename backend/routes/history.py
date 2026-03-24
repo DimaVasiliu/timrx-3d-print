@@ -86,10 +86,12 @@ def history_mod():
             # Check per-identity cache (avoids repeated 3s+ DB/fallback fetches)
             _hcache_key = f"{identity_id}:{limit}:{offset}"
             _hcached = _history_cache.get(_hcache_key)
+            _cached_has_more = False
             if _hcached:
-                _hc_items, _hc_ts = _hcached
+                _hc_items, _hc_has_more, _hc_ts = _hcached
                 if _time.monotonic() - _hc_ts < _HISTORY_CACHE_TTL:
                     items = _hc_items
+                    _cached_has_more = _hc_has_more
                     db_source = True
                     print(f"[History][CACHE_HIT] {len(items)} items")
 
@@ -131,10 +133,12 @@ def history_mod():
                             h.payload->>'original_id', h.payload->>'original_job_id'
                         ) IS NOT NULL))
                     WHERE h.identity_id = %s
-                    ORDER BY h.created_at DESC
+                    ORDER BY h.created_at DESC, h.id DESC
                     LIMIT %s OFFSET %s
                 """
-                _hparams = (identity_id, limit, offset)
+                # Fetch one extra row to detect whether more pages exist,
+                # without a separate COUNT query.
+                _hparams = (identity_id, limit + 1, offset)
 
                 def _fetch_history(conn_getter):
                     with conn_getter as c:
@@ -301,6 +305,15 @@ def history_mod():
 
                         items.append(item)
 
+                    # Trim the extra peek row and derive has_more.
+                    # We fetched limit+1 rows; if we got more than limit,
+                    # there is definitely a next page.
+                    if len(items) > limit:
+                        items = items[:limit]
+                        _cached_has_more = True
+                    else:
+                        _cached_has_more = False
+
                     # Summary: count rig/animate items (per-item logging removed for production)
                     stage_counts = {}
                     for item in items:
@@ -311,13 +324,14 @@ def history_mod():
                         print(f"[History] Rig/animate items: {stage_counts}")
 
                     save_history_store(items)
-                    # Cache the enriched items for short-TTL reuse
-                    _history_cache[_hcache_key] = (items, _time.monotonic())
+                    # Cache the enriched items + has_more flag for short-TTL reuse
+                    _history_cache[_hcache_key] = (items, _cached_has_more, _time.monotonic())
                 except Exception as e:
                     if is_transient_db_error(e):
                         # Try stale cache before degrading to empty
                         if _hcached:
                             items = _hcached[0]
+                            _cached_has_more = _hcached[1]
                             db_source = True
                             print(f"[History][STALE_OK] returning {len(items)} cached items: {type(e).__name__}")
                         else:
@@ -339,9 +353,19 @@ def history_mod():
             total_time = time.time() - start_time
             print(f"[History][mod] GET: Total response time {total_time:.3f}s for {len(items)} items")
 
-            # Always return 200 with bare array for frontend compatibility
-            # Frontend expects: Array.isArray(result.data) to be true
-            return jsonify(items)
+            # Return paginated response.
+            # has_more is determined by the fetch-limit+1 pattern (DB path)
+            # or preserved from the process cache (cache-hit path).
+            has_more = _cached_has_more
+            return jsonify({
+                "ok": True,
+                "items": items,
+                "limit": limit,
+                "offset": offset,
+                "count": len(items),
+                "has_more": has_more,
+                "next_offset": offset + len(items) if has_more else None,
+            })
 
         try:
             payload = request.get_json(silent=True) or []
