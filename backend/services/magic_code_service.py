@@ -29,6 +29,7 @@ from backend.db import (
     execute,
     Tables,
     hash_string,
+    is_transient_db_error,
 )
 from backend.config import config
 from backend.emailer import send_magic_code, notify_restore_request
@@ -120,9 +121,9 @@ class MagicCodeService:
         # Hash IP for storage (privacy)
         ip_hash = hash_string(ip_address) if ip_address else None
 
-        # Store code under the INPUT email so redeem can find it by what the user typed.
-        # transaction() has pool→direct fallback built in, so this works even
-        # when the pool is sick.
+        # ── Step 1: Store code in DB ──
+        # transaction() has pool→direct fallback built in.
+        # Only catch transient DB errors; re-raise real bugs.
         expiry_minutes = config.MAGIC_CODE_EXPIRY_MINUTES
         try:
             with transaction("restore_create_code") as cur:
@@ -137,39 +138,37 @@ class MagicCodeService:
                 )
                 code_record = fetch_one(cur)
         except Exception as db_err:
-            print(f"[RESTORE][DB_FAIL] code creation failed for {input_email}: {type(db_err).__name__}: {db_err}")
-            return {"ok": False, "message": "Service temporarily unavailable. Please try again in a moment."}
+            if is_transient_db_error(db_err):
+                print(f"[RESTORE][DB_FAIL] code creation failed for {input_email}: {type(db_err).__name__}: {db_err}")
+                return {"ok": False, "message": "Service temporarily unavailable. Please try again in a moment."}
+            # Non-transient = real bug. Log and re-raise so it surfaces.
+            print(f"[RESTORE][BUG] unexpected DB error creating code for {input_email}: {type(db_err).__name__}: {db_err}")
+            raise
 
         if not code_record:
-            print(f"[MAGIC_CODE] Failed to create code record for {input_email}")
-            return {"ok": False, "message": "Failed to create code"}
+            print(f"[RESTORE][DB_FAIL] INSERT returned no row for {input_email}")
+            return {"ok": False, "message": "Service temporarily unavailable. Please try again in a moment."}
 
-        # Send email to the exact address entered
+        # ── Step 2: Send email ──
+        # Only runs if DB write succeeded. If email fails, return explicit failure.
         try:
             email_sent = send_magic_code(delivery_email, plain_code)
         except Exception as email_err:
-            print(f"[RESTORE][EMAIL_FAIL] SES send failed for {delivery_email}: {type(email_err).__name__}: {email_err}")
-            email_sent = False
+            print(f"[RESTORE][EMAIL_FAIL] SES exception for {delivery_email}: {type(email_err).__name__}: {email_err}")
+            return {"ok": False, "message": "We couldn't send the code right now. Please try again in a moment."}
 
         if not email_sent:
-            print(f"[MAGIC_CODE] Failed to send email to {delivery_email}")
-            return {
-                "ok": True,
-                "message": "If this email is registered, a code has been sent",
-            }
+            print(f"[RESTORE][EMAIL_FAIL] send_magic_code returned False for {delivery_email}")
+            return {"ok": False, "message": "We couldn't send the code right now. Please try again in a moment."}
 
-        # Notify admin (optional, non-blocking)
+        # ── Step 3: Admin notification (non-blocking, only on success) ──
         try:
             notify_restore_request(delivery_email)
         except Exception as notify_err:
-            print(f"[MAGIC_CODE] WARNING: Admin notification failed: {notify_err}")
+            print(f"[RESTORE] admin notification failed (non-critical): {notify_err}")
 
-        print(f"[RESTORE][OK] Code sent to {delivery_email} expires_in={expiry_minutes}m")
-
-        return {
-            "ok": True,
-            "message": "Code sent to your email",
-        }
+        print(f"[RESTORE][OK] code sent to {delivery_email} expires_in={expiry_minutes}m")
+        return {"ok": True, "message": "Code sent to your email"}
 
     @staticmethod
     def _check_rate_limits(email: str) -> Tuple[bool, str]:

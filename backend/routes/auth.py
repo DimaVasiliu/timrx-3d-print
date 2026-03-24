@@ -216,14 +216,15 @@ def request_restore():
             }
         }), 400
 
-    # Get client IP for rate limiting
     ip_address = _get_client_ip()
+    print(f"[RESTORE][REQUEST] email={email} ip={ip_address or 'none'}")
 
-    # Request the code
     result = MagicCodeService.request_restore(email, ip_address)
 
     if not result.get("ok"):
         message = result.get("message", "Request failed")
+        print(f"[RESTORE][ROUTE_FAIL] email={email} message={message}")
+
         # Rate limit errors should return 429
         if "wait" in message.lower() or "too many" in message.lower():
             return jsonify({
@@ -233,6 +234,15 @@ def request_restore():
                 }
             }), 429
 
+        # Transient service errors → 503 so frontend knows to retry
+        if "temporarily unavailable" in message.lower() or "couldn't send" in message.lower():
+            return jsonify({
+                "error": {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": message,
+                }
+            }), 503
+
         return jsonify({
             "error": {
                 "code": "REQUEST_FAILED",
@@ -240,6 +250,7 @@ def request_restore():
             }
         }), 400
 
+    print(f"[RESTORE][ROUTE_OK] email={email}")
     return jsonify({
         "ok": True,
         "message": result.get("message", "Code sent"),

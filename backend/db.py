@@ -521,7 +521,16 @@ def transaction(source: str = ""):
             with _run_transaction(conn) as cur:
                 yield cur
         finally:
-            pool.putconn(conn)
+            # Return connection to pool. putconn handles broken connections
+            # (discards them instead of poisoning the pool).
+            try:
+                pool.putconn(conn)
+            except Exception:
+                # Pool closed or connection already detached — close directly
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     else:
         # Direct connection (pool failed or disabled)
         conn = _create_connection()
