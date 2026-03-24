@@ -77,7 +77,7 @@ def history_mod():
 
             # Pagination parameters
             import base64 as _b64
-            limit = request.args.get("limit", type=int, default=50)
+            limit = request.args.get("limit", type=int, default=350)
             item_type_filter = request.args.get("type", type=str, default="all").lower().strip()
             cursor_raw = request.args.get("cursor", type=str, default="")
             # Legacy offset support (ignored when cursor is provided)
