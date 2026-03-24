@@ -2050,6 +2050,14 @@ def start_operations_loop():
             _am_leader = is_leader()
             _cycle_had_db_error = False
 
+            # If we're in a DB error streak, skip all ops this cycle to
+            # avoid competing with user-facing requests for pool/DB connections.
+            if consecutive_db_errors >= 3:
+                print(f"[OPS][BACKOFF] skipping ops cycle={cycle} consecutive_errors={consecutive_db_errors}")
+                consecutive_db_errors -= 1  # slowly recover toward 0
+                _worker_stop.wait(timeout=min(consecutive_db_errors * 5, 60))
+                continue
+
             # -- Stall detection (always runs on all workers, lightweight) --
             try:
                 detect_stalled_jobs()

@@ -532,93 +532,92 @@ def fetch_scalar(cur) -> Any:
 
 
 # ─────────────────────────────────────────────────────────────
-# Standalone Query Helpers — retry-once on transient connection errors
+# Standalone Query Helpers — pool-first, direct-fallback on transient errors
 #
-# These are the primary DB access functions for request handlers.
-# On SSL/transport errors (Render killing idle connections), the
-# broken connection is returned to the pool (which discards it),
-# and the query is retried ONCE on a fresh connection.
+# Primary path uses the pool. On transient SSL/transport/pool errors,
+# the retry uses a DIRECT connection (bypasses the sick pool entirely).
+# This is the key resilience mechanism: user-facing reads survive pool storms.
 #
 # Non-connection errors (constraint violations, syntax errors, etc.)
 # are never retried.
 # ─────────────────────────────────────────────────────────────
 def query_one(sql: str, params: tuple = None, source: str = "") -> Optional[Dict[str, Any]]:
-    """Execute a query and return one row as dict. Retries once on transient errors."""
+    """Execute a query and return one row as dict. Falls back to direct connection on transient errors."""
     try:
         with transaction(source) as cur:
             cur.execute(sql, params or ())
             return fetch_one(cur)
     except Exception as e:
         if is_transient_db_error(e):
-            print(f"[DB][RETRY] transient error in query_one source={source or 'unknown'}: {type(e).__name__}: {e}")
-            with transaction(source) as cur:
+            print(f"[DB][FALLBACK] query_one pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
                 cur.execute(sql, params or ())
                 return fetch_one(cur)
         raise
 
 
 def query_all(sql: str, params: tuple = None, source: str = "") -> List[Dict[str, Any]]:
-    """Execute a query and return all rows as list of dicts. Retries once on transient errors."""
+    """Execute a query and return all rows. Falls back to direct connection on transient errors."""
     try:
         with transaction(source) as cur:
             cur.execute(sql, params or ())
             return fetch_all(cur)
     except Exception as e:
         if is_transient_db_error(e):
-            print(f"[DB][RETRY] transient error in query_all source={source or 'unknown'}: {type(e).__name__}: {e}")
-            with transaction(source) as cur:
+            print(f"[DB][FALLBACK] query_all pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
                 cur.execute(sql, params or ())
                 return fetch_all(cur)
         raise
 
 
 def execute(sql: str, params: tuple = None, source: str = "") -> int:
-    """Execute a statement and return affected row count. Retries once on transient errors."""
+    """Execute a statement and return affected row count. Falls back to direct on transient errors."""
     try:
         with transaction(source) as cur:
             cur.execute(sql, params or ())
             return cur.rowcount
     except Exception as e:
         if is_transient_db_error(e):
-            print(f"[DB][RETRY] transient error in execute source={source or 'unknown'}: {type(e).__name__}: {e}")
-            with transaction(source) as cur:
+            print(f"[DB][FALLBACK] execute pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
                 cur.execute(sql, params or ())
                 return cur.rowcount
         raise
 
 
 def execute_returning(sql: str, params: tuple = None, source: str = "") -> Optional[Dict[str, Any]]:
-    """Execute an INSERT/UPDATE with RETURNING clause. Retries once on transient errors."""
+    """Execute an INSERT/UPDATE with RETURNING clause. Falls back to direct on transient errors."""
     try:
         with transaction(source) as cur:
             cur.execute(sql, params or ())
             return fetch_one(cur)
     except Exception as e:
         if is_transient_db_error(e):
-            print(f"[DB][RETRY] transient error in execute_returning source={source or 'unknown'}: {type(e).__name__}: {e}")
-            with transaction(source) as cur:
+            print(f"[DB][FALLBACK] execute_returning pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
                 cur.execute(sql, params or ())
                 return fetch_one(cur)
         raise
 
 
 def execute_returning_all(sql: str, params: tuple = None, source: str = "") -> List[Dict[str, Any]]:
-    """Execute an INSERT/UPDATE with RETURNING clause, return all rows. Retries once on transient errors."""
+    """Execute an INSERT/UPDATE with RETURNING, return all rows. Falls back to direct on transient errors."""
     try:
         with transaction(source) as cur:
             cur.execute(sql, params or ())
             return fetch_all(cur)
     except Exception as e:
         if is_transient_db_error(e):
-            print(f"[DB][RETRY] transient error in execute_returning_all source={source or 'unknown'}: {type(e).__name__}: {e}")
-            with transaction(source) as cur:
+            print(f"[DB][FALLBACK] execute_returning_all pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
                 cur.execute(sql, params or ())
                 return fetch_all(cur)
         raise
 
 
 def execute_many(sql: str, params_list: List[tuple], source: str = "") -> int:
-    """Execute a batch of statements. Retries once on transient errors."""
+    """Execute a batch of statements. Falls back to direct on transient errors."""
     if not params_list:
         return 0
     try:
@@ -627,8 +626,8 @@ def execute_many(sql: str, params_list: List[tuple], source: str = "") -> int:
             return cur.rowcount
     except Exception as e:
         if is_transient_db_error(e):
-            print(f"[DB][RETRY] transient error in execute_many source={source or 'unknown'}: {type(e).__name__}: {e}")
-            with transaction(source) as cur:
+            print(f"[DB][FALLBACK] execute_many pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
                 cur.executemany(sql, params_list)
                 return cur.rowcount
         raise

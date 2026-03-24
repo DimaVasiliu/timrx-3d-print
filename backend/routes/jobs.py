@@ -908,8 +908,9 @@ def get_active_jobs():
         identity_id = g.identity_id
 
         # Try new JobService method first (from timrx_billing.jobs)
+        jobs = []  # always initialize to avoid UnboundLocalError
         try:
-            jobs = JobService.get_active_jobs_for_identity(identity_id)
+            jobs = JobService.get_active_jobs_for_identity(identity_id) or []
             if jobs:
                 return jsonify({
                     "ok": True,
@@ -919,13 +920,17 @@ def get_active_jobs():
             print(f"[JOBS] get_active_jobs_for_identity failed: {e}")
 
         # Fall back to legacy active_jobs table
-        legacy_jobs = get_active_jobs_from_db(identity_id)
+        try:
+            legacy_jobs = get_active_jobs_from_db(identity_id) or []
+        except Exception as e:
+            print(f"[JOBS][DEGRADED] legacy active_jobs query failed: {e}")
+            legacy_jobs = []
 
         # Merge and deduplicate by job_id
         seen_ids = set()
         merged = []
 
-        for job in jobs if jobs else []:
+        for job in jobs:
             job_id = job.get("id") or job.get("job_id")
             if job_id and job_id not in seen_ids:
                 seen_ids.add(job_id)
@@ -943,7 +948,8 @@ def get_active_jobs():
         })
 
     except Exception as e:
-        print(f"[JOBS] Error getting active jobs: {e}")
+        # Catch-all: always return valid JSON, never crash
+        print(f"[JOBS][DEGRADED] returning empty jobs: {type(e).__name__}: {e}")
         return jsonify({
             "ok": True,
             "jobs": [],
