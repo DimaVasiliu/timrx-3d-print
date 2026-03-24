@@ -9,13 +9,19 @@ Handles:
 - POST /api/me/logout - End current session
 """
 
+import time as _time
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import with_session, require_session, no_cache
 from backend.services.identity_service import IdentityService
 from backend.services.wallet_service import WalletService
+from backend.db import is_transient_db_error
 
 bp = Blueprint("me", __name__)
+
+# Short TTL cache for /api/me response — avoids repeated DB hits on page-load burst
+_me_cache = {}  # identity_id -> (payload_dict, monotonic_ts)
+_ME_CACHE_TTL = 10  # seconds
 
 
 @bp.route("", methods=["GET"])
@@ -27,52 +33,65 @@ def get_me():
     Creates anonymous identity if none exists.
     Returns identity_id, email (if set), wallet balances (general + video), etc.
     """
-    identity = g.identity
+    identity_id = g.identity_id
 
-    # Fetch wallet balances from wallets table (both general and video credits)
-    balance = 0
-    video_balance = 0
-    reserved = 0
-    video_reserved = 0
+    # Fast path: return cached response if fresh (avoids all DB calls)
+    cached = _me_cache.get(identity_id)
+    if cached:
+        payload, ts = cached
+        if _time.monotonic() - ts < _ME_CACHE_TTL:
+            return jsonify(payload)
 
-    if g.identity_id:
-        # Get all balances at once
-        balances = WalletService.get_all_balances(g.identity_id)
-        balance = balances["general"]
-        video_balance = balances["video"]
+    try:
+        identity = g.identity
 
-        # Get all reserved credits at once
-        reserved_credits = WalletService.get_all_reserved_credits(g.identity_id)
-        reserved = reserved_credits["general"]
-        video_reserved = reserved_credits["video"]
+        balance = 0
+        video_balance = 0
+        reserved = 0
+        video_reserved = 0
 
-    # AUTH-6: last_active_at is updated by restore/verify/merge and serves as
-    # a cross-subdomain freshness marker.  Frontends on different origins compare
-    # this against a locally stored stamp to detect auth changes that happened
-    # on another subdomain.
-    last_active_at = None
-    if identity:
-        raw = identity.get("last_seen_at") or identity.get("created_at")
-        if raw:
-            last_active_at = raw.isoformat() if hasattr(raw, 'isoformat') else str(raw)
+        if identity_id:
+            balances = WalletService.get_all_balances(identity_id)
+            balance = balances["general"]
+            video_balance = balances["video"]
 
-    return jsonify({
-        "ok": True,
-        "identity_id": g.identity_id,
-        "email": identity.get("email") if identity else None,
-        "email_verified": identity.get("email_verified", False) if identity else False,
-        # General credits (3D + images)
-        "balance_credits": balance,
-        "reserved_credits": reserved,
-        "available_credits": max(0, balance - reserved),
-        # Video credits (separate balance)
-        "balance_video_credits": video_balance,
-        "reserved_video_credits": video_reserved,
-        "available_video_credits": max(0, video_balance - video_reserved),
-        "created_at": identity.get("created_at").isoformat() if identity and identity.get("created_at") else None,
-        # AUTH-6: Cross-subdomain freshness marker
-        "last_active_at": last_active_at,
-    })
+            reserved_credits = WalletService.get_all_reserved_credits(identity_id)
+            reserved = reserved_credits["general"]
+            video_reserved = reserved_credits["video"]
+
+        last_active_at = None
+        if identity:
+            raw = identity.get("last_seen_at") or identity.get("created_at")
+            if raw:
+                last_active_at = raw.isoformat() if hasattr(raw, 'isoformat') else str(raw)
+
+        payload = {
+            "ok": True,
+            "identity_id": identity_id,
+            "email": identity.get("email") if identity else None,
+            "email_verified": identity.get("email_verified", False) if identity else False,
+            "balance_credits": balance,
+            "reserved_credits": reserved,
+            "available_credits": max(0, balance - reserved),
+            "balance_video_credits": video_balance,
+            "reserved_video_credits": video_reserved,
+            "available_video_credits": max(0, video_balance - video_reserved),
+            "created_at": identity.get("created_at").isoformat() if identity and identity.get("created_at") else None,
+            "last_active_at": last_active_at,
+        }
+
+        # Cache successful response
+        if identity_id:
+            _me_cache[identity_id] = (payload, _time.monotonic())
+
+        return jsonify(payload)
+
+    except Exception as e:
+        # On transient DB error, return stale cache if available
+        if is_transient_db_error(e) and cached:
+            print(f"[ME][STALE_OK] returning cached /api/me: {type(e).__name__}")
+            return jsonify(cached[0])
+        raise
 
 
 @bp.route("/email", methods=["POST"])

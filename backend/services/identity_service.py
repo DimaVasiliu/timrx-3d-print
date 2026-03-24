@@ -760,7 +760,7 @@ class IdentityService:
 
     # In-memory touch throttle: identity_id -> monotonic timestamp of last touch
     _touch_cache = {}
-    _TOUCH_TTL = 300  # 5 minutes — no need to UPDATE last_seen_at more often
+    _TOUCH_TTL = 600  # 10 minutes — low-value freshness write, not auth-critical
 
     @staticmethod
     def touch_identity(identity_id: str) -> bool:

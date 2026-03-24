@@ -10,12 +10,17 @@ This module provides a simple, stable interface for:
 2. Backend services to charge credits for paid actions
 """
 
+import time as _time
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_session, no_cache
 from backend.services.wallet_service import WalletService, LedgerEntryType
 from backend.services.pricing_service import PricingService
-from backend.db import transaction, fetch_one, Tables, DatabaseIntegrityError
+from backend.db import transaction, fetch_one, Tables, DatabaseIntegrityError, is_transient_db_error
+
+# Short TTL cache for wallet response — avoids repeated DB hits
+_wallet_cache = {}  # identity_id -> (payload_dict, monotonic_ts)
+_WALLET_CACHE_TTL = 10  # seconds
 
 bp = Blueprint("credits", __name__)
 
@@ -107,34 +112,46 @@ def get_wallet():
         "error": {"code": "UNAUTHORIZED", "message": "No valid session"}
     }
     """
+    identity_id = g.identity_id
+
+    # Fast path: return cached wallet if fresh
+    cached = _wallet_cache.get(identity_id)
+    if cached:
+        payload, ts = cached
+        if _time.monotonic() - ts < _WALLET_CACHE_TTL:
+            return jsonify(payload)
+
     try:
-        # General credits
-        balance = WalletService.get_balance(g.identity_id)
-        reserved = WalletService.get_reserved_credits(g.identity_id)
+        balance = WalletService.get_balance(identity_id)
+        reserved = WalletService.get_reserved_credits(identity_id)
         available = max(0, balance - reserved)
 
-        # Video credits (separate pool)
-        video_balance = WalletService.get_balance(g.identity_id, "video")
-        video_reserved = WalletService.get_reserved_credits(g.identity_id, "video")
+        video_balance = WalletService.get_balance(identity_id, "video")
+        video_reserved = WalletService.get_reserved_credits(identity_id, "video")
         video_available = max(0, video_balance - video_reserved)
 
-        # Debug: Log wallet fetch (always for video debugging)
-        print(f"[WALLET] Fetch: identity={g.identity_id[:8]}..., general(bal={balance},res={reserved},avail={available}), "
+        print(f"[WALLET] Fetch: identity={identity_id[:8]}..., general(bal={balance},res={reserved},avail={available}), "
               f"video(bal={video_balance},res={video_reserved},avail={video_available})")
 
-        return jsonify({
+        payload = {
             "ok": True,
-            "identity_id": g.identity_id,
-            # General credits
+            "identity_id": identity_id,
             "credits_balance": balance,
             "reserved_credits": reserved,
             "available_credits": available,
-            # Video credits (separate pool)
             "video_credits_balance": video_balance,
             "video_reserved_credits": video_reserved,
             "video_available_credits": video_available,
-        })
+        }
+
+        _wallet_cache[identity_id] = (payload, _time.monotonic())
+        return jsonify(payload)
+
     except Exception as e:
+        # On transient DB error, return stale cache if available
+        if is_transient_db_error(e) and cached:
+            print(f"[WALLET][STALE_OK] returning cached wallet: {type(e).__name__}")
+            return jsonify(cached[0])
         print(f"[CREDITS] Error fetching wallet: {e}")
         return jsonify({
             "ok": False,
