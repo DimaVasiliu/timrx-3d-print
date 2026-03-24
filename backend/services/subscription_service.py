@@ -284,7 +284,8 @@ class SubscriptionService:
         if not USE_DB:
             return None
         try:
-            with get_conn("billing_sub_me") as conn:
+            from backend.db import get_conn_resilient
+            with get_conn_resilient("billing_sub_me") as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"""

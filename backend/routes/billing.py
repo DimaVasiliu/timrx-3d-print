@@ -19,7 +19,7 @@ import time
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import require_session, require_email, require_verified_email, no_cache
-from backend.db import get_conn, Tables
+from backend.db import get_conn, get_conn_resilient, Tables, is_transient_db_error
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService
 from backend.services.reservation_service import ReservationService
@@ -1788,37 +1788,40 @@ def subscription_summary():
     from backend.services.subscription_service import SUBSCRIPTION_PLANS
 
     # Get any subscription (active, cancelled, pending_payment, suspended)
+    # Pool-first with direct fallback, then degraded-safe on total failure
+    _sub_sql = f"""
+        SELECT s.*,
+               (SELECT sc.payment_status FROM {Tables.SUBSCRIPTION_CYCLES} sc
+                WHERE sc.subscription_id = s.id
+                ORDER BY sc.granted_at DESC NULLS LAST, sc.period_start DESC LIMIT 1) as last_payment_status,
+               (SELECT sc.granted_at FROM {Tables.SUBSCRIPTION_CYCLES} sc
+                WHERE sc.subscription_id = s.id
+                ORDER BY sc.granted_at DESC NULLS LAST, sc.period_start DESC LIMIT 1) as last_payment_at
+        FROM {Tables.SUBSCRIPTIONS} s
+        WHERE s.identity_id = %s
+          AND s.status IN ('active', 'cancelled', 'pending_payment', 'suspended', 'past_due')
+        ORDER BY
+            CASE s.status
+                WHEN 'active' THEN 1
+                WHEN 'pending_payment' THEN 2
+                WHEN 'cancelled' THEN 3
+                WHEN 'suspended' THEN 4
+                WHEN 'past_due' THEN 5
+            END,
+            s.created_at DESC
+        LIMIT 1
+    """
     sub = None
     try:
-        with get_conn("billing_sub_summary") as conn:
+        with get_conn_resilient("billing_sub_summary") as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT s.*,
-                           (SELECT sc.payment_status FROM {Tables.SUBSCRIPTION_CYCLES} sc
-                            WHERE sc.subscription_id = s.id
-                            ORDER BY sc.granted_at DESC NULLS LAST, sc.period_start DESC LIMIT 1) as last_payment_status,
-                           (SELECT sc.granted_at FROM {Tables.SUBSCRIPTION_CYCLES} sc
-                            WHERE sc.subscription_id = s.id
-                            ORDER BY sc.granted_at DESC NULLS LAST, sc.period_start DESC LIMIT 1) as last_payment_at
-                    FROM {Tables.SUBSCRIPTIONS} s
-                    WHERE s.identity_id = %s
-                      AND s.status IN ('active', 'cancelled', 'pending_payment', 'suspended', 'past_due')
-                    ORDER BY
-                        CASE s.status
-                            WHEN 'active' THEN 1
-                            WHEN 'pending_payment' THEN 2
-                            WHEN 'cancelled' THEN 3
-                            WHEN 'suspended' THEN 4
-                            WHEN 'past_due' THEN 5
-                        END,
-                        s.created_at DESC
-                    LIMIT 1
-                    """,
-                    (g.identity_id,),
-                )
+                cur.execute(_sub_sql, (g.identity_id,))
                 sub = cur.fetchone()
     except Exception as e:
+        if is_transient_db_error(e):
+            # Both pool and direct failed — return safe "no subscription" instead of 500
+            print(f"[SUB_API][DEGRADED] summary returning safe empty: {type(e).__name__}: {e}")
+            return jsonify({"ok": True, "has_subscription": False})
         print(f"[BILLING] Error fetching subscription summary: {e}")
         return jsonify({"ok": False, "error": "internal_error"}), 500
 

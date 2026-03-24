@@ -19,9 +19,14 @@ Generation Reliability Layer:
 - Active jobs endpoint allows UI reconnection after navigation
 """
 
+import time as _time
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_session, with_session
+
+# Short TTL cache for /jobs/active — avoids pool pressure for repeated polls
+_jobs_active_cache: dict = {}  # identity_id -> (result_list, monotonic_ts)
+_JOBS_CACHE_TTL = 10  # seconds
 from backend.services.job_service import (
     JobService,
     JobStatus,
@@ -907,15 +912,20 @@ def get_active_jobs():
     try:
         identity_id = g.identity_id
 
+        # Check short-TTL cache first — avoids pool pressure during page-load bursts
+        _cached = _jobs_active_cache.get(identity_id)
+        if _cached:
+            _cached_jobs, _cached_ts = _cached
+            if _time.monotonic() - _cached_ts < _JOBS_CACHE_TTL:
+                return jsonify({"ok": True, "jobs": _cached_jobs})
+
         # Try new JobService method first (from timrx_billing.jobs)
-        jobs = []  # always initialize to avoid UnboundLocalError
+        jobs = []
         try:
             jobs = JobService.get_active_jobs_for_identity(identity_id) or []
             if jobs:
-                return jsonify({
-                    "ok": True,
-                    "jobs": jobs,
-                })
+                _jobs_active_cache[identity_id] = (jobs, _time.monotonic())
+                return jsonify({"ok": True, "jobs": jobs})
         except Exception as e:
             print(f"[JOBS] get_active_jobs_for_identity failed: {e}")
 
@@ -926,34 +936,31 @@ def get_active_jobs():
             print(f"[JOBS][DEGRADED] legacy active_jobs query failed: {e}")
             legacy_jobs = []
 
-        # Merge and deduplicate by job_id
+        # Merge and deduplicate
         seen_ids = set()
         merged = []
-
         for job in jobs:
             job_id = job.get("id") or job.get("job_id")
             if job_id and job_id not in seen_ids:
                 seen_ids.add(job_id)
                 merged.append(job)
-
         for job in legacy_jobs:
             job_id = job.get("job_id")
             if job_id and job_id not in seen_ids:
                 seen_ids.add(job_id)
                 merged.append(job)
 
-        return jsonify({
-            "ok": True,
-            "jobs": merged,
-        })
+        _jobs_active_cache[identity_id] = (merged, _time.monotonic())
+        return jsonify({"ok": True, "jobs": merged})
 
     except Exception as e:
-        # Catch-all: always return valid JSON, never crash
+        # Return stale cache if available, otherwise empty
+        _stale = _jobs_active_cache.get(g.identity_id if hasattr(g, 'identity_id') else None)
+        if _stale:
+            print(f"[JOBS][STALE_OK] returning cached jobs: {type(e).__name__}: {e}")
+            return jsonify({"ok": True, "jobs": _stale[0]})
         print(f"[JOBS][DEGRADED] returning empty jobs: {type(e).__name__}: {e}")
-        return jsonify({
-            "ok": True,
-            "jobs": [],
-        })
+        return jsonify({"ok": True, "jobs": []})
 
 
 @bp.route("/<job_id>", methods=["DELETE", "OPTIONS"])

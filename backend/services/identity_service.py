@@ -758,18 +758,33 @@ class IdentityService:
 
         return result, True, reason
 
+    # In-memory touch throttle: identity_id -> monotonic timestamp of last touch
+    _touch_cache = {}
+    _TOUCH_TTL = 300  # 5 minutes — no need to UPDATE last_seen_at more often
+
     @staticmethod
     def touch_identity(identity_id: str) -> bool:
         """
         Update last_seen_at for an identity.
-        Runs at most once per HTTP request (skips if already touched).
+        Throttled to at most once per 5 minutes per identity (in-memory).
+        Also deduped per-request via g._identity_touch_done.
         """
-        # Request-scoped dedup: don't touch again in the same request
+        # Request-scoped dedup
         try:
             if getattr(g, '_identity_touch_done', False):
                 return True
         except RuntimeError:
-            pass  # outside request context
+            pass
+
+        # In-memory throttle: skip DB write if touched recently
+        now = _time.monotonic()
+        last = IdentityService._touch_cache.get(identity_id, 0)
+        if now - last < IdentityService._TOUCH_TTL:
+            try:
+                g._identity_touch_done = True
+            except RuntimeError:
+                pass
+            return True  # skip — fresh enough
 
         try:
             count = execute(
@@ -777,6 +792,14 @@ class IdentityService:
                 (identity_id,),
                 source="identity_touch",
             )
+            IdentityService._touch_cache[identity_id] = now
+            # Evict old entries to bound memory (keep last 500)
+            if len(IdentityService._touch_cache) > 500:
+                cutoff = now - IdentityService._TOUCH_TTL
+                IdentityService._touch_cache = {
+                    k: v for k, v in IdentityService._touch_cache.items()
+                    if v > cutoff
+                }
             try:
                 g._identity_touch_done = True
             except RuntimeError:
