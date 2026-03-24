@@ -240,14 +240,22 @@ def _worker_loop():
 
     print(f"[JOB] Worker loop started: {WORKER_ID} (leader)")
 
+    from backend.db import is_transient_db_error
+
+    consecutive_db_errors = 0
+    MAX_DB_BACKOFF = 10  # seconds
+
     try:
         while not _worker_stop.is_set():
             try:
                 job = _claim_next_job()
 
                 if job is None:
+                    consecutive_db_errors = 0  # claim succeeded (returned None = no work)
                     _worker_stop.wait(timeout=WORKER_LOOP_SLEEP)
                     continue
+
+                consecutive_db_errors = 0  # claim succeeded
 
                 job_id = str(job["id"])
                 provider = job.get("provider") or "unknown"
@@ -269,9 +277,19 @@ def _worker_loop():
                     _release_claim(job_id)
 
             except Exception as e:
-                print(f"[JOB] Worker claim error: {e}")
-                traceback.print_exc()
-                _worker_stop.wait(timeout=5)
+                if is_transient_db_error(e):
+                    consecutive_db_errors += 1
+                    backoff = min(consecutive_db_errors * 2, MAX_DB_BACKOFF)
+                    print(
+                        f"[JOB][TRANSIENT] DB connection error in worker loop "
+                        f"(consecutive={consecutive_db_errors}, backoff={backoff}s): "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    _worker_stop.wait(timeout=backoff)
+                else:
+                    print(f"[JOB] Worker claim error: {e}")
+                    traceback.print_exc()
+                    _worker_stop.wait(timeout=5)
 
     finally:
         _release_leader_lock()
@@ -2014,7 +2032,10 @@ def start_operations_loop():
     pid = os.getpid()
 
     def _loop():
+        from backend.db import is_transient_db_error
+
         cycle = 0
+        consecutive_db_errors = 0
         # Wait briefly for the worker thread to attempt leader election
         # before deciding whether to run heavy ops.
         _worker_stop.wait(timeout=5)
@@ -2027,28 +2048,28 @@ def start_operations_loop():
         while not _worker_stop.is_set():
             cycle += 1
             _am_leader = is_leader()
-
-            # -- Pool diagnostics (every 10 cycles ≈ 10min at 60s interval) --
-            if cycle % 10 == 1:
-                try:
-                    from backend.db import pool_stats
-                    stats = pool_stats()
-                    print(f"[OPS][POOL] cycle={cycle} pid={pid} leader={_am_leader} {stats}")
-                except Exception:
-                    pass
+            _cycle_had_db_error = False
 
             # -- Stall detection (always runs on all workers, lightweight) --
             try:
                 detect_stalled_jobs()
             except Exception as e:
-                print(f"[OPS] stall detection error: {e}")
+                if is_transient_db_error(e):
+                    _cycle_had_db_error = True
+                    print(f"[OPS][TRANSIENT] stall detection: {type(e).__name__}: {e}")
+                else:
+                    print(f"[OPS] stall detection error: {e}")
 
             # -- Stale sweep (leader only when leader_only=true) --
             if sweep_enabled and (_am_leader or not leader_only):
                 try:
                     run_stale_sweep()
                 except Exception as e:
-                    print(f"[OPS] stale sweep error: {e}")
+                    if is_transient_db_error(e):
+                        _cycle_had_db_error = True
+                        print(f"[OPS][TRANSIENT] stale sweep: {type(e).__name__}: {e}")
+                    else:
+                        print(f"[OPS] stale sweep error: {e}")
 
             # -- Rescue pass (leader only when leader_only=true) --
             if rescue_enabled and cycle % rescue_every_n == 0 and (_am_leader or not leader_only):
@@ -2068,9 +2089,21 @@ def start_operations_loop():
                     else:
                         print(f"[OPS] rescue pass done candidates={candidates} no_actions")
                 except Exception as e:
-                    print(f"[OPS] rescue pass error: {e}")
+                    if is_transient_db_error(e):
+                        _cycle_had_db_error = True
+                        print(f"[OPS][TRANSIENT] rescue pass: {type(e).__name__}: {e}")
+                    else:
+                        print(f"[OPS] rescue pass error: {e}")
 
-            _worker_stop.wait(timeout=sweep_interval)
+            # Backoff on transient DB errors — don't hammer a broken connection
+            if _cycle_had_db_error:
+                consecutive_db_errors += 1
+                backoff = min(consecutive_db_errors * 2, 30)
+                print(f"[OPS][TRANSIENT] backing off {backoff}s (consecutive={consecutive_db_errors})")
+                _worker_stop.wait(timeout=backoff)
+            else:
+                consecutive_db_errors = 0
+                _worker_stop.wait(timeout=sweep_interval)
 
     _ops_thread = threading.Thread(
         target=_loop,
