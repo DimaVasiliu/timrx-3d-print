@@ -62,9 +62,9 @@ _DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1"
 _DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
 _DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
 _DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "3"))  # 3s — fail fast to direct fallback
-_DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "120"))   # recycle before Render kills
-_DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "30"))            # close idle fast
-_DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "false").lower() in ("true", "1", "yes")  # OFF — open=True + max_lifetime=120 handles staleness; check adds a roundtrip per borrow
+_DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "60"))    # 60s — aggressive recycle, Render kills SSL at ~2-5min
+_DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "20"))            # 20s — close idle connections fast
+_DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "true").lower() in ("true", "1", "yes")  # ON — detects dead SSL connections before handing to caller
 _APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
 _BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
 
