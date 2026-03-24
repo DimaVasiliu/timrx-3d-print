@@ -16,9 +16,24 @@ from flask import Blueprint, jsonify, request, g
 
 from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, Tables, is_transient_db_error
 
-# Short TTL per-identity cache for history GET — avoids repeated heavy JOIN
-_history_cache = {}  # identity_id -> (rows_list, monotonic_ts)
+# Short TTL per-identity cache for history GET — avoids repeated heavy JOIN.
+# Invalidated on known writes (job finalize, history insert) so completed
+# generations appear immediately.
+_history_cache = {}  # "identity_id:limit:offset" -> (items_list, monotonic_ts)
 _HISTORY_CACHE_TTL = 15  # seconds
+
+
+def invalidate_history_cache(identity_id: str):
+    """Evict all cached history entries for an identity.
+    Call this after any write that adds/changes history items for this user
+    (job finalize, history POST, video/image/model save to normalized DB).
+    Safe to call from any thread. No-op if identity has no cached entries."""
+    if not identity_id:
+        return
+    prefix = f"{identity_id}:"
+    keys_to_drop = [k for k in _history_cache if k.startswith(prefix)]
+    for k in keys_to_drop:
+        _history_cache.pop(k, None)
 from backend.middleware import with_session
 from backend.services.history_service import (
     _local_history_id,
@@ -560,6 +575,8 @@ def history_mod():
                     traceback.print_exc()
                     db_ok = False
 
+            # Invalidate history cache after writes so new items appear immediately
+            invalidate_history_cache(identity_id)
             save_history_store(payload)
             return jsonify(
                 {

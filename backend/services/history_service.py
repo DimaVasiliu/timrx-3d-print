@@ -906,6 +906,12 @@ def save_image_to_normalized_db(
                     )
             conn.commit()
         # print(f"[DB] Saved image {image_id} -> {history_uuid} to normalized tables (user_id={user_id})")
+        # Invalidate history cache so the new image appears immediately
+        try:
+            from backend.routes.history import invalidate_history_cache
+            invalidate_history_cache(user_id)
+        except Exception:
+            pass
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
@@ -1422,6 +1428,11 @@ def save_video_to_normalized_db(
                     )
             conn.commit()
         # print(f"[DB] Saved video {video_id} -> {history_uuid} to normalized tables (user_id={user_id})")
+        try:
+            from backend.routes.history import invalidate_history_cache
+            invalidate_history_cache(user_id)
+        except Exception:
+            pass
         return returned_video_id
     except Exception as e:
         print(f"[DB] Failed to save video {video_id} (attempt 1): {e}")
@@ -2791,6 +2802,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             for key in ("processed_usdz_url", "processed_armature_fbx_url", "processed_animation_fps_fbx_url"):
                 if status_data.get(key):
                     result[key] = status_data[key]
+        try:
+            from backend.routes.history import invalidate_history_cache
+            invalidate_history_cache(user_id)
+        except Exception:
+            pass
         return result
     except Exception as e:
         print(f"[DB] Failed to save finished job {job_id}: {e}")
