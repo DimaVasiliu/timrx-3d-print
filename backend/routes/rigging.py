@@ -38,7 +38,7 @@ from backend.services.job_service import (
     save_store,
     verify_job_ownership_detailed,
 )
-from backend.services.meshy_service import build_source_payload
+from backend.services.meshy_service import build_source_payload, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.rigging_service import (
     create_rigging_task,
     get_rigging_task,
@@ -368,6 +368,15 @@ def rig_status(job_id: str):
 
     try:
         ms = get_rigging_task(job_id)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: rig job_id={job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({
+            "status": "failed",
+            "error": "TASK_EXPIRED",
+            "message": "This rigging task has expired on the provider.",
+            "job_id": job_id,
+        }), 200
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({
@@ -662,6 +671,15 @@ def rig_animate_status(job_id: str):
 
     try:
         ms = get_animation_task(job_id)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: anim job_id={job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({
+            "status": "failed",
+            "error": "TASK_EXPIRED",
+            "message": "This animation task has expired on the provider.",
+            "job_id": job_id,
+        }), 200
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({
