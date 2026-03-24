@@ -151,11 +151,15 @@ def _get_pool():
         try:
             _check_cb = _ConnectionPool.check_connection if _DB_POOL_CHECK else None
 
+            # open=False (default): pool background threads start on first
+            # .connection() or .open() call — NOT in the master process.
+            # We call pool.open() + pool.wait() inside init_db() which runs
+            # per-worker inside create_app(), so each Gunicorn worker gets
+            # its own live pool with min_size connections ready.
             _pool = _ConnectionPool(
                 conninfo=_DATABASE_URL,
                 min_size=_DB_POOL_MIN_SIZE,
                 max_size=_DB_POOL_MAX_SIZE,
-                open=True,  # establish min_size connections at boot, not lazily on first request
                 timeout=_DB_POOL_TIMEOUT,
                 max_lifetime=_DB_POOL_MAX_LIFETIME,
                 max_idle=_DB_POOL_MAX_IDLE,
@@ -736,10 +740,24 @@ def init_db() -> bool:
         return False
 
     try:
+        # Eagerly open the pool and wait for min_size connections.
+        # This runs inside create_app() which executes per Gunicorn worker
+        # (after fork), so each worker gets its own pool with live connections.
+        pool = _get_pool()
+        if pool is not None:
+            try:
+                pool.open(wait=True, timeout=_DB_CONNECT_TIMEOUT)
+                print(
+                    f"[DB] Pool warmed: {_DB_POOL_MIN_SIZE} connections ready "
+                    f"pid={os.getpid()}"
+                )
+            except Exception as e:
+                print(f"[DB] Pool warm failed (will create on demand): {e}")
+
         if verify_connection():
             print("[DB] Database connection verified successfully")
             if _DB_POOL_ENABLED and _POOL_AVAILABLE:
-                print(f"[DB] Pool mode: ENABLED (lazy init, min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
+                print(f"[DB] Pool mode: ENABLED (min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
             else:
                 print("[DB] Pool mode: DISABLED — using direct connections")
             ensure_schema()

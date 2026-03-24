@@ -190,12 +190,15 @@ def _bootstrap_single_flight(request, response, create_fn):
             evt.set()
 
 
-# Production safety warning (one-time at startup)
-if SESSION_DEBUG and config.IS_PROD:
-    print(
-        "[WARN] SESSION_DEBUG enabled in production - "
-        "disable after troubleshooting (set SESSION_DEBUG=0 or remove env var)"
-    )
+# Production safety warning (deferred — config.IS_PROD may not be safe at import time)
+try:
+    if SESSION_DEBUG and config.IS_PROD:
+        print(
+            "[WARN] SESSION_DEBUG enabled in production - "
+            "disable after troubleshooting (set SESSION_DEBUG=0 or remove env var)"
+        )
+except Exception:
+    pass
 
 
 # Sentinel to distinguish "cached None" from "not cached yet"
