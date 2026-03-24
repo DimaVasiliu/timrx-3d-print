@@ -228,8 +228,9 @@ class MagicCodeService:
         email = email.strip().lower()
         code = code.strip()
 
-        # Validate inputs
-        if not email or not code or not session_id:
+        # Validate inputs (session_id may be None for sessionless/cross-origin
+        # restore — AUTH-3.  The route handler creates a session afterward.)
+        if not email or not code:
             return (False, None, "Missing required fields", None)
 
         if len(code) != 6 or not code.isdigit():
