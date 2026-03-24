@@ -856,44 +856,42 @@ def rig_thumbnail(job_id: str):
     updated_tables = []
     if USE_DB:
         try:
-            from backend.db import get_conn, Tables
-            from psycopg.rows import dict_row
+            from backend.db import transaction, Tables
             from backend.services.s3_service import parse_s3_key
             s3_key = parse_s3_key(s3_thumbnail_url) if s3_thumbnail_url else None
-            with get_conn() as conn:
-                with conn.cursor(row_factory=dict_row) as cur:
-                    # Update models table
-                    cur.execute(
-                        f"""
-                        UPDATE {Tables.MODELS}
-                        SET thumbnail_url = %s,
-                            thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
-                            updated_at = NOW()
-                        WHERE upstream_job_id = %s AND identity_id = %s
-                        RETURNING id
-                        """,
-                        (s3_thumbnail_url, s3_key, job_id, identity_id),
-                    )
-                    model_row = cur.fetchone()
-                    if model_row:
-                        updated_tables.append("models")
+            with transaction("rig_thumbnail_update") as cur:
+                # Update models table
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.MODELS}
+                    SET thumbnail_url = %s,
+                        thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
+                        updated_at = NOW()
+                    WHERE upstream_job_id = %s AND identity_id = %s
+                    RETURNING id
+                    """,
+                    (s3_thumbnail_url, s3_key, job_id, identity_id),
+                )
+                model_row = cur.fetchone()
+                if model_row:
+                    updated_tables.append("models")
 
-                    # Update history_items table
-                    cur.execute(
-                        f"""
-                        UPDATE {Tables.HISTORY_ITEMS}
-                        SET thumbnail_url = %s, updated_at = NOW()
-                        WHERE identity_id = %s
-                          AND (payload->>'original_job_id' = %s
-                               OR id::text = %s)
-                        RETURNING id
-                        """,
-                        (s3_thumbnail_url, identity_id, job_id, job_id),
-                    )
-                    hist_row = cur.fetchone()
-                    if hist_row:
-                        updated_tables.append("history_items")
-                conn.commit()
+                # Update history_items table
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.HISTORY_ITEMS}
+                    SET thumbnail_url = %s, updated_at = NOW()
+                    WHERE identity_id = %s
+                      AND (payload->>'original_job_id' = %s
+                           OR id::text = %s)
+                    RETURNING id
+                    """,
+                    (s3_thumbnail_url, identity_id, job_id, job_id),
+                )
+                hist_row = cur.fetchone()
+                if hist_row:
+                    updated_tables.append("history_items")
+            # transaction() auto-commits on success.
         except Exception as e:
             print(f"[RIG_THUMB] DB update error for job={job_id}: {e}")
 

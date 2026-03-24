@@ -14,7 +14,7 @@ import uuid
 import time as _time
 from flask import Blueprint, jsonify, request, g
 
-from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, Tables, is_transient_db_error
+from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, transaction, dict_row, Tables, is_transient_db_error
 
 # Short TTL per-identity cache for history GET — avoids repeated heavy JOIN.
 # Invalidated on known writes (job finalize, history insert) so completed
@@ -356,218 +356,221 @@ def history_mod():
 
             if USE_DB:
                 try:
-                    with get_conn() as conn:
-                        with conn.cursor() as cur:
-                            for item in payload:
-                                item_id = item.get("id") or item.get("job_id")
-                                if not item_id:
-                                    continue
+                    # ── Pre-process: convert data-URIs to S3 URLs BEFORE
+                    #    opening a DB connection, so S3 I/O never pins a
+                    #    pooled connection. S3 keys are content-hash based
+                    #    so the result is identical regardless of use_id. ──
+                    for item in payload:
+                        _item_type = item.get("type") or item.get("item_type") or "model"
+                        _provider = "openai" if _item_type == "image" else "meshy"
+                        _item_id = item.get("id") or item.get("job_id") or ""
+                        _thumb = item.get("thumbnail_url")
+                        _img = item.get("image_url")
+                        if _thumb and isinstance(_thumb, str) and _thumb.startswith("data:"):
+                            item["thumbnail_url"] = ensure_s3_url_for_data_uri(
+                                _thumb, "thumbnails",
+                                f"thumbnails/{identity_id}/{_item_id}",
+                                user_id=identity_id, name="thumbnail",
+                                provider=_provider,
+                            )
+                        if _img and isinstance(_img, str) and _img.startswith("data:"):
+                            item["image_url"] = ensure_s3_url_for_data_uri(
+                                _img, "images",
+                                f"images/{identity_id}/{_item_id}",
+                                user_id=identity_id, name="image",
+                                provider=_provider,
+                            )
+
+                    # ── DB phase: atomic SELECT + INSERT/UPDATE (no S3 held) ──
+                    with transaction("history_bulk_sync") as cur:
+                        for item in payload:
+                            item_id = item.get("id") or item.get("job_id")
+                            if not item_id:
+                                continue
+
+                            cur.execute(
+                                f"""
+                                SELECT id FROM {Tables.HISTORY_ITEMS}
+                                WHERE (id::text = %s
+                                   OR payload->>'original_job_id' = %s
+                                   OR payload->>'original_id' = %s
+                                   OR payload->>'job_id' = %s)
+                                  AND identity_id = %s
+                                LIMIT 1
+                                """,
+                                (str(item_id), str(item_id), str(item_id), str(item_id), identity_id),
+                            )
+                            existing = cur.fetchone()
+                            # Note: cursor returns dict due to connection's default row_factory=dict_row
+                            existing_id = existing["id"] if existing else None
+
+                            item_type = item.get("type") or item.get("item_type") or "model"
+                            status = item.get("status") or "pending"
+                            stage = item.get("stage")
+                            title = item.get("title")
+                            prompt = item.get("prompt")
+                            root_prompt = item.get("root_prompt")
+                            if not title:
+                                title = derive_display_title(prompt, None, root_prompt=root_prompt)
+                            thumbnail_url = item.get("thumbnail_url")
+                            glb_url = item.get("glb_url")
+                            image_url = item.get("image_url")
+                            provider = "openai" if item_type == "image" else "meshy"
+
+                            if existing_id:
+                                use_id = str(existing_id)
+                            else:
+                                try:
+                                    uuid.UUID(str(item_id))
+                                    use_id = str(item_id)
+                                except (ValueError, TypeError, AttributeError):
+                                    use_id = str(uuid.uuid4())
+                                    item["original_id"] = item_id
+
+                            item["id"] = use_id
+
+                            if existing_id:
+                                cur.execute(
+                                    f"""UPDATE {Tables.HISTORY_ITEMS}
+                                       SET item_type = %s,
+                                           status = COALESCE(%s, status),
+                                           stage = COALESCE(%s, stage),
+                                           title = CASE
+                                               WHEN %s::text IS NOT NULL
+                                                AND %s::text <> ''
+                                                AND %s::text NOT IN ('3D Model', 'Untitled')
+                                               THEN %s::text
+                                               ELSE title
+                                           END,
+                                           prompt = COALESCE(%s, prompt),
+                                           root_prompt = COALESCE(%s, root_prompt),
+                                           identity_id = COALESCE(%s, identity_id),
+                                           thumbnail_url = COALESCE(%s, thumbnail_url),
+                                           glb_url = COALESCE(%s, glb_url),
+                                           image_url = COALESCE(%s, image_url),
+                                           payload = %s,
+                                           updated_at = NOW()
+                                       WHERE id = %s;""",
+                                    (
+                                        item_type,
+                                        status,
+                                        stage,
+                                        title,
+                                        title,
+                                        title,
+                                        title,
+                                        prompt,
+                                        root_prompt,
+                                        identity_id,
+                                        thumbnail_url,
+                                        glb_url,
+                                        image_url,
+                                        json.dumps(item),
+                                        use_id,
+                                    ),
+                                )
+                                updated_ids.append(use_id)
+                            else:
+                                model_id = item.get("model_id")
+                                image_id = item.get("image_id")
+                                lookup_reason = None
+
+                                # Video items use video_id, not model_id/image_id
+                                video_id = None
+                                if item_type == "video":
+                                    model_id = None
+                                    image_id = None
+                                    video_id = item.get("video_id")
+                                    if not video_id:
+                                        # Failed videos have no video record — skip to avoid XOR constraint violation
+                                        # Skipped: video item without video_id (counted in summary)
+                                        skipped_items.append({"client_id": str(item_id), "reason": "no_video_id"})
+                                        continue
+
+                                    # Validate video_id references videos table (not jobs table).
+                                    # Frontend may send job_id as video_id — resolve to real videos.id.
+                                    cur.execute(
+                                        f"SELECT id FROM {Tables.VIDEOS} WHERE id::text = %s LIMIT 1",
+                                        (str(video_id),),
+                                    )
+                                    if not cur.fetchone():
+                                        # video_id is not in videos table — try resolving via jobs.meta
+                                        from backend.services.history_service import resolve_video_uuid
+                                        resolved = resolve_video_uuid(str(video_id), identity_id)
+                                        if resolved:
+                                            # Resolved job_id → video_uuid (counted in summary)
+                                            video_id = resolved
+                                        else:
+                                            # Skipped: video_id not in videos table (counted in summary)
+                                            skipped_items.append({"client_id": str(item_id), "reason": "video_id_not_in_videos"})
+                                            continue
+                                else:
+                                    if not model_id and not image_id:
+                                        model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
+                                            cur, item_type, item_id, glb_url, image_url, identity_id, provider
+                                        )
+                                    if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
+                                        if lookup_reason:
+                                            skip_reason = lookup_reason
+                                        elif model_id and image_id:
+                                            skip_reason = "xor_violation"
+                                        else:
+                                            skip_reason = "missing_asset_reference"
+                                        # Skipped: asset validation (counted in summary)
+                                        skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
+                                        continue
 
                                 cur.execute(
-                                    f"""
-                                    SELECT id FROM {Tables.HISTORY_ITEMS}
-                                    WHERE (id::text = %s
-                                       OR payload->>'original_job_id' = %s
-                                       OR payload->>'original_id' = %s
-                                       OR payload->>'job_id' = %s)
-                                      AND identity_id = %s
-                                    LIMIT 1
-                                    """,
-                                    (str(item_id), str(item_id), str(item_id), str(item_id), identity_id),
-                                )
-                                existing = cur.fetchone()
-                                # Note: cursor returns dict due to connection's default row_factory=dict_row
-                                existing_id = existing["id"] if existing else None
-
-                                item_type = item.get("type") or item.get("item_type") or "model"
-                                status = item.get("status") or "pending"
-                                stage = item.get("stage")
-                                title = item.get("title")
-                                prompt = item.get("prompt")
-                                root_prompt = item.get("root_prompt")
-                                if not title:
-                                    title = derive_display_title(prompt, None, root_prompt=root_prompt)
-                                thumbnail_url = item.get("thumbnail_url")
-                                glb_url = item.get("glb_url")
-                                image_url = item.get("image_url")
-
-                                if existing_id:
-                                    use_id = str(existing_id)
-                                else:
-                                    try:
-                                        uuid.UUID(str(item_id))
-                                        use_id = str(item_id)
-                                    except (ValueError, TypeError, AttributeError):
-                                        use_id = str(uuid.uuid4())
-                                        item["original_id"] = item_id
-
-                                provider = "openai" if item_type == "image" else "meshy"
-                                s3_user_id = identity_id
-                                if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
-                                    thumbnail_url = ensure_s3_url_for_data_uri(
+                                    f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
+                                           root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, video_id, payload)
+                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                           %s, %s, %s, %s, %s, %s, %s, %s)
+                                       ON CONFLICT (id) DO UPDATE
+                                       SET item_type = EXCLUDED.item_type,
+                                           status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
+                                           stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
+                                           title = CASE
+                                               WHEN EXCLUDED.title IS NOT NULL
+                                                AND EXCLUDED.title <> ''
+                                                AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                               THEN EXCLUDED.title
+                                               ELSE {Tables.HISTORY_ITEMS}.title
+                                           END,
+                                           prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
+                                           root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
+                                           identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
+                                           thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
+                                           glb_url = COALESCE(EXCLUDED.glb_url, {Tables.HISTORY_ITEMS}.glb_url),
+                                           image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
+                                           model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
+                                           image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
+                                           video_id = COALESCE(EXCLUDED.video_id, {Tables.HISTORY_ITEMS}.video_id),
+                                           payload = EXCLUDED.payload,
+                                           updated_at = NOW();""",
+                                    (
+                                        use_id,
+                                        identity_id,
+                                        item_type,
+                                        status,
+                                        stage,
+                                        title,
+                                        prompt,
+                                        root_prompt,
                                         thumbnail_url,
-                                        "thumbnails",
-                                        f"thumbnails/{s3_user_id}/{use_id}",
-                                        user_id=identity_id,
-                                        name="thumbnail",
-                                        provider=provider,
-                                    )
-                                if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
-                                    image_url = ensure_s3_url_for_data_uri(
+                                        glb_url,
                                         image_url,
-                                        "images",
-                                        f"images/{s3_user_id}/{use_id}",
-                                        user_id=identity_id,
-                                        name="image",
-                                        provider=provider,
-                                    )
-                                item["thumbnail_url"] = thumbnail_url
-                                item["image_url"] = image_url
-
-                                item["id"] = use_id
-
-                                if existing_id:
-                                    cur.execute(
-                                        f"""UPDATE {Tables.HISTORY_ITEMS}
-                                           SET item_type = %s,
-                                               status = COALESCE(%s, status),
-                                               stage = COALESCE(%s, stage),
-                                               title = CASE
-                                                   WHEN %s::text IS NOT NULL
-                                                    AND %s::text <> ''
-                                                    AND %s::text NOT IN ('3D Model', 'Untitled')
-                                                   THEN %s::text
-                                                   ELSE title
-                                               END,
-                                               prompt = COALESCE(%s, prompt),
-                                               root_prompt = COALESCE(%s, root_prompt),
-                                               identity_id = COALESCE(%s, identity_id),
-                                               thumbnail_url = COALESCE(%s, thumbnail_url),
-                                               glb_url = COALESCE(%s, glb_url),
-                                               image_url = COALESCE(%s, image_url),
-                                               payload = %s,
-                                               updated_at = NOW()
-                                           WHERE id = %s;""",
-                                        (
-                                            item_type,
-                                            status,
-                                            stage,
-                                            title,
-                                            title,
-                                            title,
-                                            title,
-                                            prompt,
-                                            root_prompt,
-                                            identity_id,
-                                            thumbnail_url,
-                                            glb_url,
-                                            image_url,
-                                            json.dumps(item),
-                                            use_id,
-                                        ),
-                                    )
-                                    updated_ids.append(use_id)
-                                else:
-                                    model_id = item.get("model_id")
-                                    image_id = item.get("image_id")
-                                    lookup_reason = None
-
-                                    # Video items use video_id, not model_id/image_id
-                                    video_id = None
-                                    if item_type == "video":
-                                        model_id = None
-                                        image_id = None
-                                        video_id = item.get("video_id")
-                                        if not video_id:
-                                            # Failed videos have no video record — skip to avoid XOR constraint violation
-                                            # Skipped: video item without video_id (counted in summary)
-                                            skipped_items.append({"client_id": str(item_id), "reason": "no_video_id"})
-                                            continue
-
-                                        # Validate video_id references videos table (not jobs table).
-                                        # Frontend may send job_id as video_id — resolve to real videos.id.
-                                        cur.execute(
-                                            f"SELECT id FROM {Tables.VIDEOS} WHERE id::text = %s LIMIT 1",
-                                            (str(video_id),),
-                                        )
-                                        if not cur.fetchone():
-                                            # video_id is not in videos table — try resolving via jobs.meta
-                                            from backend.services.history_service import resolve_video_uuid
-                                            resolved = resolve_video_uuid(str(video_id), identity_id)
-                                            if resolved:
-                                                # Resolved job_id → video_uuid (counted in summary)
-                                                video_id = resolved
-                                            else:
-                                                # Skipped: video_id not in videos table (counted in summary)
-                                                skipped_items.append({"client_id": str(item_id), "reason": "video_id_not_in_videos"})
-                                                continue
-                                    else:
-                                        if not model_id and not image_id:
-                                            model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                                cur, item_type, item_id, glb_url, image_url, identity_id, provider
-                                            )
-                                        if not _validate_history_item_asset_ids(model_id, image_id, f"bulk_sync:{item_id}"):
-                                            if lookup_reason:
-                                                skip_reason = lookup_reason
-                                            elif model_id and image_id:
-                                                skip_reason = "xor_violation"
-                                            else:
-                                                skip_reason = "missing_asset_reference"
-                                            # Skipped: asset validation (counted in summary)
-                                            skipped_items.append({"client_id": str(item_id), "reason": skip_reason})
-                                            continue
-
-                                    cur.execute(
-                                        f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
-                                               root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, video_id, payload)
-                                           VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                               %s, %s, %s, %s, %s, %s, %s, %s)
-                                           ON CONFLICT (id) DO UPDATE
-                                           SET item_type = EXCLUDED.item_type,
-                                               status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
-                                               stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
-                                               title = CASE
-                                                   WHEN EXCLUDED.title IS NOT NULL
-                                                    AND EXCLUDED.title <> ''
-                                                    AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
-                                                   THEN EXCLUDED.title
-                                                   ELSE {Tables.HISTORY_ITEMS}.title
-                                               END,
-                                               prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
-                                               root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
-                                               identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
-                                               thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
-                                               glb_url = COALESCE(EXCLUDED.glb_url, {Tables.HISTORY_ITEMS}.glb_url),
-                                               image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
-                                               model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
-                                               image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
-                                               video_id = COALESCE(EXCLUDED.video_id, {Tables.HISTORY_ITEMS}.video_id),
-                                               payload = EXCLUDED.payload,
-                                               updated_at = NOW();""",
-                                        (
-                                            use_id,
-                                            identity_id,
-                                            item_type,
-                                            status,
-                                            stage,
-                                            title,
-                                            prompt,
-                                            root_prompt,
-                                            thumbnail_url,
-                                            glb_url,
-                                            image_url,
-                                            model_id,
-                                            image_id,
-                                            video_id,
-                                            json.dumps(item),
-                                        ),
-                                    )
-                                    inserted_ids.append(use_id)
-                        conn.commit()
-                        print(
-                            f"[History][mod] Bulk sync: updated={len(updated_ids)}, inserted={len(inserted_ids)}, skipped={len(skipped_items)}"
-                        )
-                        db_ok = True
+                                        model_id,
+                                        image_id,
+                                        video_id,
+                                        json.dumps(item),
+                                    ),
+                                )
+                                inserted_ids.append(use_id)
+                    # transaction() auto-commits on success.
+                    print(
+                        f"[History][mod] Bulk sync: updated={len(updated_ids)}, inserted={len(inserted_ids)}, skipped={len(skipped_items)}"
+                    )
+                    db_ok = True
                 except Exception as e:
                     log_db_continue("history_bulk_write", e)
                     db_errors.append({"op": "history_bulk_write", "error": str(e)})
@@ -625,208 +628,190 @@ def history_item_add_mod():
 
             if USE_DB:
                 try:
-                    with get_conn() as conn:
-                        with conn.cursor() as cur:
+                    # ── Extract fields and convert data-URIs to S3 BEFORE
+                    #    opening a DB connection, so S3 I/O never pins a
+                    #    pooled connection. ──
+                    item_type = item.get("type") or item.get("item_type") or "model"
+                    status = item.get("status") or "pending"
+                    stage = item.get("stage")
+                    title = item.get("title")
+                    prompt = item.get("prompt")
+                    root_prompt = item.get("root_prompt")
+                    if not title:
+                        title = derive_display_title(prompt, None, root_prompt=root_prompt)
+                    thumbnail_url = item.get("thumbnail_url")
+                    glb_url = item.get("glb_url")
+                    image_url = item.get("image_url")
+
+                    provider = "openai" if item_type == "image" else "meshy"
+                    s3_user_id = identity_id
+                    if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
+                        thumbnail_url = ensure_s3_url_for_data_uri(
+                            thumbnail_url,
+                            "thumbnails",
+                            f"thumbnails/{s3_user_id}/{item_id}",
+                            user_id=identity_id,
+                            name="thumbnail",
+                            provider=provider,
+                        )
+                    if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
+                        image_url = ensure_s3_url_for_data_uri(
+                            image_url,
+                            "images",
+                            f"images/{s3_user_id}/{item_id}",
+                            user_id=identity_id,
+                            name="image",
+                            provider=provider,
+                        )
+                    item["thumbnail_url"] = thumbnail_url
+                    item["image_url"] = image_url
+
+                    # ── DB phase: atomic SELECT + INSERT/UPDATE (no S3 held) ──
+                    with transaction("history_item_add") as cur:
+                        cur.execute(
+                            f"""
+                            SELECT id FROM {Tables.HISTORY_ITEMS}
+                            WHERE (id::text = %s
+                               OR payload->>'original_job_id' = %s
+                               OR payload->>'original_id' = %s
+                               OR payload->>'job_id' = %s)
+                              AND identity_id = %s
+                            LIMIT 1
+                            """,
+                            (str(item_id), str(item_id), str(item_id), str(item_id), identity_id),
+                        )
+                        existing = cur.fetchone()
+                        existing_id = existing["id"] if existing else None
+
+                        if existing_id:
+                            use_id = str(existing_id)
+                        else:
+                            try:
+                                uuid.UUID(str(item_id))
+                                use_id = str(item_id)
+                            except (ValueError, TypeError, AttributeError):
+                                use_id = str(uuid.uuid4())
+                                item["original_id"] = item_id
+
+                        item["id"] = use_id
+
+                        if existing_id:
                             cur.execute(
-                                f"""
-                                SELECT id FROM {Tables.HISTORY_ITEMS}
-                                WHERE (id::text = %s
-                                   OR payload->>'original_job_id' = %s
-                                   OR payload->>'original_id' = %s
-                                   OR payload->>'job_id' = %s)
-                                  AND identity_id = %s
-                                LIMIT 1
-                                """,
-                                (str(item_id), str(item_id), str(item_id), str(item_id), identity_id),
+                                f"""UPDATE {Tables.HISTORY_ITEMS}
+                                   SET item_type = %s,
+                                       status = COALESCE(%s, status),
+                                       stage = COALESCE(%s, stage),
+                                       title = CASE
+                                           WHEN %s::text IS NOT NULL
+                                            AND %s::text <> ''
+                                            AND %s::text NOT IN ('3D Model', 'Untitled')
+                                           THEN %s::text
+                                           ELSE title
+                                       END,
+                                       prompt = COALESCE(%s, prompt),
+                                       root_prompt = COALESCE(%s, root_prompt),
+                                       identity_id = COALESCE(%s, identity_id),
+                                       thumbnail_url = COALESCE(%s, thumbnail_url),
+                                       glb_url = COALESCE(%s, glb_url),
+                                       image_url = COALESCE(%s, image_url),
+                                       payload = %s,
+                                       updated_at = NOW()
+                                   WHERE id = %s;""",
+                                (
+                                    item_type, status, stage,
+                                    title, title, title, title,
+                                    prompt, root_prompt, identity_id,
+                                    thumbnail_url, glb_url, image_url,
+                                    json.dumps(item), use_id,
+                                ),
                             )
-                            existing = cur.fetchone()
-                            # Note: cursor returns dict due to connection's default row_factory=dict_row
-                            existing_id = existing["id"] if existing else None
+                            db_ok = True
+                            item_id = use_id
+                        else:
+                            model_id = item.get("model_id")
+                            image_id = item.get("image_id")
+                            lookup_reason = None
 
-                            item_type = item.get("type") or item.get("item_type") or "model"
-                            status = item.get("status") or "pending"
-                            stage = item.get("stage")
-                            title = item.get("title")
-                            prompt = item.get("prompt")
-                            root_prompt = item.get("root_prompt")
-                            if not title:
-                                title = derive_display_title(prompt, None, root_prompt=root_prompt)
-                            thumbnail_url = item.get("thumbnail_url")
-                            glb_url = item.get("glb_url")
-                            image_url = item.get("image_url")
-
-                            if existing_id:
-                                use_id = str(existing_id)
-                            else:
-                                try:
-                                    uuid.UUID(str(item_id))
-                                    use_id = str(item_id)
-                                except (ValueError, TypeError, AttributeError):
-                                    use_id = str(uuid.uuid4())
-                                    item["original_id"] = item_id
-
-                            provider = "openai" if item_type == "image" else "meshy"
-                            s3_user_id = identity_id
-                            if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.startswith("data:"):
-                                thumbnail_url = ensure_s3_url_for_data_uri(
-                                    thumbnail_url,
-                                    "thumbnails",
-                                    f"thumbnails/{s3_user_id}/{use_id}",
-                                    user_id=identity_id,
-                                    name="thumbnail",
-                                    provider=provider,
+                            # Video items use video_id, not model_id/image_id — skip XOR check
+                            if item_type == "video":
+                                model_id = None
+                                image_id = None
+                            elif not model_id and not image_id:
+                                model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
+                                    cur, item_type, item_id, glb_url, image_url, identity_id, provider
                                 )
-                            if image_url and isinstance(image_url, str) and image_url.startswith("data:"):
-                                image_url = ensure_s3_url_for_data_uri(
-                                    image_url,
-                                    "images",
-                                    f"images/{s3_user_id}/{use_id}",
-                                    user_id=identity_id,
-                                    name="image",
-                                    provider=provider,
-                                )
-                            item["thumbnail_url"] = thumbnail_url
-                            item["image_url"] = image_url
+                            if item_type != "video" and not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
+                                if lookup_reason:
+                                    skip_reason = lookup_reason
+                                elif model_id and image_id:
+                                    skip_reason = "xor_violation"
+                                else:
+                                    skip_reason = "missing_asset_reference"
 
-                            item["id"] = use_id
-
-                            if existing_id:
-                                cur.execute(
-                                    f"""UPDATE {Tables.HISTORY_ITEMS}
-                                       SET item_type = %s,
-                                           status = COALESCE(%s, status),
-                                           stage = COALESCE(%s, stage),
-                                           title = CASE
-                                               WHEN %s::text IS NOT NULL
-                                                AND %s::text <> ''
-                                                AND %s::text NOT IN ('3D Model', 'Untitled')
-                                               THEN %s::text
-                                               ELSE title
-                                           END,
-                                           prompt = COALESCE(%s, prompt),
-                                           root_prompt = COALESCE(%s, root_prompt),
-                                           identity_id = COALESCE(%s, identity_id),
-                                           thumbnail_url = COALESCE(%s, thumbnail_url),
-                                           glb_url = COALESCE(%s, glb_url),
-                                           image_url = COALESCE(%s, image_url),
-                                           payload = %s,
-                                           updated_at = NOW()
-                                       WHERE id = %s;""",
-                                    (
-                                        item_type,
-                                        status,
-                                        stage,
-                                        title,
-                                        title,
-                                        title,
-                                        title,
-                                        prompt,
-                                        root_prompt,
-                                        identity_id,
-                                        thumbnail_url,
-                                        glb_url,
-                                        image_url,
-                                        json.dumps(item),
-                                        use_id,
-                                    ),
-                                )
-                                db_ok = True
-                                item_id = use_id
-                            else:
-                                model_id = item.get("model_id")
-                                image_id = item.get("image_id")
-                                lookup_reason = None
-
-                                # Video items use video_id, not model_id/image_id — skip XOR check
-                                if item_type == "video":
-                                    model_id = None
-                                    image_id = None
-                                elif not model_id and not image_id:
-                                    model_id, image_id, lookup_reason = _lookup_asset_id_for_history(
-                                        cur, item_type, item_id, glb_url, image_url, identity_id, provider
-                                    )
-                                if item_type != "video" and not _validate_history_item_asset_ids(model_id, image_id, f"item_add:{item_id}"):
-                                    if lookup_reason:
-                                        skip_reason = lookup_reason
-                                    elif model_id and image_id:
-                                        skip_reason = "xor_violation"
-                                    else:
-                                        skip_reason = "missing_asset_reference"
-
-                                    if skip_reason == "xor_violation":
-                                        print(f"[History][mod] Rejecting item {item_id} - reason: {skip_reason}")
-                                        return jsonify(
-                                            {
-                                                "ok": False,
-                                                "error": {
-                                                    "code": "INVALID_ASSET_REFERENCE",
-                                                    "message": "History item cannot have both model_id and image_id set",
-                                                    "reason": skip_reason,
-                                                    "client_id": str(item_id),
-                                                },
-                                            }
-                                        ), 400
-
-                                    print(
-                                        f"[History][mod] Skipped early insert for {item_id} - backend will create on job completion"
-                                    )
+                                if skip_reason == "xor_violation":
+                                    print(f"[History][mod] Rejecting item {item_id} - reason: {skip_reason}")
                                     return jsonify(
                                         {
-                                            "ok": True,
-                                            "id": str(item_id),
-                                            "db": False,
-                                            "backend_handles": True,
-                                            "message": "History will be created automatically when job completes and asset is saved",
-                                            "source": "modular",
+                                            "ok": False,
+                                            "error": {
+                                                "code": "INVALID_ASSET_REFERENCE",
+                                                "message": "History item cannot have both model_id and image_id set",
+                                                "reason": skip_reason,
+                                                "client_id": str(item_id),
+                                            },
                                         }
-                                    )
+                                    ), 400
 
-                                cur.execute(
-                                    f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
-                                           root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
-                                       VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s, %s, %s)
-                                       ON CONFLICT (id) DO UPDATE
-                                       SET item_type = EXCLUDED.item_type,
-                                           status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
-                                           stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
-                                           title = CASE
-                                               WHEN EXCLUDED.title IS NOT NULL
-                                                AND EXCLUDED.title <> ''
-                                                AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
-                                               THEN EXCLUDED.title
-                                               ELSE {Tables.HISTORY_ITEMS}.title
-                                           END,
-                                           prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
-                                           root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
-                                           identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
-                                           thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
-                                           glb_url = COALESCE(EXCLUDED.glb_url, {Tables.HISTORY_ITEMS}.glb_url),
-                                           image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
-                                           model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
-                                           image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
-                                           payload = EXCLUDED.payload,
-                                           updated_at = NOW();""",
-                                    (
-                                        use_id,
-                                        identity_id,
-                                        item_type,
-                                        status,
-                                        stage,
-                                        title,
-                                        prompt,
-                                        root_prompt,
-                                        thumbnail_url,
-                                        glb_url,
-                                        image_url,
-                                        model_id,
-                                        image_id,
-                                        json.dumps(item),
-                                    ),
+                                print(
+                                    f"[History][mod] Skipped early insert for {item_id} - backend will create on job completion"
                                 )
-                                db_ok = True
-                                item_id = use_id
-                        conn.commit()
+                                return jsonify(
+                                    {
+                                        "ok": True,
+                                        "id": str(item_id),
+                                        "db": False,
+                                        "backend_handles": True,
+                                        "message": "History will be created automatically when job completes and asset is saved",
+                                        "source": "modular",
+                                    }
+                                )
+
+                            cur.execute(
+                                f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
+                                       root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                   VALUES (%s, %s, %s, %s, %s, %s, %s,
+                                       %s, %s, %s, %s, %s, %s, %s)
+                                   ON CONFLICT (id) DO UPDATE
+                                   SET item_type = EXCLUDED.item_type,
+                                       status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
+                                       stage = COALESCE(EXCLUDED.stage, {Tables.HISTORY_ITEMS}.stage),
+                                       title = CASE
+                                           WHEN EXCLUDED.title IS NOT NULL
+                                            AND EXCLUDED.title <> ''
+                                            AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                           THEN EXCLUDED.title
+                                           ELSE {Tables.HISTORY_ITEMS}.title
+                                       END,
+                                       prompt = COALESCE(EXCLUDED.prompt, {Tables.HISTORY_ITEMS}.prompt),
+                                       root_prompt = COALESCE(EXCLUDED.root_prompt, {Tables.HISTORY_ITEMS}.root_prompt),
+                                       identity_id = COALESCE(EXCLUDED.identity_id, {Tables.HISTORY_ITEMS}.identity_id),
+                                       thumbnail_url = COALESCE(EXCLUDED.thumbnail_url, {Tables.HISTORY_ITEMS}.thumbnail_url),
+                                       glb_url = COALESCE(EXCLUDED.glb_url, {Tables.HISTORY_ITEMS}.glb_url),
+                                       image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
+                                       model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
+                                       image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
+                                       payload = EXCLUDED.payload,
+                                       updated_at = NOW();""",
+                                (
+                                    use_id, identity_id, item_type, status, stage,
+                                    title, prompt, root_prompt,
+                                    thumbnail_url, glb_url, image_url,
+                                    model_id, image_id, json.dumps(item),
+                                ),
+                            )
+                            db_ok = True
+                            item_id = use_id
+                    # transaction() auto-commits on success.
                 except Exception as e:
                     log_db_continue("history_item_add", e)
                     db_errors.append({"op": "history_item_add", "error": str(e)})
@@ -1084,6 +1069,7 @@ def history_item_update_mod(item_id: str):
 
             if USE_DB:
                 try:
+                    # ── Read phase: fetch row + collect S3 keys (short get_conn) ──
                     with get_conn() as conn:
                         with conn.cursor(row_factory=dict_row) as cur:
                             cur.execute(
@@ -1096,173 +1082,177 @@ def history_item_update_mod(item_id: str):
                                 (str(item_id), identity_id),
                             )
                             row = cur.fetchone()
-                        if not row:
-                            return jsonify({"ok": False, "error": "not_found"}), 404
+                    # Connection released here.
 
-                        model_id = row["model_id"]
-                        image_id = row["image_id"]
-                        video_id = row["video_id"]
-                        payload = row["payload"] if row["payload"] else {}
-                        if isinstance(payload, str):
-                            try:
-                                payload = json.loads(payload)
-                            except Exception:
-                                payload = {}
+                    if not row:
+                        return jsonify({"ok": False, "error": "not_found"}), 404
 
-                        row["payload"] = payload
+                    model_id = row["model_id"]
+                    image_id = row["image_id"]
+                    video_id = row["video_id"]
+                    payload = row["payload"] if row["payload"] else {}
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except Exception:
+                            payload = {}
 
-                        # Collect ALL S3 keys BEFORE deleting DB rows
-                        # This includes keys from history row AND from model/image/video tables
-                        s3_keys = collect_all_s3_keys_for_history_item(
-                            history_row=row,
-                            model_id=model_id,
-                            image_id=image_id,
-                            video_id=video_id,
+                    row["payload"] = payload
+
+                    # Collect ALL S3 keys BEFORE deleting DB rows.
+                    # This calls get_conn() internally — safe now that
+                    # the read-phase connection was already released.
+                    s3_keys = collect_all_s3_keys_for_history_item(
+                        history_row=row,
+                        model_id=model_id,
+                        image_id=image_id,
+                        video_id=video_id,
+                    )
+
+                    print(f"[DELETE] history_item={item_id} model_id={model_id} image_id={image_id} video_id={video_id} s3_keys={len(s3_keys)}")
+
+                    # ── Write phase: atomic multi-table cascade (transaction) ──
+                    orphaned_jobs = []
+                    with transaction("history_item_delete") as cur:
+                        # Remove community posts referencing this history item,
+                        # its sibling history items, or its model/image assets.
+                        # Must happen BEFORE deleting history items to avoid
+                        # ON DELETE SET NULL violating ck_community_one_ref.
+                        cur.execute(
+                            """
+                            DELETE FROM timrx_app.community_posts
+                            WHERE identity_id = %s AND (
+                                history_item_id::text = %s
+                                OR (model_id IS NOT NULL AND model_id = %s)
+                                OR (image_id IS NOT NULL AND image_id = %s)
+                                OR history_item_id IN (
+                                    SELECT id FROM timrx_app.history_items
+                                    WHERE identity_id = %s AND (
+                                        (model_id IS NOT NULL AND model_id = %s)
+                                        OR (image_id IS NOT NULL AND image_id = %s)
+                                        OR (video_id IS NOT NULL AND video_id = %s)
+                                    )
+                                )
+                            )
+                            """,
+                            (identity_id, str(item_id), model_id, image_id,
+                             identity_id, model_id, image_id, video_id),
+                        )
+                        community_deleted = cur.rowcount
+                        if community_deleted:
+                            print(f"[DELETE] removed {community_deleted} community post(s) for history_item={item_id}")
+
+                        # Delete the requested history item
+                        cur.execute(
+                            f"""
+                            DELETE FROM {Tables.HISTORY_ITEMS}
+                            WHERE id::text = %s AND identity_id = %s
+                            """,
+                            (str(item_id), identity_id),
                         )
 
-                        print(f"[DELETE] history_item={item_id} model_id={model_id} image_id={image_id} video_id={video_id} s3_keys={len(s3_keys)}")
+                        # Delete any OTHER history items referencing the same asset
+                        # to avoid ON DELETE SET NULL violating the asset_xor constraint
+                        if model_id:
+                            cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE model_id = %s AND identity_id = %s", (model_id, identity_id))
+                        if image_id:
+                            cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE image_id = %s AND identity_id = %s", (image_id, identity_id))
+                        if video_id:
+                            cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE video_id = %s AND identity_id = %s", (video_id, identity_id))
 
-                        orphaned_jobs = []
-                        with conn.cursor() as cur:
-                            # Remove community posts referencing this history item,
-                            # its sibling history items, or its model/image assets.
-                            # Must happen BEFORE deleting history items to avoid
-                            # ON DELETE SET NULL violating ck_community_one_ref.
-                            cur.execute(
-                                """
-                                DELETE FROM timrx_app.community_posts
-                                WHERE identity_id = %s AND (
-                                    history_item_id::text = %s
-                                    OR (model_id IS NOT NULL AND model_id = %s)
-                                    OR (image_id IS NOT NULL AND image_id = %s)
-                                    OR history_item_id IN (
-                                        SELECT id FROM timrx_app.history_items
-                                        WHERE identity_id = %s AND (
-                                            (model_id IS NOT NULL AND model_id = %s)
-                                            OR (image_id IS NOT NULL AND image_id = %s)
-                                            OR (video_id IS NOT NULL AND video_id = %s)
-                                        )
-                                    )
-                                )
-                                """,
-                                (identity_id, str(item_id), model_id, image_id,
-                                 identity_id, model_id, image_id, video_id),
-                            )
-                            community_deleted = cur.rowcount
-                            if community_deleted:
-                                print(f"[DELETE] removed {community_deleted} community post(s) for history_item={item_id}")
-
-                            # Delete the requested history item
+                        # Mark linked jobs as deleted_by_user so recovery never revives them
+                        if model_id:
+                            # Find jobs via model's upstream_job_id
                             cur.execute(
                                 f"""
-                                DELETE FROM {Tables.HISTORY_ITEMS}
-                                WHERE id::text = %s AND identity_id = %s
+                                SELECT j.id::text AS job_id, j.reservation_id::text AS reservation_id
+                                FROM {Tables.JOBS} j
+                                INNER JOIN {Tables.MODELS} m ON j.upstream_job_id = m.upstream_job_id
+                                WHERE m.id = %s AND j.identity_id = %s
+                                  AND j.status NOT IN ('ready', 'succeeded', 'failed', 'refunded', 'ready_unbilled', 'deleted_by_user')
                                 """,
-                                (str(item_id), identity_id),
+                                (model_id, identity_id),
                             )
-
-                            # Delete any OTHER history items referencing the same asset
-                            # to avoid ON DELETE SET NULL violating the asset_xor constraint
-                            if model_id:
-                                cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE model_id = %s AND identity_id = %s", (model_id, identity_id))
-                            if image_id:
-                                cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE image_id = %s AND identity_id = %s", (image_id, identity_id))
-                            if video_id:
-                                cur.execute(f"DELETE FROM {Tables.HISTORY_ITEMS} WHERE video_id = %s AND identity_id = %s", (video_id, identity_id))
-
-                            # Mark linked jobs as deleted_by_user so recovery never revives them
-                            if model_id:
-                                # Find jobs via model's upstream_job_id
+                            model_orphaned_jobs = cur.fetchall() or []
+                            if model_orphaned_jobs:
+                                job_ids = [oj["job_id"] for oj in model_orphaned_jobs]
+                                placeholders = ",".join(["%s"] * len(job_ids))
                                 cur.execute(
                                     f"""
-                                    SELECT j.id::text AS job_id, j.reservation_id::text AS reservation_id
-                                    FROM {Tables.JOBS} j
-                                    INNER JOIN {Tables.MODELS} m ON j.upstream_job_id = m.upstream_job_id
-                                    WHERE m.id = %s AND j.identity_id = %s
-                                      AND j.status NOT IN ('ready', 'succeeded', 'failed', 'refunded', 'ready_unbilled', 'deleted_by_user')
+                                    UPDATE {Tables.JOBS}
+                                    SET status = 'deleted_by_user',
+                                        completed_at = COALESCE(completed_at, NOW()),
+                                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"deleted_by_user": true}}'::jsonb,
+                                        updated_at = NOW()
+                                    WHERE id::text IN ({placeholders})
                                     """,
-                                    (model_id, identity_id),
+                                    tuple(job_ids),
                                 )
-                                model_orphaned_jobs = cur.fetchall() or []
-                                if model_orphaned_jobs:
-                                    job_ids = [oj["job_id"] for oj in model_orphaned_jobs]
-                                    placeholders = ",".join(["%s"] * len(job_ids))
-                                    cur.execute(
-                                        f"""
-                                        UPDATE {Tables.JOBS}
-                                        SET status = 'deleted_by_user',
-                                            completed_at = COALESCE(completed_at, NOW()),
-                                            meta = COALESCE(meta, '{{}}'::jsonb) || '{{"deleted_by_user": true}}'::jsonb,
-                                            updated_at = NOW()
-                                        WHERE id::text IN ({placeholders})
-                                        """,
-                                        tuple(job_ids),
-                                    )
-                                    print(f"[DELETE] marked {len(model_orphaned_jobs)} linked job(s) as deleted_by_user for model_id={model_id}")
-                                    orphaned_jobs.extend(model_orphaned_jobs)
+                                print(f"[DELETE] marked {len(model_orphaned_jobs)} linked job(s) as deleted_by_user for model_id={model_id}")
+                                orphaned_jobs.extend(model_orphaned_jobs)
 
-                            if model_id:
-                                cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s AND identity_id = %s", (model_id, identity_id))
-                            if image_id:
-                                cur.execute(f"DELETE FROM {Tables.IMAGES} WHERE id = %s AND identity_id = %s", (image_id, identity_id))
-                            if video_id:
-                                # Collect reservation_ids from linked jobs before marking them terminal
+                        if model_id:
+                            cur.execute(f"DELETE FROM {Tables.MODELS} WHERE id = %s AND identity_id = %s", (model_id, identity_id))
+                        if image_id:
+                            cur.execute(f"DELETE FROM {Tables.IMAGES} WHERE id = %s AND identity_id = %s", (image_id, identity_id))
+                        if video_id:
+                            # Collect reservation_ids from linked jobs before marking them terminal
+                            cur.execute(
+                                f"""
+                                SELECT id::text AS job_id, reservation_id::text AS reservation_id
+                                FROM {Tables.JOBS}
+                                WHERE meta->>'video_uuid' = %s
+                                  AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user')
+                                """,
+                                (str(video_id),),
+                            )
+                            video_orphaned_jobs = cur.fetchall() or []
+
+                            # Mark linked jobs as deleted_by_user so rescue never revives them
+                            if video_orphaned_jobs:
                                 cur.execute(
                                     f"""
-                                    SELECT id::text AS job_id, reservation_id::text AS reservation_id
-                                    FROM {Tables.JOBS}
+                                    UPDATE {Tables.JOBS}
+                                    SET status = 'deleted_by_user',
+                                        completed_at = COALESCE(completed_at, NOW()),
+                                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"deleted_by_user": true}}'::jsonb,
+                                        updated_at = NOW()
                                     WHERE meta->>'video_uuid' = %s
                                       AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user')
                                     """,
                                     (str(video_id),),
                                 )
-                                video_orphaned_jobs = cur.fetchall() or []
+                                print(f"[DELETE] marked {len(video_orphaned_jobs)} linked job(s) as deleted_by_user for video_id={video_id}")
+                                orphaned_jobs.extend(video_orphaned_jobs)
 
-                                # Mark linked jobs as deleted_by_user so rescue never revives them
-                                if video_orphaned_jobs:
-                                    cur.execute(
-                                        f"""
-                                        UPDATE {Tables.JOBS}
-                                        SET status = 'deleted_by_user',
-                                            completed_at = COALESCE(completed_at, NOW()),
-                                            meta = COALESCE(meta, '{{}}'::jsonb) || '{{"deleted_by_user": true}}'::jsonb,
-                                            updated_at = NOW()
-                                        WHERE meta->>'video_uuid' = %s
-                                          AND status NOT IN ('ready', 'succeeded', 'refunded', 'ready_unbilled', 'deleted_by_user')
-                                        """,
-                                        (str(video_id),),
-                                    )
-                                    print(f"[DELETE] marked {len(video_orphaned_jobs)} linked job(s) as deleted_by_user for video_id={video_id}")
-                                    orphaned_jobs.extend(video_orphaned_jobs)
+                            cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s AND identity_id = %s", (video_id, identity_id))
+                    # transaction() auto-commits on success, rolls back on exception.
+                    db_ok = True
 
-                                cur.execute(f"DELETE FROM {Tables.VIDEOS} WHERE id = %s AND identity_id = %s", (video_id, identity_id))
-                        conn.commit()
-                        db_ok = True
+                    # Release held credits for orphaned jobs (after commit, best-effort)
+                    if orphaned_jobs:
+                        from backend.services.credits_helper import release_job_credits
+                        from backend.services.video_errors import ErrorCategory
+                        for oj in orphaned_jobs:
+                            res_id = oj.get("reservation_id")
+                            if res_id:
+                                try:
+                                    release_job_credits(res_id, ErrorCategory.INTERNAL, oj["job_id"])
+                                    print(f"[DELETE] released credits reservation={res_id} job={oj['job_id']}")
+                                except Exception as cre:
+                                    print(f"[DELETE] WARNING: credit release failed reservation={res_id}: {cre}")
 
-                        # Release held credits for orphaned jobs (after commit, best-effort)
-                        if orphaned_jobs:
-                            from backend.services.credits_helper import release_job_credits
-                            from backend.services.video_errors import ErrorCategory
-                            for oj in orphaned_jobs:
-                                res_id = oj.get("reservation_id")
-                                if res_id:
-                                    try:
-                                        release_job_credits(res_id, ErrorCategory.INTERNAL, oj["job_id"])
-                                        print(f"[DELETE] released credits reservation={res_id} job={oj['job_id']}")
-                                    except Exception as cre:
-                                        print(f"[DELETE] WARNING: credit release failed reservation={res_id}: {cre}")
-
-                        # Delete S3 objects (idempotent - safe to retry, logs errors)
-                        if s3_keys:
-                            s3_cleanup_result = delete_s3_objects_safe(
-                                keys=s3_keys,
-                                source=f"history_item_delete:{item_id}",
-                            )
-                            if s3_cleanup_result.get("errors"):
-                                db_errors.append({
-                                    "op": "history_item_delete_s3",
-                                    "error": f"partial_failure: {len(s3_cleanup_result['errors'])} errors",
-                                })
+                    # Delete S3 objects (idempotent - safe to retry, logs errors)
+                    if s3_keys:
+                        s3_cleanup_result = delete_s3_objects_safe(
+                            keys=s3_keys,
+                            source=f"history_item_delete:{item_id}",
+                        )
+                        if s3_cleanup_result.get("errors"):
+                            db_errors.append({
+                                "op": "history_item_delete_s3",
+                                "error": f"partial_failure: {len(s3_cleanup_result['errors'])} errors",
+                            })
 
                 except Exception as e:
                     log_db_continue("history_item_delete", e)

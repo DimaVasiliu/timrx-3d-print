@@ -18,7 +18,7 @@ except ImportError:
     _tuple_row = None
 
 from backend.config import config
-from backend.db import USE_DB, get_conn
+from backend.db import USE_DB, get_conn, transaction
 from backend.middleware import with_session
 from backend.services.identity_service import require_identity
 from backend.services.wallet_service import WalletService, CreditType
@@ -332,53 +332,48 @@ def community_react(post_id: str):
                 return jsonify({"ok": False, "error": {"code": "INVALID_REACTION",
                     "message": f"reaction must be one of {VALID_REACTIONS}"}}), 400
 
-            with get_conn("community_react") as conn:
-                cursor = _cur(conn)
-
+            with transaction("community_react") as cur:
                 # Verify post exists
-                cursor.execute("""
+                cur.execute("""
                     SELECT id FROM timrx_app.community_posts
                     WHERE id = %s AND status = 'published' AND deleted_at IS NULL
                 """, (post_id,))
-                if not cursor.fetchone():
-                    cursor.close()
+                if not cur.fetchone():
                     return jsonify({"ok": False, "error": {"code": "POST_NOT_FOUND"}}), 404
 
                 if reaction is None:
                     # Remove any existing reaction
-                    cursor.execute("""
+                    cur.execute("""
                         DELETE FROM timrx_app.community_reactions
                         WHERE post_id = %s AND identity_id = %s
                     """, (post_id, identity_id))
                 else:
                     # Upsert reaction (one per user per post — replace if different)
-                    cursor.execute("""
+                    cur.execute("""
                         INSERT INTO timrx_app.community_reactions (post_id, identity_id, reaction)
                         VALUES (%s, %s, %s)
                         ON CONFLICT (post_id, identity_id)
                         DO UPDATE SET reaction = EXCLUDED.reaction, created_at = now()
                     """, (post_id, identity_id, reaction))
 
-                # Return updated counts
-                cursor.execute("""
-                    SELECT reaction, COUNT(*)::int
+                # Return updated counts (dict_row: each row is {"reaction": ..., "count": ...})
+                cur.execute("""
+                    SELECT reaction, COUNT(*)::int AS count
                     FROM timrx_app.community_reactions
                     WHERE post_id = %s
                     GROUP BY reaction
                 """, (post_id,))
-                reactions = {r: cnt for (r, cnt) in cursor.fetchall()}
+                reactions = {row["reaction"]: row["count"] for row in cur.fetchall()}
 
                 # Return what this user's current reaction is
-                cursor.execute("""
+                cur.execute("""
                     SELECT reaction FROM timrx_app.community_reactions
                     WHERE post_id = %s AND identity_id = %s
                 """, (post_id, identity_id))
-                row = cursor.fetchone()
-                my_reaction = row[0] if row else None
+                row = cur.fetchone()
+                my_reaction = row["reaction"] if row else None
 
-                cursor.close()
-                conn.commit()
-
+            # transaction() auto-commits on success.
             return jsonify({"ok": True, "reactions": reactions, "my_reaction": my_reaction})
 
         except Exception as e:
@@ -473,22 +468,21 @@ def community_tip():
                 return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Tip failed."}}), 500
 
             # Record in tips table
-            with get_conn("community_tip_record") as conn:
-                cursor = _cur(conn)
-                cursor.execute("""
+            with transaction("community_tip_record") as cur:
+                cur.execute("""
                     INSERT INTO timrx_app.community_tips
                         (post_id, tipper_identity_id, recipient_identity_id, amount)
                     VALUES (%s, %s, %s, %s)
                 """, (post_id, tipper_id, recipient_id, amount))
 
-                cursor.execute("""
-                    SELECT COALESCE(SUM(amount), 0)::int
+                cur.execute("""
+                    SELECT COALESCE(SUM(amount), 0)::int AS total
                     FROM timrx_app.community_tips
                     WHERE post_id = %s
                 """, (post_id,))
-                tip_total = cursor.fetchone()[0]
-                cursor.close()
-                conn.commit()
+                row = cur.fetchone()
+                tip_total = row["total"] if row else 0
+            # transaction() auto-commits on success.
 
             return jsonify({"ok": True, "tip_total": tip_total})
 

@@ -46,7 +46,7 @@ import traceback
 import uuid
 from typing import Any, Dict, Optional
 
-from backend.db import USE_DB, get_conn, Tables
+from backend.db import USE_DB, get_conn, transaction, Tables
 from backend.services.video_errors import (
     TERMINAL_STATES as _SHARED_TERMINAL_STATES,
     TERMINAL_ERROR_CODES as _SHARED_TERMINAL_ERROR_CODES,
@@ -1911,51 +1911,49 @@ def recover_stale_jobs():
     provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
 
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                # Recover recent supported jobs (including finalizing)
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'stalled',
-                        claimed_by = NULL,
-                        claimed_at = NULL,
-                        updated_at = NOW()
-                    WHERE status IN (
-                        'queued', 'dispatched', 'pending', 'processing',
-                        'provider_pending', 'provider_processing', 'recovering',
-                        'finalizing'
-                    )
-                    AND provider IN ({provider_list})
-                    AND stage = 'video'
-                    AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
-                    RETURNING id, status, provider
-                    """,
+        with transaction("startup_recovery") as cur:
+            # Recover recent supported jobs (including finalizing)
+            cur.execute(
+                f"""
+                UPDATE {Tables.JOBS}
+                SET status = 'stalled',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = NOW()
+                WHERE status IN (
+                    'queued', 'dispatched', 'pending', 'processing',
+                    'provider_pending', 'provider_processing', 'recovering',
+                    'finalizing'
                 )
-                recovered = cur.fetchall() or []
+                AND provider IN ({provider_list})
+                AND stage = 'video'
+                AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
+                RETURNING id, status, provider
+                """,
+            )
+            recovered = cur.fetchall() or []
 
-                # Abandon very old non-terminal jobs that are past recovery age
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.JOBS}
-                    SET status = 'abandoned_legacy',
-                        claimed_by = NULL,
-                        claimed_at = NULL,
-                        meta = COALESCE(meta, '{{}}'::jsonb) || '{{"abandoned_reason": "too_old_for_recovery", "abandoned_by": "startup_recovery"}}'::jsonb,
-                        updated_at = NOW()
-                    WHERE status IN (
-                        'queued', 'dispatched', 'pending', 'processing',
-                        'provider_pending', 'provider_processing', 'recovering', 'stalled',
-                        'finalizing'
-                    )
-                    AND created_at <= NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
-                    AND status NOT IN ({', '.join(f"'{s}'" for s in TERMINAL_STATES)})
-                    RETURNING id, status, provider
-                    """,
+            # Abandon very old non-terminal jobs that are past recovery age
+            cur.execute(
+                f"""
+                UPDATE {Tables.JOBS}
+                SET status = 'abandoned_legacy',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    meta = COALESCE(meta, '{{}}'::jsonb) || '{{"abandoned_reason": "too_old_for_recovery", "abandoned_by": "startup_recovery"}}'::jsonb,
+                    updated_at = NOW()
+                WHERE status IN (
+                    'queued', 'dispatched', 'pending', 'processing',
+                    'provider_pending', 'provider_processing', 'recovering', 'stalled',
+                    'finalizing'
                 )
-                abandoned = cur.fetchall() or []
-
-            conn.commit()
+                AND created_at <= NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
+                AND status NOT IN ({', '.join(f"'{s}'" for s in TERMINAL_STATES)})
+                RETURNING id, status, provider
+                """,
+            )
+            abandoned = cur.fetchall() or []
+        # transaction() auto-commits on success.
 
         rec_count = len(recovered)
         abn_count = len(abandoned)

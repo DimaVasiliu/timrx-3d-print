@@ -133,13 +133,17 @@ def _pool_timeout_class():
 
 def _configure_pooled_conn(conn):
     """Configure session settings for a new pooled connection.
-    Runs in autocommit so SETs are immediate and survive rollbacks."""
+    Runs in autocommit so SETs are immediate and survive rollbacks.
+    Leaves the connection in autocommit mode so that read-only
+    get_conn() callers never open an implicit transaction (INTRANS).
+    transaction() temporarily switches to non-autocommit when it
+    needs real transactional semantics."""
     conn.autocommit = True
     conn.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public")
     conn.execute("SET statement_timeout = '30000'")
     conn.execute("SET idle_in_transaction_session_timeout = '60000'")
     conn.execute("SET lock_timeout = '10000'")
-    conn.autocommit = False
+    # Stays autocommit=True — no implicit transactions on idle connections.
 
 
 def _get_pool():
@@ -336,6 +340,21 @@ def _safe_rollback(conn):
         pass
 
 
+def _ensure_idle(conn):
+    """Roll back if the connection is still INTRANS/INERROR so it can be
+    returned to the pool in a clean state.  Without this, psycopg_pool logs
+    'rolling back returned connection' warnings and the connection costs an
+    extra round-trip inside putconn()."""
+    try:
+        # psycopg3: conn.info.transaction_status is a pq.TransactionStatus enum.
+        # IDLE (0) = clean, INTRANS (2) = open txn, INERROR (3) = failed txn.
+        status = conn.info.transaction_status
+        if status != 0:  # anything other than IDLE
+            conn.rollback()
+    except Exception:
+        pass  # broken connection — putconn will discard it
+
+
 def _create_connection():
     """
     Create a new database connection.
@@ -376,8 +395,13 @@ def get_conn(source: str = ""):
     direct connection instead.  If the pool checkout succeeds, the caller
     gets that pooled connection normally.
 
-    Connection is NOT auto-committed — caller must commit explicitly
-    or use transaction().
+    Pooled connections are in autocommit mode: each statement commits
+    immediately and the connection stays IDLE (no implicit transaction).
+    Callers that need atomicity across multiple statements should use
+    transaction() instead.
+
+    Direct-fallback connections use psycopg3's default (autocommit=False),
+    so callers doing writes on the fallback path should still commit.
 
     This covers the main failure mode: pool full or dead SSL connections.
     If a query fails mid-execution on a connection that was healthy at
@@ -403,8 +427,25 @@ def get_conn(source: str = ""):
         try:
             yield conn
         finally:
-            # Return connection to pool.  putconn handles broken connections
-            # (discards them instead of poisoning the pool).
+            # Clean up transaction state so the pool doesn't have to.
+            # Without this, connections returned while INTRANS cause
+            # psycopg_pool to log "rolling back returned connection"
+            # and spend an extra server round-trip inside putconn().
+            _ensure_idle(conn)
+            # Verify the connection is still in autocommit mode.
+            # A prior transaction() that failed to restore autocommit
+            # could have left it in non-autocommit mode, which would
+            # cause the NEXT borrower's queries to open implicit txns.
+            try:
+                if not conn.autocommit:
+                    conn.autocommit = True
+            except Exception:
+                # Broken — discard instead of poisoning the pool.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
             try:
                 pool.putconn(conn)
             except Exception:
@@ -514,12 +555,31 @@ def transaction(source: str = ""):
                 raise
 
     if conn is not None and from_pool:
+        # Pooled connections live in autocommit mode.  Switch to
+        # transactional mode for the duration of this block so
+        # _run_transaction gets real BEGIN/COMMIT/ROLLBACK semantics.
+        conn.autocommit = False
         try:
             with _run_transaction(conn) as cur:
                 yield cur
         finally:
-            # Return connection to pool. putconn handles broken connections
-            # (discards them instead of poisoning the pool).
+            # _run_transaction commits on success and rolls back on error,
+            # but defensive _ensure_idle catches edge cases (e.g. commit
+            # itself raising after partial flush).
+            _ensure_idle(conn)
+            # Restore autocommit before returning to pool so the next
+            # borrower (likely a read-only get_conn) stays IDLE.
+            # If restoring autocommit fails, the connection is broken or
+            # wedged — do NOT return it to the pool (it would cause
+            # INTRANS warnings on the next checkout).  Close it directly.
+            try:
+                conn.autocommit = True
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return  # skip putconn — connection is dead
             try:
                 pool.putconn(conn)
             except Exception:
@@ -529,7 +589,7 @@ def transaction(source: str = ""):
                 except Exception:
                     pass
     else:
-        # Direct connection (pool failed or disabled)
+        # Direct connection (already autocommit=False per psycopg3 default)
         conn = _create_connection()
         try:
             with _run_transaction(conn) as cur:
