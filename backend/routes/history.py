@@ -13,7 +13,7 @@ import uuid
 
 from flask import Blueprint, jsonify, request, g
 
-from backend.db import USE_DB, get_conn, get_conn_resilient, dict_row, Tables, is_transient_db_error
+from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, Tables, is_transient_db_error
 from backend.middleware import with_session
 from backend.services.history_service import (
     _local_history_id,
@@ -64,83 +64,67 @@ def history_mod():
             print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, offset={offset}")
 
             if USE_DB:
+                _hsql = f"""
+                    SELECT
+                        h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
+                        h.thumbnail_url, h.glb_url, h.image_url, h.video_url, h.payload, h.created_at,
+                        h.model_id, h.image_id, h.video_id, h.lineage_origin_id,
+                        m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
+                        m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
+                        m.prompt AS m_prompt, m.status AS m_status,
+                        i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
+                        i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt,
+                        v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
+                        v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
+                        v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio,
+                        v.meta AS v_meta, v.prompt AS v_prompt
+                    FROM {Tables.HISTORY_ITEMS} h
+                    LEFT JOIN {Tables.MODELS} m ON (
+                        (h.model_id IS NOT NULL AND h.model_id = m.id) OR
+                        (h.model_id IS NULL AND m.upstream_job_id = COALESCE(
+                            h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
+                        ) AND COALESCE(
+                            h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
+                        ) IS NOT NULL))
+                    LEFT JOIN {Tables.IMAGES} i ON (
+                        (h.image_id IS NOT NULL AND h.image_id = i.id) OR
+                        (h.image_id IS NULL AND i.upstream_id = COALESCE(
+                            h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
+                        ) AND COALESCE(
+                            h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
+                        ) IS NOT NULL))
+                    LEFT JOIN {Tables.VIDEOS} v ON (
+                        (h.video_id IS NOT NULL AND h.video_id = v.id) OR
+                        (h.video_id IS NULL AND v.upstream_id = COALESCE(
+                            h.payload->>'original_id', h.payload->>'original_job_id'
+                        ) AND COALESCE(
+                            h.payload->>'original_id', h.payload->>'original_job_id'
+                        ) IS NOT NULL))
+                    WHERE h.identity_id = %s
+                    ORDER BY h.created_at DESC
+                    LIMIT %s OFFSET %s
+                """
+                _hparams = (identity_id, limit, offset)
+
+                def _fetch_history(conn_getter):
+                    with conn_getter as c:
+                        with c.cursor(row_factory=dict_row) as cur:
+                            cur.execute(_hsql, _hparams)
+                            return cur.fetchall()
+
                 try:
-                    with get_conn_resilient("history") as conn:
-                        with conn.cursor(row_factory=dict_row) as cur:
-                            # Single optimized query with LEFT JOINs to avoid N+1 problem
-                            # This replaces the previous per-item get_canonical_model_row/get_canonical_image_row calls
-                            cur.execute(
-                                f"""
-                                SELECT
-                                    h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
-                                    h.thumbnail_url, h.glb_url, h.image_url, h.video_url, h.payload, h.created_at,
-                                    h.model_id, h.image_id, h.video_id,
-                                    h.lineage_origin_id,
-                                    -- Model data from joined models table
-                                    m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
-                                    m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
-                                    m.prompt AS m_prompt, m.status AS m_status,
-                                    -- Image data from joined images table
-                                    i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
-                                    i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt,
-                                    -- Video data from joined videos table
-                                    v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
-                                    v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
-                                    v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio,
-                                    v.meta AS v_meta, v.prompt AS v_prompt
-                                FROM {Tables.HISTORY_ITEMS} h
-                                LEFT JOIN {Tables.MODELS} m ON (
-                                    -- Direct model_id lookup
-                                    (h.model_id IS NOT NULL AND h.model_id = m.id)
-                                    OR
-                                    -- Fallback: upstream_job_id lookup when no model_id
-                                    (h.model_id IS NULL AND m.upstream_job_id = COALESCE(
-                                        h.payload->>'original_job_id',
-                                        h.payload->>'preview_task_id',
-                                        h.payload->>'source_task_id'
-                                    ) AND COALESCE(
-                                        h.payload->>'original_job_id',
-                                        h.payload->>'preview_task_id',
-                                        h.payload->>'source_task_id'
-                                    ) IS NOT NULL)
-                                )
-                                LEFT JOIN {Tables.IMAGES} i ON (
-                                    -- Direct image_id lookup
-                                    (h.image_id IS NOT NULL AND h.image_id = i.id)
-                                    OR
-                                    -- Fallback: upstream_id lookup when no image_id
-                                    (h.image_id IS NULL AND i.upstream_id = COALESCE(
-                                        h.payload->>'original_job_id',
-                                        h.payload->>'preview_task_id',
-                                        h.payload->>'source_task_id'
-                                    ) AND COALESCE(
-                                        h.payload->>'original_job_id',
-                                        h.payload->>'preview_task_id',
-                                        h.payload->>'source_task_id'
-                                    ) IS NOT NULL)
-                                )
-                                LEFT JOIN {Tables.VIDEOS} v ON (
-                                    -- Direct video_id lookup
-                                    (h.video_id IS NOT NULL AND h.video_id = v.id)
-                                    OR
-                                    -- Fallback: upstream_id lookup when no video_id
-                                    (h.video_id IS NULL AND v.upstream_id = COALESCE(
-                                        h.payload->>'original_id',
-                                        h.payload->>'original_job_id'
-                                    ) AND COALESCE(
-                                        h.payload->>'original_id',
-                                        h.payload->>'original_job_id'
-                                    ) IS NOT NULL)
-                                )
-                                WHERE h.identity_id = %s
-                                ORDER BY h.created_at DESC
-                                LIMIT %s OFFSET %s;
-                                """,
-                                (identity_id, limit, offset),
-                            )
-                            rows = cur.fetchall()
+                    # 1) Try pool (resilient handles checkout failure)
+                    try:
+                        rows = _fetch_history(get_conn_resilient("history"))
+                    except Exception as e1:
+                        if is_transient_db_error(e1):
+                            # 2) Pool checkout OK but query died mid-flight — try direct
+                            print(f"[History][FALLBACK] pool query failed, using direct: {type(e1).__name__}")
+                            rows = _fetch_history(get_conn_direct("history_direct"))
+                        else:
+                            raise
                     query_time = time.time() - start_time
-                    print(f"[History][mod] GET: Fetched {len(rows)} items from database in {query_time:.3f}s (single JOIN query)")
+                    print(f"[History][mod] GET: Fetched {len(rows)} items in {query_time:.3f}s")
                     db_source = True
 
                     def _scrub_meshy_urls(value):

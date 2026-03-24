@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional
 
 from flask import Blueprint, jsonify, request, Response
 
-from backend.db import USE_DB, get_conn, get_conn_resilient, dict_row
+from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, is_transient_db_error
 
 # Debug: confirm module loads
 print("[INSPIRE] Module loaded successfully")
@@ -486,72 +486,80 @@ def inspire_feed() -> Response:
         if mix_mode not in ("balanced", "sequential"):
             mix_mode = "balanced"
 
-        with get_conn_resilient("inspire_feed") as conn:
-            cursor = conn.cursor(row_factory=dict_row)
-
-            # Get prompt of the day
-            potd = _get_prompt_of_the_day(cursor)
-
-            total_available = 0
-            already_shuffled = False
-
-            # Fetch ALL items from DB (no limit), then mix and slice
-            if filter_type == "all":
-                models = _fetch_models(cursor, limit=None, debug=True)
-                images = _fetch_images(cursor, limit=None, debug=True)
-                videos = _fetch_videos(cursor, limit=None, debug=True)
-                total_available = len(models) + len(images) + len(videos)
-
-                print(
-                    f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} "
-                    f"videos:{len(videos)} total:{total_available} mix:{mix_mode}"
-                )
-
-                if mix_mode == "balanced":
-                    # Shuffle each source first so balancing does not always pick the same recent rows.
-                    if shuffle:
-                        if seed:
-                            models = _seeded_shuffle(models, seed + "_models")
-                            images = _seeded_shuffle(images, seed + "_images")
-                            videos = _seeded_shuffle(videos, seed + "_videos")
-                        else:
-                            random.shuffle(models)
-                            random.shuffle(images)
-                            random.shuffle(videos)
-
-                    items = _balanced_mix(
-                        models=models,
-                        images=images,
-                        videos=videos,
-                        target=limit,
-                        shuffle=shuffle,
-                        seed=seed,
-                    )
-                    already_shuffled = True
+        # ── DB fetch with pool→direct fallback ──
+        def _inspire_db_read(conn_getter):
+            """Run all inspire DB reads inside one connection."""
+            with conn_getter as conn:
+                cursor = conn.cursor(row_factory=dict_row)
+                potd = _get_prompt_of_the_day(cursor)
+                if filter_type == "all":
+                    models = _fetch_models(cursor, limit=None, debug=True)
+                    images = _fetch_images(cursor, limit=None, debug=True)
+                    videos = _fetch_videos(cursor, limit=None, debug=True)
+                elif filter_type in ("model", "models"):
+                    models = _fetch_models(cursor, limit=None, debug=True)
+                    images, videos = [], []
+                elif filter_type in ("image", "images"):
+                    images = _fetch_images(cursor, limit=None, debug=True)
+                    models, videos = [], []
+                elif filter_type in ("video", "videos"):
+                    videos = _fetch_videos(cursor, limit=None, debug=True)
+                    models, images = [], []
                 else:
-                    # Sequential mode keeps historical behavior for compatibility.
-                    items = models + images + videos
+                    models, images, videos = [], [], []
+                cursor.close()
+                return potd, models, images, videos
 
-            elif filter_type in ("model", "models"):
-                items = _fetch_models(cursor, limit=None, debug=True)
-                total_available = len(items)
-                print(f"[INSPIRE] Models-only feed: {len(items)} items")
-
-            elif filter_type in ("image", "images"):
-                items = _fetch_images(cursor, limit=None, debug=True)
-                total_available = len(items)
-                print(f"[INSPIRE] Images-only feed: {len(items)} items")
-
-            elif filter_type in ("video", "videos"):
-                items = _fetch_videos(cursor, limit=None, debug=True)
-                total_available = len(items)
-                print(f"[INSPIRE] Videos-only feed: {len(items)} items")
-
+        try:
+            potd, models, images, videos = _inspire_db_read(get_conn_resilient("inspire_feed"))
+        except Exception as _e1:
+            if is_transient_db_error(_e1):
+                print(f"[INSPIRE][FALLBACK] pool query failed, using direct: {type(_e1).__name__}")
+                potd, models, images, videos = _inspire_db_read(get_conn_direct("inspire_direct"))
             else:
-                items = []
-                total_available = 0
+                raise
 
-            cursor.close()
+        total_available = len(models) + len(images) + len(videos)
+        already_shuffled = False
+
+        if filter_type == "all":
+            print(
+                f"[INSPIRE] Feed counts - models:{len(models)} images:{len(images)} "
+                f"videos:{len(videos)} total:{total_available} mix:{mix_mode}"
+            )
+            if mix_mode == "balanced":
+                if shuffle:
+                    if seed:
+                        models = _seeded_shuffle(models, seed + "_models")
+                        images = _seeded_shuffle(images, seed + "_images")
+                        videos = _seeded_shuffle(videos, seed + "_videos")
+                    else:
+                        random.shuffle(models)
+                        random.shuffle(images)
+                        random.shuffle(videos)
+
+                items = _balanced_mix(
+                    models=models,
+                    images=images,
+                    videos=videos,
+                    target=limit,
+                    shuffle=shuffle,
+                    seed=seed,
+                )
+                already_shuffled = True
+            else:
+                items = models + images + videos
+        elif filter_type in ("model", "models"):
+            items = models
+            print(f"[INSPIRE] Models-only feed: {len(items)} items")
+        elif filter_type in ("image", "images"):
+            items = images
+            print(f"[INSPIRE] Images-only feed: {len(items)} items")
+        elif filter_type in ("video", "videos"):
+            items = videos
+            print(f"[INSPIRE] Videos-only feed: {len(items)} items")
+        else:
+            items = []
 
         # Shuffle ALL items together (balanced mode already shuffled/mixed above)
         if shuffle and not already_shuffled:
@@ -590,11 +598,9 @@ def inspire_feed() -> Response:
         return response
 
     except Exception as e:
-        from backend.db import is_transient_db_error
         if is_transient_db_error(e):
-            # Pool sick or SSL churn — return empty feed instead of 500.
-            # Frontend will show no inspire cards, which is better than an error page.
-            print(f"[INSPIRE][DEGRADED] returning empty feed: {type(e).__name__}: {e}")
+            # Both pool AND direct failed — truly degraded
+            print(f"[INSPIRE][DEGRADED] pool+direct both failed, returning empty: {type(e).__name__}: {e}")
             response = jsonify({
                 "ok": True,
                 "prompt_of_the_day": None,

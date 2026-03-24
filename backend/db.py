@@ -392,31 +392,46 @@ def get_conn_resilient(source: str = ""):
     """
     Pool-first, direct-fallback connection context manager.
 
-    Tries the pool first. If it fails with a transient error (PoolTimeout,
-    SSL, connection closed), transparently opens a direct connection instead.
-    Use this for read endpoints that should survive pool storms without
-    waiting the full pool timeout + separate fallback.
+    Tries to borrow from the pool. If the pool CHECKOUT fails with a
+    transient error (PoolTimeout, SSL on idle connection), opens a fresh
+    direct connection instead. If the pool checkout succeeds, the caller
+    gets that pooled connection normally.
+
+    This covers the main failure mode: pool full of dead SSL connections.
+    If a query fails mid-execution on a connection that was healthy at
+    checkout, that error propagates to the caller (and the pool discards
+    the broken connection automatically).
     """
     pool = _get_pool()
+    conn = None
+    from_pool = False
+
     if pool is not None:
         try:
-            with pool.connection() as conn:
-                yield conn
-                return
+            conn = pool.getconn(timeout=_DB_POOL_TIMEOUT)
+            from_pool = True
         except Exception as e:
             if is_transient_db_error(e):
-                print(f"[DB][FALLBACK] get_conn_resilient pool failed, using direct source={source}: {type(e).__name__}")
+                print(f"[DB][FALLBACK] pool checkout failed, using direct source={source}: {type(e).__name__}")
+                conn = None
             else:
                 raise
-    # Direct fallback (or pool disabled)
-    conn = _create_connection()
-    try:
-        yield conn
-    finally:
+
+    if conn is not None and from_pool:
         try:
-            conn.close()
-        except Exception:
-            pass
+            yield conn
+        finally:
+            pool.putconn(conn)
+    else:
+        # Direct connection (pool failed or disabled)
+        conn = _create_connection()
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @contextmanager
