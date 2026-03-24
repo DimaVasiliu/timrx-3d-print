@@ -61,7 +61,7 @@ _DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 _DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
 _DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
 _DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
-_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "5"))  # 5s — fail fast to direct fallback
+_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "3"))  # 3s — fail fast to direct fallback
 _DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "120"))   # recycle before Render kills
 _DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "30"))            # close idle fast
 _DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "false").lower() in ("true", "1", "yes")  # OFF — open=True + max_lifetime=120 handles staleness; check adds a roundtrip per borrow
