@@ -245,6 +245,14 @@ def _worker_loop():
     consecutive_db_errors = 0
     MAX_DB_BACKOFF = 30  # seconds — back off hard to protect user-facing pool slots
 
+    # Delay first claim so the pool has time to warm up and serve the
+    # initial wave of user-facing requests (auth, history, wallet).
+    # The worker is a background consumer — 5s of delay is invisible
+    # but avoids competing with bootstrap for pool connections.
+    _worker_stop.wait(timeout=5)
+    if _worker_stop.is_set():
+        return
+
     try:
         while not _worker_stop.is_set():
             try:
