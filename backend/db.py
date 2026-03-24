@@ -947,6 +947,19 @@ def ensure_schema() -> None:
                 WHERE payment_id IS NOT NULL
             """)
 
+            # ── History pagination indexes ──
+            # Composite index for cursor-based pagination:
+            # WHERE identity_id = X ORDER BY created_at DESC, id DESC
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_identity_created
+                ON {_APP_SCHEMA}.history_items (identity_id, created_at DESC, id DESC)
+            """)
+            # Per-type pagination (WHERE identity_id = X AND item_type = Y)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_identity_type_created
+                ON {_APP_SCHEMA}.history_items (identity_id, item_type, created_at DESC, id DESC)
+            """)
+
         print("[DB] Schema indexes ensured")
 
         try:
@@ -973,6 +986,15 @@ def _ensure_schema_direct() -> None:
                     CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
                     ON timrx_billing.purchases (provider, payment_id)
                     WHERE payment_id IS NOT NULL
+                """)
+                # History pagination indexes
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_identity_created
+                    ON {_APP_SCHEMA}.history_items (identity_id, created_at DESC, id DESC)
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_identity_type_created
+                    ON {_APP_SCHEMA}.history_items (identity_id, item_type, created_at DESC, id DESC)
                 """)
             conn.commit()
             print("[DB] Schema indexes ensured")

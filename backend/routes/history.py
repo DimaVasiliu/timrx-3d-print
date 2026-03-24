@@ -76,19 +76,35 @@ def history_mod():
             db_source = False
 
             # Pagination parameters
-            limit = request.args.get("limit", type=int, default=100)
-            offset = request.args.get("offset", type=int, default=0)
+            import base64 as _b64
+            limit = request.args.get("limit", type=int, default=50)
             item_type_filter = request.args.get("type", type=str, default="all").lower().strip()
+            cursor_raw = request.args.get("cursor", type=str, default="")
+            # Legacy offset support (ignored when cursor is provided)
+            offset = request.args.get("offset", type=int, default=0)
             limit = min(max(1, limit), 500)  # Clamp to 1-500
             offset = max(0, offset)
             # Validate type filter
             if item_type_filter not in ("all", "model", "image", "video"):
                 item_type_filter = "all"
 
-            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, offset={offset}, type={item_type_filter}")
+            # Decode cursor if provided (base64-encoded JSON: {"created_at": ..., "id": ...})
+            cursor_created_at = None
+            cursor_id = None
+            if cursor_raw:
+                try:
+                    cursor_json = json.loads(_b64.urlsafe_b64decode(cursor_raw + "==").decode("utf-8"))
+                    cursor_created_at = cursor_json.get("created_at")
+                    cursor_id = cursor_json.get("id")
+                except Exception:
+                    pass  # Invalid cursor — treat as first page
+
+            use_cursor = cursor_created_at is not None and cursor_id is not None
+
+            print(f"[History][mod] GET: identity_id={identity_id}, USE_DB={USE_DB}, limit={limit}, type={item_type_filter}, cursor={'yes' if use_cursor else 'no'}")
 
             # Check per-identity cache (avoids repeated 3s+ DB/fallback fetches)
-            _hcache_key = f"{identity_id}:{item_type_filter}:{limit}:{offset}"
+            _hcache_key = f"{identity_id}:{item_type_filter}:{limit}:{cursor_raw or offset}"
             _hcached = _history_cache.get(_hcache_key)
             _cached_has_more = False
             if _hcached:
@@ -138,15 +154,23 @@ def history_mod():
                         ) IS NOT NULL))
                     WHERE h.identity_id = %s
                       {("AND h.item_type = %s" if item_type_filter != "all" else "")}
+                      {("AND (h.created_at, h.id) < (%s, %s::uuid)" if use_cursor else "")}
                     ORDER BY h.created_at DESC, h.id DESC
-                    LIMIT %s OFFSET %s
+                    LIMIT %s
                 """
-                # Fetch one extra row to detect whether more pages exist,
-                # without a separate COUNT query.
+                # Fetch limit+1 to detect has_more without a COUNT query.
+                # Build params dynamically based on which clauses are active.
+                _hparams_list = [identity_id]
                 if item_type_filter != "all":
-                    _hparams = (identity_id, item_type_filter, limit + 1, offset)
-                else:
-                    _hparams = (identity_id, limit + 1, offset)
+                    _hparams_list.append(item_type_filter)
+                if use_cursor:
+                    _hparams_list.extend([cursor_created_at, cursor_id])
+                _hparams_list.append(limit + 1)
+                # Fall back to OFFSET only when no cursor is provided and offset > 0
+                if not use_cursor and offset > 0:
+                    _hsql += " OFFSET %s"
+                    _hparams_list.append(offset)
+                _hparams = tuple(_hparams_list)
 
                 def _fetch_history(conn_getter):
                     with conn_getter as c:
@@ -365,6 +389,23 @@ def history_mod():
             # has_more is determined by the fetch-limit+1 pattern (DB path)
             # or preserved from the process cache (cache-hit path).
             has_more = _cached_has_more
+
+            # Build next_cursor from the last item in the page (for cursor-based pagination).
+            next_cursor = None
+            if has_more and items:
+                last = items[-1]
+                last_created_at = last.get("created_at")
+                last_id = last.get("id")
+                if last_created_at is not None and last_id:
+                    # created_at is epoch ms (int) — convert to ISO for the cursor
+                    from datetime import datetime, timezone as _tz
+                    if isinstance(last_created_at, (int, float)):
+                        iso_ts = datetime.fromtimestamp(last_created_at / 1000, tz=_tz.utc).isoformat()
+                    else:
+                        iso_ts = str(last_created_at)
+                    cursor_payload = json.dumps({"created_at": iso_ts, "id": str(last_id)})
+                    next_cursor = _b64.urlsafe_b64encode(cursor_payload.encode()).decode().rstrip("=")
+
             return jsonify({
                 "ok": True,
                 "items": items,
@@ -373,6 +414,8 @@ def history_mod():
                 "offset": offset,
                 "count": len(items),
                 "has_more": has_more,
+                "next_cursor": next_cursor,
+                # Legacy field — kept for backward compatibility with offset-based consumers
                 "next_offset": offset + len(items) if has_more else None,
             })
 
