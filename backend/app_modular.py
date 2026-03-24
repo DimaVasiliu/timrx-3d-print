@@ -62,6 +62,32 @@ def create_app() -> Flask:
     def _identity_default():
         g.identity_id = None
         g.user_id = None
+        g._identity_resolved = False
+        g._identity_source = None
+        g._identity_touch_done = False
+        g._cached_identity = None
+
+    # ── Lightweight per-request diagnostic (auth efficiency) ──
+    _AUTH_DIAG = os.getenv("AUTH_DIAG", "false").lower() in ("true", "1", "yes")
+
+    @app.after_request
+    def _auth_diag(response):
+        if not _AUTH_DIAG:
+            return response
+        try:
+            source = getattr(g, '_identity_source', None)
+            if source:
+                sid = getattr(g, 'session_id', None)
+                sid_short = sid[:8] + "..." if sid else "none"
+                touched = getattr(g, '_identity_touch_done', False)
+                print(
+                    f"[AUTH_DIAG] {request.method} {request.path} "
+                    f"sid={sid_short} source={source} "
+                    f"touched={touched} status={response.status_code}"
+                )
+        except Exception:
+            pass
+        return response
 
     # ─────────────────────────────────────────────────────────────
     # Origin validation for state-changing requests.

@@ -28,78 +28,6 @@ from flask import request, g, jsonify, make_response
 # Debug flag for verbose session logging (set SESSION_DEBUG=1 to enable)
 SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEBUG: Session Cookie Diagnostics
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _log_session_debug(endpoint_name: str):
-    """
-    Log detailed session/cookie diagnostics for debugging cookie collisions.
-    Call this at the start of session-related middleware.
-    """
-    try:
-        from backend.config import config
-
-        # Use module-level SESSION_DEBUG constant
-        session_debug = SESSION_DEBUG
-
-        # Only log for specific endpoints to reduce noise
-        path = request.path
-        if not any(p in path for p in ["/api/me", "/api/billing/checkout", "/api/billing/subscriptions", "/api/auth/"]):
-            return
-
-        # Get raw Cookie header
-        raw_cookie_header = request.headers.get("Cookie", "(no Cookie header)")
-
-        # Get parsed cookie value (Flask's version)
-        flask_parsed_sid = request.cookies.get("timrx_sid", "(not found)")
-
-        # Count how many timrx_sid appear in raw header (detect collision)
-        sid_count = raw_cookie_header.count("timrx_sid=")
-
-        # Get resolved session ID using our collision-aware logic
-        try:
-            from backend.services.identity_service import IdentityService
-            resolved_sid, candidates, reason = IdentityService.resolve_session_id(request)
-        except Exception:
-            resolved_sid, candidates, reason = None, [], "error"
-
-        # Collision detection
-        is_collision = sid_count > 1
-
-        # Production: only log a minimal one-liner for collisions (for monitoring)
-        # Debug mode (SESSION_DEBUG=1): log verbose block
-        if not session_debug:
-            if is_collision:
-                # Minimal collision log for production monitoring
-                print(f"[SESSION] Cookie collision: {len(candidates)} cookies, resolved={reason}")
-            return
-
-        # Verbose debug block (only when SESSION_DEBUG=1)
-        print("=" * 70)
-        print(f"[SESSION DEBUG] {endpoint_name} - {request.method} {path}")
-        print("-" * 70)
-        print("  Config:")
-        print(f"    IS_PROD={config.IS_PROD}, IS_RENDER={config.IS_RENDER}")
-        print(f"    SESSION_COOKIE_DOMAIN={config.SESSION_COOKIE_DOMAIN!r}")
-        print(f"    SESSION_COOKIE_SAMESITE={config.SESSION_COOKIE_SAMESITE!r}")
-        print(f"    SESSION_COOKIE_SECURE={config.SESSION_COOKIE_SECURE}")
-        print("  Request:")
-        print(f"    Host: {request.host}")
-        print(f"    Origin: {request.headers.get('Origin', '(none)')}")
-        print(f"    timrx_sid count in Cookie header: {sid_count}")
-        if is_collision:
-            print("    *** COOKIE COLLISION DETECTED! ***")
-            print(f"    Candidates: {[s[:8] + '...' for s in candidates]}")
-            print(f"    Resolution: {reason}")
-        print(f"    Flask parsed: {flask_parsed_sid[:16] + '...' if flask_parsed_sid != '(not found)' else flask_parsed_sid}")
-        print(f"    Our resolved: {resolved_sid[:16] + '...' if resolved_sid else 'None'}")
-        print(f"    Raw Cookie: {raw_cookie_header[:300]}{'...' if len(raw_cookie_header) > 300 else ''}")
-        print("=" * 70)
-
-    except Exception as e:
-        print(f"[SESSION DEBUG] Error in debug logging: {e}")
-
 # NOTE: Do NOT import IdentityService, config, or db at module level!
 # These cause circular imports. Import them lazily inside functions.
 
@@ -116,43 +44,61 @@ def _get_database_error():
     return DatabaseError
 
 
+# ─────────────────────────────────────────────────────────────
+# Core identity resolution (shared by ALL middleware decorators)
+# ─────────────────────────────────────────────────────────────
+
+def _resolve_identity():
+    """
+    Resolve the current request's identity, using request-scoped caching.
+
+    Returns (identity_dict_or_None, session_id_or_None).
+    After this call, g.session_id / g.identity_id / g.identity are set.
+
+    This is the ONLY function that should call get_current_identity().
+    All middleware decorators delegate here so that within a single HTTP
+    request the identity is resolved at most once (0 or 1 DB borrows for
+    session validation, 0 or 1 for touch).
+    """
+    # Fast path: already resolved in this request
+    if getattr(g, '_identity_resolved', False):
+        return g.identity, g.session_id
+
+    IdentityService = _get_identity_service()
+
+    session_id = IdentityService.get_session_id_from_request(request)
+    identity = IdentityService.get_current_identity(request)
+
+    g.session_id = session_id
+    g.identity_id = str(identity["id"]) if identity else None
+    g.identity = identity
+    g._identity_resolved = True
+
+    return identity, session_id
+
+
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+
 def no_cache(f):
-    """
-    Decorator that adds Cache-Control headers to prevent caching.
-
-    Adds:
-        - Cache-Control: no-store, no-cache, must-revalidate, max-age=0
-        - Pragma: no-cache (for HTTP/1.0 compatibility)
-        - Expires: 0
-
-    Use for sensitive endpoints like /api/me, /api/credits/*, /api/billing/*.
-    This ensures Cloudflare returns CF-Cache-Status: DYNAMIC.
-    """
+    """Decorator that adds Cache-Control headers to prevent caching."""
     @wraps(f)
     def decorated(*args, **kwargs):
         result = f(*args, **kwargs)
-
-        # Handle different return types
         if hasattr(result, 'headers'):
-            # Already a Response object
             response = result
         elif isinstance(result, tuple):
-            # Tuple (body, status) or (body, status, headers)
             response = make_response(result[0], result[1] if len(result) > 1 else 200)
             if len(result) > 2:
                 for key, value in result[2].items():
                     response.headers[key] = value
         else:
-            # Plain return value (dict, string, etc.)
             response = make_response(result)
-
-        # Add no-cache headers
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
-
         return response
-
     return decorated
 
 
@@ -171,6 +117,20 @@ def _copy_cookies(source_response, target_response):
         target_response.headers.add('Set-Cookie', cookie)
 
 
+def _maybe_refresh_cookie(identity, session_id, result):
+    """If session was renewed (sliding window), refresh cookie Max-Age."""
+    if identity and identity.get("_session_renewed") and session_id:
+        IdentityService = _get_identity_service()
+        resp = _ensure_response(result)
+        IdentityService.set_session_cookie(resp, session_id)
+        return resp
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# Session/Auth Middleware Decorators
+# ─────────────────────────────────────────────────────────────
+
 def with_session(f):
     """
     Decorator that ensures a session exists.
@@ -178,40 +138,22 @@ def with_session(f):
     Skips session logic entirely for OPTIONS (CORS preflight).
 
     Sets on g:
-        - g.session_id: The session ID
-        - g.identity_id: The identity ID (string)
-        - g.identity: The full identity dict (with wallet balance)
-
-    The session cookie is automatically set on new sessions.
-    If an existing session was renewed (sliding window), the cookie
-    Max-Age is refreshed so the browser stays in sync.
+        - g.session_id, g.identity_id, g.identity
     """
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
             return f(*args, **kwargs)
+
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
-        _log_session_debug("with_session")
-
         try:
-            identity = IdentityService.get_current_identity(request)
+            identity, session_id = _resolve_identity()
 
             if identity:
-                g.session_id = IdentityService.get_session_id_from_request(request)
-                g.identity_id = str(identity["id"])
-                g.identity = identity
-
                 result = f(*args, **kwargs)
-
-                # If session was renewed (sliding window), refresh cookie Max-Age
-                if identity.get("_session_renewed") and g.session_id:
-                    resp = _ensure_response(result)
-                    IdentityService.set_session_cookie(resp, g.session_id)
-                    return resp
-
-                return result
+                return _maybe_refresh_cookie(identity, session_id, result)
 
             # No valid session — create anonymous identity + session
             cookie_response = make_response()
@@ -220,6 +162,7 @@ def with_session(f):
             g.session_id = session_id
             g.identity_id = identity_id
             g.identity = IdentityService.get_identity_with_wallet(identity_id)
+            g._identity_resolved = True
 
             result = f(*args, **kwargs)
             resp = _ensure_response(result)
@@ -229,10 +172,7 @@ def with_session(f):
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in with_session: {e}")
             return jsonify({
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "Database error occurred"
-                }
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
 
     return decorated
@@ -241,56 +181,26 @@ def with_session(f):
 def with_optional_session(f):
     """
     Decorator that validates an existing session but NEVER creates one.
-
-    AUTH-3: Used by restore/redeem to avoid creating throwaway identities.
-    If no valid session exists, sets g.session_id / g.identity_id / g.identity
-    to None and lets the handler proceed — the handler is responsible for
-    creating a session for the restore target if needed.
-
-    Sets on g:
-        - g.session_id: The session ID, or None
-        - g.identity_id: The identity ID (string), or None
-        - g.identity: The full identity dict, or None
+    If no valid session, sets g fields to None and lets the handler proceed.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
-        IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
-        _log_session_debug("with_optional_session")
-
         try:
-            identity = IdentityService.get_current_identity(request)
+            identity, session_id = _resolve_identity()
 
             if identity:
-                g.session_id = IdentityService.get_session_id_from_request(request)
-                g.identity_id = str(identity["id"])
-                g.identity = identity
-
                 result = f(*args, **kwargs)
+                return _maybe_refresh_cookie(identity, session_id, result)
 
-                # If session was renewed (sliding window), refresh cookie Max-Age
-                if identity.get("_session_renewed") and g.session_id:
-                    resp = _ensure_response(result)
-                    IdentityService.set_session_cookie(resp, g.session_id)
-                    return resp
-
-                return result
-
-            # No valid session — proceed WITHOUT creating one
-            g.session_id = None
-            g.identity_id = None
-            g.identity = None
-
+            # No valid session — proceed without one
             return f(*args, **kwargs)
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in with_optional_session: {e}")
             return jsonify({
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "Database error occurred"
-                }
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
 
     return decorated
@@ -302,72 +212,36 @@ def require_session(f):
     Returns 401 if no valid session exists.
     Does NOT create anonymous sessions.
     Skips auth for OPTIONS (CORS preflight).
-
-    Sets on g:
-        - g.session_id: The session ID
-        - g.identity_id: The identity ID (string)
-        - g.identity: The full identity dict
     """
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
             return f(*args, **kwargs)
-        # Lazy imports to avoid circular import at module load time
-        IdentityService = _get_identity_service()
+
         DatabaseError = _get_database_error()
 
-        # DEBUG: Log session diagnostics
-        _log_session_debug("require_session")
-
         try:
-            # Get session ID first for logging
-            session_id = IdentityService.get_session_id_from_request(request)
-            identity = IdentityService.get_current_identity(request)
+            identity, session_id = _resolve_identity()
 
             if not identity:
-                # DEBUG: Log subscription auth failures always (production debugging)
-                # For other paths, only log when SESSION_DEBUG=1
-                is_subscription_path = "/subscriptions" in request.path
-                cookie_present = bool(request.cookies.get("timrx_sid"))
-                origin = request.headers.get("Origin", "(no origin)")
-
-                if is_subscription_path or SESSION_DEBUG:
+                if SESSION_DEBUG or "/subscriptions" in request.path:
                     print(
                         f"[MIDDLEWARE] require_session 401: "
                         f"path={request.path}, "
-                        f"origin={origin}, "
-                        f"cookie_present={cookie_present}, "
-                        f"session_id={session_id[:16] + '...' if session_id else 'None'}, "
-                        f"identity=None (session invalid/expired/not_found)"
+                        f"cookie_present={bool(request.cookies.get('timrx_sid'))}, "
+                        f"session_id={session_id[:16] + '...' if session_id else 'None'}"
                     )
                 return jsonify({
-                    "error": {
-                        "code": "UNAUTHORIZED",
-                        "message": "Valid session required"
-                    }
+                    "error": {"code": "UNAUTHORIZED", "message": "Valid session required"}
                 }), 401
 
-            g.session_id = session_id
-            g.identity_id = str(identity["id"])
-            g.identity = identity
-
             result = f(*args, **kwargs)
-
-            # If session was renewed (sliding window), refresh cookie Max-Age
-            if identity.get("_session_renewed") and session_id:
-                resp = _ensure_response(result)
-                IdentityService.set_session_cookie(resp, session_id)
-                return resp
-
-            return result
+            return _maybe_refresh_cookie(identity, session_id, result)
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in require_session: {e}")
             return jsonify({
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "Database error occurred"
-                }
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
 
     return decorated
@@ -377,50 +251,33 @@ def require_email(f):
     """
     Decorator that requires a valid session with an attached email.
     Returns 401 if no session, 403 if no email attached.
-    Skips auth for OPTIONS (CORS preflight).
-
-    Use for endpoints that require email (e.g., purchases).
     """
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
             return f(*args, **kwargs)
-        # Lazy imports to avoid circular import at module load time
-        IdentityService = _get_identity_service()
+
         DatabaseError = _get_database_error()
 
         try:
-            identity = IdentityService.get_current_identity(request)
+            identity, _ = _resolve_identity()
 
             if not identity:
                 return jsonify({
-                    "error": {
-                        "code": "UNAUTHORIZED",
-                        "message": "Valid session required"
-                    }
+                    "error": {"code": "UNAUTHORIZED", "message": "Valid session required"}
                 }), 401
 
             if not identity.get("email"):
                 return jsonify({
-                    "error": {
-                        "code": "EMAIL_REQUIRED",
-                        "message": "Email address required for this action"
-                    }
+                    "error": {"code": "EMAIL_REQUIRED", "message": "Email address required for this action"}
                 }), 403
-
-            g.session_id = IdentityService.get_session_id_from_request(request)
-            g.identity_id = str(identity["id"])
-            g.identity = identity
 
             return f(*args, **kwargs)
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in require_email: {e}")
             return jsonify({
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "Database error occurred"
-                }
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
 
     return decorated
@@ -430,83 +287,51 @@ def require_verified_email(f):
     """
     Decorator that requires a valid session with a VERIFIED email.
     Returns 401 if no session, 403 if no email or email not verified.
-    Skips auth for OPTIONS (CORS preflight).
-
-    Use for paid actions (checkout, subscriptions) that require verified email.
-
-    Error codes:
-        - UNAUTHORIZED: No valid session
-        - EMAIL_REQUIRED: No email attached to identity
-        - EMAIL_NOT_VERIFIED: Email attached but not yet verified
     """
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
             return f(*args, **kwargs)
-        # Lazy imports to avoid circular import at module load time
-        IdentityService = _get_identity_service()
+
         DatabaseError = _get_database_error()
 
         try:
-            identity = IdentityService.get_current_identity(request)
+            identity, _ = _resolve_identity()
 
             if not identity:
                 return jsonify({
-                    "error": {
-                        "code": "UNAUTHORIZED",
-                        "message": "Valid session required"
-                    }
+                    "error": {"code": "UNAUTHORIZED", "message": "Valid session required"}
                 }), 401
 
             if not identity.get("email"):
                 return jsonify({
-                    "error": {
-                        "code": "EMAIL_REQUIRED",
-                        "message": "Email address required for this action"
-                    }
+                    "error": {"code": "EMAIL_REQUIRED", "message": "Email address required for this action"}
                 }), 403
 
             if not identity.get("email_verified"):
                 return jsonify({
-                    "error": {
-                        "code": "EMAIL_NOT_VERIFIED",
-                        "message": "Please verify your email address before making purchases"
-                    }
+                    "error": {"code": "EMAIL_NOT_VERIFIED", "message": "Please verify your email address before making purchases"}
                 }), 403
-
-            g.session_id = IdentityService.get_session_id_from_request(request)
-            g.identity_id = str(identity["id"])
-            g.identity = identity
 
             return f(*args, **kwargs)
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in require_verified_email: {e}")
             return jsonify({
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "Database error occurred"
-                }
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
 
     return decorated
 
 
 def get_identity_from_request():
-    """
-    Helper function to get identity from current request.
-    Returns None if no valid session.
-    Use this when you don't want a decorator.
-    """
-    IdentityService = _get_identity_service()
-    return IdentityService.get_current_identity(request)
+    """Helper function to get identity from current request."""
+    identity, _ = _resolve_identity()
+    return identity
 
 
 def get_session_id_from_request():
-    """
-    Helper function to get session ID from current request.
-    Returns None if no session cookie.
-    """
+    """Helper function to get session ID from current request."""
     IdentityService = _get_identity_service()
     return IdentityService.get_session_id_from_request(request)
 
@@ -514,34 +339,20 @@ def get_session_id_from_request():
 def require_admin(f):
     """
     Decorator that requires admin authentication.
-    Supports two authentication methods:
-      1. Token-based: X-Admin-Token header (for scripts/automation)
-      2. Email-based: Session with email in ADMIN_EMAILS list (for browser)
-
-    Returns 401 if not authenticated, 403 if not an admin.
-
-    Sets on g:
-        - g.admin_auth_method: 'token' or 'email'
-        - g.admin_email: The admin email (if email-based auth)
-        - g.identity: The identity (if email-based auth)
+    Supports token-based (X-Admin-Token) and email-based auth.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Lazy imports to avoid circular import at module load time
         from backend.config import config
         IdentityService = _get_identity_service()
         DatabaseError = _get_database_error()
 
-        # Check if admin auth is configured at all
         if not config.ADMIN_AUTH_CONFIGURED:
             return jsonify({
-                "error": {
-                    "code": "ADMIN_NOT_CONFIGURED",
-                    "message": "Admin authentication is not configured"
-                }
+                "error": {"code": "ADMIN_NOT_CONFIGURED", "message": "Admin authentication is not configured"}
             }), 503
 
-        # Method 1: Token-based authentication (X-Admin-Token header)
+        # Method 1: Token-based authentication
         admin_token = request.headers.get("X-Admin-Token")
         if admin_token:
             if config.ADMIN_TOKEN and admin_token == config.ADMIN_TOKEN:
@@ -551,56 +362,37 @@ def require_admin(f):
                 return f(*args, **kwargs)
             else:
                 return jsonify({
-                    "error": {
-                        "code": "INVALID_ADMIN_TOKEN",
-                        "message": "Invalid admin token"
-                    }
+                    "error": {"code": "INVALID_ADMIN_TOKEN", "message": "Invalid admin token"}
                 }), 403
 
-        # Method 2: Email-based authentication (session with admin email)
+        # Method 2: Email-based authentication
         try:
-            identity = IdentityService.get_current_identity(request)
+            identity, _ = _resolve_identity()
 
             if not identity:
                 return jsonify({
-                    "error": {
-                        "code": "UNAUTHORIZED",
-                        "message": "Authentication required"
-                    }
+                    "error": {"code": "UNAUTHORIZED", "message": "Authentication required"}
                 }), 401
 
             email = identity.get("email")
             if not email:
                 return jsonify({
-                    "error": {
-                        "code": "EMAIL_REQUIRED",
-                        "message": "Admin access requires verified email"
-                    }
+                    "error": {"code": "EMAIL_REQUIRED", "message": "Admin access requires verified email"}
                 }), 403
 
             if not config.is_admin_email(email):
                 return jsonify({
-                    "error": {
-                        "code": "NOT_ADMIN",
-                        "message": "You do not have admin privileges"
-                    }
+                    "error": {"code": "NOT_ADMIN", "message": "You do not have admin privileges"}
                 }), 403
 
             g.admin_auth_method = "email"
             g.admin_email = email
-            g.session_id = IdentityService.get_session_id_from_request(request)
-            g.identity_id = str(identity["id"])
-            g.identity = identity
-
             return f(*args, **kwargs)
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in require_admin: {e}")
             return jsonify({
-                "error": {
-                    "code": "DATABASE_ERROR",
-                    "message": "Database error occurred"
-                }
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
 
     return decorated

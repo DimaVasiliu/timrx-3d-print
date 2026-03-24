@@ -47,12 +47,58 @@ from backend.emailer import notify_new_identity
 # Debug flag for verbose cookie logging (set SESSION_DEBUG=1 to enable)
 SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 
+# ─── Short-TTL in-process session cache ──────────────────────
+# Absorbs the burst of 4-6 concurrent requests from a single browser
+# page load that all validate the same session_id simultaneously.
+# Positive-only (never caches failures), per-process, auto-evicts.
+import time as _time
+import threading as _threading
+
+_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "5"))  # seconds
+_SESSION_CACHE_MAX = int(os.getenv("SESSION_CACHE_MAX", "200"))   # max entries
+_session_cache: Dict[str, tuple] = {}   # session_id -> (identity_dict, expires_at)
+_session_cache_lock = _threading.Lock()
+
+
+def _session_cache_get(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return cached identity if still valid, else None."""
+    entry = _session_cache.get(session_id)
+    if entry and entry[1] > _time.monotonic():
+        return entry[0]
+    return None
+
+
+def _session_cache_put(session_id: str, identity: Dict[str, Any]):
+    """Store a successful validation result. Evicts oldest if at capacity."""
+    now = _time.monotonic()
+    with _session_cache_lock:
+        # Evict expired entries if at capacity
+        if len(_session_cache) >= _SESSION_CACHE_MAX:
+            expired = [k for k, (_, exp) in _session_cache.items() if exp <= now]
+            for k in expired:
+                del _session_cache[k]
+            # If still at capacity after evicting expired, drop oldest quarter
+            if len(_session_cache) >= _SESSION_CACHE_MAX:
+                to_drop = sorted(_session_cache, key=lambda k: _session_cache[k][1])[:_SESSION_CACHE_MAX // 4]
+                for k in to_drop:
+                    del _session_cache[k]
+        _session_cache[session_id] = (identity, now + _SESSION_CACHE_TTL)
+
+
+def _session_cache_invalidate(session_id: str):
+    """Remove a session from cache (on revoke, merge, etc.)."""
+    _session_cache.pop(session_id, None)
+
 # Production safety warning (one-time at startup)
 if SESSION_DEBUG and config.IS_PROD:
     print(
         "[WARN] SESSION_DEBUG enabled in production - "
         "disable after troubleshooting (set SESSION_DEBUG=0 or remove env var)"
     )
+
+
+# Sentinel to distinguish "cached None" from "not cached yet"
+_IDENTITY_NONE_SENTINEL = object()
 
 
 class IdentityService:
@@ -612,14 +658,25 @@ class IdentityService:
     def touch_identity(identity_id: str) -> bool:
         """
         Update last_seen_at for an identity.
-        Called on each authenticated request.
+        Runs at most once per HTTP request (skips if already touched).
         """
+        # Request-scoped dedup: don't touch again in the same request
+        try:
+            if getattr(g, '_identity_touch_done', False):
+                return True
+        except RuntimeError:
+            pass  # outside request context
+
         try:
             count = execute(
                 f"UPDATE {Tables.IDENTITIES} SET last_seen_at = NOW() WHERE id = %s",
                 (identity_id,),
                 source="identity_touch",
             )
+            try:
+                g._identity_touch_done = True
+            except RuntimeError:
+                pass
             return count > 0
         except DatabaseError:
             return False
@@ -792,9 +849,10 @@ class IdentityService:
     @staticmethod
     def revoke_session(session_id: str) -> bool:
         """
-        Revoke a session by ID.
+        Revoke a session by ID. Also evicts from process cache.
         Returns True on success.
         """
+        _session_cache_invalidate(session_id)
         try:
             count = execute(
                 f"UPDATE {Tables.SESSIONS} SET revoked_at = NOW() WHERE id = %s AND revoked_at IS NULL",
@@ -1136,11 +1194,55 @@ class IdentityService:
         Get the current identity from the request session.
         Returns None if no valid session.
         Does NOT create a new identity.
+
+        Uses three cache layers to minimize DB borrows:
+        1. g._cached_identity — request-scoped (same HTTP request never hits DB twice)
+        2. _session_cache — process-level 5s TTL (absorbs concurrent fan-out)
+        3. DB — full validate_session() with touch + renewal
         """
+        # Layer 1: request-scoped cache (already resolved this request)
+        try:
+            cached = getattr(g, '_cached_identity', None)
+            if cached is not None:
+                g._identity_source = "request_cache"
+                return cached if cached != _IDENTITY_NONE_SENTINEL else None
+        except RuntimeError:
+            pass  # outside request context (background thread)
+
         session_id = IdentityService.get_session_id_from_request(request)
         if not session_id:
+            try:
+                g._cached_identity = _IDENTITY_NONE_SENTINEL
+                g._identity_source = "no_cookie"
+            except RuntimeError:
+                pass
             return None
-        return IdentityService.validate_session(session_id)
+
+        # Layer 2: process-level short-TTL cache (absorbs concurrent startup fan-out)
+        cached_identity = _session_cache_get(session_id)
+        if cached_identity is not None:
+            try:
+                g._cached_identity = cached_identity
+                g._identity_source = "process_cache"
+            except RuntimeError:
+                pass
+            return cached_identity
+
+        # Layer 3: DB — full validation (happens once per session per TTL window)
+        identity = IdentityService.validate_session(session_id)
+
+        try:
+            if identity:
+                g._cached_identity = identity
+                g._identity_source = "db"
+                _session_cache_put(session_id, identity)
+            else:
+                g._cached_identity = _IDENTITY_NONE_SENTINEL
+                g._identity_source = "db_miss"
+        except RuntimeError:
+            pass
+
+        return identity
 
     @staticmethod
     def require_identity(request) -> Dict[str, Any]:
