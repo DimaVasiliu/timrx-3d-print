@@ -2042,9 +2042,12 @@ def start_operations_loop():
 
         cycle = 0
         consecutive_db_errors = 0
-        # Wait briefly for the worker thread to attempt leader election
-        # before deciding whether to run heavy ops.
-        _worker_stop.wait(timeout=5)
+        # Wait for the pool to warm up and the initial user-request burst
+        # to pass before starting background DB operations.  This also
+        # gives the worker thread time to complete leader election.
+        _worker_stop.wait(timeout=10)
+        if _worker_stop.is_set():
+            return
 
         print(f"[OPS] operations loop started pid={pid} sweep_interval={sweep_interval}s "
               f"sweep_enabled={sweep_enabled} rescue_enabled={rescue_enabled} "
@@ -2066,15 +2069,18 @@ def start_operations_loop():
                 _worker_stop.wait(timeout=backoff_s)
                 continue
 
-            # -- Stall detection (always runs on all workers, lightweight) --
-            try:
-                detect_stalled_jobs()
-            except Exception as e:
-                if is_transient_db_error(e):
-                    _cycle_had_db_error = True
-                    print(f"[OPS][TRANSIENT] stall detection: {type(e).__name__}: {e}")
-                else:
-                    print(f"[OPS] stall detection error: {e}")
+            # -- Stall detection (leader only when leader_only=true) --
+            # Previously ran on all workers, but non-leaders never claim jobs
+            # so their stall detection is wasted DB work.
+            if _am_leader or not leader_only:
+                try:
+                    detect_stalled_jobs()
+                except Exception as e:
+                    if is_transient_db_error(e):
+                        _cycle_had_db_error = True
+                        print(f"[OPS][TRANSIENT] stall detection: {type(e).__name__}: {e}")
+                    else:
+                        print(f"[OPS] stall detection error: {e}")
 
             # -- Stale sweep (leader only when leader_only=true) --
             if sweep_enabled and (_am_leader or not leader_only):
