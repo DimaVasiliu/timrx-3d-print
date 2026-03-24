@@ -54,7 +54,7 @@ SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 import time as _time
 import threading as _threading
 
-_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "5"))  # seconds
+_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "15"))  # seconds (was 5; raised to absorb status-poll bursts)
 _SESSION_CACHE_MAX = int(os.getenv("SESSION_CACHE_MAX", "200"))   # max entries
 _session_cache: Dict[str, tuple] = {}   # session_id -> (identity_dict, expires_at)
 _session_cache_lock = _threading.Lock()
@@ -1468,3 +1468,4 @@ def require_identity() -> tuple[str | None, Response | None]:
         }),
         401,
     )
+
