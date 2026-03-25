@@ -194,6 +194,17 @@ def _get_pool():
                 f"check={'SELECT1' if _DB_POOL_CHECK else 'DISABLED'} "
                 f"pid={os.getpid()}"
             )
+            # Warn if pool min_size is too small for the thread count.
+            # Each Gunicorn thread can need 1-2 pool connections concurrently.
+            # min_size < 2×threads means checkout waits during request bursts.
+            _gunicorn_threads = int(os.getenv("GUNICORN_THREADS", "4"))
+            _recommended_min = _gunicorn_threads * 2
+            if _DB_POOL_MIN_SIZE < _recommended_min:
+                print(
+                    f"[DB][WARN] Pool min_size={_DB_POOL_MIN_SIZE} is below "
+                    f"recommended {_recommended_min} for {_gunicorn_threads} threads. "
+                    f"Set DB_POOL_MIN_SIZE={_recommended_min} to reduce PoolTimeout fallbacks."
+                )
             return _pool
         except Exception as e:
             print(f"[DB] Pool init failed: {e} — using direct connections")
