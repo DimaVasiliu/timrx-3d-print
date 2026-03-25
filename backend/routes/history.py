@@ -35,7 +35,7 @@ def invalidate_history_cache(identity_id: str):
     keys_to_drop = [k for k in _history_cache if k.startswith(prefix)]
     for k in keys_to_drop:
         _history_cache.pop(k, None)
-from backend.middleware import with_session
+from backend.middleware import with_session, with_session_readonly
 from backend.services.history_service import (
     _local_history_id,
     _lookup_asset_id_for_history,
@@ -57,7 +57,11 @@ bp = Blueprint("history", __name__)
 
 @bp.route("/history", methods=["GET", "POST", "OPTIONS"])
 def history_mod():
-    @with_session
+    # GET is read-only: use readonly session (skips touch + renewal = 0 DB writes).
+    # POST modifies history: use full session (touch + renewal as normal).
+    _session_wrapper = with_session_readonly if request.method == "GET" else with_session
+
+    @_session_wrapper
     def _inner():
         if request.method == "OPTIONS":
             return ("", 204)
