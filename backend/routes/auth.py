@@ -360,9 +360,31 @@ def redeem_restore():
                 f"{identity_id[:8]}... (no throwaway identity)"
             )
 
+    # Invalidate stale session process cache so subsequent /api/me and
+    # /api/credits/wallet calls return the NEW identity's data, not the
+    # old anonymous identity cached for this session_id.
+    if session_id:
+        from backend.services.identity_service import _session_cache_invalidate
+        _session_cache_invalidate(session_id)
+
+    # Also invalidate response caches for both identities
+    from backend.routes.me import _me_cache
+    _me_cache.pop(identity_id, None)
+    if g.identity_id and g.identity_id != identity_id:
+        _me_cache.pop(g.identity_id, None)
+    # Invalidate wallet cache so /api/credits/wallet returns fresh data
+    from backend.services.wallet_service import invalidate_wallet_cache
+    invalidate_wallet_cache(identity_id)
+
     # Fetch updated identity and wallet data
     identity = IdentityService.get_identity(identity_id)
     wallet = WalletService.get_wallet(identity_id)
+
+    # Seed session cache with the new identity so subsequent GET /api/me
+    # and /api/credits/wallet return the correct identity immediately.
+    if session_id and identity:
+        from backend.services.identity_service import _session_cache_put
+        _session_cache_put(session_id, identity)
 
     balance = wallet.get("balance_credits", 0) if wallet else 0
     reserved = WalletService.get_reserved_credits(identity_id)
