@@ -31,11 +31,19 @@ def get_me():
     """
     Get current session info.
     Creates anonymous identity if none exists.
-    Returns identity_id, email (if set), wallet balances (general + video), etc.
+
+    Returns identity fields only — NO wallet queries.
+    Wallet data comes from /api/credits/wallet (separate, faster endpoint).
+    This split means /api/me needs 0 extra DB queries beyond session validation,
+    making it fast (~50ms) even under pool pressure.
+
+    For backward compatibility, balance fields are still present in the
+    response but set to 0.  Frontend MUST use /api/credits/wallet for
+    authoritative wallet state.
     """
     identity_id = g.identity_id
 
-    # Fast path: return cached response if fresh (avoids all DB calls)
+    # Fast path: return cached response if fresh
     cached = _me_cache.get(identity_id)
     if cached:
         payload, ts = cached
@@ -44,20 +52,6 @@ def get_me():
 
     try:
         identity = g.identity
-
-        balance = 0
-        video_balance = 0
-        reserved = 0
-        video_reserved = 0
-
-        if identity_id:
-            balances = WalletService.get_all_balances(identity_id)
-            balance = balances["general"]
-            video_balance = balances["video"]
-
-            reserved_credits = WalletService.get_all_reserved_credits(identity_id)
-            reserved = reserved_credits["general"]
-            video_reserved = reserved_credits["video"]
 
         last_active_at = None
         if identity:
@@ -70,12 +64,14 @@ def get_me():
             "identity_id": identity_id,
             "email": identity.get("email") if identity else None,
             "email_verified": identity.get("email_verified", False) if identity else False,
-            "balance_credits": balance,
-            "reserved_credits": reserved,
-            "available_credits": max(0, balance - reserved),
-            "balance_video_credits": video_balance,
-            "reserved_video_credits": video_reserved,
-            "available_video_credits": max(0, video_balance - video_reserved),
+            # Wallet fields kept for backward compatibility but always 0.
+            # Frontend should use /api/credits/wallet for real balances.
+            "balance_credits": 0,
+            "reserved_credits": 0,
+            "available_credits": 0,
+            "balance_video_credits": 0,
+            "reserved_video_credits": 0,
+            "available_video_credits": 0,
             "created_at": identity.get("created_at").isoformat() if identity and identity.get("created_at") else None,
             "last_active_at": last_active_at,
         }
