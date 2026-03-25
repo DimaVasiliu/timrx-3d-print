@@ -1622,7 +1622,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
         return False
 
     try:
-        with get_conn() as conn:
+        with get_conn(source="save_finished_job") as conn:
+            # Pooled connections are in autocommit mode, but this function
+            # uses SAVEPOINTs for partial error recovery.  SAVEPOINTs require
+            # an active transaction block, so switch out of autocommit.
+            # conn.commit() at the end of this block commits the work.
+            conn.autocommit = False
             cur = conn.cursor(row_factory=dict_row)
             db_errors: list[dict[str, str]] = []
             glb_url = status_data.get("glb_url") or status_data.get("textured_glb_url")
