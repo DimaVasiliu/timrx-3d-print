@@ -156,20 +156,24 @@ def _get_pool():
     global _pool, _pool_init_attempted
     if not _DB_POOL_ENABLED:
         return None
+
+    # Always check PID first — detect stale pool from pre-fork master.
+    # Must run BEFORE any fast-path return so the very first call from a
+    # job-worker thread (or any post-fork code) resets immediately instead
+    # of wasting a full pool timeout on dead sockets.
+    if _pool is not None and hasattr(_pool, '_opener_pid') and _pool._opener_pid != os.getpid():
+        print(f"[DB] Pool PID mismatch: created in pid={_pool._opener_pid}, "
+              f"current pid={os.getpid()} — resetting stale pool")
+        try:
+            _pool.close()
+        except Exception:
+            pass
+        _pool = None
+        _pool_init_attempted = False
+        # Fall through to create fresh pool
+
     if _pool is not None:
-        # Detect pool created in master before fork
-        if hasattr(_pool, '_opener_pid') and _pool._opener_pid != os.getpid():
-            print(f"[DB] Pool PID mismatch: created in pid={_pool._opener_pid}, "
-                  f"current pid={os.getpid()} — resetting stale pool")
-            try:
-                _pool.close()
-            except Exception:
-                pass
-            _pool = None
-            _pool_init_attempted = False
-            # Fall through to create a new pool in this worker
-        else:
-            return _pool
+        return _pool
     if _pool_init_attempted:
         return None
     if not _POOL_AVAILABLE or not _DATABASE_URL or not PSYCOPG_AVAILABLE:
