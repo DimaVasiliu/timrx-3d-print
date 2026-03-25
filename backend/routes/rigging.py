@@ -167,6 +167,23 @@ def rig_preflight():
                 try:
                     task_info = mesh_get(f"/openapi/v1/image-to-3d/{source_task_id}")
                     print(f"[RIG_PREFLIGHT] found via image-to-3d: task={source_task_id}")
+                    # Extract face count from image-to-3d response (same structure)
+                    face_count = None
+                    vertex_count = None
+                    for container_key in ["output", "result", ""]:
+                        container = task_info.get(container_key, task_info) if container_key else task_info
+                        if isinstance(container, dict):
+                            face_count = face_count or container.get("face_count") or container.get("faces")
+                            vertex_count = vertex_count or container.get("vertex_count") or container.get("vertices")
+                    if face_count:
+                        result["face_count"] = int(face_count)
+                        result["vertex_count"] = int(vertex_count) if vertex_count else None
+                        if result["face_count"] > 300000:
+                            result["riggable"] = False
+                            result["reason"] = f"Model has {result['face_count']:,} faces (limit: 300,000). Remesh the model first."
+                            result["recommended_action"] = "remesh_first"
+                            print(f"[RIG_PREFLIGHT] too_many_faces: {result['face_count']} > 300K")
+                    print(f"[RIG_PREFLIGHT] image-to-3d faces={face_count} vertices={vertex_count}")
                 except Exception:
                     print(f"[RIG_PREFLIGHT] task_lookup_failed (may be fine for uploaded models): {e}")
             else:
