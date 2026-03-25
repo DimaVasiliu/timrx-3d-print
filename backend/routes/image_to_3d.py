@@ -58,12 +58,16 @@ def image_to_3d_start_mod():
     prompt = (body.get("prompt") or "").strip()
     # For image-to-3d, use prompt if available, otherwise use a descriptive fallback
     title = derive_display_title(prompt, None) if prompt else "Image to 3D Model"
+    # Link to source image history item for lineage grouping
+    source_image_history_id = (body.get("source_image_history_id") or "").strip() or None
     job_meta = {
         "prompt": prompt,
         "root_prompt": prompt,
         "title": title,
         "stage": "image3d",
     }
+    if source_image_history_id:
+        job_meta["source_task_id"] = source_image_history_id
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
         return credit_error
@@ -87,6 +91,7 @@ def image_to_3d_start_mod():
         "identity_id": identity_id,
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
+        "source_task_id": source_image_history_id,
     }
 
     # Persist immediately so status polling can return queued while dispatch runs
