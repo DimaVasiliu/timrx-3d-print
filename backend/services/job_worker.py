@@ -71,7 +71,7 @@ HEARTBEAT_TIMEOUT = 90           # seconds before a claim is considered expired
 STALL_TIMEOUT = 120              # seconds before marking a job as stalled
 POLL_SLEEP_PENDING = 15          # seconds between provider polls (pending)
 POLL_SLEEP_PROCESSING = 10       # seconds between provider polls (processing)
-WORKER_LOOP_SLEEP = 5            # seconds between claim attempts when idle
+WORKER_LOOP_SLEEP = 10           # seconds between claim attempts when idle (video jobs take minutes; 10s is fine)
 MAX_ATTEMPTS = 5                 # max retry attempts before permanent failure
 MAX_RECOVERY_AGE_HOURS = 48      # don't claim jobs older than this
 
