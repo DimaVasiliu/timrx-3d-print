@@ -114,9 +114,12 @@ _worker_stop = threading.Event()
 _leader_conn = None  # Dedicated connection holding the advisory lock
 
 
+_atexit_registered = False
+
+
 def start_worker():
     """Start the durable job worker in a background daemon thread."""
-    global _worker_thread
+    global _worker_thread, _atexit_registered
     if _worker_thread and _worker_thread.is_alive():
         print(f"[JOB] Worker already running: {WORKER_ID}")
         return
@@ -129,6 +132,22 @@ def start_worker():
     )
     _worker_thread.start()
     print(f"[JOB] Worker thread launched: {WORKER_ID}")
+
+    # Register atexit handler so worker+ops threads stop cleanly on
+    # SIGTERM / Gunicorn shutdown.  Without this, daemon threads keep
+    # running (and hitting the DB pool) during the 30s Render grace
+    # period after a deploy, producing log spam that looks like the
+    # NEW process is doing ops work at startup.
+    if not _atexit_registered:
+        import atexit
+        atexit.register(_shutdown_all_workers)
+        _atexit_registered = True
+
+
+def _shutdown_all_workers():
+    """atexit callback: signal all background threads to stop immediately."""
+    _worker_stop.set()
+    print(f"[JOB][pid={os.getpid()}] atexit: signaled worker+ops threads to stop")
 
 
 def stop_worker():
