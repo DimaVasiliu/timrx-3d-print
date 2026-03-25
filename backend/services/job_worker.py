@@ -1890,17 +1890,18 @@ def run_stale_sweep():
 
             conn.commit()
 
+        _spid = os.getpid()
         if swept_total > 0:
-            print(f"[SWEEP] swept {swept_total} stale jobs")
+            print(f"[SWEEP][pid={_spid}] swept {swept_total} stale jobs")
             for d in details:
-                print(f"[SWEEP]   {d}")
+                print(f"[SWEEP][pid={_spid}]   {d}")
         else:
-            print("[SWEEP] no stale jobs found")
+            print(f"[SWEEP][pid={_spid}] no stale jobs found")
 
         return {"swept": swept_total, "details": details}
 
     except Exception as e:
-        print(f"[SWEEP] error: {e}")
+        print(f"[SWEEP][pid={os.getpid()}] error: {e}")
         return {"swept": 0, "error": str(e)}
 
 
@@ -2045,66 +2046,72 @@ def start_operations_loop():
 
         cycle = 0
         consecutive_db_errors = 0
-        # Wait for the pool to warm up and the initial user-request burst
-        # to pass before starting background DB operations.  This also
-        # gives the worker thread time to complete leader election.
-        # 20s delay: the full user startup burst (history, wallet, inspire,
-        # action-costs) takes 5-10s, plus pool warmup takes a few seconds.
-        _ops_delay = 20
-        print(f"[OPS] First sweep scheduled in {_ops_delay}s (protecting startup burst)")
-        _worker_stop.wait(timeout=_ops_delay)
+
+        # ── STARTUP GATE ────────────────────────────────────────
+        # Wait before touching the DB at all.  The pool needs time to
+        # warm up (min_size connections) and serve the first wave of
+        # user-facing requests (auth, history, wallet, inspire).
+        # The loop sleeps FIRST, then does work — so the first DB
+        # access is at T + startup_delay + sweep_interval.
+        _startup_delay = 30
+        print(f"[OPS][pid={pid}] Startup gate: sleeping {_startup_delay}s before first ops cycle")
+        _worker_stop.wait(timeout=_startup_delay)
         if _worker_stop.is_set():
             return
 
-        print(f"[OPS] operations loop started pid={pid} sweep_interval={sweep_interval}s "
-              f"sweep_enabled={sweep_enabled} rescue_enabled={rescue_enabled} "
-              f"rescue_every={rescue_every_n} cycles ({rescue_interval}s) "
-              f"leader_only={leader_only} is_leader={is_leader()}")
+        print(f"[OPS][pid={pid}] Entering normal cadence: sweep every {sweep_interval}s, "
+              f"rescue every {rescue_every_n} cycles ({rescue_interval}s), "
+              f"leader={is_leader()}")
 
         while not _worker_stop.is_set():
+            # ── SLEEP FIRST, then work ──────────────────────────
+            # This ensures the very first cycle also respects the
+            # interval.  Without this, the loop would do DB work
+            # immediately after the startup gate, then sleep.
+            # By sleeping first:  first DB touch = T + 30s + 60s = T+90s.
+            if consecutive_db_errors >= 2:
+                backoff_s = min(consecutive_db_errors * 10, 60)
+                print(f"[OPS][pid={pid}][BACKOFF] cycle={cycle} errors={consecutive_db_errors} sleep={backoff_s}s")
+                consecutive_db_errors -= 1
+                _worker_stop.wait(timeout=backoff_s)
+                if _worker_stop.is_set():
+                    return
+            else:
+                _worker_stop.wait(timeout=sweep_interval)
+                if _worker_stop.is_set():
+                    return
+
             cycle += 1
             _am_leader = is_leader()
             _cycle_had_db_error = False
 
-            # If we're in a DB error streak, skip all ops this cycle to
-            # avoid competing with user-facing requests for pool/DB connections.
-            # Threshold=2: yield after just 2 consecutive transient errors.
-            if consecutive_db_errors >= 2:
-                backoff_s = min(consecutive_db_errors * 10, 60)
-                print(f"[OPS][BACKOFF] skipping ops cycle={cycle} consecutive_errors={consecutive_db_errors} sleep={backoff_s}s")
-                consecutive_db_errors -= 1  # slowly recover toward 0
-                _worker_stop.wait(timeout=backoff_s)
-                continue
-
-            # -- Stall detection (leader only when leader_only=true) --
-            # Previously ran on all workers, but non-leaders never claim jobs
-            # so their stall detection is wasted DB work.
+            # -- Stall detection (leader only) --
             if _am_leader or not leader_only:
                 try:
                     detect_stalled_jobs()
                 except Exception as e:
                     if is_transient_db_error(e):
                         _cycle_had_db_error = True
-                        print(f"[OPS][TRANSIENT] stall detection: {type(e).__name__}: {e}")
+                        print(f"[OPS][pid={pid}][TRANSIENT] stall detection: {type(e).__name__}: {e}")
                     else:
-                        print(f"[OPS] stall detection error: {e}")
+                        print(f"[OPS][pid={pid}] stall detection error: {e}")
 
-            # -- Stale sweep (leader only when leader_only=true) --
+            # -- Stale sweep (leader only) --
             if sweep_enabled and (_am_leader or not leader_only):
                 try:
                     run_stale_sweep()
                 except Exception as e:
                     if is_transient_db_error(e):
                         _cycle_had_db_error = True
-                        print(f"[OPS][TRANSIENT] stale sweep: {type(e).__name__}: {e}")
+                        print(f"[OPS][pid={pid}][TRANSIENT] stale sweep: {type(e).__name__}: {e}")
                     else:
-                        print(f"[OPS] stale sweep error: {e}")
+                        print(f"[OPS][pid={pid}] stale sweep error: {e}")
 
-            # -- Rescue pass (leader only when leader_only=true) --
+            # -- Rescue pass (leader only, every Nth cycle) --
             if rescue_enabled and cycle % rescue_every_n == 0 and (_am_leader or not leader_only):
                 try:
                     from backend.services.job_rescue import rescue_late_completed_jobs
-                    print(f"[OPS] rescue pass starting pid={pid} lookback={rescue_lookback}h max={rescue_max}")
+                    print(f"[OPS][pid={pid}] rescue pass starting lookback={rescue_lookback}h max={rescue_max}")
                     result = rescue_late_completed_jobs(
                         hours=rescue_lookback,
                         dry_run=False,
@@ -2114,25 +2121,20 @@ def start_operations_loop():
                     requeued = result.get("requeued", 0)
                     candidates = result.get("candidates", 0)
                     if rescued > 0 or requeued > 0:
-                        print(f"[OPS] rescue pass done candidates={candidates} rescued={rescued} requeued={requeued}")
+                        print(f"[OPS][pid={pid}] rescue done candidates={candidates} rescued={rescued} requeued={requeued}")
                     else:
-                        print(f"[OPS] rescue pass done candidates={candidates} no_actions")
+                        print(f"[OPS][pid={pid}] rescue done candidates={candidates} no_actions")
                 except Exception as e:
                     if is_transient_db_error(e):
                         _cycle_had_db_error = True
-                        print(f"[OPS][TRANSIENT] rescue pass: {type(e).__name__}: {e}")
+                        print(f"[OPS][pid={pid}][TRANSIENT] rescue pass: {type(e).__name__}: {e}")
                     else:
-                        print(f"[OPS] rescue pass error: {e}")
+                        print(f"[OPS][pid={pid}] rescue pass error: {e}")
 
-            # Backoff on transient DB errors — don't hammer a broken connection
             if _cycle_had_db_error:
                 consecutive_db_errors += 1
-                backoff = min(consecutive_db_errors * 2, 30)
-                print(f"[OPS][TRANSIENT] backing off {backoff}s (consecutive={consecutive_db_errors})")
-                _worker_stop.wait(timeout=backoff)
             else:
                 consecutive_db_errors = 0
-                _worker_stop.wait(timeout=sweep_interval)
 
     _ops_thread = threading.Thread(
         target=_loop,
