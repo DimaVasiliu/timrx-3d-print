@@ -199,7 +199,8 @@ def create_app() -> Flask:
             from backend.services.job_recovery import recover_stale_jobs
 
             result = recover_stale_jobs(app)
-            print(f"[APP] Job recovery: {result}")
+            if result.get("recovered", 0) > 0 or result.get("abandoned", 0) > 0:
+                print(f"[APP] Job recovery: {result}")
         except Exception as e:
             print(f"[APP] Warning: Stale job recovery failed: {e}")
 
@@ -221,9 +222,6 @@ def create_app() -> Flask:
             from backend.services.job_worker import start_operations_loop
 
             start_operations_loop()
-            print(f"[APP] Operations loop: sweep_interval={config.STALE_SWEEP_INTERVAL_S}s "
-                  f"rescue_interval={config.RESCUE_INTERVAL_S}s "
-                  f"rescue_lookback={config.RESCUE_LOOKBACK_HOURS}h")
         except Exception as e:
             print(f"[APP] Warning: Failed to start operations loop: {e}")
 

@@ -13,7 +13,7 @@ This module provides a simple, stable interface for:
 import time as _time
 from flask import Blueprint, request, jsonify, g
 
-from backend.middleware import require_session, no_cache
+from backend.middleware import require_session, require_session_readonly, no_cache
 from backend.services.wallet_service import WalletService, LedgerEntryType
 from backend.services.pricing_service import PricingService
 from backend.db import transaction, fetch_one, Tables, DatabaseIntegrityError, is_transient_db_error
@@ -88,7 +88,7 @@ def _resolve_action_cost(action: str) -> tuple[str, int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @bp.route("/wallet", methods=["GET"])
-@require_session
+@require_session_readonly
 @no_cache
 def get_wallet():
     """

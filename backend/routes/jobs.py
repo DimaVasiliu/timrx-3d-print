@@ -22,7 +22,7 @@ Generation Reliability Layer:
 import time as _time
 from flask import Blueprint, request, jsonify, g
 
-from backend.middleware import require_session, with_session
+from backend.middleware import require_session, with_session, with_session_readonly
 
 # Short TTL cache for /jobs/active — avoids pool pressure for repeated polls
 _jobs_active_cache: dict = {}  # identity_id -> (result_list, monotonic_ts)
@@ -897,7 +897,7 @@ def save_active_job():
 
 
 @bp.route("/active", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def get_active_jobs():
     """
     Get all active (queued/pending/processing) jobs for current user.

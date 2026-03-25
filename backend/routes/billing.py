@@ -19,7 +19,7 @@ import threading as _threading
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from backend.middleware import require_session, require_email, require_verified_email, no_cache
+from backend.middleware import require_session, require_session_readonly, require_email, require_verified_email, no_cache
 from backend.db import get_conn, get_conn_resilient, Tables, is_transient_db_error
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService
@@ -347,7 +347,7 @@ def get_costs():
 
 
 @bp.route("/ledger", methods=["GET"])
-@require_session
+@require_session_readonly
 @no_cache
 def get_ledger():
     """
@@ -1325,7 +1325,7 @@ def subscription_plans():
 
 
 @bp.route("/subscriptions/me", methods=["GET"])
-@require_session
+@require_session_readonly
 @no_cache
 def subscription_me():
     """
@@ -1769,7 +1769,7 @@ def subscription_status():
 
 
 @bp.route("/subscriptions/summary", methods=["GET"])
-@require_session
+@require_session_readonly
 @no_cache
 def subscription_summary():
     """

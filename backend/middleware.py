@@ -409,6 +409,50 @@ def require_session(f):
     return decorated
 
 
+def require_session_readonly(f):
+    """
+    Decorator that requires a valid session (returns 401 if missing).
+    Same as require_session but on cache-miss validation:
+    - skips identity touch (last_seen_at UPDATE)
+    - skips session renewal (sliding-window expiry extension)
+    - skips cookie refresh
+
+    Use for read-only GET endpoints (wallet, subscriptions/summary,
+    jobs/active) where DB writes from session bookkeeping are wasted.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+
+        DatabaseError = _get_database_error()
+
+        try:
+            identity, session_id = _resolve_identity(readonly=True)
+
+            if not identity:
+                if SESSION_DEBUG or "/subscriptions" in request.path:
+                    print(
+                        f"[MIDDLEWARE] require_session_readonly 401: "
+                        f"path={request.path}, "
+                        f"cookie_present={bool(request.cookies.get('timrx_sid'))}, "
+                        f"session_id={session_id[:16] + '...' if session_id else 'None'}"
+                    )
+                return jsonify({
+                    "error": {"code": "UNAUTHORIZED", "message": "Valid session required"}
+                }), 401
+
+            return f(*args, **kwargs)
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in require_session_readonly: {e}")
+            return jsonify({
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
+            }), 500
+
+    return decorated
+
+
 def require_email(f):
     """
     Decorator that requires a valid session with an attached email.

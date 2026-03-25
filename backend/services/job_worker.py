@@ -145,8 +145,14 @@ def _register_shutdown_hooks():
 
     def _on_shutdown_signal(signum, frame):
         sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
-        print(f"[JOB][pid={_pid}] Received {sig_name}, stopping worker+ops threads")
+        print(f"[SHUTDOWN][pid={_pid}] {sig_name} received, stopping background threads")
         _worker_stop.set()
+        # Close the DB pool to stop pool maintenance threads and release connections
+        try:
+            from backend.db import close_pool
+            close_pool()
+        except Exception:
+            pass
         # Call the previous handler so Gunicorn can shut down properly
         prev = _prev_handlers.get(signum)
         if callable(prev):
@@ -249,18 +255,23 @@ def _acquire_leader_lock() -> bool:
     for attempt in range(max_attempts):
         try:
             if _try_lock_once():
-                print(f"[JOB] Leader lock acquired by {WORKER_ID} (attempt={attempt + 1})")
+                if attempt > 0:
+                    print(f"[JOB] Leader lock acquired by {WORKER_ID} (attempt={attempt + 1})")
+                else:
+                    print(f"[JOB] Leader lock acquired by {WORKER_ID}")
                 return True
         except Exception as e:
-            print(f"[JOB] Leader lock error (attempt {attempt + 1}): {e} — proceeding without lock")
+            print(f"[JOB] Leader lock error: {e} — proceeding without lock")
             return True  # Fail-open on error
 
+        # Only log once on first failure, not every retry
+        if attempt == 0:
+            total_wait = sum(retry_delays)
+            print(f"[JOB] Leader lock held by previous process. Will retry for ~{total_wait}s.")
+        if _worker_stop.is_set():
+            return False
         if attempt < len(retry_delays):
-            delay = retry_delays[attempt]
-            print(f"[JOB] Leader lock NOT acquired (attempt {attempt + 1}/{max_attempts}). Retrying in {delay}s.")
-            if _worker_stop.is_set():
-                return False
-            _worker_stop.wait(timeout=delay)
+            _worker_stop.wait(timeout=retry_delays[attempt])
 
     print(f"[JOB] Leader lock NOT acquired after {max_attempts} attempts. {WORKER_ID} giving up.")
     return False
@@ -290,8 +301,6 @@ def _worker_loop():
         print(f"[JOB] {WORKER_ID} exiting — not the leader")
         return
 
-    print(f"[JOB] Worker loop started: {WORKER_ID} (leader)")
-
     from backend.db import is_transient_db_error
 
     consecutive_db_errors = 0
@@ -299,14 +308,11 @@ def _worker_loop():
 
     # Delay first claim so the pool has time to warm up and serve the
     # initial wave of user-facing requests (auth, history, wallet, inspire).
-    # The full startup burst takes 5-8s on Render. A 15s delay ensures
-    # the worker never competes with bootstrap for pool connections.
     _startup_delay = 15
-    print(f"[JOB] First claim scheduled in {_startup_delay}s (protecting startup burst)")
+    print(f"[JOB] Worker {WORKER_ID} ready (leader). First claim in {_startup_delay}s.")
     _worker_stop.wait(timeout=_startup_delay)
     if _worker_stop.is_set():
         return
-    print(f"[JOB] Worker entering claim loop: {WORKER_ID}")
 
     try:
         while not _worker_stop.is_set():
@@ -1942,13 +1948,12 @@ def run_stale_sweep():
 
             conn.commit()
 
-        _spid = os.getpid()
+        # Only log when something was actually swept — silence the common no-op.
         if swept_total > 0:
+            _spid = os.getpid()
             print(f"[SWEEP][pid={_spid}] swept {swept_total} stale jobs")
             for d in details:
                 print(f"[SWEEP][pid={_spid}]   {d}")
-        else:
-            print(f"[SWEEP][pid={_spid}] no stale jobs found")
 
         return {"swept": swept_total, "details": details}
 
@@ -2026,8 +2031,7 @@ def recover_stale_jobs():
             print(f"[JOB] startup recovery: marked {rec_count} jobs as stalled")
             for r in recovered:
                 print(f"[JOB]   reclaimed job={r['id']} was_status={r['status']} provider={r.get('provider', '?')}")
-        else:
-            print("[JOB] startup recovery: no recoverable jobs found")
+        # Silence the common no-op case — only log when work was done.
 
         if abn_count > 0:
             print(f"[JOB] startup recovery: abandoned {abn_count} legacy jobs (>{MAX_RECOVERY_AGE_HOURS}h old)")
@@ -2106,14 +2110,10 @@ def start_operations_loop():
         # The loop sleeps FIRST, then does work — so the first DB
         # access is at T + startup_delay + sweep_interval.
         _startup_delay = 30
-        print(f"[OPS][pid={pid}] Startup gate: sleeping {_startup_delay}s before first ops cycle")
+        print(f"[OPS][pid={pid}] Ops loop deferred {_startup_delay}s. Cadence: sweep={sweep_interval}s rescue={rescue_interval}s")
         _worker_stop.wait(timeout=_startup_delay)
         if _worker_stop.is_set():
             return
-
-        print(f"[OPS][pid={pid}] Entering normal cadence: sweep every {sweep_interval}s, "
-              f"rescue every {rescue_every_n} cycles ({rescue_interval}s), "
-              f"leader={is_leader()}")
 
         while not _worker_stop.is_set():
             # ── SLEEP FIRST, then work ──────────────────────────
@@ -2177,7 +2177,6 @@ def start_operations_loop():
             if rescue_enabled and cycle % rescue_every_n == 0 and (_am_leader or not leader_only):
                 try:
                     from backend.services.job_rescue import rescue_late_completed_jobs
-                    print(f"[OPS][pid={pid}] rescue pass starting lookback={rescue_lookback}h max={rescue_max}")
                     result = rescue_late_completed_jobs(
                         hours=rescue_lookback,
                         dry_run=False,
@@ -2186,10 +2185,9 @@ def start_operations_loop():
                     rescued = result.get("rescued", 0)
                     requeued = result.get("requeued", 0)
                     candidates = result.get("candidates", 0)
+                    # Only log when rescue actually did something
                     if rescued > 0 or requeued > 0:
                         print(f"[OPS][pid={pid}] rescue done candidates={candidates} rescued={rescued} requeued={requeued}")
-                    else:
-                        print(f"[OPS][pid={pid}] rescue done candidates={candidates} no_actions")
                 except Exception as e:
                     if is_transient_db_error(e):
                         _cycle_had_db_error = True
