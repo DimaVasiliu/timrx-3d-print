@@ -387,8 +387,11 @@ def redeem_restore():
         _session_cache_put(session_id, identity)
 
     balance = wallet.get("balance_credits", 0) if wallet else 0
+    video_balance = wallet.get("balance_video_credits", 0) if wallet else 0
     reserved = WalletService.get_reserved_credits(identity_id)
+    video_reserved = WalletService.get_reserved_credits(identity_id, "video")
     available = max(0, balance - reserved)
+    video_available = max(0, video_balance - video_reserved)
 
     # Format created_at safely
     created_at = None
@@ -410,6 +413,9 @@ def redeem_restore():
             "balance": balance,
             "reserved": reserved,
             "available": available,
+            "video_balance": video_balance,
+            "video_reserved": video_reserved,
+            "video_available": video_available,
             "currency": "GBP",
         },
     })
