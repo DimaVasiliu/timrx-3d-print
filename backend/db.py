@@ -137,12 +137,17 @@ def _configure_pooled_conn(conn):
     Leaves the connection in autocommit mode so that read-only
     get_conn() callers never open an implicit transaction (INTRANS).
     transaction() temporarily switches to non-autocommit when it
-    needs real transactional semantics."""
+    needs real transactional semantics.
+
+    All SETs are batched into ONE round trip to minimize network cost
+    (~40ms instead of ~160ms for 4 separate execute() calls)."""
     conn.autocommit = True
-    conn.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public")
-    conn.execute("SET statement_timeout = '30000'")
-    conn.execute("SET idle_in_transaction_session_timeout = '60000'")
-    conn.execute("SET lock_timeout = '10000'")
+    conn.execute(
+        f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public; "
+        "SET statement_timeout = '30000'; "
+        "SET idle_in_transaction_session_timeout = '60000'; "
+        "SET lock_timeout = '10000';"
+    )
     # Stays autocommit=True — no implicit transactions on idle connections.
 
 
@@ -186,6 +191,15 @@ def _get_pool():
                 configure=_configure_pooled_conn,
                 check=_check_cb,
             )
+            # Explicitly open the pool and wait for min_size connections.
+            # Without this, the pool starts with 0 connections and creates
+            # them reactively on first getconn() — causing PoolTimeout on
+            # the first burst of requests.
+            _pool.open(wait=False)  # Start background threads immediately
+            try:
+                _pool.wait(timeout=10.0)  # Wait up to 10s for min_size connections
+            except Exception as e:
+                print(f"[DB] Pool warmup incomplete: {e} — continuing with partial pool")
             print(
                 f"[DB] Connection pool ACTIVE: min={_DB_POOL_MIN_SIZE} "
                 f"max={_DB_POOL_MAX_SIZE} timeout={_DB_POOL_TIMEOUT}s "
@@ -383,12 +397,17 @@ def _create_connection():
             connect_timeout=_DB_CONNECT_TIMEOUT,
             row_factory=dict_row,  # Default to dict rows
         )
-        # Set search path and session safety limits
+        # Set search path and session safety limits in ONE round trip.
+        # Previously 4 separate execute() calls = 4 network round trips
+        # (each ~40ms to external PostgreSQL = ~160ms total).
+        # Batching into one string cuts this to ~40ms.
         with conn.cursor() as cur:
-            cur.execute(f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public;")
-            cur.execute("SET statement_timeout = '30000';")
-            cur.execute("SET idle_in_transaction_session_timeout = '60000';")
-            cur.execute("SET lock_timeout = '10000';")
+            cur.execute(
+                f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public; "
+                "SET statement_timeout = '30000'; "
+                "SET idle_in_transaction_session_timeout = '60000'; "
+                "SET lock_timeout = '10000';"
+            )
         return conn
     except psycopg.OperationalError as e:
         raise DatabaseConnectionError(f"Failed to connect to database: {e}", original_error=e)
@@ -419,9 +438,13 @@ def get_conn(source: str = ""):
     checkout, that error propagates to the caller (and the pool discards
     the broken connection automatically).
     """
+    import time as _gc_time
     pool = _get_pool()
     conn = None
     from_pool = False
+    _pool_failed = False
+    _t0 = _gc_time.monotonic()
+    _ms_pool_wait = 0
 
     if pool is not None:
         try:
@@ -429,12 +452,30 @@ def get_conn(source: str = ""):
             from_pool = True
         except Exception as e:
             if is_transient_db_error(e):
-                print(f"[DB][FALLBACK] get_conn pool checkout failed, using direct source={source}: {type(e).__name__}")
+                _ms_pool_wait = int((_gc_time.monotonic() - _t0) * 1000)
+                _pool_failed = True
                 conn = None
             else:
                 raise
 
-    if conn is not None and from_pool:
+    if conn is None:
+        # Direct connection (pool failed/timed out, or pool disabled)
+        _t_direct = _gc_time.monotonic()
+        conn = _create_connection()
+        _ms_direct = int((_gc_time.monotonic() - _t_direct) * 1000)
+        if _pool_failed:
+            print(f"[DB][FALLBACK] source={source} pool_wait={_ms_pool_wait}ms direct={_ms_direct}ms")
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return
+
+    # Pooled connection path
+    if from_pool:
         try:
             yield conn
         finally:
@@ -542,9 +583,11 @@ def transaction(source: str = ""):
     Automatically commits on success, rolls back on exception.
     Yields a cursor with dict_row factory.
     """
+    import time as _tx_time
     pool = _get_pool()
     conn = None
     from_pool = False
+    _t0 = _tx_time.monotonic()
 
     if pool is not None:
         try:
@@ -552,12 +595,16 @@ def transaction(source: str = ""):
             from_pool = True
         except Exception as e:
             if is_transient_db_error(e):
-                print(f"[DB][TX_FALLBACK] pool checkout failed, using direct source={source}: {type(e).__name__}")
-                conn = None
+                _ms_pool = int((_tx_time.monotonic() - _t0) * 1000)
+                _t_dir = _tx_time.monotonic()
+                conn = _create_connection()
+                _ms_dir = int((_tx_time.monotonic() - _t_dir) * 1000)
+                print(f"[DB][TX_FALLBACK] source={source} pool_wait={_ms_pool}ms direct={_ms_dir}ms")
+                # fall through to direct path below
             else:
                 raise
 
-    if conn is not None and from_pool:
+    if from_pool:
         # Pooled connections live in autocommit mode.  Switch to
         # transactional mode for the duration of this block so
         # _run_transaction gets real BEGIN/COMMIT/ROLLBACK semantics.
@@ -566,18 +613,11 @@ def transaction(source: str = ""):
             with _run_transaction(conn) as cur:
                 yield cur
         finally:
-            # _run_transaction commits on success and rolls back on error,
-            # but defensive _ensure_idle catches edge cases (e.g. commit
-            # itself raising after partial flush).
             _ensure_idle(conn)
-            # Best-effort: restore autocommit for the next borrower.
             try:
                 conn.autocommit = True
             except Exception:
-                pass  # broken conn — putconn will discard it
-            # ALWAYS return via putconn so the pool can free the slot.
-            # putconn detects broken/closed connections and discards them.
-            # Skipping putconn leaks the slot permanently.
+                pass
             try:
                 pool.putconn(conn)
             except Exception:
@@ -586,8 +626,9 @@ def transaction(source: str = ""):
                 except Exception:
                     pass
     else:
-        # Direct connection (already autocommit=False per psycopg3 default)
-        conn = _create_connection()
+        # Direct connection (fallback already created it, or pool disabled)
+        if conn is None:
+            conn = _create_connection()
         try:
             with _run_transaction(conn) as cur:
                 yield cur
