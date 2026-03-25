@@ -114,17 +114,66 @@ _worker_stop = threading.Event()
 _leader_conn = None  # Dedicated connection holding the advisory lock
 
 
-_atexit_registered = False
+_shutdown_registered = False
+
+
+def _register_shutdown_hooks():
+    """Register SIGTERM/SIGINT handlers and atexit so background threads
+    stop immediately when the process is asked to shut down.
+
+    atexit alone is too late — it fires during interpreter finalization,
+    after the ops loop may have already started another DB cycle.
+    The signal handler fires instantly on SIGTERM, waking any sleeping
+    _worker_stop.wait() call within milliseconds.
+
+    Safe to call multiple times (idempotent).
+    """
+    global _shutdown_registered
+    if _shutdown_registered:
+        return
+    _shutdown_registered = True
+
+    import signal
+    import atexit
+
+    _pid = os.getpid()
+
+    # Chain with existing signal handlers (Gunicorn installs its own).
+    # We set _worker_stop first, then call the original handler so
+    # Gunicorn's shutdown proceeds normally.
+    _prev_handlers = {}
+
+    def _on_shutdown_signal(signum, frame):
+        sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+        print(f"[JOB][pid={_pid}] Received {sig_name}, stopping worker+ops threads")
+        _worker_stop.set()
+        # Call the previous handler so Gunicorn can shut down properly
+        prev = _prev_handlers.get(signum)
+        if callable(prev):
+            prev(signum, frame)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev = signal.getsignal(sig)
+            _prev_handlers[sig] = prev
+            signal.signal(sig, _on_shutdown_signal)
+        except (OSError, ValueError):
+            # Can't set signal handler from a non-main thread — fall back to atexit only
+            pass
+
+    atexit.register(lambda: _worker_stop.set())
 
 
 def start_worker():
     """Start the durable job worker in a background daemon thread."""
-    global _worker_thread, _atexit_registered
+    global _worker_thread
     if _worker_thread and _worker_thread.is_alive():
         print(f"[JOB] Worker already running: {WORKER_ID}")
         return
 
     _worker_stop.clear()
+    _register_shutdown_hooks()
+
     _worker_thread = threading.Thread(
         target=_worker_loop,
         name=f"job-worker-{WORKER_ID}",
@@ -132,22 +181,6 @@ def start_worker():
     )
     _worker_thread.start()
     print(f"[JOB] Worker thread launched: {WORKER_ID}")
-
-    # Register atexit handler so worker+ops threads stop cleanly on
-    # SIGTERM / Gunicorn shutdown.  Without this, daemon threads keep
-    # running (and hitting the DB pool) during the 30s Render grace
-    # period after a deploy, producing log spam that looks like the
-    # NEW process is doing ops work at startup.
-    if not _atexit_registered:
-        import atexit
-        atexit.register(_shutdown_all_workers)
-        _atexit_registered = True
-
-
-def _shutdown_all_workers():
-    """atexit callback: signal all background threads to stop immediately."""
-    _worker_stop.set()
-    print(f"[JOB][pid={os.getpid()}] atexit: signaled worker+ops threads to stop")
 
 
 def stop_worker():
@@ -2104,7 +2137,15 @@ def start_operations_loop():
             _am_leader = is_leader()
             _cycle_had_db_error = False
 
+            # ── Check stop BEFORE every DB operation ──────────
+            # SIGTERM sets _worker_stop instantly.  Without these
+            # guards, a cycle that just woke from sleep would run
+            # all three DB operations before re-checking the flag.
+
             # -- Stall detection (leader only) --
+            if _worker_stop.is_set():
+                print(f"[OPS][pid={pid}] stop detected, exiting before stall detect")
+                return
             if _am_leader or not leader_only:
                 try:
                     detect_stalled_jobs()
@@ -2116,6 +2157,9 @@ def start_operations_loop():
                         print(f"[OPS][pid={pid}] stall detection error: {e}")
 
             # -- Stale sweep (leader only) --
+            if _worker_stop.is_set():
+                print(f"[OPS][pid={pid}] stop detected, exiting before sweep")
+                return
             if sweep_enabled and (_am_leader or not leader_only):
                 try:
                     run_stale_sweep()
@@ -2127,6 +2171,9 @@ def start_operations_loop():
                         print(f"[OPS][pid={pid}] stale sweep error: {e}")
 
             # -- Rescue pass (leader only, every Nth cycle) --
+            if _worker_stop.is_set():
+                print(f"[OPS][pid={pid}] stop detected, exiting before rescue")
+                return
             if rescue_enabled and cycle % rescue_every_n == 0 and (_am_leader or not leader_only):
                 try:
                     from backend.services.job_rescue import rescue_late_completed_jobs
