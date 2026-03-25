@@ -907,9 +907,9 @@ def _warn_message(categories):
 # ─────────────────────────────────────────────────────────────
 def ensure_safety_schema():
     try:
-        from backend.db import USE_DB, transaction
+        from backend.db import USE_DB, transaction_direct
         if not USE_DB: return
-        with transaction() as cur:
+        with transaction_direct() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS timrx_app.safety_strikes (
                     id            BIGSERIAL PRIMARY KEY,

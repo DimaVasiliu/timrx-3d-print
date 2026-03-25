@@ -157,7 +157,19 @@ def _get_pool():
     if not _DB_POOL_ENABLED:
         return None
     if _pool is not None:
-        return _pool
+        # Detect pool created in master before fork
+        if hasattr(_pool, '_opener_pid') and _pool._opener_pid != os.getpid():
+            print(f"[DB] Pool PID mismatch: created in pid={_pool._opener_pid}, "
+                  f"current pid={os.getpid()} — resetting stale pool")
+            try:
+                _pool.close()
+            except Exception:
+                pass
+            _pool = None
+            _pool_init_attempted = False
+            # Fall through to create a new pool in this worker
+        else:
+            return _pool
     if _pool_init_attempted:
         return None
     if not _POOL_AVAILABLE or not _DATABASE_URL or not PSYCOPG_AVAILABLE:
@@ -165,7 +177,15 @@ def _get_pool():
 
     with _pool_lock:
         if _pool is not None:
-            return _pool
+            if hasattr(_pool, '_opener_pid') and _pool._opener_pid != os.getpid():
+                try:
+                    _pool.close()
+                except Exception:
+                    pass
+                _pool = None
+                _pool_init_attempted = False
+            else:
+                return _pool
         if _pool_init_attempted:
             return None
         _pool_init_attempted = True
@@ -195,6 +215,7 @@ def _get_pool():
                 configure=_configure_pooled_conn,
                 check=_check_cb,
             )
+            _pool._opener_pid = os.getpid()  # Tag for fork detection
             # Explicitly open the pool and wait for min_size connections.
             # Without this, the pool starts with 0 connections and creates
             # them reactively on first getconn() — causing PoolTimeout on
