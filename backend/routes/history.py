@@ -218,24 +218,31 @@ def history_mod():
                 _hsql_q = _SQL(_hsql)  # Wrap str → SQL for psycopg3 type safety
 
                 def _fetch_history(conn_getter):
+                    _t_conn = time.time()
                     with conn_getter as c:
+                        _t_query = time.time()
                         with c.cursor(row_factory=dict_row) as cur:
                             cur.execute(_hsql_q, _hparams)
-                            return cur.fetchall()
+                            rows = cur.fetchall()
+                        _t_done = time.time()
+                        return rows, int((_t_query - _t_conn) * 1000), int((_t_done - _t_query) * 1000)
 
                 try:
-                    # 1) Try pool (resilient handles checkout failure)
+                    _conn_source = "pool"
                     try:
-                        rows = _fetch_history(get_conn_resilient("history"))
+                        rows, _ms_checkout, _ms_query = _fetch_history(get_conn_resilient("history"))
                     except Exception as e1:
                         if is_transient_db_error(e1):
-                            # 2) Pool checkout OK but query died mid-flight — try direct
                             print(f"[History][FALLBACK] pool query failed, using direct: {type(e1).__name__}")
-                            rows = _fetch_history(get_conn_direct("history_direct"))
+                            _conn_source = "direct"
+                            rows, _ms_checkout, _ms_query = _fetch_history(get_conn_direct("history_direct"))
                         else:
                             raise
-                    query_time = time.time() - start_time
-                    print(f"[History][mod] GET: Fetched {len(rows)} items in {query_time:.3f}s")
+                    _ms_total = int((time.time() - start_time) * 1000)
+                    _ms_auth = _ms_total - _ms_checkout - _ms_query
+                    print(f"[History][mod] GET: {len(rows)} items type={item_type_filter} "
+                          f"total={_ms_total}ms auth={_ms_auth}ms conn={_ms_checkout}ms query={_ms_query}ms "
+                          f"src={_conn_source}")
                     db_source = True
 
                     def _scrub_meshy_urls(value):

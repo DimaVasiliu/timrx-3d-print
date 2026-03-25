@@ -537,7 +537,10 @@ def inspire_feed() -> Response:
 
         def _inspire_db_read(conn_getter):
             """Run all inspire DB reads inside one connection."""
+            import time as _itime
+            _t_conn = _itime.monotonic()
             with conn_getter as conn:
+                _t_start = _itime.monotonic()
                 cursor = conn.cursor(row_factory=dict_row)
                 potd = _get_prompt_of_the_day(cursor)
                 if filter_type == "all":
@@ -556,6 +559,11 @@ def inspire_feed() -> Response:
                 else:
                     models, images, videos = [], [], []
                 cursor.close()
+                _t_done = _itime.monotonic()
+                _ms_conn = int((_t_start - _t_conn) * 1000)
+                _ms_query = int((_t_done - _t_start) * 1000)
+                print(f"[INSPIRE] DB: conn={_ms_conn}ms query={_ms_query}ms "
+                      f"models={len(models)} images={len(images)} videos={len(videos)}")
                 return potd, models, images, videos
 
         try:

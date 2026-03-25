@@ -508,6 +508,86 @@ class WalletService:
         _set_cached_reserved(identity_id, result)
         return result
 
+    @staticmethod
+    def get_wallet_summary(identity_id: str) -> Dict[str, Any]:
+        """
+        Get balance + reserved credits in ONE DB connection (2 queries, 1 checkout).
+        Returns { general_balance, video_balance, general_reserved, video_reserved }.
+        Respects both wallet and reserved caches.
+        """
+        # Check caches first — may avoid DB entirely
+        cached_wallet = _get_cached_wallet(identity_id)
+        cached_reserved = _get_cached_reserved(identity_id)
+
+        wallet_hit = cached_wallet is not ...
+        reserved_hit = cached_reserved is not None
+
+        if wallet_hit and reserved_hit:
+            # Both cached — no DB needed
+            w = cached_wallet or {}
+            return {
+                "general_balance": w.get("balance_credits", 0) or 0,
+                "video_balance": w.get("balance_video_credits", 0) or 0,
+                "general_reserved": cached_reserved.get("general", 0),
+                "video_reserved": cached_reserved.get("video", 0),
+            }
+
+        # At least one cache miss — single DB connection for both queries
+        try:
+            with transaction("wallet_summary") as cur:
+                wallet_row = None
+                if not wallet_hit:
+                    cur.execute(
+                        f"""
+                        SELECT identity_id, balance_credits, balance_video_credits,
+                               reserved_video_credits, updated_at
+                        FROM {Tables.WALLETS}
+                        WHERE identity_id = %s
+                        """,
+                        (identity_id,),
+                    )
+                    wallet_row = fetch_one(cur)
+                    _set_cached_wallet(identity_id, wallet_row)
+
+                reserved_result = None
+                if not reserved_hit:
+                    cur.execute(
+                        f"""
+                        SELECT credit_type, COALESCE(SUM(cost_credits), 0) as total
+                        FROM {Tables.CREDIT_RESERVATIONS}
+                        WHERE identity_id = %s
+                          AND status = 'held'
+                          AND expires_at > NOW()
+                        GROUP BY credit_type
+                        """,
+                        (identity_id,),
+                    )
+                    reserved_rows = fetch_all(cur)
+                    reserved_result = {"general": 0, "video": 0}
+                    for row in reserved_rows:
+                        ct = row.get("credit_type", "general")
+                        reserved_result[ct] = int(row.get("total", 0) or 0)
+                    _set_cached_reserved(identity_id, reserved_result)
+        except Exception:
+            # Fall back to individual methods on error
+            balances = WalletService.get_all_balances(identity_id)
+            reserved_result = WalletService.get_all_reserved_credits(identity_id)
+            return {
+                "general_balance": balances["general"],
+                "video_balance": balances["video"],
+                "general_reserved": reserved_result["general"],
+                "video_reserved": reserved_result["video"],
+            }
+
+        w = wallet_row if wallet_row else (cached_wallet if cached_wallet is not ... else None) or {}
+        r = reserved_result if reserved_result else cached_reserved or {}
+        return {
+            "general_balance": w.get("balance_credits", 0) or 0,
+            "video_balance": w.get("balance_video_credits", 0) or 0,
+            "general_reserved": r.get("general", 0),
+            "video_reserved": r.get("video", 0),
+        }
+
     # ─────────────────────────────────────────────────────────────
     # Write Operations (Transactional)
     # ─────────────────────────────────────────────────────────────

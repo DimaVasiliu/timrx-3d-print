@@ -114,6 +114,7 @@ def get_wallet():
     """
     identity_id = g.identity_id
 
+    _t0 = _time.monotonic()
     # Fast path: return cached wallet if fresh
     cached = _wallet_cache.get(identity_id)
     if cached:
@@ -122,17 +123,18 @@ def get_wallet():
             return jsonify(payload)
 
     try:
-        balances = WalletService.get_all_balances(identity_id)
-        reserved = WalletService.get_all_reserved_credits(identity_id)
+        # Single DB connection for both balance + reserved queries
+        summary = WalletService.get_wallet_summary(identity_id)
 
-        balance = balances["general"]
-        video_balance = balances["video"]
-        reserved_general = reserved["general"]
-        video_reserved = reserved["video"]
+        balance = summary["general_balance"]
+        video_balance = summary["video_balance"]
+        reserved_general = summary["general_reserved"]
+        video_reserved = summary["video_reserved"]
         available = max(0, balance - reserved_general)
         video_available = max(0, video_balance - video_reserved)
 
-        print(f"[WALLET] Fetch: identity={identity_id[:8]}..., general(bal={balance},res={reserved_general},avail={available}), "
+        _ms = int((_time.monotonic() - _t0) * 1000)
+        print(f"[WALLET] Fetch: identity={identity_id[:8]}... {_ms}ms general(bal={balance},res={reserved_general},avail={available}), "
               f"video(bal={video_balance},res={video_reserved},avail={video_available})")
 
         payload = {
