@@ -61,8 +61,8 @@ _DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
 _DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
 _DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "8"))
 _DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "20"))
-_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "0.5"))  # 0.5s — fail very fast to direct fallback; pool is bonus, not critical path
-_DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "120"))   # 120s — recycle before Render SSL issues (~2-5min)
+_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "0.15"))  # 150ms — fail very fast to direct fallback; saves ~350ms vs 0.5s on each pool miss
+_DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "300"))   # 300s — longer lifetime reduces synchronized mass-recycling events that starve the pool
 _DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "60"))            # 60s — keep idle conns longer to avoid cold-start bursts
 _DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "true").lower() in ("true", "1", "yes")  # ON — detects dead SSL connections before handing to caller
 _APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
@@ -218,6 +218,11 @@ def _get_pool():
                     f"[DB][WARN] Pool min_size={_DB_POOL_MIN_SIZE} is below "
                     f"recommended {_recommended_min} for {_gunicorn_threads} threads. "
                     f"Set DB_POOL_MIN_SIZE={_recommended_min} to reduce PoolTimeout fallbacks."
+                )
+            if _DB_POOL_TIMEOUT > 0.2:
+                print(
+                    f"[DB][HINT] Pool timeout={_DB_POOL_TIMEOUT}s. Consider DB_POOL_TIMEOUT=0.15 "
+                    f"— fallback path costs ~135ms, so shorter timeout = faster total response."
                 )
             return _pool
         except Exception as e:
