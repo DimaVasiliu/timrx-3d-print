@@ -194,12 +194,16 @@ def proxy_glb_mod():
                         SELECT 'history_items' AS src
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
+                        UNION
+                        SELECT 'images' AS src
+                        FROM {Tables.IMAGES}
+                        WHERE identity_id = ANY(%s) AND (image_url = %s OR thumbnail_url = %s)
                         LIMIT 1
                         """,
-                        (identity_ids, s3_key, s3_key, u, u, identity_ids, u, u),
+                        (identity_ids, s3_key, s3_key, u, u, identity_ids, u, u, identity_ids, u, u),
                     )
                 elif meshy_task_id:
-                    # Check active_jobs, jobs, models, and history_items for Meshy task ID
+                    # Check active_jobs, jobs, models, history_items, and images for Meshy task ID
                     cur.execute(
                         f"""
                         SELECT 'active_jobs' AS src FROM {Tables.ACTIVE_JOBS}
@@ -218,6 +222,9 @@ def proxy_glb_mod():
                             OR payload->>'preview_task_id' = %s
                             OR payload->>'source_task_id' = %s
                           )
+                        UNION
+                        SELECT 'images' AS src FROM {Tables.IMAGES}
+                        WHERE identity_id = ANY(%s) AND upstream_id = %s
                         LIMIT 1
                         """,
                         (
@@ -225,6 +232,7 @@ def proxy_glb_mod():
                             identity_ids, meshy_task_id,
                             identity_ids, meshy_task_id,
                             identity_ids, meshy_task_id, meshy_task_id, meshy_task_id,
+                            identity_ids, meshy_task_id,
                         ),
                     )
                 else:
@@ -237,9 +245,13 @@ def proxy_glb_mod():
                         SELECT 'history_items' AS src
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
+                        UNION
+                        SELECT 'images' AS src
+                        FROM {Tables.IMAGES}
+                        WHERE identity_id = ANY(%s) AND (image_url = %s OR thumbnail_url = %s)
                         LIMIT 1
                         """,
-                        (identity_ids, u, u, identity_ids, u, u),
+                        (identity_ids, u, u, identity_ids, u, u, identity_ids, u, u),
                     )
                 row = cur.fetchone()
         if row:
@@ -292,6 +304,10 @@ def proxy_glb_mod():
         resp.headers.update(cors_headers)
         return resp, 500
 
+    # download=1: stream content with Content-Disposition: attachment
+    # (used by frontend image/video download to avoid cross-origin issues)
+    force_download = request.args.get("download") == "1"
+
     # === S3 URLs: Redirect to presigned URL (no proxying needed) ===
     if is_our_s3 and s3_key:
         try:
@@ -308,6 +324,30 @@ def proxy_glb_mod():
                     "Cache-Control": "public, max-age=3600",
                 }
                 return Response("", status=200, headers=headers)
+
+            # For download requests, stream via presigned URL so the
+            # browser gets a same-origin response it can save as a file.
+            if force_download:
+                try:
+                    r = requests.get(presigned_url, stream=True, timeout=(5, 60))
+                    content_type = r.headers.get("Content-Type", "application/octet-stream")
+                    filename = s3_key.rsplit("/", 1)[-1] if "/" in s3_key else s3_key
+
+                    def s3_gen():
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                yield chunk
+
+                    headers = {
+                        **cors_headers,
+                        "Content-Type": content_type,
+                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Cache-Control": "private, no-cache",
+                    }
+                    return Response(s3_gen(), status=r.status_code, headers=headers)
+                except Exception as e:
+                    print(f"[proxy-glb][mod] S3 download stream failed: {e}")
+                    # Fall through to redirect
 
             # For GET requests, redirect to presigned URL
             headers = {
@@ -355,12 +395,15 @@ def proxy_glb_mod():
                 break
             yield chunk
 
-    headers = {
+    resp_headers = {
         **cors_headers,
         "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
         "Cache-Control": "public, max-age=3600",
     }
-    return Response(gen(), status=r.status_code, headers=headers)
+    if force_download:
+        filename = p.path.rsplit("/", 1)[-1] or "download"
+        resp_headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return Response(gen(), status=r.status_code, headers=resp_headers)
 
 
 @bp.route("/assets/<asset_type>/<asset_id>/download", methods=["GET", "OPTIONS"])
