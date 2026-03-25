@@ -31,6 +31,7 @@ from backend.services.s3_service import (
     collect_s3_keys,
 )
 from backend.utils import (
+    GENERIC_TITLES,
     build_canonical_url,
     derive_display_title,
     is_generic_title,
@@ -38,6 +39,14 @@ from backend.utils import (
     normalize_epoch_ms,
     sanitize_filename,
     unpack_upload_result,
+)
+
+# Single source of truth for SQL title guards, derived from GENERIC_TITLES.
+# Used with LOWER() in SQL for case-insensitive matching.
+_GENERIC_TITLES_SQL = ", ".join(
+    "'" + t.replace("'", "''") + "'"
+    for t in sorted(GENERIC_TITLES)
+    if t  # empty string handled by separate <> '' check
 )
 
 
@@ -602,7 +611,7 @@ def save_image_to_normalized_db(
                             title = CASE
                                 WHEN %s IS NOT NULL
                                  AND %s <> ''
-                                 AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                 AND LOWER(%s) NOT IN ({_GENERIC_TITLES_SQL})
                                 THEN %s
                                 ELSE title
                             END,
@@ -672,7 +681,7 @@ def save_image_to_normalized_db(
                         title = CASE
                             WHEN EXCLUDED.title IS NOT NULL
                              AND EXCLUDED.title <> ''
-                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                             AND LOWER(EXCLUDED.title) NOT IN ({_GENERIC_TITLES_SQL})
                             THEN EXCLUDED.title
                             ELSE {Tables.IMAGES}.title
                         END,
@@ -734,7 +743,7 @@ def save_image_to_normalized_db(
                         title = CASE
                             WHEN EXCLUDED.title IS NOT NULL
                              AND EXCLUDED.title <> ''
-                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                             AND LOWER(EXCLUDED.title) NOT IN ({_GENERIC_TITLES_SQL})
                             THEN EXCLUDED.title
                             ELSE {Tables.IMAGES}.title
                         END,
@@ -821,7 +830,7 @@ def save_image_to_normalized_db(
                             title = CASE
                                 WHEN %s IS NOT NULL
                                  AND %s <> ''
-                                 AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                 AND LOWER(%s) NOT IN ({_GENERIC_TITLES_SQL})
                                 THEN %s
                                 ELSE title
                             END,
@@ -876,7 +885,7 @@ def save_image_to_normalized_db(
                             title = CASE
                                 WHEN EXCLUDED.title IS NOT NULL
                                  AND EXCLUDED.title <> ''
-                                 AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                 AND LOWER(EXCLUDED.title) NOT IN ({_GENERIC_TITLES_SQL})
                                 THEN EXCLUDED.title
                                 ELSE {Tables.HISTORY_ITEMS}.title
                             END,
@@ -2077,12 +2086,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                         -- Keep existing good title
                                         WHEN title IS NOT NULL
                                          AND BTRIM(title) <> ''
-                                         AND LOWER(BTRIM(title)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
+                                         AND LOWER(BTRIM(title)) NOT IN ({_GENERIC_TITLES_SQL})
                                         THEN title
                                         -- Use incoming title if it's good
                                         WHEN %s IS NOT NULL
                                          AND BTRIM(%s) <> ''
-                                         AND LOWER(BTRIM(%s)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
+                                         AND LOWER(BTRIM(%s)) NOT IN ({_GENERIC_TITLES_SQL})
                                         THEN %s
                                         -- Fallback to existing
                                         ELSE COALESCE(title, %s)
@@ -2159,12 +2168,12 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                         -- Keep existing good title
                                         WHEN {Tables.MODELS}.title IS NOT NULL
                                          AND BTRIM({Tables.MODELS}.title) <> ''
-                                         AND LOWER(BTRIM({Tables.MODELS}.title)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
+                                         AND LOWER(BTRIM({Tables.MODELS}.title)) NOT IN ({_GENERIC_TITLES_SQL})
                                         THEN {Tables.MODELS}.title
                                         -- Use incoming title if it's good
                                         WHEN EXCLUDED.title IS NOT NULL
                                          AND BTRIM(EXCLUDED.title) <> ''
-                                         AND LOWER(BTRIM(EXCLUDED.title)) NOT IN ('untitled', '(untitled)', '3d model', 'textured model', 'remeshed model', 'refined model', 'rigged model', 'image to 3d model', 'generated model', 'model', 'image', 'video')
+                                         AND LOWER(BTRIM(EXCLUDED.title)) NOT IN ({_GENERIC_TITLES_SQL})
                                         THEN EXCLUDED.title
                                         -- Fallback to existing (even if generic)
                                         ELSE COALESCE({Tables.MODELS}.title, EXCLUDED.title)
@@ -2224,23 +2233,9 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         if existing_row:
                             # Determine safe title: protect existing good titles
                             existing_title = existing_row.get("title") or ""
-                            existing_is_good = (
-                                existing_title.strip() != ""
-                                and existing_title.lower().strip() not in (
-                                    'untitled', '(untitled)', '3d model', 'textured model',
-                                    'remeshed model', 'refined model', 'rigged model',
-                                    'image to 3d model', 'generated model', 'model', 'image', 'video'
-                                )
-                            )
+                            existing_is_good = not is_generic_title(existing_title)
                             incoming_title = final_title or ""
-                            incoming_is_good = (
-                                incoming_title.strip() != ""
-                                and incoming_title.lower().strip() not in (
-                                    'untitled', '(untitled)', '3d model', 'textured model',
-                                    'remeshed model', 'refined model', 'rigged model',
-                                    'image to 3d model', 'generated model', 'model', 'image', 'video'
-                                )
-                            )
+                            incoming_is_good = not is_generic_title(incoming_title)
                             # Keep existing good title, otherwise use incoming if good, else keep existing
                             safe_title = existing_title if existing_is_good else (incoming_title if incoming_is_good else existing_title or incoming_title)
 
@@ -2428,7 +2423,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                 title = CASE
                                     WHEN EXCLUDED.title IS NOT NULL
                                      AND EXCLUDED.title <> ''
-                                     AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                     AND LOWER(EXCLUDED.title) NOT IN ({_GENERIC_TITLES_SQL})
                                     THEN EXCLUDED.title
                                     ELSE {Tables.IMAGES}.title
                                 END,
@@ -2484,7 +2479,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                     title = CASE
                                         WHEN %s IS NOT NULL
                                          AND %s <> ''
-                                         AND %s NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                                         AND LOWER(%s) NOT IN ({_GENERIC_TITLES_SQL})
                                         THEN %s
                                         ELSE title
                                     END,
@@ -2660,7 +2655,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         title = CASE
                             WHEN EXCLUDED.title IS NOT NULL
                              AND EXCLUDED.title <> ''
-                             AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
+                             AND LOWER(EXCLUDED.title) NOT IN ({_GENERIC_TITLES_SQL})
                             THEN EXCLUDED.title
                             ELSE {Tables.HISTORY_ITEMS}.title
                         END,
@@ -2720,11 +2715,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                             UPDATE {Tables.MODELS}
                             SET title = %s, updated_at = NOW()
                             WHERE id = %s
-                              AND (title IS NULL OR LOWER(TRIM(title)) IN (
-                                  'untitled', '(untitled)', '', '3d model', 'textured model',
-                                  'remeshed model', 'refined model', 'rigged model',
-                                  'image to 3d model', 'generated model', 'model', 'image', 'video'
-                              ))
+                              AND (title IS NULL OR LOWER(TRIM(title)) IN ({_GENERIC_TITLES_SQL}))
                             """,
                             (prompt_title, model_id),
                         )
