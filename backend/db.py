@@ -983,6 +983,23 @@ def ensure_schema() -> None:
                 ON {_BILLING_SCHEMA}.credit_reservations (identity_id, status, expires_at)
                 WHERE status = 'held'
             """)
+            # Indexes on FK-join columns used by history LEFT JOINs.
+            # These cover the JOIN conditions: m.upstream_job_id, i.upstream_id, v.upstream_id
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_models_upstream_job_id
+                ON {_APP_SCHEMA}.models (upstream_job_id)
+                WHERE upstream_job_id IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_images_upstream_id
+                ON {_APP_SCHEMA}.images (upstream_id)
+                WHERE upstream_id IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_videos_upstream_id
+                ON {_APP_SCHEMA}.videos (upstream_id)
+                WHERE upstream_id IS NOT NULL
+            """)
 
         print("[DB] Schema indexes ensured")
 
@@ -1041,6 +1058,22 @@ def _ensure_schema_direct() -> None:
                     CREATE INDEX IF NOT EXISTS idx_reservations_identity_held
                     ON {_BILLING_SCHEMA}.credit_reservations (identity_id, status, expires_at)
                     WHERE status = 'held'
+                """)
+                # FK-join indexes for history LEFT JOINs
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_models_upstream_job_id
+                    ON {_APP_SCHEMA}.models (upstream_job_id)
+                    WHERE upstream_job_id IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_images_upstream_id
+                    ON {_APP_SCHEMA}.images (upstream_id)
+                    WHERE upstream_id IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_videos_upstream_id
+                    ON {_APP_SCHEMA}.videos (upstream_id)
+                    WHERE upstream_id IS NOT NULL
                 """)
             conn.commit()
             print("[DB] Schema indexes ensured")

@@ -13,6 +13,7 @@ import uuid
 
 import time as _time
 from flask import Blueprint, jsonify, request, g
+from psycopg.sql import SQL as _SQL
 
 from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, transaction, dict_row, Tables, is_transient_db_error
 
@@ -116,45 +117,83 @@ def history_mod():
                     print(f"[History][CACHE_HIT] {len(items)} items")
 
             if USE_DB and not db_source:
-                _hsql = f"""
-                    SELECT
-                        h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
+                # ── Build type-specific queries to avoid unnecessary JOINs ──
+                # For type=image: only LEFT JOIN images (skip models + videos)
+                # For type=video: only LEFT JOIN videos (skip models + images)
+                # For type=model: only LEFT JOIN models (skip images + videos)
+                # For type=all:   3-way LEFT JOIN (needed for mixed results)
+                # This eliminates 2 of 3 expensive JSONB-OR joins for filtered tabs.
+
+                _h_base_cols = """h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
                         h.thumbnail_url, h.glb_url, h.image_url, h.video_url, h.payload, h.created_at,
-                        h.model_id, h.image_id, h.video_id, h.lineage_origin_id,
+                        h.model_id, h.image_id, h.video_id, h.lineage_origin_id"""
+
+                _model_cols = """,
                         m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
                         m.thumbnail_url AS m_thumbnail_url, m.meta AS m_meta,
-                        m.prompt AS m_prompt, m.status AS m_status,
-                        i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
-                        i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt,
-                        v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
-                        v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
-                        v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio,
-                        v.meta AS v_meta, v.prompt AS v_prompt
-                    FROM {Tables.HISTORY_ITEMS} h
-                    LEFT JOIN {Tables.MODELS} m ON (
+                        m.prompt AS m_prompt, m.status AS m_status"""
+                _model_join = f"""LEFT JOIN {Tables.MODELS} m ON (
                         (h.model_id IS NOT NULL AND h.model_id = m.id) OR
                         (h.model_id IS NULL AND m.upstream_job_id = COALESCE(
                             h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
                         ) AND COALESCE(
                             h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
-                        ) IS NOT NULL))
-                    LEFT JOIN {Tables.IMAGES} i ON (
+                        ) IS NOT NULL))"""
+
+                _image_cols = """,
+                        i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
+                        i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt"""
+                _image_join = f"""LEFT JOIN {Tables.IMAGES} i ON (
                         (h.image_id IS NOT NULL AND h.image_id = i.id) OR
                         (h.image_id IS NULL AND i.upstream_id = COALESCE(
                             h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
                         ) AND COALESCE(
                             h.payload->>'original_job_id', h.payload->>'preview_task_id', h.payload->>'source_task_id'
-                        ) IS NOT NULL))
-                    LEFT JOIN {Tables.VIDEOS} v ON (
+                        ) IS NOT NULL))"""
+
+                _video_cols = """,
+                        v.id AS v_id, v.title AS v_title, v.video_url AS v_video_url,
+                        v.thumbnail_url AS v_thumbnail_url, v.duration_seconds AS v_duration_seconds,
+                        v.resolution AS v_resolution, v.aspect_ratio AS v_aspect_ratio,
+                        v.meta AS v_meta, v.prompt AS v_prompt"""
+                _video_join = f"""LEFT JOIN {Tables.VIDEOS} v ON (
                         (h.video_id IS NOT NULL AND h.video_id = v.id) OR
                         (h.video_id IS NULL AND v.upstream_id = COALESCE(
                             h.payload->>'original_id', h.payload->>'original_job_id'
                         ) AND COALESCE(
                             h.payload->>'original_id', h.payload->>'original_job_id'
-                        ) IS NOT NULL))
+                        ) IS NOT NULL))"""
+
+                # Null placeholders for columns not selected (keeps enrichment code safe)
+                _model_nulls = ",\n                        NULL AS m_id, NULL AS m_title, NULL AS m_glb_url, NULL AS m_thumbnail_url, NULL AS m_meta, NULL AS m_prompt, NULL AS m_status"
+                _image_nulls = ",\n                        NULL AS i_id, NULL AS i_title, NULL AS i_image_url, NULL AS i_thumbnail_url, NULL AS i_prompt"
+                _video_nulls = ",\n                        NULL AS v_id, NULL AS v_title, NULL AS v_video_url, NULL AS v_thumbnail_url, NULL AS v_duration_seconds, NULL AS v_resolution, NULL AS v_aspect_ratio, NULL AS v_meta, NULL AS v_prompt"
+
+                if item_type_filter == "model":
+                    _select_extra = _model_cols + _image_nulls + _video_nulls
+                    _joins = _model_join
+                elif item_type_filter == "image":
+                    _select_extra = _model_nulls + _image_cols + _video_nulls
+                    _joins = _image_join
+                elif item_type_filter == "video":
+                    _select_extra = _model_nulls + _image_nulls + _video_cols
+                    _joins = _video_join
+                else:
+                    # type=all — full 3-way join
+                    _select_extra = _model_cols + _image_cols + _video_cols
+                    _joins = f"{_model_join}\n                    {_image_join}\n                    {_video_join}"
+
+                _where_type = "AND h.item_type = %s" if item_type_filter != "all" else ""
+                _where_cursor = "AND (h.created_at, h.id) < (%s, %s::uuid)" if use_cursor else ""
+
+                _hsql = f"""
+                    SELECT
+                        {_h_base_cols}{_select_extra}
+                    FROM {Tables.HISTORY_ITEMS} h
+                    {_joins}
                     WHERE h.identity_id = %s
-                      {("AND h.item_type = %s" if item_type_filter != "all" else "")}
-                      {("AND (h.created_at, h.id) < (%s, %s::uuid)" if use_cursor else "")}
+                      {_where_type}
+                      {_where_cursor}
                     ORDER BY h.created_at DESC, h.id DESC
                     LIMIT %s
                 """
@@ -172,10 +211,12 @@ def history_mod():
                     _hparams_list.append(offset)
                 _hparams = tuple(_hparams_list)
 
+                _hsql_q = _SQL(_hsql)  # Wrap str → SQL for psycopg3 type safety
+
                 def _fetch_history(conn_getter):
                     with conn_getter as c:
                         with c.cursor(row_factory=dict_row) as cur:
-                            cur.execute(_hsql, _hparams)
+                            cur.execute(_hsql_q, _hparams)
                             return cur.fetchall()
 
                 try:
