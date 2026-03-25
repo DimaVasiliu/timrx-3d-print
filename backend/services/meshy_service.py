@@ -275,11 +275,30 @@ def normalize_status(ms: dict) -> dict:
 
     glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, rigged_fbx = extract_model_urls(ms)
 
+    # Human-readable status message for the frontend progress label
+    if status == "done":
+        message = "Generation complete"
+    elif status == "failed":
+        task_error = _pick_first(containers, ["task_error", "error"])
+        if isinstance(task_error, dict):
+            message = task_error.get("message") or task_error.get("detail") or "Generation failed"
+        elif isinstance(task_error, str):
+            message = task_error
+        else:
+            message = _pick_first(containers, ["message", "error_message", "fail_reason"]) or "Generation failed"
+    elif status == "running":
+        message = f"Generating 3D {stage}..." if stage != "preview" else "Generating 3D preview..."
+    elif status == "pending":
+        message = "Waiting for provider..."
+    else:
+        message = "Processing..."
+
     return {
         "id": _pick_first(containers, ["id", "task_id"]),
         "status": status,
         "pct": pct,
         "stage": stage,
+        "message": message,
         "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
         "glb_url": glb_url,
         "model_urls": model_urls,
