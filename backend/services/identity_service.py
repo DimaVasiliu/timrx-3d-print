@@ -54,7 +54,7 @@ SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 import time as _time
 import threading as _threading
 
-_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "60"))  # seconds — sessions don't change during normal use; revocation/expiry are rare events
+_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "120"))  # seconds — sessions don't change during normal use; revocation/expiry are rare events. Longer TTL reduces pool pressure from auth DB hits.
 _SESSION_CACHE_MAX = int(os.getenv("SESSION_CACHE_MAX", "200"))   # max entries
 _session_cache: Dict[str, tuple] = {}   # session_id -> (identity_dict, expires_at)
 _session_cache_lock = _threading.Lock()
