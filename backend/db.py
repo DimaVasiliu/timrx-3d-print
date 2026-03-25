@@ -187,6 +187,10 @@ def _get_pool():
                 kwargs={
                     "connect_timeout": _DB_CONNECT_TIMEOUT,
                     "row_factory": dict_row,
+                    "keepalives": 1,           # enable TCP keepalives
+                    "keepalives_idle": 30,      # first probe after 30s idle
+                    "keepalives_interval": 10,  # retry probe every 10s
+                    "keepalives_count": 3,      # give up after 3 failed probes
                 },
                 configure=_configure_pooled_conn,
                 check=_check_cb,
@@ -208,22 +212,6 @@ def _get_pool():
                 f"check={'SELECT1' if _DB_POOL_CHECK else 'DISABLED'} "
                 f"pid={os.getpid()}"
             )
-            # Warn if pool min_size is too small for the thread count.
-            # Each Gunicorn thread can need 1-2 pool connections concurrently.
-            # min_size < 2×threads means checkout waits during request bursts.
-            _gunicorn_threads = int(os.getenv("GUNICORN_THREADS", "4"))
-            _recommended_min = _gunicorn_threads * 2
-            if _DB_POOL_MIN_SIZE < _recommended_min:
-                print(
-                    f"[DB][WARN] Pool min_size={_DB_POOL_MIN_SIZE} is below "
-                    f"recommended {_recommended_min} for {_gunicorn_threads} threads. "
-                    f"Set DB_POOL_MIN_SIZE={_recommended_min} to reduce PoolTimeout fallbacks."
-                )
-            if _DB_POOL_TIMEOUT > 0.2:
-                print(
-                    f"[DB][HINT] Pool timeout={_DB_POOL_TIMEOUT}s. Consider DB_POOL_TIMEOUT=0.15 "
-                    f"— fallback path costs ~135ms, so shorter timeout = faster total response."
-                )
             return _pool
         except Exception as e:
             print(f"[DB] Pool init failed: {e} — using direct connections")
