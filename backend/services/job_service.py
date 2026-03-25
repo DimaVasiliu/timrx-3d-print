@@ -2116,6 +2116,11 @@ def create_internal_job_row(
             action_code = "MESHY_TEXT_TO_3D"
 
     cost_credits = PricingService.get_action_cost(action_key)
+    # Auto-extract stage from meta if not explicitly passed — critical for
+    # job recovery routing (/api/jobs/active uses jobs.stage to determine
+    # which frontend watcher to resume with after page reload).
+    if not stage and meta:
+        stage = meta.get("stage")
     meta_json = json.dumps(meta or {})
 
     try:
