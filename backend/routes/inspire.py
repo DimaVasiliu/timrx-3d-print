@@ -30,6 +30,42 @@ MAX_LIMIT = 60
 DEFAULT_LIMIT = 24
 RECENT_DAYS = 30  # For "new" and "trending" tags
 
+# ── Inspire feed response cache ──
+# The feed content changes slowly (admin publishes models/images/videos).
+# Seeded requests produce deterministic results, so cache by full param set.
+# Non-seeded requests get a short TTL since each random shuffle differs.
+import time as _time
+
+_inspire_cache: dict = {}   # cache_key -> (response_dict, monotonic_ts)
+_INSPIRE_CACHE_TTL_SEEDED = 60    # 60s for seeded (deterministic) requests
+_INSPIRE_CACHE_TTL_RANDOM = 15    # 15s for random (non-seeded) requests
+_INSPIRE_CACHE_MAX = 50
+
+
+def _inspire_cache_key(limit, filter_type, mix_mode, shuffle, seed):
+    """Build a cache key from all parameters that affect the response."""
+    return (limit, filter_type, mix_mode, shuffle, seed or "__random__")
+
+
+def _get_cached_inspire(key, seed):
+    entry = _inspire_cache.get(key)
+    if not entry:
+        return None
+    ttl = _INSPIRE_CACHE_TTL_SEEDED if seed else _INSPIRE_CACHE_TTL_RANDOM
+    if (_time.monotonic() - entry[1]) < ttl:
+        return entry[0]
+    del _inspire_cache[key]
+    return None
+
+
+def _set_cached_inspire(key, data):
+    _inspire_cache[key] = (data, _time.monotonic())
+    if len(_inspire_cache) > _INSPIRE_CACHE_MAX:
+        cutoff = _time.monotonic() - _INSPIRE_CACHE_TTL_SEEDED
+        expired = [k for k, (_, ts) in _inspire_cache.items() if ts < cutoff]
+        for k in expired:
+            del _inspire_cache[k]
+
 
 # =============================================================================
 # HELPERS
@@ -486,24 +522,36 @@ def inspire_feed() -> Response:
         if mix_mode not in ("balanced", "sequential"):
             mix_mode = "balanced"
 
+        # Short-circuit: return cached response if within TTL
+        _cache_key = _inspire_cache_key(limit, filter_type, mix_mode, shuffle, seed)
+        cached = _get_cached_inspire(_cache_key, seed)
+        if cached is not None:
+            response = jsonify(cached)
+            response.headers["Content-Type"] = "application/json"
+            return response
+
         # ── DB fetch with pool→direct fallback ──
+        # Cap per-type fetch to 3x the requested limit. This prevents full table
+        # scans while leaving enough headroom for balanced mix reallocation.
+        _fetch_cap = min(limit * 3, 200)
+
         def _inspire_db_read(conn_getter):
             """Run all inspire DB reads inside one connection."""
             with conn_getter as conn:
                 cursor = conn.cursor(row_factory=dict_row)
                 potd = _get_prompt_of_the_day(cursor)
                 if filter_type == "all":
-                    models = _fetch_models(cursor, limit=None, debug=True)
-                    images = _fetch_images(cursor, limit=None, debug=True)
-                    videos = _fetch_videos(cursor, limit=None, debug=True)
+                    models = _fetch_models(cursor, limit=_fetch_cap, debug=True)
+                    images = _fetch_images(cursor, limit=_fetch_cap, debug=True)
+                    videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True)
                 elif filter_type in ("model", "models"):
-                    models = _fetch_models(cursor, limit=None, debug=True)
+                    models = _fetch_models(cursor, limit=_fetch_cap, debug=True)
                     images, videos = [], []
                 elif filter_type in ("image", "images"):
-                    images = _fetch_images(cursor, limit=None, debug=True)
+                    images = _fetch_images(cursor, limit=_fetch_cap, debug=True)
                     models, videos = [], []
                 elif filter_type in ("video", "videos"):
-                    videos = _fetch_videos(cursor, limit=None, debug=True)
+                    videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True)
                     models, images = [], []
                 else:
                     models, images, videos = [], [], []
@@ -586,14 +634,16 @@ def inspire_feed() -> Response:
             if card:
                 cards.append(card)
 
-        response = jsonify({
+        result = {
             "ok": True,
             "prompt_of_the_day": potd,
             "cards": cards,
             "total": len(cards),
             "total_available": total_available,
             "source": "inspire"
-        })
+        }
+        _set_cached_inspire(_cache_key, result)
+        response = jsonify(result)
         response.headers["Content-Type"] = "application/json"
         return response
 

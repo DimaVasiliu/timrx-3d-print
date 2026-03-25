@@ -26,7 +26,7 @@ from backend.middleware import require_session, with_session
 
 # Short TTL cache for /jobs/active — avoids pool pressure for repeated polls
 _jobs_active_cache: dict = {}  # identity_id -> (result_list, monotonic_ts)
-_JOBS_CACHE_TTL = 10  # seconds
+_JOBS_CACHE_TTL = 30  # seconds — jobs take minutes; 30s is fine for status freshness
 
 
 def invalidate_jobs_active_cache(identity_id: str):

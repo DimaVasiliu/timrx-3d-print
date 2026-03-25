@@ -29,6 +29,37 @@ logger = logging.getLogger(__name__)
 VALID_REACTIONS = ('heart', 'fire', 'star', 'clap', 'wow')
 TIP_AMOUNTS     = (5, 10, 25, 50)
 
+# ── Community feed response cache ──
+# The feed is public (not per-user), so we can cache aggressively.
+# Keyed by (limit, offset, type) → (response_dict, monotonic_timestamp).
+import time as _time
+_feed_cache: dict = {}
+_FEED_CACHE_TTL = 15  # seconds — community content changes slowly
+
+
+def _get_cached_feed(limit, offset, asset_type):
+    key = (limit, offset, asset_type or "all")
+    entry = _feed_cache.get(key)
+    if entry and (_time.monotonic() - entry[1]) < _FEED_CACHE_TTL:
+        return entry[0]
+    return None
+
+
+def _set_cached_feed(limit, offset, asset_type, data):
+    key = (limit, offset, asset_type or "all")
+    _feed_cache[key] = (data, _time.monotonic())
+    # Evict if too many entries
+    if len(_feed_cache) > 200:
+        cutoff = _time.monotonic() - _FEED_CACHE_TTL
+        expired = [k for k, (_, ts) in _feed_cache.items() if ts < cutoff]
+        for k in expired:
+            del _feed_cache[k]
+
+
+def invalidate_community_feed_cache():
+    """Call after share, delete, reaction, or tip to refresh feed."""
+    _feed_cache.clear()
+
 
 def _cur(conn):
     return conn.cursor(row_factory=_tuple_row) if _tuple_row else conn.cursor()
@@ -67,6 +98,11 @@ def community_feed_mod():
         limit      = min(int(request.args.get("limit", 20)), 100)
         offset     = int(request.args.get("offset", 0))
         asset_type = request.args.get("type")
+
+        # Short-circuit: return cached response if within TTL
+        cached = _get_cached_feed(limit, offset, asset_type)
+        if cached is not None:
+            return jsonify(cached)
 
         # Build type filter — everything is stored as history_item_id now, so
         # filter based on the joined history_items fields.
@@ -220,13 +256,15 @@ def community_feed_mod():
 
             cursor.close()
 
-        return jsonify({
+        result = {
             "ok":      True,
             "posts":   posts,
             "total":   total,
             "has_more": offset + len(posts) < total,
             "source":  "modular",
-        })
+        }
+        _set_cached_feed(limit, offset, asset_type, result)
+        return jsonify(result)
 
     except Exception as e:
         print(f"[COMMUNITY][mod] Error in feed: {e}")
@@ -298,6 +336,7 @@ def community_share_mod():
                 cursor.close()
                 conn.commit()
 
+            invalidate_community_feed_cache()
             return jsonify({"ok": True, "post_id": str(post_id), "source": "modular"})
 
         except Exception as e:
@@ -374,6 +413,7 @@ def community_react(post_id: str):
                 my_reaction = row["reaction"] if row else None
 
             # transaction() auto-commits on success.
+            invalidate_community_feed_cache()
             return jsonify({"ok": True, "reactions": reactions, "my_reaction": my_reaction})
 
         except Exception as e:
@@ -484,6 +524,7 @@ def community_tip():
                 tip_total = row["total"] if row else 0
             # transaction() auto-commits on success.
 
+            invalidate_community_feed_cache()
             return jsonify({"ok": True, "tip_total": tip_total})
 
         except Exception as e:
@@ -526,6 +567,7 @@ def community_delete_mod(post_id: str):
 
                 cursor.close()
                 conn.commit()
+            invalidate_community_feed_cache()
             return jsonify({"ok": True, "source": "modular"})
 
         except Exception as e:
