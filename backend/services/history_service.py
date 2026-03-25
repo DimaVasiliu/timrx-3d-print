@@ -1659,7 +1659,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 if isinstance(url, str) and url:
                     normalized_textures.append((str(map_type or "texture"), url))
 
-            final_stage = status_data.get("stage") or job_meta.get("stage") or "preview"
+            final_stage = job_meta.get("stage") or "preview"
             # Use texture_prompt as fallback when prompt/root_prompt are empty (for texture jobs)
             texture_prompt_fallback = job_meta.get("texture_prompt") or ""
             final_prompt = job_meta.get("prompt") or texture_prompt_fallback
