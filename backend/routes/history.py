@@ -50,7 +50,7 @@ from backend.services.s3_service import (
     delete_s3_objects_safe,
     ensure_s3_url_for_data_uri,
 )
-from backend.utils import derive_display_title, log_db_continue
+from backend.utils import derive_display_title, is_generic_title, log_db_continue
 
 bp = Blueprint("history", __name__)
 
@@ -540,9 +540,13 @@ def history_mod():
                             root_prompt = item.get("root_prompt")
                             if not title:
                                 title = derive_display_title(prompt, None, root_prompt=root_prompt)
+                            # Nullify generic titles so SQL COALESCE preserves existing good titles
+                            if is_generic_title(title):
+                                title = None
                             thumbnail_url = item.get("thumbnail_url")
                             glb_url = item.get("glb_url")
                             image_url = item.get("image_url")
+                            lineage_origin_id = item.get("lineage_origin_id") or item.get("lineage_root_id")
                             provider = "openai" if item_type == "image" else "meshy"
 
                             if existing_id:
@@ -566,7 +570,7 @@ def history_mod():
                                            title = CASE
                                                WHEN %s::text IS NOT NULL
                                                 AND %s::text <> ''
-                                                AND %s::text NOT IN ('3D Model', 'Untitled')
+                                                AND %s::text NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                                THEN %s::text
                                                ELSE title
                                            END,
@@ -576,6 +580,7 @@ def history_mod():
                                            thumbnail_url = COALESCE(%s, thumbnail_url),
                                            glb_url = COALESCE(%s, glb_url),
                                            image_url = COALESCE(%s, image_url),
+                                           lineage_origin_id = COALESCE(%s::uuid, lineage_origin_id),
                                            payload = %s,
                                            updated_at = NOW()
                                        WHERE id = %s;""",
@@ -593,6 +598,7 @@ def history_mod():
                                         thumbnail_url,
                                         glb_url,
                                         image_url,
+                                        lineage_origin_id,
                                         json.dumps(item),
                                         use_id,
                                     ),
@@ -650,9 +656,11 @@ def history_mod():
 
                                 cur.execute(
                                     f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
-                                           root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, video_id, payload)
+                                           root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, video_id,
+                                           lineage_origin_id, payload)
                                        VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                           %s, %s, %s, %s, %s, %s, %s, %s)
+                                           %s, %s, %s, %s, %s, %s, %s,
+                                           %s::uuid, %s)
                                        ON CONFLICT (id) DO UPDATE
                                        SET item_type = EXCLUDED.item_type,
                                            status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
@@ -660,7 +668,7 @@ def history_mod():
                                            title = CASE
                                                WHEN EXCLUDED.title IS NOT NULL
                                                 AND EXCLUDED.title <> ''
-                                                AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                                AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                                THEN EXCLUDED.title
                                                ELSE {Tables.HISTORY_ITEMS}.title
                                            END,
@@ -673,6 +681,7 @@ def history_mod():
                                            model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
                                            image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
                                            video_id = COALESCE(EXCLUDED.video_id, {Tables.HISTORY_ITEMS}.video_id),
+                                           lineage_origin_id = COALESCE(EXCLUDED.lineage_origin_id, {Tables.HISTORY_ITEMS}.lineage_origin_id),
                                            payload = EXCLUDED.payload,
                                            updated_at = NOW();""",
                                     (
@@ -690,6 +699,7 @@ def history_mod():
                                         model_id,
                                         image_id,
                                         video_id,
+                                        lineage_origin_id,
                                         json.dumps(item),
                                     ),
                                 )
@@ -767,9 +777,13 @@ def history_item_add_mod():
                     root_prompt = item.get("root_prompt")
                     if not title:
                         title = derive_display_title(prompt, None, root_prompt=root_prompt)
+                    # Nullify generic titles so SQL COALESCE preserves existing good titles
+                    if is_generic_title(title):
+                        title = None
                     thumbnail_url = item.get("thumbnail_url")
                     glb_url = item.get("glb_url")
                     image_url = item.get("image_url")
+                    lineage_origin_id = item.get("lineage_origin_id") or item.get("lineage_root_id")
 
                     provider = "openai" if item_type == "image" else "meshy"
                     s3_user_id = identity_id
@@ -832,7 +846,7 @@ def history_item_add_mod():
                                        title = CASE
                                            WHEN %s::text IS NOT NULL
                                             AND %s::text <> ''
-                                            AND %s::text NOT IN ('3D Model', 'Untitled')
+                                            AND %s::text NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                            THEN %s::text
                                            ELSE title
                                        END,
@@ -842,6 +856,7 @@ def history_item_add_mod():
                                        thumbnail_url = COALESCE(%s, thumbnail_url),
                                        glb_url = COALESCE(%s, glb_url),
                                        image_url = COALESCE(%s, image_url),
+                                       lineage_origin_id = COALESCE(%s::uuid, lineage_origin_id),
                                        payload = %s,
                                        updated_at = NOW()
                                    WHERE id = %s;""",
@@ -850,6 +865,7 @@ def history_item_add_mod():
                                     title, title, title, title,
                                     prompt, root_prompt, identity_id,
                                     thumbnail_url, glb_url, image_url,
+                                    lineage_origin_id,
                                     json.dumps(item), use_id,
                                 ),
                             )
@@ -906,9 +922,11 @@ def history_item_add_mod():
 
                             cur.execute(
                                 f"""INSERT INTO {Tables.HISTORY_ITEMS} (id, identity_id, item_type, status, stage, title, prompt,
-                                       root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id, payload)
+                                       root_prompt, thumbnail_url, glb_url, image_url, model_id, image_id,
+                                       lineage_origin_id, payload)
                                    VALUES (%s, %s, %s, %s, %s, %s, %s,
-                                       %s, %s, %s, %s, %s, %s, %s)
+                                       %s, %s, %s, %s, %s, %s,
+                                       %s::uuid, %s)
                                    ON CONFLICT (id) DO UPDATE
                                    SET item_type = EXCLUDED.item_type,
                                        status = COALESCE(EXCLUDED.status, {Tables.HISTORY_ITEMS}.status),
@@ -916,7 +934,7 @@ def history_item_add_mod():
                                        title = CASE
                                            WHEN EXCLUDED.title IS NOT NULL
                                             AND EXCLUDED.title <> ''
-                                            AND EXCLUDED.title NOT IN ('3D Model', 'Untitled')
+                                            AND EXCLUDED.title NOT IN ('3D Model', 'Untitled', '(untitled)', 'Textured Model', 'Remeshed Model', 'Refined Model', 'Rigged Model', 'Image to 3D Model', 'Generated Model', 'Model', 'Image', 'Video')
                                            THEN EXCLUDED.title
                                            ELSE {Tables.HISTORY_ITEMS}.title
                                        END,
@@ -928,13 +946,15 @@ def history_item_add_mod():
                                        image_url = COALESCE(EXCLUDED.image_url, {Tables.HISTORY_ITEMS}.image_url),
                                        model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
                                        image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
+                                       lineage_origin_id = COALESCE(EXCLUDED.lineage_origin_id, {Tables.HISTORY_ITEMS}.lineage_origin_id),
                                        payload = EXCLUDED.payload,
                                        updated_at = NOW();""",
                                 (
                                     use_id, identity_id, item_type, status, stage,
                                     title, prompt, root_prompt,
                                     thumbnail_url, glb_url, image_url,
-                                    model_id, image_id, json.dumps(item),
+                                    model_id, image_id,
+                                    lineage_origin_id, json.dumps(item),
                                 ),
                             )
                             db_ok = True
