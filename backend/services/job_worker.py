@@ -71,7 +71,7 @@ HEARTBEAT_TIMEOUT = 90           # seconds before a claim is considered expired
 STALL_TIMEOUT = 120              # seconds before marking a job as stalled
 POLL_SLEEP_PENDING = 15          # seconds between provider polls (pending)
 POLL_SLEEP_PROCESSING = 10       # seconds between provider polls (processing)
-WORKER_LOOP_SLEEP = 2            # seconds between claim attempts when idle
+WORKER_LOOP_SLEEP = 5            # seconds between claim attempts when idle
 MAX_ATTEMPTS = 5                 # max retry attempts before permanent failure
 MAX_RECOVERY_AGE_HOURS = 48      # don't claim jobs older than this
 
@@ -246,12 +246,15 @@ def _worker_loop():
     MAX_DB_BACKOFF = 30  # seconds — back off hard to protect user-facing pool slots
 
     # Delay first claim so the pool has time to warm up and serve the
-    # initial wave of user-facing requests (auth, history, wallet).
-    # The worker is a background consumer — 5s of delay is invisible
-    # but avoids competing with bootstrap for pool connections.
-    _worker_stop.wait(timeout=5)
+    # initial wave of user-facing requests (auth, history, wallet, inspire).
+    # The full startup burst takes 5-8s on Render. A 15s delay ensures
+    # the worker never competes with bootstrap for pool connections.
+    _startup_delay = 15
+    print(f"[JOB] First claim scheduled in {_startup_delay}s (protecting startup burst)")
+    _worker_stop.wait(timeout=_startup_delay)
     if _worker_stop.is_set():
         return
+    print(f"[JOB] Worker entering claim loop: {WORKER_ID}")
 
     try:
         while not _worker_stop.is_set():
@@ -2045,7 +2048,11 @@ def start_operations_loop():
         # Wait for the pool to warm up and the initial user-request burst
         # to pass before starting background DB operations.  This also
         # gives the worker thread time to complete leader election.
-        _worker_stop.wait(timeout=10)
+        # 20s delay: the full user startup burst (history, wallet, inspire,
+        # action-costs) takes 5-10s, plus pool warmup takes a few seconds.
+        _ops_delay = 20
+        print(f"[OPS] First sweep scheduled in {_ops_delay}s (protecting startup burst)")
+        _worker_stop.wait(timeout=_ops_delay)
         if _worker_stop.is_set():
             return
 
