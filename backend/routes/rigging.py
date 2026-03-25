@@ -22,7 +22,7 @@ from flask import Blueprint, Response, jsonify, request, g
 
 from backend.config import ACTION_KEYS, MESHY_API_KEY
 from backend.db import USE_DB
-from backend.middleware import with_session
+from backend.middleware import with_session, with_session_readonly
 from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import (
     finalize_job_credits,
@@ -349,7 +349,7 @@ def rig_start():
 # ─── GET /rig/status/<job_id> ───────────────────────────────────────────────
 
 @bp.route("/rig/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def rig_status(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -659,7 +659,7 @@ def rig_animate():
 # ─── GET /rig/animate/status/<job_id> ───────────────────────────────────────
 
 @bp.route("/rig/animate/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def rig_animate_status(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)

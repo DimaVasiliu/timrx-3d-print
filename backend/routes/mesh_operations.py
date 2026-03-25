@@ -12,7 +12,7 @@ from flask import Blueprint, jsonify, request, g
 
 from backend.config import ACTION_KEYS, MESHY_API_KEY
 from backend.db import USE_DB
-from backend.middleware import with_session
+from backend.middleware import with_session, with_session_readonly
 from backend.utils import derive_display_title, is_generic_title
 from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
@@ -203,7 +203,7 @@ def mesh_remesh_mod():
 
 
 @bp.route("/mesh/remesh/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def mesh_remesh_status_mod(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -746,7 +746,7 @@ def _log_retexture_diagnostics(
 
 
 @bp.route("/mesh/retexture/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def mesh_retexture_status_mod(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)

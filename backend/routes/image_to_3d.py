@@ -13,7 +13,7 @@ from flask import Blueprint, jsonify, request, g
 from backend.config import ACTION_KEYS, MESHY_API_KEY
 from backend.utils import derive_display_title
 from backend.db import USE_DB, get_conn
-from backend.middleware import with_session
+from backend.middleware import with_session, with_session_readonly
 from backend.services.async_dispatch import _dispatch_meshy_image_to_3d_async, _dispatch_meshy_multi_image_to_3d_async, get_executor
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
@@ -129,7 +129,7 @@ def image_to_3d_start_mod():
 
 
 @bp.route("/image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def image_to_3d_status_mod(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -428,7 +428,7 @@ def multi_image_to_3d_start_mod():
 
 
 @bp.route("/multi-image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def multi_image_to_3d_status_mod(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)

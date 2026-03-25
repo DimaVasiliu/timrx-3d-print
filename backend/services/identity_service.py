@@ -54,7 +54,7 @@ SESSION_DEBUG = os.getenv("SESSION_DEBUG", "").lower() in ("1", "true", "yes")
 import time as _time
 import threading as _threading
 
-_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "15"))  # seconds (was 5; raised to absorb status-poll bursts)
+_SESSION_CACHE_TTL = float(os.getenv("SESSION_CACHE_TTL", "60"))  # seconds — sessions don't change during normal use; revocation/expiry are rare events
 _SESSION_CACHE_MAX = int(os.getenv("SESSION_CACHE_MAX", "200"))   # max entries
 _session_cache: Dict[str, tuple] = {}   # session_id -> (identity_dict, expires_at)
 _session_cache_lock = _threading.Lock()
@@ -894,20 +894,22 @@ class IdentityService:
         return True
 
     @staticmethod
-    def validate_session(session_id: str) -> Optional[Dict[str, Any]]:
+    def validate_session(session_id: str, readonly: bool = False) -> Optional[Dict[str, Any]]:
         """
         Validate a session ID and return the associated identity.
         Returns None if session is invalid, expired, or revoked.
-        Also updates identity's last_seen_at.
+
+        When readonly=False (default):
+          - Updates identity's last_seen_at (throttled)
+          - Performs sliding-window session renewal
+          - Logs session diagnostic
+
+        When readonly=True:
+          - Skips touch, renewal, and diagnostic logging
+          - Used by status polling endpoints to avoid DB writes on hot read paths
 
         Returns the exact identity the session points to — does not
         follow merged_into_id. Each account is independent.
-
-        Session renewal (sliding window):
-        - If >50% of SESSION_TTL_DAYS has elapsed since session creation,
-          extends expires_at by another full TTL from now.
-        - Sets result["_session_renewed"] = True when renewal happens,
-          so callers (middleware) can re-set the cookie with fresh Max-Age.
         """
         if not session_id:
             return None
@@ -932,6 +934,11 @@ class IdentityService:
         # Each account is independent — do not follow merged_into_id.
         # Legacy merged_into_id values may exist from old merges but are
         # no longer acted on in user-facing session validation.
+
+        if readonly:
+            # Skip touch, renewal, and diagnostics — pure read validation
+            result["_session_renewed"] = False
+            return result
 
         # Touch identity in background (don't fail if this fails)
         try:
@@ -1324,16 +1331,19 @@ class IdentityService:
         return session_id, identity_id
 
     @staticmethod
-    def get_current_identity(request) -> Optional[Dict[str, Any]]:
+    def get_current_identity(request, readonly: bool = False) -> Optional[Dict[str, Any]]:
         """
         Get the current identity from the request session.
         Returns None if no valid session.
         Does NOT create a new identity.
 
+        When readonly=True, the DB validation path skips touch + renewal,
+        eliminating DB writes from status polling endpoints.
+
         Uses three cache layers to minimize DB borrows:
         1. g._cached_identity — request-scoped (same HTTP request never hits DB twice)
-        2. _session_cache — process-level 5s TTL (absorbs concurrent fan-out)
-        3. DB — full validate_session() with touch + renewal
+        2. _session_cache — process-level 60s TTL (absorbs concurrent fan-out)
+        3. DB — validate_session() (with or without touch + renewal)
         """
         # Layer 1: request-scoped cache (already resolved this request)
         try:
@@ -1363,8 +1373,8 @@ class IdentityService:
                 pass
             return cached_identity
 
-        # Layer 3: DB — full validation (happens once per session per TTL window)
-        identity = IdentityService.validate_session(session_id)
+        # Layer 3: DB — validation (happens once per session per TTL window)
+        identity = IdentityService.validate_session(session_id, readonly=readonly)
 
         try:
             if identity:

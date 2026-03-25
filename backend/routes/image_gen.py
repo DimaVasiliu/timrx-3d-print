@@ -17,7 +17,7 @@ from flask import Blueprint, Response, jsonify, request
 
 from backend.config import OPENAI_API_KEY, config
 from backend.db import USE_DB, get_conn, dict_row, Tables
-from backend.middleware import with_session
+from backend.middleware import with_session, with_session_readonly
 from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, dispatch_gemini_image_async, dispatch_piapi_nano_banana_async, update_job_status_ready, update_job_status_failed
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.expense_guard import ExpenseGuard
@@ -876,7 +876,7 @@ def openai_image_mod():
 
 
 @bp.route("/image/openai/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def openai_image_status_mod(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
@@ -974,7 +974,7 @@ def openai_image_status_mod(job_id: str):
 
 
 @bp.route("/image/gemini/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def gemini_image_status_mod(job_id: str):
     """
     Poll status of a Gemini image generation job.
@@ -1094,7 +1094,7 @@ def gemini_image_status_mod(job_id: str):
 
 
 @bp.route("/image/piapi/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def piapi_image_status_mod(job_id: str):
     """
     Poll status of a PiAPI Nano Banana image generation job.

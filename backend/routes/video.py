@@ -22,7 +22,7 @@ import uuid
 from flask import Blueprint, jsonify, request
 
 from backend.db import USE_DB, get_conn, Tables
-from backend.middleware import with_session
+from backend.middleware import with_session, with_session_readonly
 from backend.services.async_dispatch import get_executor
 from backend.services.credits_helper import start_paid_job, release_job_credits
 from backend.services.expense_guard import ExpenseGuard
@@ -752,7 +752,7 @@ def video_presets():
 
 # ── GET /video/status/<job_id> — Canonical status endpoint ───
 @bp.route("/video/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def video_status_canonical(job_id: str):
     """Canonical status endpoint (delegates to shared handler)."""
     return _video_status_handler(job_id)
@@ -760,7 +760,7 @@ def video_status_canonical(job_id: str):
 
 # ── GET /video/generate/status/<job_id> — Legacy alias ───────
 @bp.route("/video/generate/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session
+@with_session_readonly
 def video_status(job_id: str):
     """Legacy status endpoint (delegates to shared handler)."""
     return _video_status_handler(job_id)

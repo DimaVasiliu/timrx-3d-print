@@ -54,12 +54,15 @@ def _get_database_error():
 # Core identity resolution (shared by ALL middleware decorators)
 # ─────────────────────────────────────────────────────────────
 
-def _resolve_identity():
+def _resolve_identity(readonly=False):
     """
     Resolve the current request's identity, using request-scoped caching.
 
     Returns (identity_dict_or_None, session_id_or_None).
     After this call, g.session_id / g.identity_id / g.identity are set.
+
+    When readonly=True, the DB validation path skips touch + renewal,
+    avoiding DB writes on read-only endpoints like status polling.
 
     This is the ONLY function that should call get_current_identity().
     All middleware decorators delegate here so that within a single HTTP
@@ -73,7 +76,7 @@ def _resolve_identity():
     IdentityService = _get_identity_service()
 
     session_id = IdentityService.get_session_id_from_request(request)
-    identity = IdentityService.get_current_identity(request)
+    identity = IdentityService.get_current_identity(request, readonly=readonly)
 
     g.session_id = session_id
     g.identity_id = str(identity["id"]) if identity else None
@@ -278,6 +281,60 @@ def with_session(f):
 
         except DatabaseError as e:
             print(f"[MIDDLEWARE] Database error in with_session: {e}")
+            return jsonify({
+                "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
+            }), 500
+
+    return decorated
+
+
+def with_session_readonly(f):
+    """
+    Decorator for read-only endpoints (status polling, etc.).
+
+    Same as with_session but when the session cache misses and a DB
+    validation is required, it skips:
+    - identity touch (last_seen_at UPDATE)
+    - session renewal (sliding-window expiry extension)
+    - session diagnostic logging
+
+    This eliminates DB writes from status polling paths, reducing
+    DB connection usage from 2-3 per poll to 0-1.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)
+
+        DatabaseError = _get_database_error()
+
+        try:
+            identity, session_id = _resolve_identity(readonly=True)
+
+            if identity:
+                # No cookie refresh needed — readonly never renews sessions
+                return f(*args, **kwargs)
+
+            # No valid session — bootstrap anonymous identity (still needed
+            # for first-visit status checks via shared links, etc.)
+            try:
+                session_id, identity_id, identity_with_wallet, cookie_response = _do_bootstrap()
+            except _BootstrapBusy:
+                return _bootstrap_retry_response()
+
+            g.session_id = session_id
+            g.identity_id = identity_id
+            g.identity = identity_with_wallet
+            g._identity_resolved = True
+            g._identity_source = "bootstrap"
+
+            result = f(*args, **kwargs)
+            resp = _ensure_response(result)
+            _copy_cookies(cookie_response, resp)
+            return resp
+
+        except DatabaseError as e:
+            print(f"[MIDDLEWARE] Database error in with_session_readonly: {e}")
             return jsonify({
                 "error": {"code": "DATABASE_ERROR", "message": "Database error occurred"}
             }), 500
