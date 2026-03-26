@@ -301,6 +301,9 @@ def dispatch_meshy_image_to_3d_async(
             except Exception as e:
                 print(f"[ASYNC] WARNING: Failed to upload source image to S3: {e}")
 
+        # Persist the ORIGINAL source image URL (not the Meshy-normalized derivative).
+        # payload["image_url"] may have been replaced by the preflight step above,
+        # but s3_image_url always points to the original full-resolution image.
         store = load_store()
         store_meta["upstream_job_id"] = meshy_task_id
         store_meta["image_url"] = s3_image_url
