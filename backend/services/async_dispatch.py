@@ -1119,64 +1119,54 @@ def _dispatch_to_vertex_with_fallback(
     route_params: dict,
     router,
 ) -> tuple:
-    """Route to Vertex via the router; fall back to Seedance on failure."""
+    """
+    Route video generation via the provider router.
+
+    For text2video and image2video: delegates to router.route_*() which
+    iterates all configured providers (vertex > seedance > fal_seedance)
+    with automatic fallback on auth/config/quota errors.
+
+    For image_transition: dispatches directly to Vertex (the only provider
+    with first-frame + last-frame conditioning). No fallback — transition
+    is Vertex-only.
+    """
     from backend.services.video_router import (
         resolve_video_provider,
         ProviderUnavailableError,
     )
 
-    try:
-        if task == "image_transition":
-            # Two-image transition via Vertex (first-frame + last-frame conditioning)
-            vertex = resolve_video_provider("vertex")
-            if not vertex:
-                raise ProviderUnavailableError("Vertex provider not available for transition")
-            fp = payload.get("motion") or prompt
-            resp = vertex.start_image_transition(
-                start_image=payload.get("start_image", ""),
-                end_image=payload.get("end_image", ""),
-                prompt=fp,
-                **route_params,
-            )
-            return resp, "vertex"
-        elif task == "image2video":
-            prompt = payload.get("motion") or prompt
-            resp, provider_used = router.route_image_to_video(
-                image_data=payload.get("image_data", ""),
-                prompt=prompt,
-                **route_params,
-            )
-        else:
-            resp, provider_used = router.route_text_to_video(
-                prompt=prompt,
-                **route_params,
-            )
-        return resp, provider_used
+    # image_transition is Vertex-only (requires first-frame + last-frame conditioning)
+    if task == "image_transition":
+        vertex = resolve_video_provider("vertex")
+        if not vertex:
+            raise ProviderUnavailableError("Vertex provider not available for transition")
+        configured, config_err = vertex.is_configured()
+        if not configured:
+            raise ProviderUnavailableError(f"Vertex not configured for transition: {config_err}")
+        fp = payload.get("motion") or prompt
+        resp = vertex.start_image_transition(
+            start_image=payload.get("start_image", ""),
+            end_image=payload.get("end_image", ""),
+            prompt=fp,
+            **route_params,
+        )
+        print(f"[ASYNC] image_transition routed to vertex for job {internal_job_id}")
+        return resp, "vertex"
 
-    except (ProviderUnavailableError, RuntimeError) as vertex_err:
-        # Transition jobs must NOT silently fall back — Seedance has no transition support
-        if task == "image_transition":
-            print(f"[ASYNC] Vertex transition failed for job {internal_job_id}: {vertex_err} — NO fallback available")
-            raise vertex_err
-
-        print(f"[ASYNC] Vertex failed for job {internal_job_id}: {vertex_err}, attempting Seedance failover")
-        failover = resolve_video_provider("seedance")
-        if failover:
-            configured, _ = failover.is_configured()
-            if configured:
-                route_params["task_type"] = "seedance-2-fast-preview"
-                if task == "image2video":
-                    fp = payload.get("motion") or payload.get("prompt", "")
-                    resp = failover.start_image_to_video(
-                        image_data=payload.get("image_data", ""), prompt=fp, **route_params,
-                    )
-                else:
-                    resp = failover.start_text_to_video(
-                        prompt=payload.get("prompt", ""), **route_params,
-                    )
-                print(f"[ASYNC] Seedance failover succeeded for job {internal_job_id}")
-                return resp, "seedance"
-        raise vertex_err
+    # text2video and image2video: use the router's full provider chain with fallback
+    if task == "image2video":
+        prompt = payload.get("motion") or prompt
+        resp, provider_used = router.route_image_to_video(
+            image_data=payload.get("image_data", ""),
+            prompt=prompt,
+            **route_params,
+        )
+    else:
+        resp, provider_used = router.route_text_to_video(
+            prompt=prompt,
+            **route_params,
+        )
+    return resp, provider_used
 
 
 def dispatch_gemini_video_async(
@@ -2548,3 +2538,5 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+
