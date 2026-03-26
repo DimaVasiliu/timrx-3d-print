@@ -283,6 +283,32 @@ def text_to_3d_refine_mod():
             "code": "PREVIEW_TASK_NOT_FOUND",
         }), 400
 
+    # ── Preflight: verify the preview task still exists on Meshy ──────────
+    # Meshy expires preview tasks after ~7 days.  Without this check, the
+    # async dispatch burns ~18 s retrying before failing.  Fail fast instead.
+    try:
+        from backend.services.meshy_service import mesh_get, MeshyTaskNotFoundError
+        try:
+            upstream = mesh_get(f"/openapi/v2/text-to-3d/{preview_task_id}")
+            upstream_status = (upstream.get("status") or "").upper()
+            print(f"[REFINE:PREFLIGHT] task_id={preview_task_id} status={upstream_status}")
+            if upstream_status == "FAILED":
+                return jsonify({
+                    "ok": False,
+                    "error": "Preview task not found — the preview generation failed. Please generate a new preview first.",
+                    "code": "PREVIEW_FAILED_UPSTREAM",
+                }), 400
+        except MeshyTaskNotFoundError:
+            print(f"[REFINE:PREFLIGHT] task_id={preview_task_id} EXPIRED (404 from provider)")
+            return jsonify({
+                "ok": False,
+                "error": "Preview task not found — this model's source data has expired. Please generate a new preview first.",
+                "code": "PREVIEW_EXPIRED_UPSTREAM",
+            }), 400
+    except Exception as e:
+        # Network error or import issue — don't block, let the dispatch retry logic handle it
+        print(f"[REFINE:PREFLIGHT] check failed ({e}) — proceeding without validation")
+
     store = load_store()
     preview_meta = get_job_metadata(preview_task_id_input, store)
     if not preview_meta.get("prompt"):

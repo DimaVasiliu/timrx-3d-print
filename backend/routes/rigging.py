@@ -219,6 +219,42 @@ def rig_start():
         return jsonify({"ok": False, "error": err}), 400
     print(f"[RIG_SOURCE] resolved: input_task_id={source.get('input_task_id')} model_url={'yes' if source.get('model_url') else 'no'}")
 
+    # ── Server-side face count guard ──
+    # Prevent sending models with >300K faces to Meshy (which rejects them
+    # with potentially huge error payloads). Mirrors the preflight check.
+    FACE_LIMIT = 300_000
+    source_task_id = source.get("input_task_id")
+    if source_task_id:
+        try:
+            from backend.services.meshy_service import mesh_get
+            task_info = None
+            for endpoint_tpl in (
+                "/openapi/v1/text-to-3d/{}",
+                "/openapi/v1/image-to-3d/{}",
+            ):
+                try:
+                    task_info = mesh_get(endpoint_tpl.format(source_task_id))
+                    break
+                except Exception:
+                    continue
+            if task_info:
+                face_count = None
+                for container_key in ("output", "result", ""):
+                    container = task_info.get(container_key, task_info) if container_key else task_info
+                    if isinstance(container, dict):
+                        face_count = face_count or container.get("face_count") or container.get("faces")
+                if face_count and int(face_count) > FACE_LIMIT:
+                    print(f"[RIG_SUBMIT] BLOCKED: {face_count} faces > {FACE_LIMIT} limit")
+                    return jsonify({
+                        "ok": False,
+                        "error": "MODEL_TOO_COMPLEX",
+                        "message": f"Model has {int(face_count):,} faces (limit: {FACE_LIMIT:,}). Please remesh the model first, then try rigging again.",
+                    }), 400
+                print(f"[RIG_SUBMIT] face_check: faces={face_count} (limit={FACE_LIMIT})")
+        except Exception as fc_err:
+            # Non-fatal: cannot determine face count, proceed and let Meshy decide
+            print(f"[RIG_SUBMIT] face_count_check_skipped: {fc_err}")
+
     # Parse optional height_meters (default 1.7)
     try:
         height_meters = float(body.get("height_meters", 1.7))
@@ -275,7 +311,7 @@ def rig_start():
                 "message": "Rigging failed. Please try again.",
             }), 502
     except Exception as e:
-        err_str = str(e).lower()
+        err_str = str(e)[:2000].lower()  # Truncate to avoid huge Meshy error payloads
 
         # Auto-retry with model_url when input_task_id expired on Meshy
         if ("input task not found" in err_str or "task not found" in err_str) and source.get("input_task_id"):

@@ -49,7 +49,17 @@ def create_rigging_task(
 
 def get_rigging_task(task_id: str) -> dict:
     """Poll a Meshy rigging task by ID."""
-    return mesh_get(f"/openapi/v1/rigging/{task_id}")
+    resp = mesh_get(f"/openapi/v1/rigging/{task_id}")
+    # Guard against oversized error payloads from Meshy (e.g. 300K+ char errors)
+    if isinstance(resp, dict):
+        task_error = resp.get("task_error")
+        if isinstance(task_error, str) and len(task_error) > 5000:
+            resp["task_error"] = task_error[:5000] + "...[truncated]"
+        elif isinstance(task_error, dict):
+            msg = task_error.get("message", "")
+            if isinstance(msg, str) and len(msg) > 5000:
+                task_error["message"] = msg[:5000] + "...[truncated]"
+    return resp
 
 
 def stream_rigging_task(task_id: str):

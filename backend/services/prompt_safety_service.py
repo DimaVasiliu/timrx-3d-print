@@ -124,10 +124,10 @@ _RULES_RAW: List[Tuple[str, str, int, str]] = [
     # ═════════════════════════════════════════════════════════
     # WEAPONS  (low weight, never blocks alone)
     # ═════════════════════════════════════════════════════════
-    (r"\b(?:holding|brandish\w+|wield\w+|carry\w*)\s+(?:a\s+)?(?:gun|rifle|pistol|sword|knife|weapon|blade|axe|machete)\b", "weapons", 5, "W01_holding_weapon"),
-    (r"\b(?:armed|weaponized)\b", "weapons", 4, "W02_armed"),
-    (r"\b(?:gun|rifle|pistol|firearm|shotgun|revolver)\b", "weapons", 4, "W03_gun_present"),
-    (r"\b(?:fight(?:ing)?|combat|battle)\b.*\b(?:scene|sequence)\b", "weapons", 3, "W04_combat_scene"),
+    (r"\b(?:holding|brandish\w+|wield\w+|carry\w*)\s+(?:a\s+)?(?:gun|rifle|pistol|sword|knife|weapon|blade|axe|machete)\b", "weapons", 3, "W01_holding_weapon"),
+    (r"\b(?:armed|weaponized)\b", "weapons", 2, "W02_armed"),
+    (r"\b(?:gun|rifle|pistol|firearm|shotgun|revolver)\b", "weapons", 2, "W03_gun_present"),
+    (r"\b(?:fight(?:ing)?|combat|battle)\b.*\b(?:scene|sequence)\b", "weapons", 2, "W04_combat_scene"),
 
     # ═════════════════════════════════════════════════════════
     # HORROR  (low weight, never blocks alone)
@@ -141,10 +141,10 @@ _RULES_RAW: List[Tuple[str, str, int, str]] = [
     # ═════════════════════════════════════════════════════════
     # LOW-SIGNAL (tiny scores, never block alone)
     # ═════════════════════════════════════════════════════════
-    (r"\b(?:blood|bleed(?:s|ing)?)\b", "violence", 3, "LO01_blood"),
-    (r"\b(?:wound(?:ed)?|injur\w+)\b", "violence", 3, "LO02_wound"),
-    (r"\b(?:explosion|explod\w+|detonate|blast)\b", "violence", 3, "LO03_explosion"),
-    (r"\b(?:punch\w*|kick\w*)\b.*\b(?:person|opponent|enemy|face)\b", "violence", 4, "LO04_punch"),
+    (r"\b(?:blood|bleed(?:s|ing)?)\b", "violence", 1, "LO01_blood"),
+    (r"\b(?:wound(?:ed)?|injur\w+)\b", "violence", 1, "LO02_wound"),
+    (r"\b(?:explosion|explod\w+|detonate|blast)\b", "violence", 2, "LO03_explosion"),
+    (r"\b(?:punch\w*|kick\w*)\b.*\b(?:person|opponent|enemy|face)\b", "violence", 2, "LO04_punch"),
 ]
 
 _RULES = [(re.compile(p, re.IGNORECASE), cat, w, rid) for p, cat, w, rid in _RULES_RAW]
@@ -180,8 +180,8 @@ _HARMFUL_ACTION_VERBS = re.compile(
 # violence rules (V01-V02) still match "shot" when combined with human
 # targets, so real violence is still caught.
 
-_SAFE_SCORE_THRESHOLD = 4
-_SAFE_DAMPEN_FACTOR   = 0.3
+_SAFE_SCORE_THRESHOLD = 2
+_SAFE_DAMPEN_FACTOR   = 0.2
 
 
 # ─────────────────────────────────────────────────────────────
@@ -214,6 +214,25 @@ _HUMAN_SUBJECTS = re.compile(
 # references ("its body", "spider body") causing false positives.
 # "body" only appears in rule patterns where it's already contextual
 # (e.g. "nude body" in S03, "stab.*body" in V05).
+
+# Fiction / fantasy context — dampen violence + weapons when the prompt is
+# clearly about game characters, fantasy settings, or fictional worlds.
+_FICTION_CONTEXT = re.compile(
+    r"\b(?:knight|warrior|wizard|mage|paladin|ranger|rogue|cleric|barbarian|"
+    r"elven|dwarven|orcish|halfling|"
+    r"medieval|fantasy|mythical|legendary|enchanted|quest|dungeon|"
+    r"dragon|orc|goblin|troll|ogre|minotaur|griffin|phoenix|wyvern|"
+    r"castle|kingdom|realm|throne|tavern|forge|"
+    r"sword\s+and\s+sorcery|dark\s+fantasy|high\s+fantasy|epic\s+fantasy|"
+    r"RPG|D&D|tabletop|game\s+character|video\s+game|"
+    r"anime|manga|cartoon|animated|pixar[\s-]?style|"
+    r"superhero|supervillain|comic\s+book|"
+    r"sci[\s-]?fi|cyberpunk|steampunk|post[\s-]?apocalyptic|"
+    r"space\s+(?:marine|pirate|battle|war|station)|starship|"
+    r"robot|android|cyborg|mech|mecha)\b",
+    re.IGNORECASE,
+)
+_FICTION_DAMPEN_FACTOR = 0.3
 
 # Photography / technical metadata — never risk-relevant
 _PHOTO_METADATA = re.compile(
@@ -248,21 +267,21 @@ _PROVIDER_STRICTNESS: Dict[str, float] = {
 }
 
 _MEDIUM_STRICTNESS: Dict[str, float] = {
-    "video": 1.2, "image": 1.0, "text": 0.8, "text_enhancement": 0.8,
+    "video": 1.1, "image": 1.0, "text": 0.8, "text_enhancement": 0.8,
 }
 
 # ─────────────────────────────────────────────────────────────
 # Per-category thresholds (after multiplier)
 # ─────────────────────────────────────────────────────────────
 _CATEGORY_THRESHOLDS: Dict[str, Dict[str, float]] = {
-    "violence":    {"warn_at": 8,  "block_at": 12},
+    "violence":    {"warn_at": 10, "block_at": 14},
     "sexual":      {"warn_at": 8,  "block_at": 12},
     "minors":      {"warn_at": 1,  "block_at": 1},
     "self_harm":   {"warn_at": 1,  "block_at": 1},
     "hate":        {"warn_at": 8,  "block_at": 14},
     "real_person": {"warn_at": 8,  "block_at": 14},
     "copyright":   {"warn_at": 6,  "block_at": 14},
-    "weapons":     {"warn_at": 8,  "block_at": 999},
+    "weapons":     {"warn_at": 10, "block_at": 999},
     "horror":      {"warn_at": 10, "block_at": 999},
 }
 _DEFAULT_WARN_AT  = 8
@@ -740,6 +759,20 @@ def check_prompt_safety(
                 cat_scores[c] *= _SAFE_DAMPEN_FACTOR
                 safe_reduced = True
 
+    # Fiction / fantasy context dampener:
+    # If prompt is about fantasy, gaming, sci-fi etc. and has no real-person
+    # references, dampen violence and weapons scores (fictional combat is common).
+    has_fiction_context = bool(_FICTION_CONTEXT.search(text_cleaned))
+    fiction_reduced = False
+    if has_fiction_context:
+        # Check no real-person category was triggered
+        has_real_person_trigger = "real_person" in cat_scores and cat_scores["real_person"] > 0
+        if not has_real_person_trigger:
+            for c in ("violence", "weapons"):
+                if c in cat_scores:
+                    cat_scores[c] *= _FICTION_DAMPEN_FACTOR
+                    fiction_reduced = True
+
     # Non-human subject override:
     # If prompt is about animals/insects/nature/macro and has NO human subjects,
     # zero out violence and sexual scores entirely.
@@ -773,6 +806,8 @@ def check_prompt_safety(
         "safe_context_count": safe_count,
         "has_harmful_verbs": has_harmful_verbs,
         "safe_reduced": safe_reduced,
+        "fiction_context": has_fiction_context,
+        "fiction_reduced": fiction_reduced,
         "nonhuman_override": nonhuman_override,
         "has_nonhuman_subject": has_nonhuman,
         "has_human_subject": has_human,
@@ -790,11 +825,11 @@ def check_prompt_safety(
         f"matched={json.dumps([r['rule'] for r in matched_rules])} "
         f"scores={json.dumps({k: round(v, 1) for k, v in cat_scores.items()})} "
         f"safe_ctx={safe_count} harmful_verbs={has_harmful_verbs} "
-        f"reduced={safe_reduced} nonhuman={nonhuman_override} mult={total_mult:.2f}"
+        f"reduced={safe_reduced} fiction={fiction_reduced} nonhuman={nonhuman_override} mult={total_mult:.2f}"
     )
 
     # False positive warning: log when a block/warn looks suspicious
-    if decision != "allow" and not has_harmful_verbs and (safe_count >= 4 or nonhuman_override):
+    if decision != "allow" and not has_harmful_verbs and (safe_count >= 4 or nonhuman_override or fiction_reduced):
         print(
             f"[SAFETY_WARNING_FALSE_POSITIVE] decision={decision} categories={triggered_cats} "
             f"safe_ctx={safe_count} nonhuman={nonhuman_override} harmful_verbs=False "

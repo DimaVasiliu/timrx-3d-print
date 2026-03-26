@@ -174,6 +174,10 @@ def sanitize_job_error_message(raw_error: Optional[str]) -> Optional[str]:
     if any(kw in lower for kw in WALLET_KEYWORDS):
         return "Generation temporarily unavailable. Please try again shortly."
 
+    # Expired preview / model — pass through so frontend shows the nice modal
+    if "preview task not found" in lower or "task not found" in lower:
+        return "Preview task not found — this model's source data has expired. Please generate a new preview."
+
     # Check for common provider error patterns
     if any(p in lower for p in ("api_error", "status_code", "http ", "->", "non-json")):
         return "Generation failed. Please try again."
