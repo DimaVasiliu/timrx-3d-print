@@ -875,16 +875,22 @@ def openai_image_mod():
     )
 
 
-@bp.route("/image/openai/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session_readonly
-def openai_image_status_mod(job_id: str):
-    if request.method == "OPTIONS":
-        return ("", 204)
+# ─────────────────────────────────────────────────────────────
+# Unified Image Status Endpoint
+# ─────────────────────────────────────────────────────────────
+# Single canonical endpoint for all image providers.
+# Resolves provider from the DB job row, then returns a consistent
+# response shape regardless of which provider generated the image.
+# Legacy provider-specific endpoints below are kept for backward compat.
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
 
+def _image_status_handler(job_id: str, identity_id: str):
+    """
+    Shared image status logic for all providers.
+
+    Checks DB job row first (authoritative), falls back to in-memory store.
+    Returns a consistent response dict or a Flask response tuple on error.
+    """
     store = load_store()
     meta = store.get(job_id) or {}
 
@@ -894,7 +900,7 @@ def openai_image_status_mod(job_id: str):
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT id, status, error_message, meta
+                        SELECT id, status, error_message, meta, provider
                         FROM timrx_billing.jobs
                         WHERE id::text = %s AND identity_id = %s
                         LIMIT 1
@@ -911,11 +917,13 @@ def openai_image_status_mod(job_id: str):
                     except Exception:
                         job_meta = {}
 
-                if job["status"] == "queued":
-                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image..."})
+                provider = job.get("provider") or meta.get("provider") or job_meta.get("provider") or "unknown"
+
+                if job["status"] in ("queued", "processing"):
+                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "provider": provider, "message": "Generating image..."})
 
                 if job["status"] == "failed":
-                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "error": job.get("error_message", "Image generation failed")})
+                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "provider": provider, "error": job.get("error_message", "Image generation failed")})
 
                 if job["status"] == "ready":
                     image_url = meta.get("image_url") or job_meta.get("image_url")
@@ -926,12 +934,16 @@ def openai_image_status_mod(job_id: str):
                         upstream_id=job_id,
                         alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
                     )
+                    thumbnail_url = None
                     if canonical:
                         if canonical.get("image_url"):
                             image_url = canonical["image_url"]
                             image_urls = [image_url]
                         if canonical.get("thumbnail_url"):
-                            meta["thumbnail_url"] = canonical["thumbnail_url"]
+                            thumbnail_url = canonical["thumbnail_url"]
+
+                    balance_info = get_current_balance(identity_id) if identity_id else None
+
                     return jsonify({
                         "ok": True,
                         "status": "done",
@@ -939,25 +951,33 @@ def openai_image_status_mod(job_id: str):
                         "image_id": job_id,
                         "image_url": image_url,
                         "image_urls": image_urls,
+                        "thumbnail_url": thumbnail_url,
                         "image_base64": meta.get("image_base64") or job_meta.get("image_base64"),
                         "model": meta.get("model") or job_meta.get("model"),
-                        "size": meta.get("size") or job_meta.get("size"),
+                        "provider": provider,
+                        "new_balance": balance_info["available"] if balance_info else None,
                     })
         except Exception as e:
-            print(f"[STATUS][mod] Error checking OpenAI job {job_id}: {e}")
+            print(f"[STATUS][mod] Error checking image job {job_id}: {e}")
 
+    # Fallback to in-memory store
     if meta.get("status") == "done":
+        provider = meta.get("provider") or "unknown"
         canonical = get_canonical_image_row(
             identity_id,
             upstream_id=job_id,
             alt_upstream_id=meta.get("image_id"),
         )
+        thumbnail_url = None
         if canonical:
             if canonical.get("image_url"):
                 meta["image_url"] = canonical["image_url"]
                 meta["image_urls"] = [canonical["image_url"]]
             if canonical.get("thumbnail_url"):
-                meta["thumbnail_url"] = canonical["thumbnail_url"]
+                thumbnail_url = canonical["thumbnail_url"]
+
+        balance_info = get_current_balance(identity_id) if identity_id else None
+
         return jsonify({
             "ok": True,
             "status": "done",
@@ -965,252 +985,78 @@ def openai_image_status_mod(job_id: str):
             "image_id": job_id,
             "image_url": meta.get("image_url"),
             "image_urls": meta.get("image_urls", []),
+            "thumbnail_url": thumbnail_url,
             "image_base64": meta.get("image_base64"),
             "model": meta.get("model"),
-            "size": meta.get("size"),
+            "provider": provider,
+            "new_balance": balance_info["available"] if balance_info else None,
         })
 
     return jsonify({"error": "Job not found"}), 404
+
+
+@bp.route("/image/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def image_status_unified(job_id: str):
+    """
+    Canonical image status endpoint — works for all providers.
+
+    Resolves provider from the DB job row. Returns a consistent response shape:
+    - status: "queued" | "done" | "failed"
+    - On done: image_url, image_urls, thumbnail_url, model, provider, new_balance
+    - On failed: error message
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    return _image_status_handler(job_id, identity_id)
+
+
+# ─────────────────────────────────────────────────────────────
+# Legacy Provider-Specific Status Endpoints (kept for backward compat)
+# ─────────────────────────────────────────────────────────────
+# These delegate to the shared handler above. The canonical endpoint
+# is /image/status/<job_id> — frontend should migrate to that.
+
+
+@bp.route("/image/openai/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def openai_image_status_mod(job_id: str):
+    """Legacy OpenAI image status — delegates to unified handler."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    return _image_status_handler(job_id, identity_id)
 
 
 @bp.route("/image/gemini/status/<job_id>", methods=["GET", "OPTIONS"])
 @with_session_readonly
 def gemini_image_status_mod(job_id: str):
-    """
-    Poll status of a Gemini image generation job.
-
-    Returns:
-    - status: "queued" | "done" | "failed"
-    - On done: image_url, image_urls, image_base64
-    - On failed: error message
-    """
+    """Legacy Gemini image status — delegates to unified handler."""
     if request.method == "OPTIONS":
         return ("", 204)
-
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
-
-    store = load_store()
-    meta = store.get(job_id) or {}
-
-    if USE_DB:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT id, status, error_message, meta
-                        FROM timrx_billing.jobs
-                        WHERE id::text = %s AND identity_id = %s
-                        LIMIT 1
-                        """,
-                        (job_id, identity_id),
-                    )
-                    job = cur.fetchone()
-
-            if job:
-                job_meta = job.get("meta") or {}
-                if isinstance(job_meta, str):
-                    try:
-                        job_meta = __import__('json').loads(job_meta)
-                    except Exception:
-                        job_meta = {}
-
-                if job["status"] == "queued":
-                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image..."})
-
-                if job["status"] == "failed":
-                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "error": job.get("error_message", "Image generation failed")})
-
-                if job["status"] == "ready":
-                    image_url = meta.get("image_url") or job_meta.get("image_url")
-                    image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
-
-                    canonical = get_canonical_image_row(
-                        identity_id,
-                        upstream_id=job_id,
-                        alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
-                    )
-                    if canonical:
-                        if canonical.get("image_url"):
-                            image_url = canonical["image_url"]
-                            image_urls = [image_url]
-                        if canonical.get("thumbnail_url"):
-                            meta["thumbnail_url"] = canonical["thumbnail_url"]
-
-                    # Get updated balance to return to frontend
-                    balance_info = get_current_balance(identity_id) if identity_id else None
-
-                    return jsonify({
-                        "ok": True,
-                        "status": "done",
-                        "job_id": job_id,
-                        "image_id": job_id,
-                        "image_url": image_url,
-                        "image_urls": image_urls,
-                        "image_base64": meta.get("image_base64") or job_meta.get("image_base64"),
-                        "model": meta.get("model") or job_meta.get("model") or "imagen-4.0",
-                        "aspect_ratio": meta.get("aspect_ratio") or job_meta.get("aspect_ratio"),
-                        "image_size": meta.get("image_size") or job_meta.get("image_size"),
-                        "provider": "google",
-                        "new_balance": balance_info["available"] if balance_info else None,
-                    })
-        except Exception as e:
-            print(f"[STATUS][mod] Error checking Gemini job {job_id}: {e}")
-
-    # Fallback to in-memory store
-    if meta.get("status") == "done":
-        canonical = get_canonical_image_row(
-            identity_id,
-            upstream_id=job_id,
-            alt_upstream_id=meta.get("image_id"),
-        )
-        if canonical:
-            if canonical.get("image_url"):
-                meta["image_url"] = canonical["image_url"]
-                meta["image_urls"] = [canonical["image_url"]]
-            if canonical.get("thumbnail_url"):
-                meta["thumbnail_url"] = canonical["thumbnail_url"]
-
-        balance_info = get_current_balance(identity_id) if identity_id else None
-
-        return jsonify({
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "image_id": job_id,
-            "image_url": meta.get("image_url"),
-            "image_urls": meta.get("image_urls", []),
-            "image_base64": meta.get("image_base64"),
-            "model": meta.get("model") or "imagen-4.0",
-            "aspect_ratio": meta.get("aspect_ratio"),
-            "image_size": meta.get("image_size"),
-            "provider": "google",
-            "new_balance": balance_info["available"] if balance_info else None,
-        })
-
-    return jsonify({"error": "Job not found"}), 404
+    return _image_status_handler(job_id, identity_id)
 
 
 @bp.route("/image/piapi/status/<job_id>", methods=["GET", "OPTIONS"])
 @with_session_readonly
 def piapi_image_status_mod(job_id: str):
-    """
-    Poll status of a PiAPI Nano Banana image generation job.
-
-    Returns:
-    - status: "queued" | "done" | "failed"
-    - On done: image_url, image_urls
-    - On failed: error message
-    """
+    """Legacy PiAPI image status — delegates to unified handler."""
     if request.method == "OPTIONS":
         return ("", 204)
-
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
-
-    store = load_store()
-    meta = store.get(job_id) or {}
-
-    if USE_DB:
-        try:
-            with get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT id, status, error_message, meta
-                        FROM timrx_billing.jobs
-                        WHERE id::text = %s AND identity_id = %s
-                        LIMIT 1
-                        """,
-                        (job_id, identity_id),
-                    )
-                    job = cur.fetchone()
-
-            if job:
-                job_meta = job.get("meta") or {}
-                if isinstance(job_meta, str):
-                    try:
-                        job_meta = __import__('json').loads(job_meta)
-                    except Exception:
-                        job_meta = {}
-
-                if job["status"] == "queued":
-                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image..."})
-
-                if job["status"] == "processing":
-                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "message": "Generating image with Nano Banana..."})
-
-                if job["status"] == "failed":
-                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "error": job.get("error_message", "Image generation failed")})
-
-                if job["status"] == "ready":
-                    image_url = meta.get("image_url") or job_meta.get("image_url")
-                    image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
-
-                    canonical = get_canonical_image_row(
-                        identity_id,
-                        upstream_id=job_id,
-                        alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
-                    )
-                    if canonical:
-                        if canonical.get("image_url"):
-                            image_url = canonical["image_url"]
-                            image_urls = [image_url]
-                        if canonical.get("thumbnail_url"):
-                            meta["thumbnail_url"] = canonical["thumbnail_url"]
-
-                    balance_info = get_current_balance(identity_id) if identity_id else None
-
-                    return jsonify({
-                        "ok": True,
-                        "status": "done",
-                        "job_id": job_id,
-                        "image_id": job_id,
-                        "image_url": image_url,
-                        "image_urls": image_urls,
-                        "model": meta.get("model") or job_meta.get("model") or "nano-banana-2",
-                        "aspect_ratio": meta.get("aspect_ratio") or job_meta.get("aspect_ratio"),
-                        "resolution": meta.get("resolution") or job_meta.get("resolution"),
-                        "provider": "nano_banana",
-                        "new_balance": balance_info["available"] if balance_info else None,
-                    })
-        except Exception as e:
-            print(f"[STATUS][mod] Error checking PiAPI job {job_id}: {e}")
-
-    # Fallback to in-memory store
-    if meta.get("status") == "done":
-        canonical = get_canonical_image_row(
-            identity_id,
-            upstream_id=job_id,
-            alt_upstream_id=meta.get("image_id"),
-        )
-        if canonical:
-            if canonical.get("image_url"):
-                meta["image_url"] = canonical["image_url"]
-                meta["image_urls"] = [canonical["image_url"]]
-            if canonical.get("thumbnail_url"):
-                meta["thumbnail_url"] = canonical["thumbnail_url"]
-
-        balance_info = get_current_balance(identity_id) if identity_id else None
-
-        return jsonify({
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "image_id": job_id,
-            "image_url": meta.get("image_url"),
-            "image_urls": meta.get("image_urls", []),
-            "model": meta.get("model") or "nano-banana-2",
-            "aspect_ratio": meta.get("aspect_ratio"),
-            "resolution": meta.get("resolution"),
-            "provider": "nano_banana",
-            "new_balance": balance_info["available"] if balance_info else None,
-        })
-
-    return jsonify({"error": "Job not found"}), 404
+    return _image_status_handler(job_id, identity_id)
 
 
 @bp.route("/proxy-image")

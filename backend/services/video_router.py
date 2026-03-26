@@ -3,9 +3,15 @@ Video Provider Router with Fallback.
 
 Routes video generation requests to available providers.
 
-Active providers:
-- vertex   (Vertex AI Veo 3.1) — production default
-- seedance (PiAPI Seedance 2.0)
+Active providers (priority order):
+- vertex       (Vertex AI Veo 3.1) — production default
+- seedance     (PiAPI Seedance 2.0)
+- fal_seedance (fal.ai Seedance 1.5)
+
+Fallback behavior:
+- Router iterates providers in priority order, skipping unconfigured ones.
+- Auth/config/quota errors trigger fallback to the next provider.
+- Validation errors do NOT fall back (caller's fault).
 
 Normalization:
 - normalize_provider_name() is the single entry point for provider alias resolution.
@@ -20,6 +26,30 @@ from backend.services.vertex_video_service import (
     VertexAuthError,
     VertexConfigError,
     VertexQuotaError,
+)
+from backend.services.seedance_service import (
+    SeedanceAuthError,
+    SeedanceConfigError,
+    SeedanceQuotaError,
+)
+from backend.services.fal_seedance_service import (
+    FalSeedanceAuthError,
+    FalSeedanceConfigError,
+    FalSeedanceQuotaError,
+)
+
+# Errors that should trigger fallback to the next provider in the chain.
+# Auth/config errors mean the provider can't serve right now.
+# Quota errors mean the provider is temporarily exhausted.
+_FALLBACK_AUTH_CONFIG_ERRORS = (
+    VertexAuthError, VertexConfigError,
+    SeedanceAuthError, SeedanceConfigError,
+    FalSeedanceAuthError, FalSeedanceConfigError,
+)
+_FALLBACK_QUOTA_ERRORS = (
+    VertexQuotaError,
+    SeedanceQuotaError,
+    FalSeedanceQuotaError,
 )
 
 
@@ -99,11 +129,19 @@ def _get_fal_seedance_provider():
 
 def _get_ordered_providers() -> List[VideoProvider]:
     """
-    Get video providers ordered by priority.
+    Get all video providers ordered by priority.
 
-    Returns Vertex as the primary provider.
+    Priority order: vertex (production default) > seedance > fal_seedance.
+    All providers are included regardless of configuration status —
+    is_configured() is checked at routing time by VideoRouter._route().
+    This ensures admin endpoints can inspect all known providers and
+    the router can fall through to the next configured provider on failure.
     """
-    return [_get_vertex_provider()]
+    return [
+        _get_vertex_provider(),
+        _get_seedance_provider(),
+        _get_fal_seedance_provider(),
+    ]
 
 
 # Legacy provider aliases that all resolve to "vertex".
@@ -220,10 +258,10 @@ class VideoRouter:
             except QuotaExhaustedError as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
-            except (VertexAuthError, VertexConfigError) as e:
+            except _FALLBACK_AUTH_CONFIG_ERRORS as e:
                 last_error = e
                 print(f"[VideoRouter] {provider.name} auth/config error: {e}, trying next…")
-            except VertexQuotaError as e:
+            except _FALLBACK_QUOTA_ERRORS as e:
                 last_error = QuotaExhaustedError(provider.name, str(e))
                 print(f"[VideoRouter] {provider.name} quota exhausted, trying next…")
 
