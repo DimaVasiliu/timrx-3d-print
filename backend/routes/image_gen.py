@@ -1325,7 +1325,11 @@ def cache_image_mod():
 
 @bp.route("/cache-image/<path:filename>", methods=["GET"])
 def cache_image_get_mod(filename: str):
-    target = config.CACHE_DIR / filename
-    if not target.exists():
+    # Path traversal protection: resolve and verify target stays within CACHE_DIR
+    cache_dir = config.CACHE_DIR.resolve()
+    target = (cache_dir / filename).resolve()
+    if not str(target).startswith(str(cache_dir) + os.sep) and target != cache_dir:
+        return jsonify({"error": "Not found"}), 404
+    if not target.exists() or not target.is_file():
         return jsonify({"error": "Not found"}), 404
     return Response(target.read_bytes(), mimetype="image/png")

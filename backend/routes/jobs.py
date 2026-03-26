@@ -753,8 +753,8 @@ def job_callback():
     Internal callback for existing pipeline to complete jobs by upstream_job_id.
     Called when Meshy/OpenAI job finishes (from status polling or webhook).
 
-    NO AUTH REQUIRED - This is an internal endpoint called by the existing pipeline.
-    Should be protected at network level (internal only) or via shared secret.
+    AUTH: Requires Bearer token matching INTERNAL_CALLBACK_TOKEN env var.
+    Send header: Authorization: Bearer <token>
 
     IDEMPOTENT: Safe to call multiple times.
 
@@ -774,6 +774,39 @@ def job_callback():
         "found": true              // whether a matching job was found
     }
     """
+    # ── Internal bearer token verification ──
+    from backend.config import config as _cfg
+    expected_token = _cfg.INTERNAL_CALLBACK_TOKEN
+    if not expected_token:
+        print("[JOBS_CALLBACK] REJECTED: INTERNAL_CALLBACK_TOKEN not configured")
+        return jsonify({
+            "error": {
+                "code": "NOT_CONFIGURED",
+                "message": "Internal callback authentication is not configured",
+            }
+        }), 503
+
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        print(f"[JOBS_CALLBACK] REJECTED: missing or malformed Authorization header (remote={request.remote_addr})")
+        return jsonify({
+            "error": {
+                "code": "UNAUTHORIZED",
+                "message": "Authorization header with Bearer token required",
+            }
+        }), 401
+
+    provided_token = auth_header[7:]  # strip "Bearer "
+    import hmac
+    if not hmac.compare_digest(provided_token, expected_token):
+        print(f"[JOBS_CALLBACK] REJECTED: invalid bearer token (remote={request.remote_addr})")
+        return jsonify({
+            "error": {
+                "code": "FORBIDDEN",
+                "message": "Invalid callback token",
+            }
+        }), 403
+
     data = request.get_json() or {}
     provider = data.get("provider", "").strip().lower()
     upstream_job_id = data.get("upstream_job_id", "").strip()

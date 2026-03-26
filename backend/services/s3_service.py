@@ -340,6 +340,57 @@ def safe_upload_to_s3(
     return wrap_upload_result(s3_url, content_hash if return_hash else None, return_hash, s3_key=s3_key, reused=False)
 
 
+def generate_image_thumbnail(
+    image_bytes: bytes,
+    max_size: int = 400,
+    quality: int = 80,
+    output_format: str = "JPEG",
+) -> bytes | None:
+    """
+    Generate a thumbnail from image bytes using Pillow.
+
+    Args:
+        image_bytes: Raw image file bytes (PNG, JPEG, WebP, etc.)
+        max_size: Maximum dimension (longest side) in pixels.
+        quality: JPEG output quality (1-95). Ignored for PNG.
+        output_format: "JPEG" or "PNG".
+
+    Returns:
+        Thumbnail bytes, or None if generation fails.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Convert RGBA/palette to RGB for JPEG output
+        if output_format == "JPEG" and img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        # Only resize if image is larger than max_size
+        if max(img.size) > max_size:
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+
+        # Strip EXIF/metadata by saving without info
+        buf = io.BytesIO()
+        save_kwargs = {"format": output_format, "optimize": True}
+        if output_format == "JPEG":
+            save_kwargs["quality"] = quality
+        img.save(buf, **save_kwargs)
+        thumb_bytes = buf.getvalue()
+
+        print(f"[THUMBNAIL] Generated {output_format} thumbnail: {len(image_bytes)} -> {len(thumb_bytes)} bytes, size={img.size}")
+        return thumb_bytes
+
+    except ImportError:
+        print("[THUMBNAIL] Pillow not installed, skipping thumbnail generation")
+        return None
+    except Exception as e:
+        print(f"[THUMBNAIL] Failed to generate thumbnail: {e}")
+        return None
+
+
 def ensure_s3_url_for_data_uri(
     url: str,
     prefix: str,

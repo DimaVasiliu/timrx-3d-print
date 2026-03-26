@@ -19,20 +19,25 @@ from typing import Any, Tuple
 from urllib.parse import urlparse
 
 import boto3
+import requests
 
 from backend.config import APP_SCHEMA, AWS_ACCESS_KEY_ID, AWS_BUCKET_MODELS, AWS_REGION, AWS_SECRET_ACCESS_KEY
 from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.services.meshy_service import _filter_model_urls
 from backend.services.s3_service import (
+    build_hash_s3_key,
     ensure_s3_url_for_data_uri,
+    generate_image_thumbnail,
     get_s3_key_from_url,
     is_s3_url,
     safe_upload_to_s3,
+    upload_bytes_to_s3,
     collect_s3_keys,
 )
 from backend.utils import (
     GENERIC_TITLES,
     build_canonical_url,
+    compute_sha256,
     derive_display_title,
     is_generic_title,
     log_db_continue,
@@ -541,7 +546,44 @@ def save_image_to_normalized_db(
                         normalized_urls.append(s3_url)
                     image_urls = normalized_urls
                 image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
+
+                # ── Generate real thumbnail (400px longest side) ──
+                # Falls back to full image URL if thumbnail generation fails.
+                thumbnail_url = image_url
                 thumbnail_s3_key = get_s3_key_from_url(image_url)
+                if image_url:
+                    try:
+                        # Fetch image bytes from the canonical S3 URL
+                        thumb_source_url = image_url
+                        thumb_resp = requests.get(thumb_source_url, timeout=30)
+                        thumb_resp.raise_for_status()
+                        thumb_bytes = generate_image_thumbnail(
+                            thumb_resp.content,
+                            max_size=400,
+                            quality=80,
+                            output_format="JPEG",
+                        )
+                        if thumb_bytes:
+                            thumb_hash = compute_sha256(thumb_bytes)
+                            thumb_s3_key = build_hash_s3_key("thumbnails", provider, thumb_hash, "image/jpeg")
+                            thumb_result = upload_bytes_to_s3(
+                                thumb_bytes,
+                                content_type="image/jpeg",
+                                prefix="thumbnails",
+                                key=thumb_s3_key,
+                                return_hash=False,
+                            )
+                            thumb_url_result = unpack_upload_result(thumb_result)[0]
+                            if thumb_url_result and is_s3_url(thumb_url_result):
+                                thumbnail_url = thumb_url_result
+                                thumbnail_s3_key = get_s3_key_from_url(thumb_url_result)
+                                print(f"[THUMBNAIL] Saved image thumbnail: {thumbnail_s3_key}")
+                            else:
+                                print(f"[THUMBNAIL] Upload returned non-S3 URL, using full image as fallback")
+                        else:
+                            print(f"[THUMBNAIL] Generation returned None, using full image as fallback")
+                    except Exception as e:
+                        print(f"[THUMBNAIL] Failed for image {image_id}, using full image as fallback: {e}")
 
                 width, height = 1024, 1024
                 if size and "x" in size:
@@ -574,7 +616,7 @@ def save_image_to_normalized_db(
                     "image_urls": image_urls or [image_url],
                     "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
                     "image_url": image_url,
-                    "thumbnail_url": image_url,
+                    "thumbnail_url": thumbnail_url,
                 }
 
                 image_meta = json.dumps(
@@ -642,7 +684,7 @@ def save_image_to_normalized_db(
                             "ready",
                             s3_bucket,
                             image_url,
-                            image_url,
+                            thumbnail_url,
                             image_s3_key,
                             thumbnail_s3_key,
                             width,
@@ -709,7 +751,7 @@ def save_image_to_normalized_db(
                             "ready",
                             s3_bucket,
                             image_url,
-                            image_url,
+                            thumbnail_url,
                             image_s3_key,
                             thumbnail_s3_key,
                             width,
@@ -767,7 +809,7 @@ def save_image_to_normalized_db(
                             None,
                             "ready",
                             image_url,
-                            image_url,
+                            thumbnail_url,
                             width,
                             height,
                             image_content_hash,
@@ -855,7 +897,7 @@ def save_image_to_normalized_db(
                             prompt,
                             None,
                             user_id,
-                            image_url,
+                            thumbnail_url,
                             image_url,
                             returned_image_id,
                             json.dumps(payload),
@@ -907,7 +949,7 @@ def save_image_to_normalized_db(
                             title,
                             prompt,
                             None,
-                            image_url,
+                            thumbnail_url,
                             image_url,
                             returned_image_id,
                             json.dumps(payload),

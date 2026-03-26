@@ -311,6 +311,11 @@ class Config:
             return False
         return email.lower().strip() in [e.lower() for e in self.ADMIN_EMAILS]
 
+    # Internal callback authentication
+    # Shared secret for /api/jobs/callback and similar internal-only endpoints.
+    # Callers must send: Authorization: Bearer <token>
+    INTERNAL_CALLBACK_TOKEN: str = field(default_factory=lambda: _get_env("INTERNAL_CALLBACK_TOKEN"))
+
     # Admin notification toggles
     NOTIFY_ON_NEW_IDENTITY: bool = field(default_factory=lambda: _get_env_bool("NOTIFY_ON_NEW_IDENTITY", False))
     NOTIFY_ON_PURCHASE: bool = field(default_factory=lambda: _get_env_bool("NOTIFY_ON_PURCHASE", True))
@@ -730,6 +735,8 @@ class Config:
                 warnings.append("Email not configured - magic codes and receipts won't send")
             if not self.ADMIN_AUTH_CONFIGURED:
                 warnings.append("ADMIN_TOKEN / ADMIN_EMAILS not set - admin routes may be inaccessible")
+            if not self.INTERNAL_CALLBACK_TOKEN:
+                warnings.append("INTERNAL_CALLBACK_TOKEN not set - /api/jobs/callback will reject all requests")
             # Check payment provider based on PAYMENTS_PROVIDER setting
             if self.USE_STRIPE and not self.STRIPE_CONFIGURED:
                 warnings.append("PAYMENTS_PROVIDER includes 'stripe' but Stripe not configured")
@@ -819,6 +826,7 @@ EMAIL_FROM_NAME = config.EMAIL_FROM_NAME
 ADMIN_EMAIL = config.ADMIN_EMAIL
 ADMIN_TOKEN = config.ADMIN_TOKEN
 ADMIN_EMAILS = config.ADMIN_EMAILS
+INTERNAL_CALLBACK_TOKEN = config.INTERNAL_CALLBACK_TOKEN
 NOTIFY_ON_NEW_IDENTITY = config.NOTIFY_ON_NEW_IDENTITY
 NOTIFY_ON_PURCHASE = config.NOTIFY_ON_PURCHASE
 NOTIFY_ON_RESTORE_REQUEST = config.NOTIFY_ON_RESTORE_REQUEST

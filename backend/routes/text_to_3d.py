@@ -731,9 +731,20 @@ def text_to_3d_status_mod(job_id: str):
 
 
 @bp.route("/text-to-3d/list", methods=["GET", "OPTIONS"])
+@with_session_readonly
 def text_to_3d_list_mod():
+    """List text-to-3d jobs for the current authenticated user only."""
     if request.method == "OPTIONS":
         return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
     store = load_store()
-    items = [{"job_id": jid, **meta} for jid, meta in store.items()]
-    return jsonify([x["job_id"] for x in items if "job_id" in x] or list(store.keys()))
+    user_jobs = [
+        jid for jid, meta in store.items()
+        if isinstance(meta, dict)
+        and (meta.get("identity_id") or meta.get("user_id")) == identity_id
+    ]
+    return jsonify(user_jobs)

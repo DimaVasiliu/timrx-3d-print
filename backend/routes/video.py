@@ -22,7 +22,7 @@ import uuid
 from flask import Blueprint, jsonify, request
 
 from backend.db import USE_DB, get_conn, Tables
-from backend.middleware import with_session, with_session_readonly
+from backend.middleware import require_admin, with_session, with_session_readonly
 from backend.services.async_dispatch import get_executor
 from backend.services.credits_helper import start_paid_job, release_job_credits
 from backend.services.expense_guard import ExpenseGuard
@@ -1306,10 +1306,11 @@ def _video_status_handler(job_id: str):
 
 # ── POST /video/admin/process-queue — Admin: trigger queued jobs ──
 @bp.route("/video/admin/process-queue", methods=["POST", "OPTIONS"])
-@with_session
+@require_admin
 def video_admin_process_queue():
     """
-    Admin trigger: immediately attempt to process quota-queued video jobs.
+    Admin-only trigger: immediately attempt to process quota-queued video jobs.
+    Requires admin token or admin email.
 
     Returns:
     {
@@ -1320,10 +1321,6 @@ def video_admin_process_queue():
     """
     if request.method == "OPTIONS":
         return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
 
     from backend.services.video_queue import video_queue
 
@@ -1338,7 +1335,7 @@ def video_admin_process_queue():
 
 # ── GET /video/admin/provider-info — Show current video provider config ──
 @bp.route("/video/admin/provider-info", methods=["GET", "OPTIONS"])
-@with_session
+@require_admin
 def video_admin_provider_info():
     """
     Admin endpoint: Show current video provider configuration.
@@ -1357,10 +1354,6 @@ def video_admin_provider_info():
     """
     if request.method == "OPTIONS":
         return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
 
     from backend.config import config
 
@@ -1390,19 +1383,16 @@ def video_admin_provider_info():
 
 # ── GET /video/admin/diagnostics — Lightweight operator dashboard ──
 @bp.route("/video/admin/diagnostics", methods=["GET", "OPTIONS"])
-@with_session
+@require_admin
 def video_admin_diagnostics():
     """
-    Lightweight operator diagnostics for the video pipeline.
+    Admin-only: Lightweight operator diagnostics for the video pipeline.
 
     Returns job counts by status, provider health, and recent failures.
+    Requires admin token or admin email.
     """
     if request.method == "OPTIONS":
         return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
 
     from backend.db import query_all
     from backend.config import config
@@ -1487,13 +1477,13 @@ def video_admin_diagnostics():
 
 # ── POST /video/admin/smoke-test — Quick Veo test (no credits) ──
 @bp.route("/video/admin/smoke-test", methods=["POST", "OPTIONS"])
-@with_session
+@require_admin
 def video_admin_smoke_test():
     """
-    Admin smoke test: Start a fast Veo job and return operation name.
+    Admin-only smoke test: Start a fast Veo job and return operation name.
 
     This is for testing the Vertex AI integration without going through
-    the full credit reservation flow. Only available to admins.
+    the full credit reservation flow. Requires admin token or admin email.
 
     Request body (optional):
     {
@@ -1512,13 +1502,7 @@ def video_admin_smoke_test():
     if request.method == "OPTIONS":
         return ("", 204)
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    # Check admin access (optional - remove if you want any authenticated user)
     from backend.config import config
-    # For now, allow any authenticated user to run smoke test
 
     body = request.get_json(silent=True) or {}
     provider_name = (body.get("provider") or "vertex").lower()
@@ -1573,10 +1557,11 @@ def video_admin_smoke_test():
 
 # ── GET /video/admin/smoke-test/status — Poll smoke test operation ──
 @bp.route("/video/admin/smoke-test/status", methods=["GET", "OPTIONS"])
-@with_session
+@require_admin
 def video_admin_smoke_test_status():
     """
-    Poll a smoke test operation for status.
+    Admin-only: Poll a smoke test operation for status.
+    Requires admin token or admin email.
 
     Query params:
     - op: Operation name from smoke test
@@ -1592,10 +1577,6 @@ def video_admin_smoke_test_status():
     """
     if request.method == "OPTIONS":
         return ("", 204)
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
 
     operation_name = request.args.get("op")
     if not operation_name:
