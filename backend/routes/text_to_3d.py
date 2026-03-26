@@ -63,12 +63,16 @@ def _set_status_cache(job_id: str, data: dict):
 def _clear_status_cache(job_id: str):
     _status_cache.pop(job_id, None)
 
-# ── Finalization short-circuit ──
+# ── Finalization short-circuit (TTL-based) ──
 # Prevents duplicate finalize calls from burning 3-4 pool connections each.
-# The DB-level idempotency guard still exists as the authoritative check;
-# this in-memory set avoids hitting the DB for the common duplicate case.
-_finalized_jobs: set = set()
-_FINALIZED_JOBS_MAX = 500  # cap to prevent unbounded growth
+# The DB-level idempotency guard (FOR UPDATE lock) still exists as the
+# authoritative check; this in-memory cache avoids hitting the DB for the
+# common duplicate-poll case.
+# TTL-based instead of capped-set: entries expire after 30 min, which is
+# far longer than any polling cycle.  No cap needed — TTL naturally bounds
+# memory (at 10 jobs/min, 30min = ~300 entries max).
+_finalized_jobs: dict = {}  # job_id -> monotonic timestamp
+_FINALIZED_TTL = 1800  # 30 minutes
 
 
 @bp.route("/text-to-3d/start", methods=["POST", "OPTIONS"])
@@ -525,7 +529,7 @@ def text_to_3d_status_mod(job_id: str):
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT id, status, upstream_job_id, error_message, meta
+                        SELECT id, status, upstream_job_id, error_message, meta, reservation_id
                         FROM timrx_billing.jobs
                         WHERE id::text = %s AND identity_id = %s
                         LIMIT 1
@@ -658,7 +662,19 @@ def text_to_3d_status_mod(job_id: str):
                 out["db_ok"] = False
                 out["db_errors"] = s3_result.get("db_errors")
 
+            # Resolve reservation_id from store meta first, then fall back to
+            # the DB job row's JSONB meta or reservation_id column.  This covers
+            # the case where the in-memory store was lost (server restart) but
+            # the DB row was persisted before dispatch.
             reservation_id = meta.get("reservation_id")
+            if not reservation_id and internal_job:
+                _db_meta = internal_job.get("meta") or {}
+                if isinstance(_db_meta, str):
+                    try:
+                        _db_meta = __import__('json').loads(_db_meta)
+                    except Exception:
+                        _db_meta = {}
+                reservation_id = _db_meta.get("reservation_id") or internal_job.get("reservation_id")
             # internal_job_id from store meta, or from the DB job row if store
             # was lost (worker restart / cross-worker status poll)
             internal_job_id = (
@@ -669,16 +685,10 @@ def text_to_3d_status_mod(job_id: str):
             if reservation_id:
                 effective_job_id = internal_job_id or job_id
                 # Short-circuit: skip DB-heavy finalize if already done in-process
-                if effective_job_id not in _finalized_jobs:
+                _fin_ts = _finalized_jobs.get(effective_job_id)
+                if _fin_ts is None or (_time.monotonic() - _fin_ts) > _FINALIZED_TTL:
                     finalize_job_credits(reservation_id, effective_job_id, user_id)
-                    _finalized_jobs.add(effective_job_id)
-                    # Cap the set size
-                    if len(_finalized_jobs) > _FINALIZED_JOBS_MAX:
-                        # Discard oldest half (sets are unordered, but that's fine —
-                        # the DB idempotency guard is the real safety net)
-                        to_remove = list(_finalized_jobs)[:_FINALIZED_JOBS_MAX // 2]
-                        for jid in to_remove:
-                            _finalized_jobs.discard(jid)
+                    _finalized_jobs[effective_job_id] = _time.monotonic()
 
             if internal_job_id:
                 _update_job_status_ready(

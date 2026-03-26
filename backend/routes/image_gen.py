@@ -131,7 +131,7 @@ def image_generate_unified():
         return ("", 204)
 
     body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "nano_banana").lower()
+    provider = (body.get("provider") or "openai").lower()
 
     # 4K is exclusive to Nano Banana — reject early for other providers
     req_size = (body.get("image_size") or body.get("imageSize") or body.get("resolution") or "").upper()
