@@ -2063,6 +2063,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 "batch_group_id": job_meta.get("batch_group_id"),
                 "preview_task_id": job_meta.get("preview_task_id") or status_data.get("preview_task_id"),
                 "source_task_id": job_meta.get("source_task_id"),
+                "source_history_id": job_meta.get("source_history_id"),
                 "cover_image_url": status_data.get("cover_image_url"),
                 "texture_prompt": job_meta.get("texture_prompt"),
                 "s3_bucket": s3_bucket,
@@ -2683,7 +2684,31 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     or payload.get("source_task_id")
                     or payload.get("preview_task_id")
                 )
-                if source_task_id:
+                # source_history_id = frontend's history_items.id (most reliable link)
+                source_history_id = (
+                    job_meta.get("source_history_id")
+                    or payload.get("source_history_id")
+                )
+
+                source_row = None
+
+                # Fast path: direct lookup by source_history_id (frontend's history item UUID)
+                if source_history_id:
+                    shid = str(source_history_id)
+                    cur.execute(
+                        f"""
+                        SELECT lineage_origin_id, id FROM {Tables.HISTORY_ITEMS}
+                        WHERE LOWER(id::text) = LOWER(%s)
+                        LIMIT 1
+                        """,
+                        (shid,),
+                    )
+                    source_row = cur.fetchone()
+                    if source_row:
+                        print(f"[LINEAGE] fast-path: source_history_id={shid} -> id={source_row['id']}")
+
+                # Fallback: fuzzy lookup by source_task_id (Meshy task ID / internal UUID)
+                if not source_row and source_task_id:
                     # This is a derived model — look up the parent history item
                     # to inherit its lineage_origin_id.
                     #
@@ -2691,7 +2716,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     #   - An internal TimrX job UUID (used by text-to-3d/refine)
                     #   - A Meshy provider task ID (used by retexture/remesh)
                     #
-                    # We search:
+                    # We search (case-insensitive for UUID matching):
                     #   1. history_items.id = source_task_id (direct match)
                     #   2. payload fields (original_job_id, source_task_id, preview_task_id)
                     #   3. models.upstream_job_id = source_task_id (Meshy task ID on model)
@@ -2701,38 +2726,41 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     cur.execute(
                         f"""
                         SELECT lineage_origin_id, id FROM {Tables.HISTORY_ITEMS}
-                        WHERE id::text = %s
+                        WHERE LOWER(id::text) = LOWER(%s)
                            OR payload->>'original_job_id' = %s
+                           OR LOWER(payload->>'original_job_id') = LOWER(%s)
                            OR payload->>'source_task_id' = %s
                            OR payload->>'preview_task_id' = %s
                            OR model_id IN (
                                SELECT id FROM {Tables.MODELS}
                                WHERE upstream_job_id = %s
                            )
-                           OR id::text IN (
-                               SELECT id::text FROM {Tables.JOBS}
+                           OR LOWER(id::text) IN (
+                               SELECT LOWER(id::text) FROM {Tables.JOBS}
                                WHERE upstream_job_id = %s
                            )
                         ORDER BY created_at ASC
                         LIMIT 1
                         """,
-                        (src, src, src, src, src, src),
+                        (src, src, src, src, src, src, src),
                     )
                     source_row = cur.fetchone()
-                    if source_row:
-                        # Canonical lineage: always use the root history_items.id,
-                        # never a job id, model id, or Meshy task id.
-                        lineage_origin_id = source_row.get("lineage_origin_id") or source_row.get("id")
 
-                    parent_id = str(source_row["id"]) if source_row else None
-                    parent_lineage = str(source_row["lineage_origin_id"]) if source_row and source_row.get("lineage_origin_id") else None
-                    print(
-                        f"[LINEAGE] type={job_type} source_task_id={src} "
-                        f"source_found={'yes' if source_row else 'no'} "
-                        f"parent_history_id={parent_id} "
-                        f"parent_lineage_origin_id={parent_lineage} "
-                        f"resolved_root_id={lineage_origin_id}"
-                    )
+                if source_row:
+                    # Canonical lineage: always use the root history_items.id,
+                    # never a job id, model id, or Meshy task id.
+                    lineage_origin_id = source_row.get("lineage_origin_id") or source_row.get("id")
+
+                parent_id = str(source_row["id"]) if source_row else None
+                parent_lineage = str(source_row["lineage_origin_id"]) if source_row and source_row.get("lineage_origin_id") else None
+                _lineage_src = source_history_id or source_task_id or "none"
+                print(
+                    f"[LINEAGE] type={job_type} source_history_id={source_history_id} source_task_id={source_task_id} "
+                    f"source_found={'yes' if source_row else 'no'} "
+                    f"parent_history_id={parent_id} "
+                    f"parent_lineage_origin_id={parent_lineage} "
+                    f"resolved_root_id={lineage_origin_id}"
+                )
 
                 cur.execute(
                     f"""

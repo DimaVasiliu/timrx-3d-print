@@ -1745,6 +1745,7 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                         "user_id": str(row["identity_id"]) if row["identity_id"] else active_user_id,
                         # Include parent task IDs for lineage inheritance
                         "source_task_id": payload.get("source_task_id"),
+                        "source_history_id": payload.get("source_history_id"),
                         "preview_task_id": payload.get("preview_task_id"),
                     }
 
@@ -1801,6 +1802,7 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                         "stage": jobs_meta.get("stage"),
                         "user_id": str(jobs_row["identity_id"]) if jobs_row["identity_id"] else active_user_id,
                         "source_task_id": jobs_meta.get("source_task_id"),
+                        "source_history_id": jobs_meta.get("source_history_id"),
                         "preview_task_id": jobs_meta.get("preview_task_id"),
                         "identity_id": str(jobs_row["identity_id"]) if jobs_row["identity_id"] else None,
                     }

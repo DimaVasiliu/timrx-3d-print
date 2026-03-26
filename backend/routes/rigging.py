@@ -269,10 +269,14 @@ def rig_start():
     # Accept optional prompt/title from frontend for title persistence
     rig_prompt = (body.get("prompt") or body.get("title") or "").strip()
 
+    # source_history_id = frontend's history_items.id (survives Meshy ID resolution)
+    source_history_id = (body.get("source_history_id") or "").strip() or None
+
     job_meta = {
         "stage": "rig",
         "height_meters": height_meters,
         "source_task_id": source.get("input_task_id"),
+        "source_history_id": source_history_id,
         "model_url": source.get("model_url"),
         "prompt": rig_prompt or None,
     }
@@ -380,6 +384,7 @@ def rig_start():
         "created_at": now_s() * 1000,
         "height_meters": height_meters,
         "source_task_id": source.get("input_task_id"),
+        "source_history_id": source_history_id,
         "model_url": source.get("model_url"),
         "prompt": rig_prompt or None,
         "user_id": identity_id,
@@ -630,11 +635,15 @@ def rig_animate():
     # Accept optional prompt/title from frontend for title persistence
     anim_prompt = (body.get("prompt") or body.get("title") or "").strip()
 
+    # source_history_id = frontend's rig history_items.id for lineage linking
+    source_history_id = (body.get("source_history_id") or "").strip() or None
+
     job_meta = {
         "stage": "animate",
         "rig_task_id": rig_task_id,
         "action_id": action_id,
         "source_task_id": rig_task_id,  # parent lookup uses this to inherit title
+        "source_history_id": source_history_id,
         "prompt": anim_prompt or None,
     }
     if post_process:
@@ -691,6 +700,7 @@ def rig_animate():
         "rig_task_id": rig_task_id,
         "action_id": action_id,
         "source_task_id": rig_task_id,
+        "source_history_id": source_history_id,
         "prompt": anim_prompt or None,
         "user_id": identity_id,
         "identity_id": identity_id,
