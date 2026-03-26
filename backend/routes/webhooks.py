@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional, Tuple
 from flask import Blueprint, request, jsonify
 
 from backend.config import config
+from backend.services.status_cache import invalidate_status
 from backend.services.video_errors import (
     PIAPI_STATUS_MAP as _STATUS_MAP,
     TERMINAL_AND_FINALIZING as _TERMINAL_AND_FINALIZING,
@@ -285,6 +286,7 @@ def _webhook_finalize_success(
             "webhook_finalized_at": time.time(),
         })
 
+        invalidate_status(job_id)
         ExpenseGuard.unregister_active_job(job_id)
 
         print(f"[WEBHOOK] finalized job={job_id} provider={provider_name}")
@@ -334,6 +336,8 @@ def _webhook_mark_failed(
         "webhook_failed": True,
         "webhook_failed_at": time.time(),
     })
+
+    invalidate_status(job_id)
 
 
 # ── PiAPI Account Webhook (existing) ────────────────────────
@@ -676,6 +680,7 @@ def _meshy_webhook_finalize_success(
             "webhook_source": "meshy",
         })
 
+        invalidate_status(job_id)
         ExpenseGuard.unregister_active_job(job_id)
         print(f"[MESHY_WEBHOOK] finalized job={job_id}")
 
@@ -824,6 +829,7 @@ def meshy_task_webhook():
         print(f"[MESHY_WEBHOOK] failing job={job_id} task_id={task_id} error={error_msg[:100]}")
 
         _webhook_mark_failed(job_id, meta, error_msg, error_code, "meshy")
+        invalidate_status(job_id)
 
         return jsonify({"ok": True, "action": "failed", "job_id": job_id}), 200
 

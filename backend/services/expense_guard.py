@@ -160,6 +160,22 @@ class ExpenseGuard:
             return "standard"  # Fallback to free tier
 
     @staticmethod
+    def get_active_job_count_for_identity(identity_id: str) -> int:
+        """Count active jobs from DB — authoritative, cross-worker, deploy-safe."""
+        from backend.db import query_one, Tables
+        from backend.services.video_errors import TERMINAL_STATES
+
+        terminal_list = ", ".join(f"'{s}'" for s in TERMINAL_STATES)
+        row = query_one(
+            f"""SELECT COUNT(*) AS cnt FROM {Tables.JOBS}
+                WHERE identity_id = %s
+                AND status NOT IN ({terminal_list})""",
+            (identity_id,),
+            source="expense_guard_identity_count",
+        )
+        return row["cnt"] if row else 0
+
+    @staticmethod
     def check_image_request(n: int = 1, identity_id: Optional[str] = None) -> Optional[Tuple]:
         """
         Check if an image generation request is allowed (stability only).
@@ -184,10 +200,10 @@ class ExpenseGuard:
                 maximum=config.MAX_IMAGES_PER_REQUEST,
             )
 
-        # Concurrent job limit (per-identity, tier-based)
+        # Concurrent job limit (per-identity, tier-based) — DB-authoritative
         _cleanup_caches()
         max_concurrent = ExpenseGuard.get_max_concurrent_for_identity(identity_id)
-        user_active = sum(1 for _, (_, uid) in _active_jobs.items() if uid == identity_id)
+        user_active = ExpenseGuard.get_active_job_count_for_identity(identity_id) if identity_id else 0
         if user_active >= max_concurrent:
             return _make_error(
                 "TOO_MANY_JOBS",
@@ -224,10 +240,10 @@ class ExpenseGuard:
                 maximum=config.MAX_VIDEO_SECONDS,
             )
 
-        # Concurrent job limit (per-identity, tier-based)
+        # Concurrent job limit (per-identity, tier-based) — DB-authoritative
         _cleanup_caches()
         max_concurrent = ExpenseGuard.get_max_concurrent_for_identity(identity_id)
-        user_active = sum(1 for _, (_, uid) in _active_jobs.items() if uid == identity_id)
+        user_active = ExpenseGuard.get_active_job_count_for_identity(identity_id) if identity_id else 0
         if user_active >= max_concurrent:
             return _make_error(
                 "TOO_MANY_JOBS",
@@ -272,6 +288,7 @@ class ExpenseGuard:
     def is_duplicate_request(idempotency_key: str) -> Optional[dict]:
         """
         Check if this request is a duplicate.
+        Checks in-memory cache first (fast path), then DB (cross-worker, deploy-safe).
 
         Returns:
             Cached response if duplicate, None if new request.
@@ -281,23 +298,57 @@ class ExpenseGuard:
 
         _cleanup_caches()
 
+        # Check in-memory first (fast path)
         entry = _idempotency_cache.get(idempotency_key)
         if entry:
             timestamp, response = entry
-            # Return cached response if within TTL
             if time.time() - timestamp < IDEMPOTENCY_TTL:
-                print(f"[EXPENSE_GUARD] Idempotent hit: returning cached response for key={idempotency_key[:8]}...")
+                print(f"[EXPENSE_GUARD] Idempotent hit (memory): key={idempotency_key[:8]}...")
                 return response
+
+        # Check DB (cross-worker, deploy-safe)
+        try:
+            from backend.db import query_one
+            row = query_one(
+                """SELECT response_json FROM timrx_billing.request_idempotency
+                   WHERE idempotency_key = %s AND expires_at > NOW()""",
+                (idempotency_key,),
+                source="idemp_check",
+            )
+            if row and row.get("response_json"):
+                # Warm the in-memory cache
+                _idempotency_cache[idempotency_key] = (time.time(), row["response_json"])
+                print(f"[EXPENSE_GUARD] Idempotent hit (DB): key={idempotency_key[:8]}...")
+                return row["response_json"]
+        except Exception as e:
+            # DB check is non-critical — fall through
+            print(f"[EXPENSE_GUARD] DB idempotency check failed (non-fatal): {e}")
 
         return None
 
     @staticmethod
     def cache_response(idempotency_key: str, response: dict):
-        """Cache a response for idempotency."""
+        """Cache a response for idempotency (in-memory + DB)."""
         if not idempotency_key:
             return
 
+        import json as _json
+
         _idempotency_cache[idempotency_key] = (time.time(), response)
+
+        # Write to DB for cross-worker visibility
+        try:
+            from backend.db import execute
+            execute(
+                """INSERT INTO timrx_billing.request_idempotency
+                   (idempotency_key, response_json)
+                   VALUES (%s, %s)
+                   ON CONFLICT (idempotency_key) DO NOTHING""",
+                (idempotency_key, _json.dumps(response, default=str)),
+                source="idemp_cache",
+            )
+        except Exception as e:
+            print(f"[EXPENSE_GUARD] DB idempotency cache write failed (non-fatal): {e}")
 
     @staticmethod
     def register_active_job(job_id: str, identity_id: Optional[str] = None):
@@ -312,9 +363,17 @@ class ExpenseGuard:
 
     @staticmethod
     def get_active_job_count() -> int:
-        """Get count of currently active jobs (all identities)."""
-        _cleanup_caches()
-        return len(_active_jobs)
+        """Get total active (non-terminal) job count from DB."""
+        from backend.db import query_one, Tables
+        from backend.services.video_errors import TERMINAL_STATES
+
+        terminal_list = ", ".join(f"'{s}'" for s in TERMINAL_STATES)
+        row = query_one(
+            f"""SELECT COUNT(*) AS cnt FROM {Tables.JOBS}
+                WHERE status NOT IN ({terminal_list})""",
+            source="expense_guard_total_count",
+        )
+        return row["cnt"] if row else 0
 
     @staticmethod
     def get_status() -> dict:
@@ -326,7 +385,8 @@ class ExpenseGuard:
             per_identity[key] = per_identity.get(key, 0) + 1
         return {
             "enabled": config.ENABLED,
-            "active_jobs": len(_active_jobs),
+            "active_jobs_db": ExpenseGuard.get_active_job_count(),
+            "active_jobs_memory": len(_active_jobs),
             "active_jobs_per_identity": per_identity,
             "max_concurrent_jobs": config.MAX_CONCURRENT_JOBS,
             "idempotency_cache_size": len(_idempotency_cache),

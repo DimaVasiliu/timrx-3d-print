@@ -20,9 +20,9 @@ Single-worker guarantee:
   log a standby message and exit their worker thread immediately.
 
 Provider routing:
-  Only video jobs with supported providers are claimed. Meshy 3D model
-  jobs use a separate legacy dispatch path and are never touched here.
-  Each provider has its own timeout config and error codes.
+  Video jobs (seedance, vertex, fal_seedance) and Meshy 3D jobs are
+  claimed and processed. Meshy 3D jobs are routed to dedicated poll/
+  dispatch/finalize functions. Each provider has its own timeout config.
 
 Lifecycle states:
   created -> queued -> dispatched -> provider_pending -> provider_processing
@@ -80,9 +80,10 @@ BACKOFF_STEPS = [30, 60, 120, 300]  # seconds
 
 # ── Provider Configuration ───────────────────────────────────
 # Only these provider/stage combinations are handled by the durable worker.
-# Everything else (meshy 3D, image gen, etc.) uses legacy dispatch paths.
-_SUPPORTED_PROVIDERS = {"seedance", "vertex", "fal_seedance"}
-_SUPPORTED_STAGES = {"video"}
+# Image gen uses legacy dispatch paths.
+_SUPPORTED_PROVIDERS = {"seedance", "vertex", "fal_seedance", "meshy"}
+_SUPPORTED_STAGES = {"video", "3d", "preview", "refine", "image3d",
+                      "remesh", "retexture", "rigging"}
 
 # Per-provider timeout config: (pend_soft, pend_hard, proc_soft, proc_hard)
 # Keys can be "provider" or "provider:task_type" for finer granularity
@@ -95,6 +96,14 @@ _PROVIDER_TIMEOUTS = {
     "vertex":                           (2 * 60, 6 * 60, 4 * 60, 10 * 60),
     # fal.ai Seedance 1.5 Pro — moderate timeouts
     "fal_seedance":                     (3 * 60, 10 * 60, 8 * 60, 15 * 60),
+    # Meshy 3D — moderate timeouts (text-to-3d/image-to-3d: 2-5 min typical)
+    "meshy:text-to-3d":   (2 * 60, 8 * 60, 3 * 60, 10 * 60),
+    "meshy:image-to-3d":  (2 * 60, 8 * 60, 3 * 60, 10 * 60),
+    "meshy:refine":       (2 * 60, 10 * 60, 5 * 60, 15 * 60),
+    "meshy:remesh":       (1 * 60, 5 * 60, 2 * 60, 8 * 60),
+    "meshy:retexture":    (1 * 60, 5 * 60, 2 * 60, 8 * 60),
+    "meshy:rigging":      (1 * 60, 5 * 60, 2 * 60, 8 * 60),
+    "meshy":              (2 * 60, 8 * 60, 3 * 60, 10 * 60),  # fallback
 }
 _DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
 
@@ -382,8 +391,9 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
     if not USE_DB:
         return None
 
-    # Build provider IN clause
+    # Build provider and stage IN clauses
     provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
+    stage_list = ", ".join(f"'{s}'" for s in _SUPPORTED_STAGES)
 
     try:
         with get_conn("job_worker_claim") as conn:
@@ -403,7 +413,7 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                         OR (status = 'queued' AND created_at < NOW() - INTERVAL '30 seconds')
                     )
                       AND provider IN ({provider_list})
-                      AND stage = 'video'
+                      AND stage IN ({stage_list})
                       AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
                       AND (claimed_by IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
                       AND (next_poll_at IS NULL OR next_poll_at <= NOW())
@@ -535,6 +545,226 @@ def _update_heartbeat(job_id: str):
         pass  # Non-critical
 
 
+# ── Meshy 3D Durable Worker Functions ──────────────────────
+
+def _poll_meshy_once(
+    job: Dict[str, Any],
+    meta: Dict[str, Any],
+    timeouts: tuple,
+):
+    """Single poll cycle for a Meshy 3D job."""
+    from backend.services.meshy_service import mesh_get, MESHY_STATUS_MAP, MeshyTaskNotFoundError
+
+    job_id = str(job["id"])
+    upstream_id = job.get("upstream_job_id") or meta.get("upstream_id")
+    identity_id = str(job.get("identity_id") or "")
+    reservation_id = str(job.get("reservation_id") or "") or None
+    action_code = job.get("action_code") or meta.get("task", "text-to-3d")
+    consecutive_errors = meta.get("consecutive_errors", 0)
+
+    if not upstream_id:
+        _fail_job(job_id, meta, "No upstream job ID", "no_upstream_id", "meshy")
+        return
+
+    # Determine the correct Meshy API path based on action
+    if action_code in ("image-to-3d", "image_to_3d"):
+        api_path = f"/openapi/v1/image-to-3d/{upstream_id}"
+    else:
+        api_path = f"/openapi/v2/text-to-3d/{upstream_id}"
+
+    try:
+        task_data = mesh_get(api_path)
+    except MeshyTaskNotFoundError:
+        print(f"[JOB] meshy task EXPIRED job={job_id} upstream={upstream_id}")
+        from backend.services.meshy_service import terminalize_expired_meshy_job
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return
+    except Exception as e:
+        consecutive_errors += 1
+        print(f"[JOB] meshy poll ERROR job={job_id} error={e} consecutive={consecutive_errors}")
+        if consecutive_errors >= MAX_ATTEMPTS:
+            _fail_job(job_id, meta, f"Poll failed after {consecutive_errors} errors: {e}",
+                     "meshy_poll_exhausted", "meshy")
+            return
+        backoff = BACKOFF_STEPS[min(consecutive_errors - 1, len(BACKOFF_STEPS) - 1)]
+        _transition_job(job_id, job["status"], {
+            "next_poll_at": f"NOW() + INTERVAL '{backoff} seconds'",
+        }, meta_patch={"consecutive_errors": consecutive_errors})
+        return
+
+    # Map Meshy status
+    raw_status = (task_data.get("status") or "unknown").upper()
+    internal_status = MESHY_STATUS_MAP.get(raw_status, "unknown")
+    progress = task_data.get("progress", 0)
+
+    print(f"[JOB] meshy poll job={job_id} upstream={upstream_id} "
+          f"raw={raw_status} internal={internal_status} progress={progress}")
+
+    if internal_status == "done":
+        # Finalize
+        if not try_transition_to_finalizing(job_id):
+            print(f"[JOB] meshy finalize SKIPPED job={job_id} — already terminal")
+            return
+        _finalize_meshy_success(job_id, identity_id, reservation_id, task_data, meta)
+
+    elif internal_status == "failed":
+        error_msg = task_data.get("task_error", {}).get("message", "Meshy generation failed")
+        _fail_job(job_id, meta, error_msg, "meshy_provider_failed", "meshy")
+
+    elif internal_status in ("running", "pending"):
+        # Schedule next poll
+        new_status = "provider_processing" if internal_status == "running" else "provider_pending"
+        poll_interval = POLL_SLEEP_PROCESSING if internal_status == "running" else POLL_SLEEP_PENDING
+        meta_patch = {"consecutive_errors": 0, "provider_status": raw_status}
+
+        if internal_status == "running" and not meta.get("processing_started_at"):
+            meta_patch["processing_started_at"] = time.time()
+
+        _transition_job(job_id, new_status, {
+            "last_provider_status": raw_status.lower(),
+            "progress": progress,
+            "next_poll_at": f"NOW() + INTERVAL '{poll_interval} seconds'",
+        }, meta_patch=meta_patch)
+
+    else:
+        print(f"[JOB] meshy UNKNOWN status job={job_id} raw={raw_status}")
+        _transition_job(job_id, job["status"], {
+            "next_poll_at": f"NOW() + INTERVAL '{POLL_SLEEP_PENDING} seconds'",
+        })
+
+
+def _finalize_meshy_success(
+    job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    task_data: Dict[str, Any],
+    meta: Dict[str, Any],
+):
+    """Finalize a successful Meshy 3D job (same logic as webhook handler)."""
+    from backend.services.meshy_service import extract_model_urls
+    from backend.services.s3_service import save_finished_job_to_normalized_db
+    from backend.services.credits_helper import finalize_job_credits
+    from backend.services.expense_guard import ExpenseGuard
+    from backend.services.status_cache import invalidate_status
+
+    try:
+        model_urls = extract_model_urls(task_data)
+        status_out = {
+            "status": "done",
+            "model_urls": model_urls.get("model_urls", {}),
+            "textured_model_urls": model_urls.get("textured_model_urls", {}),
+            "glb_url": model_urls.get("glb_url", ""),
+            "thumbnail_url": model_urls.get("thumbnail_url", ""),
+        }
+        job_type = meta.get("task", "text-to-3d")
+
+        save_finished_job_to_normalized_db(
+            job_id=job_id, status_out=status_out,
+            meta=meta, job_type=job_type, user_id=identity_id,
+        )
+
+        if reservation_id:
+            try:
+                finalize_job_credits(str(reservation_id), job_id)
+                print(f"[JOB] meshy credits FINALIZED job={job_id}")
+            except Exception as e:
+                print(f"[JOB] meshy credit finalize error job={job_id}: {e}")
+
+        glb_url = model_urls.get("glb_url", "")
+        thumb_url = model_urls.get("thumbnail_url", "")
+
+        _transition_job(job_id, "ready", {
+            "result_url": glb_url,
+            "thumbnail_url": thumb_url,
+            "claimed_by": None,
+            "claimed_at": None,
+        }, meta_patch={
+            "worker_finalized": True,
+            "worker_finalized_at": time.time(),
+        })
+
+        invalidate_status(job_id)
+        ExpenseGuard.unregister_active_job(job_id)
+        print(f"[JOB] meshy FINALIZED job={job_id}")
+
+    except Exception as e:
+        print(f"[JOB] meshy finalization FAILED job={job_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        _transition_job(job_id, "stalled", {}, meta_patch={
+            "worker_finalize_error": str(e)[:300],
+        })
+
+
+def _dispatch_meshy_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
+    """Dispatch a queued Meshy 3D job to the Meshy API."""
+    from backend.services.meshy_service import mesh_post
+
+    job_id = str(job["id"])
+    action_code = job.get("action_code") or meta.get("task", "text-to-3d")
+
+    # Check for existing upstream_id (crash recovery)
+    existing_upstream = job.get("upstream_job_id") or meta.get("upstream_id")
+    if existing_upstream:
+        print(f"[JOB] meshy dispatch SKIPPED job={job_id} — upstream exists: {str(existing_upstream)[:20]}")
+        _transition_job(job_id, "dispatched", {
+            "upstream_job_id": existing_upstream,
+            "last_provider_status": "pending",
+            "next_poll_at": "NOW() + INTERVAL '5 seconds'",
+        }, meta_patch={"upstream_id": existing_upstream, "recovered_dispatch": True})
+        return
+
+    # Build the Meshy API payload from job meta
+    payload = meta.get("provider_payload") or {}
+    if not payload:
+        # Reconstruct from meta fields
+        if action_code in ("text-to-3d", "text_to_3d"):
+            payload = {
+                "mode": meta.get("mode", "preview"),
+                "prompt": meta.get("prompt", ""),
+                "art_style": meta.get("art_style", "realistic"),
+                "negative_prompt": meta.get("negative_prompt", ""),
+            }
+            if meta.get("preview_task_id"):
+                payload["preview_task_id"] = meta["preview_task_id"]
+
+    # Add webhook URL if configured
+    webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+    if webhook_url:
+        payload["webhook_url"] = webhook_url
+
+    # Determine API endpoint
+    if action_code in ("image-to-3d", "image_to_3d"):
+        api_path = "/openapi/v1/image-to-3d"
+    else:
+        api_path = "/openapi/v2/text-to-3d"
+
+    try:
+        resp = mesh_post(api_path, payload)
+        upstream_id = resp.get("result")
+        if not upstream_id:
+            raise RuntimeError("Meshy returned no task ID")
+
+        dispatch_ts = time.time()
+        _transition_job(job_id, "dispatched", {
+            "upstream_job_id": upstream_id,
+            "last_provider_status": "pending",
+            "next_poll_at": "NOW() + INTERVAL '10 seconds'",
+        }, meta_patch={
+            "upstream_id": upstream_id,
+            "dispatched_by": WORKER_ID,
+            "dispatched_at": dispatch_ts,
+            "first_dispatched_at": dispatch_ts,
+            "consecutive_errors": 0,
+        })
+
+        print(f"[JOB] meshy dispatched job={job_id} upstream={upstream_id}")
+
+    except Exception as e:
+        print(f"[JOB] meshy dispatch FAILED job={job_id}: {e}")
+        _fail_job(job_id, meta, f"Meshy dispatch failed: {e}", "meshy_dispatch_failed", "meshy")
+
+
 # ── Job Processing ──────────────────────────────────────────
 
 def _process_job(job: Dict[str, Any]):
@@ -579,12 +809,28 @@ def _process_job(job: Dict[str, Any]):
     timeout_key = f"{provider_name}:{task_type}" if task_type else provider_name
     timeouts = _PROVIDER_TIMEOUTS.get(timeout_key, _PROVIDER_TIMEOUTS.get(provider_name, _DEFAULT_TIMEOUTS))
 
+    handler = "durable_meshy_worker" if provider_name == "meshy" else "durable_video_worker"
     print(
         f"[JOB] routing job={job_id} provider={provider_name} stage={stage} "
         f"status={status} upstream={'yes' if upstream_id else 'no'} "
-        f"timeout_family={timeout_key} handler=durable_video_worker"
+        f"timeout_family={timeout_key} handler={handler}"
     )
 
+    # ── Meshy 3D routing ────────────────────────────────────────
+    if provider_name == "meshy":
+        if status in ("queued", "stalled"):
+            if upstream_id:
+                meta = _ensure_timeout_anchor(job_id, meta)
+                _poll_meshy_once(job, meta, timeouts)
+            else:
+                _dispatch_meshy_to_provider(job, meta)
+        elif status in ("dispatched", "provider_pending", "provider_processing"):
+            _poll_meshy_once(job, meta, timeouts)
+        else:
+            print(f"[JOB] skip meshy job={job_id} reason=unexpected_status status={status}")
+        return
+
+    # ── Video routing ───────────────────────────────────────────
     if status in ("queued", "stalled"):
         if upstream_id:
             # Already dispatched but stalled — validate + resume poll
@@ -1828,9 +2074,24 @@ def run_stale_sweep():
     if not USE_DB:
         return {"swept": 0}
 
+    # Advisory lock prevents duplicate sweeps across Gunicorn workers
+    SWEEP_LOCK_ID = 737484
+    try:
+        with get_conn("sweep_lock") as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (SWEEP_LOCK_ID,))
+                row = cur.fetchone()
+                got_lock = row.get("pg_try_advisory_lock", False) if isinstance(row, dict) else (row[0] if row else False)
+            conn.commit()
+        if not got_lock:
+            return {"swept": 0, "skipped": "another_process_sweeping"}
+    except Exception:
+        pass  # Proceed without lock on error (fail-open)
+
     from backend.config import config as _cfg
 
     provider_list = ", ".join(f"'{p}'" for p in _SUPPORTED_PROVIDERS)
+    stage_list = ", ".join(f"'{s}'" for s in _SUPPORTED_STAGES)
     terminal_list = ", ".join(f"'{s}'" for s in TERMINAL_STATES)
 
     swept_total = 0
@@ -1851,7 +2112,7 @@ def run_stale_sweep():
                         updated_at = NOW()
                     WHERE status IN ('queued', 'dispatched')
                       AND provider IN ({provider_list})
-                      AND stage = 'video'
+                      AND stage IN ({stage_list})
                       AND updated_at < NOW() - INTERVAL '{dispatched_age} seconds'
                       AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
                       AND status NOT IN ({terminal_list})
@@ -1869,6 +2130,7 @@ def run_stale_sweep():
                 _pending_thresholds = {
                     "seedance": getattr(_cfg, "STALE_PENDING_AGE_SEEDANCE_S", 7200),
                     "vertex": _cfg.STALE_PENDING_AGE_S,
+                    "meshy": 900,  # 15 min — Meshy preview typically completes in 2-5 min
                 }
                 for _prov, _age in _pending_thresholds.items():
                     cur.execute(
@@ -1881,7 +2143,7 @@ def run_stale_sweep():
                             updated_at = NOW()
                         WHERE status = 'provider_pending'
                           AND provider = %s
-                          AND stage = 'video'
+                          AND stage IN ({stage_list})
                           AND updated_at < NOW() - INTERVAL '{_age} seconds'
                           AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
                         RETURNING id, status, provider
@@ -1898,6 +2160,7 @@ def run_stale_sweep():
                 _processing_thresholds = {
                     "seedance": getattr(_cfg, "STALE_PROCESSING_AGE_SEEDANCE_S", 3600),
                     "vertex": _cfg.STALE_PROCESSING_AGE_S,
+                    "meshy": 1200,  # 20 min — refine can take longer
                 }
                 for _prov, _age in _processing_thresholds.items():
                     cur.execute(
@@ -1910,7 +2173,7 @@ def run_stale_sweep():
                             updated_at = NOW()
                         WHERE status = 'provider_processing'
                           AND provider = %s
-                          AND stage = 'video'
+                          AND stage IN ({stage_list})
                           AND updated_at < NOW() - INTERVAL '{_age} seconds'
                           AND (heartbeat_at IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
                         RETURNING id, status, provider
@@ -1935,7 +2198,7 @@ def run_stale_sweep():
                         updated_at = NOW()
                     WHERE status = 'finalizing'
                       AND provider IN ({provider_list})
-                      AND stage = 'video'
+                      AND stage IN ({stage_list})
                       AND updated_at < NOW() - INTERVAL '{finalizing_age} seconds'
                     RETURNING id, status, provider
                     """,
@@ -1961,16 +2224,93 @@ def run_stale_sweep():
         print(f"[SWEEP][pid={os.getpid()}] error: {e}")
         return {"swept": 0, "error": str(e)}
 
+    finally:
+        # Release sweep advisory lock
+        try:
+            with get_conn("sweep_unlock") as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s)", (SWEEP_LOCK_ID,))
+                conn.commit()
+        except Exception:
+            pass
+
+
+# ── Monitoring ──────────────────────────────────────────────
+
+def check_expired_reservations() -> int:
+    """
+    Count reservations that expired without being finalized in the last hour.
+    Each one represents potential cost leakage (we paid the provider but
+    didn't charge the user).
+    """
+    if not USE_DB:
+        return 0
+    try:
+        from backend.db import query_one
+        row = query_one(
+            f"""SELECT COUNT(*) AS cnt FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE status = 'released'
+                AND meta->>'release_reason' = 'expired'
+                AND released_at > NOW() - INTERVAL '1 hour'""",
+            source="reservation_monitor",
+        )
+        count = row["cnt"] if row else 0
+        if count > 0:
+            print(f"[BILLING][ALERT] {count} reservation(s) expired without finalization in last hour")
+        return count
+    except Exception as e:
+        print(f"[BILLING] reservation monitor error: {e}")
+        return 0
+
+
+def log_pool_metrics():
+    """Log DB pool utilization metrics."""
+    try:
+        from backend.db import _get_pool
+        pool = _get_pool()
+        if pool is None:
+            return
+        stats = pool.get_stats()
+        print(
+            f"[DB][POOL] size={stats.get('pool_size', '?')} "
+            f"available={stats.get('pool_available', '?')} "
+            f"waiting={stats.get('requests_waiting', '?')} "
+            f"usage={stats.get('requests_num', '?')}"
+        )
+    except Exception:
+        pass  # Pool metrics are non-critical
+
+
+def log_active_job_counts():
+    """Log active job counts by provider and stage."""
+    if not USE_DB:
+        return
+    try:
+        from backend.db import query_all
+        terminal_list = ", ".join(f"'{s}'" for s in TERMINAL_STATES)
+        rows = query_all(
+            f"""SELECT provider, stage, status, COUNT(*) as cnt
+                FROM {Tables.JOBS}
+                WHERE status NOT IN ({terminal_list})
+                GROUP BY provider, stage, status
+                ORDER BY cnt DESC""",
+            source="ops_job_counts",
+        )
+        if rows:
+            for r in rows:
+                print(f"[OPS][JOBS] provider={r['provider']} stage={r['stage']} "
+                      f"status={r['status']} count={r['cnt']}")
+    except Exception as e:
+        print(f"[OPS] job count error: {e}")
+
 
 # ── Startup Recovery ────────────────────────────────────────
 
 def recover_stale_jobs():
     """
-    Startup recovery: find non-terminal video jobs with supported providers
-    and mark them as stalled so the worker loop picks them up.
-
-    Jobs outside the supported scope (meshy 3D, old legacy, unknown providers)
-    are left untouched — they use separate dispatch paths.
+    Startup recovery: find non-terminal jobs with supported providers
+    (video + Meshy 3D) and mark them as stalled so the worker loop picks
+    them up. Jobs outside the supported scope are left untouched.
 
     Very old jobs (> MAX_RECOVERY_AGE_HOURS) are marked abandoned_legacy.
     """
@@ -2194,6 +2534,15 @@ def start_operations_loop():
                         print(f"[OPS][pid={pid}][TRANSIENT] rescue pass: {type(e).__name__}: {e}")
                     else:
                         print(f"[OPS][pid={pid}] rescue pass error: {e}")
+
+            # -- Monitoring (leader only, every 5th cycle) --
+            if not _worker_stop.is_set() and cycle % 5 == 0 and (_am_leader or not leader_only):
+                try:
+                    check_expired_reservations()
+                    log_pool_metrics()
+                    log_active_job_counts()
+                except Exception as e:
+                    print(f"[OPS][pid={pid}] monitoring error: {e}")
 
             if _cycle_had_db_error:
                 consecutive_db_errors += 1

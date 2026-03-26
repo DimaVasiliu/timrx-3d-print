@@ -75,6 +75,9 @@ def dispatch_meshy_text_to_3d_async(
     print(f"[TEXT-TO-3D] Starting dispatch job={internal_job_id} stage={stage} reservation={reservation_id}")
 
     try:
+        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        if webhook_url:
+            payload["webhook_url"] = webhook_url
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
         meshy_task_id = resp.get("result")
         duration_ms = int((time.time() - start_time) * 1000)
@@ -125,6 +128,9 @@ def dispatch_meshy_refine_async(
     print(f"[REFINE] Starting dispatch job={internal_job_id} preview={preview_id} reservation={reservation_id}")
 
     try:
+        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        if webhook_url:
+            payload["webhook_url"] = webhook_url
         # Meshy has eventual consistency: a just-completed preview may not be
         # queryable for refine for several seconds.  Retry with increasing delays.
         resp = None
@@ -269,6 +275,9 @@ def dispatch_meshy_image_to_3d_async(
         except Exception as preflight_err:
             print(f"[MESHY_PREFLIGHT] Normalization failed (proceeding with original): {preflight_err}")
 
+        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        if webhook_url:
+            payload["webhook_url"] = webhook_url
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
 
@@ -977,6 +986,9 @@ def dispatch_meshy_multi_image_to_3d_async(
         except Exception as preflight_err:
             print(f"[MESHY_PREFLIGHT] Multi-image normalization failed (proceeding with originals): {preflight_err}")
 
+        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        if webhook_url:
+            payload["webhook_url"] = webhook_url
         resp = mesh_post("/openapi/v1/multi-image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
 
