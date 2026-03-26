@@ -468,6 +468,15 @@ class Config:
     # ─────────────────────────────────────────────────────────────
     MESHY_API_KEY: str = field(default_factory=lambda: _get_env("MESHY_API_KEY"))
     MESHY_API_BASE: str = field(default_factory=lambda: _get_env("MESHY_API_BASE", "https://api.meshy.ai").rstrip("/"))
+
+    # ── Meshy Image-to-3D preflight normalization (TimrX policy) ──
+    # Meshy's public docs do not expose exact max image size/dimension limits,
+    # but the provider rejects oversized images with "Image too large".
+    # These are TimrX defensive defaults — adjust via env vars if Meshy's
+    # practical limits are learned from production behavior.
+    MESHY_PREFLIGHT_MAX_DIM: int = field(default_factory=lambda: _get_env_int("MESHY_PREFLIGHT_MAX_DIM", 2048))
+    MESHY_PREFLIGHT_MAX_BYTES: int = field(default_factory=lambda: _get_env_int("MESHY_PREFLIGHT_MAX_BYTES", 10 * 1024 * 1024))
+    MESHY_PREFLIGHT_JPEG_QUALITY: int = field(default_factory=lambda: _get_env_int("MESHY_PREFLIGHT_JPEG_QUALITY", 90))
     OPENAI_API_KEY: str = field(default_factory=lambda: _get_env("OPENAI_API_KEY"))
     # GEMINI_API_KEY with fallback to GOOGLE_API_KEY for backward compatibility
     GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY"))

@@ -393,43 +393,65 @@ def generate_image_thumbnail(
 
 def normalize_image_for_provider(
     image_bytes: bytes,
-    max_dimension: int = 2048,
-    max_file_bytes: int = 10 * 1024 * 1024,
-    quality: int = 90,
+    max_dimension: int | None = None,
+    max_file_bytes: int | None = None,
+    quality: int | None = None,
 ) -> bytes | None:
     """
-    Normalize an image to fit within provider limits.
+    Defensive preflight normalization for provider image submission.
 
-    Resizes if dimensions exceed max_dimension (longest side) and converts
-    to JPEG to reduce file size. Used as a preflight step before sending
-    images to Meshy (image-to-3D) which rejects "Image too large".
+    Meshy's public docs do not clearly document max image size or dimension
+    limits, but the provider rejects oversized inputs with "Image too large".
+    This function applies TimrX's configurable normalization policy to prevent
+    those rejections.  Thresholds are read from config (env-overridable):
+
+    - MESHY_PREFLIGHT_MAX_DIM    (default 2048px)
+    - MESHY_PREFLIGHT_MAX_BYTES  (default 10MB)
+    - MESHY_PREFLIGHT_JPEG_QUALITY (default 90)
+
+    Logs original and normalized dimensions/bytes for production observability
+    so the practical provider limit can be refined over time.
 
     Args:
         image_bytes: Raw image file bytes.
-        max_dimension: Maximum allowed dimension in pixels (longest side).
-        max_file_bytes: Maximum allowed file size in bytes.
-        quality: JPEG output quality (1-95).
+        max_dimension: Override for max dimension (default from config).
+        max_file_bytes: Override for max file size (default from config).
+        quality: Override for JPEG quality (default from config).
 
     Returns:
         Normalized JPEG bytes, or None if normalization fails.
-        Returns the original bytes unchanged if already within limits and JPEG.
+        Returns the original bytes unchanged if already within thresholds.
     """
     try:
         from PIL import Image
         import io
+        from backend.config import config as _cfg
+
+        # Read thresholds from config (env-overridable), with function-arg overrides
+        _max_dim = max_dimension if max_dimension is not None else _cfg.MESHY_PREFLIGHT_MAX_DIM
+        _max_bytes = max_file_bytes if max_file_bytes is not None else _cfg.MESHY_PREFLIGHT_MAX_BYTES
+        _quality = quality if quality is not None else _cfg.MESHY_PREFLIGHT_JPEG_QUALITY
 
         img = Image.open(io.BytesIO(image_bytes))
-        original_size = img.size
-        needs_resize = max(img.size) > max_dimension
-        needs_recompress = len(image_bytes) > max_file_bytes
+        original_w, original_h = img.size
+        original_bytes = len(image_bytes)
+        needs_resize = max(original_w, original_h) > _max_dim
+        needs_recompress = original_bytes > _max_bytes
+
+        # Log original image stats for observability (helps refine thresholds)
+        print(
+            f"[MESHY_PREFLIGHT] Input: {original_w}x{original_h} "
+            f"{original_bytes:,} bytes, mode={img.mode} | "
+            f"policy: max_dim={_max_dim} max_bytes={_max_bytes:,} quality={_quality}"
+        )
 
         if not needs_resize and not needs_recompress:
-            # Already within limits — return original
+            print(f"[MESHY_PREFLIGHT] SKIP: image already within thresholds")
             return image_bytes
 
         # Resize if too large
         if needs_resize:
-            img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+            img.thumbnail((_max_dim, _max_dim), Image.LANCZOS)
 
         # Convert to RGB for JPEG (handles RGBA, P, LA)
         if img.mode in ("RGBA", "P", "LA"):
@@ -437,15 +459,15 @@ def normalize_image_for_provider(
 
         # Encode as JPEG
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        img.save(buf, format="JPEG", quality=_quality, optimize=True)
         result = buf.getvalue()
 
-        action = []
-        if needs_resize:
-            action.append(f"resized {original_size} -> {img.size}")
-        if needs_recompress:
-            action.append(f"compressed {len(image_bytes)} -> {len(result)} bytes")
-        print(f"[MESHY_PREFLIGHT] Image normalized: {', '.join(action)}")
+        final_w, final_h = img.size
+        print(
+            f"[MESHY_PREFLIGHT] NORMALIZED: {original_w}x{original_h} ({original_bytes:,}B) "
+            f"-> {final_w}x{final_h} ({len(result):,}B) "
+            f"{'resized' if needs_resize else ''} {'compressed' if needs_recompress else ''}"
+        )
         return result
 
     except ImportError:

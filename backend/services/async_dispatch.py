@@ -227,9 +227,10 @@ def dispatch_meshy_image_to_3d_async(
             except Exception as e:
                 print(f"[ASYNC] Failed to pre-upload data URL to S3: {e}, sending data URL to Meshy")
 
-        # ── Preflight: normalize image for Meshy (prevents "Image too large" errors) ──
-        # Meshy rejects images above an undocumented size/dimension limit.
-        # Fetch the image, resize if > 2048px, re-encode as JPEG if oversized.
+        # ── Preflight: TimrX defensive normalization before Meshy submission ──
+        # Meshy's public docs do not expose exact image size/dimension limits,
+        # but the provider rejects oversized inputs ("Image too large").
+        # TimrX normalizes images per configurable policy (MESHY_PREFLIGHT_*).
         # The original source image is preserved in S3 for user-facing history.
         meshy_image_url = str(payload.get("image_url") or s3_image_url or "")
         try:
@@ -931,7 +932,7 @@ def dispatch_meshy_multi_image_to_3d_async(
 
         payload["image_urls"] = resolved_urls
 
-        # ── Preflight: normalize each image for Meshy (prevents "Image too large") ──
+        # ── Preflight: TimrX defensive normalization for each image before Meshy ──
         try:
             from backend.services.s3_service import (
                 normalize_image_for_provider,
@@ -2623,3 +2624,5 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
+
+
