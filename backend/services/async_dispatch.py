@@ -15,6 +15,8 @@ import os
 import time
 from typing import Optional
 
+import requests
+
 from backend.config import AWS_BUCKET_MODELS
 from backend.db import USE_DB, get_conn, Tables
 from backend.services.credits_helper import finalize_job_credits, release_job_credits
@@ -224,6 +226,47 @@ def dispatch_meshy_image_to_3d_async(
                     print(f"[ASYNC] S3 upload returned no URL, sending data URL to Meshy")
             except Exception as e:
                 print(f"[ASYNC] Failed to pre-upload data URL to S3: {e}, sending data URL to Meshy")
+
+        # ── Preflight: normalize image for Meshy (prevents "Image too large" errors) ──
+        # Meshy rejects images above an undocumented size/dimension limit.
+        # Fetch the image, resize if > 2048px, re-encode as JPEG if oversized.
+        # The original source image is preserved in S3 for user-facing history.
+        meshy_image_url = str(payload.get("image_url") or s3_image_url or "")
+        try:
+            from backend.services.s3_service import (
+                normalize_image_for_provider,
+                build_hash_s3_key,
+                upload_bytes_to_s3,
+                is_s3_url,
+            )
+            from backend.utils import compute_sha256, unpack_upload_result
+            import base64 as _b64
+
+            if meshy_image_url.startswith("data:"):
+                _, b64data = meshy_image_url.split(",", 1)
+                raw_bytes = _b64.b64decode(b64data)
+            else:
+                img_resp = requests.get(meshy_image_url, timeout=30)
+                img_resp.raise_for_status()
+                raw_bytes = img_resp.content
+
+            normalized = normalize_image_for_provider(raw_bytes)
+            if normalized is not None and normalized is not raw_bytes:
+                # Upload normalized image to S3 for Meshy to fetch
+                norm_hash = compute_sha256(normalized)
+                norm_key = build_hash_s3_key("meshy_input", "user", norm_hash, "image/jpeg")
+                norm_result = upload_bytes_to_s3(
+                    normalized,
+                    content_type="image/jpeg",
+                    key=norm_key,
+                    return_hash=False,
+                )
+                norm_url = str(unpack_upload_result(norm_result)[0] or "")
+                if norm_url and is_s3_url(norm_url):
+                    payload["image_url"] = norm_url
+                    print(f"[MESHY_PREFLIGHT] Using normalized image for Meshy: {norm_url}")
+        except Exception as preflight_err:
+            print(f"[MESHY_PREFLIGHT] Normalization failed (proceeding with original): {preflight_err}")
 
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
@@ -887,6 +930,48 @@ def dispatch_meshy_multi_image_to_3d_async(
             resolved_urls.append(url)
 
         payload["image_urls"] = resolved_urls
+
+        # ── Preflight: normalize each image for Meshy (prevents "Image too large") ──
+        try:
+            from backend.services.s3_service import (
+                normalize_image_for_provider,
+                build_hash_s3_key,
+                upload_bytes_to_s3,
+                is_s3_url,
+            )
+            from backend.utils import compute_sha256, unpack_upload_result
+            import base64 as _b64
+
+            normalized_urls = []
+            for idx, img_url in enumerate(resolved_urls):
+                img_url_str = str(img_url or "")
+                try:
+                    if img_url_str.startswith("data:"):
+                        _, b64data = img_url_str.split(",", 1)
+                        raw_bytes = _b64.b64decode(b64data)
+                    else:
+                        img_resp = requests.get(img_url_str, timeout=30)
+                        img_resp.raise_for_status()
+                        raw_bytes = img_resp.content
+
+                    normalized = normalize_image_for_provider(raw_bytes)
+                    if normalized is not None and normalized is not raw_bytes:
+                        norm_hash = compute_sha256(normalized)
+                        norm_key = build_hash_s3_key("meshy_input", "user", norm_hash, "image/jpeg")
+                        norm_result = upload_bytes_to_s3(
+                            normalized, content_type="image/jpeg", key=norm_key, return_hash=False,
+                        )
+                        norm_url = str(unpack_upload_result(norm_result)[0] or "")
+                        if norm_url and is_s3_url(norm_url):
+                            normalized_urls.append(norm_url)
+                            print(f"[MESHY_PREFLIGHT] Multi-image {idx}: normalized -> {norm_url}")
+                            continue
+                except Exception as img_err:
+                    print(f"[MESHY_PREFLIGHT] Multi-image {idx} normalization failed: {img_err}")
+                normalized_urls.append(img_url)
+            payload["image_urls"] = normalized_urls
+        except Exception as preflight_err:
+            print(f"[MESHY_PREFLIGHT] Multi-image normalization failed (proceeding with originals): {preflight_err}")
 
         resp = mesh_post("/openapi/v1/multi-image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
@@ -2538,5 +2623,3 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
-
-

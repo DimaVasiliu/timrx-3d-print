@@ -391,6 +391,71 @@ def generate_image_thumbnail(
         return None
 
 
+def normalize_image_for_provider(
+    image_bytes: bytes,
+    max_dimension: int = 2048,
+    max_file_bytes: int = 10 * 1024 * 1024,
+    quality: int = 90,
+) -> bytes | None:
+    """
+    Normalize an image to fit within provider limits.
+
+    Resizes if dimensions exceed max_dimension (longest side) and converts
+    to JPEG to reduce file size. Used as a preflight step before sending
+    images to Meshy (image-to-3D) which rejects "Image too large".
+
+    Args:
+        image_bytes: Raw image file bytes.
+        max_dimension: Maximum allowed dimension in pixels (longest side).
+        max_file_bytes: Maximum allowed file size in bytes.
+        quality: JPEG output quality (1-95).
+
+    Returns:
+        Normalized JPEG bytes, or None if normalization fails.
+        Returns the original bytes unchanged if already within limits and JPEG.
+    """
+    try:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+        original_size = img.size
+        needs_resize = max(img.size) > max_dimension
+        needs_recompress = len(image_bytes) > max_file_bytes
+
+        if not needs_resize and not needs_recompress:
+            # Already within limits — return original
+            return image_bytes
+
+        # Resize if too large
+        if needs_resize:
+            img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+
+        # Convert to RGB for JPEG (handles RGBA, P, LA)
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        # Encode as JPEG
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        result = buf.getvalue()
+
+        action = []
+        if needs_resize:
+            action.append(f"resized {original_size} -> {img.size}")
+        if needs_recompress:
+            action.append(f"compressed {len(image_bytes)} -> {len(result)} bytes")
+        print(f"[MESHY_PREFLIGHT] Image normalized: {', '.join(action)}")
+        return result
+
+    except ImportError:
+        print("[MESHY_PREFLIGHT] Pillow not installed, skipping normalization")
+        return None
+    except Exception as e:
+        print(f"[MESHY_PREFLIGHT] Failed to normalize image: {e}")
+        return None
+
+
 def ensure_s3_url_for_data_uri(
     url: str,
     prefix: str,
