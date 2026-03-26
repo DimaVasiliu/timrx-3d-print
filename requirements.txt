@@ -12,5 +12,7 @@ boto3==1.34.0
 bcrypt==4.2.0
 PyJWT==2.9.0
 cryptography>=41.0.0  # Required for PyJWT RS256 signing (service account auth)
+# Image thumbnail generation
+Pillow==11.1.0
 # Invoice PDF generation
 fpdf2==2.8.1
