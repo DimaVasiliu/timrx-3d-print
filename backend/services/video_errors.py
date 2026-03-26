@@ -42,6 +42,7 @@ TERMINAL_STATES = frozenset({
     "succeeded", "failed", "refunded", "ready", "ready_unbilled",
     "abandoned_legacy", "recovery_blocked",
     "deleted_by_user", "upstream_timeout_final",
+    "provider_stalled",
 })
 
 # States that must never be overwritten by a webhook or sweep.
