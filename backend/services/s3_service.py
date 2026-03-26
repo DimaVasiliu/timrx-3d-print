@@ -588,6 +588,88 @@ def save_finished_job_to_normalized_db(job_id, status_out, meta, job_type, user_
 
 
 # ─────────────────────────────────────────────────────────────
+# S3 Rollback Scope (compensating cleanup for upload-then-persist flows)
+# ─────────────────────────────────────────────────────────────
+
+
+class S3RollbackScope:
+    """
+    Context manager that tracks newly-created S3 objects and deletes them
+    if the block exits with an exception.
+
+    Only cleans up objects that were actually uploaded (not reused/deduped).
+    Pre-existing content-hash keys are never deleted.
+
+    Usage::
+
+        with S3RollbackScope("image_save:abc123") as scope:
+            url, _, key, reused = unpack_upload_result(
+                upload_bytes_to_s3(data, ..., return_hash=True)
+            )
+            scope.track(key, reused)
+
+            url2, _, key2, reused2 = unpack_upload_result(
+                safe_upload_to_s3(thumb, ..., return_hash=True)
+            )
+            scope.track(key2, reused2)
+
+            # ... DB writes ...
+            conn.commit()
+        # If DB write raises, scope.__exit__ deletes only newly-created keys.
+        # If commit succeeds, nothing is deleted.
+    """
+
+    def __init__(self, source: str = "unknown"):
+        self.source = source
+        self._newly_created_keys: list[str] = []
+
+    def track(self, s3_key: str | None, reused: bool | None) -> None:
+        """Record an S3 key for potential rollback. Only non-reused keys are tracked."""
+        if s3_key and reused is False:
+            self._newly_created_keys.append(s3_key)
+
+    def track_result(self, upload_result) -> tuple:
+        """
+        Unpack an upload result, track the key, and return the 4-tuple.
+
+        Convenience wrapper combining unpack_upload_result + track::
+
+            url, hash, key, reused = scope.track_result(
+                upload_bytes_to_s3(data, ..., return_hash=True)
+            )
+        """
+        from backend.utils import unpack_upload_result
+        url, content_hash, s3_key, reused = unpack_upload_result(upload_result)
+        self.track(s3_key, reused)
+        return url, content_hash, s3_key, reused
+
+    @property
+    def tracked_keys(self) -> list[str]:
+        """Return a copy of the tracked newly-created keys."""
+        return list(self._newly_created_keys)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None and self._newly_created_keys:
+            print(
+                f"[S3_CLEANUP] Exception in {self.source}, "
+                f"cleaning up {len(self._newly_created_keys)} newly-created S3 objects"
+            )
+            try:
+                result = delete_s3_objects_safe(self._newly_created_keys, source=self.source)
+                print(
+                    f"[S3_CLEANUP] Deleted {result.get('deleted', 0)}, "
+                    f"errors: {len(result.get('errors', []))}"
+                )
+            except Exception as cleanup_err:
+                print(f"[S3_CLEANUP] Cleanup itself failed (original error preserved): {cleanup_err}")
+        # Never suppress the original exception
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
 # S3 Deletion Helpers
 # ─────────────────────────────────────────────────────────────
 

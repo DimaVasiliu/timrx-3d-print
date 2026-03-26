@@ -11,6 +11,7 @@ This module owns:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import uuid
@@ -26,6 +27,7 @@ from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.services.meshy_service import _filter_model_urls
 from backend.services.s3_service import (
     build_hash_s3_key,
+    delete_s3_objects_safe,
     ensure_s3_url_for_data_uri,
     generate_image_thumbnail,
     get_s3_key_from_url,
@@ -476,6 +478,10 @@ def save_image_to_normalized_db(
         print(f"[DB] SKIPPED save_image: no identity_id for image_id={image_id} (would create orphaned row)")
         return None
 
+    # Track S3 keys newly created in this call (not reused/deduped).
+    # Used for compensating cleanup if DB persistence fails.
+    _newly_created_s3_keys: list[str] = []
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -505,18 +511,54 @@ def save_image_to_normalized_db(
                 image_reused = None
                 original_image_url = image_url
                 uploaded_url_cache: dict[str, str] = {}
+                image_bytes = None  # kept in memory for thumbnail generation
+
                 if image_url:
-                    upload_result = safe_upload_to_s3(
-                        image_url,
-                        "image/png",
-                        "images",
-                        image_id,
-                        user_id=user_id,
-                        key_base=image_key_base,
-                        return_hash=True,
-                        provider=provider,
-                    )
-                    image_url, image_content_hash, image_s3_key_from_upload, image_reused = unpack_upload_result(upload_result)
+                    # ── Fetch image bytes once, use for both upload and thumbnail ──
+                    if is_s3_url(image_url):
+                        # Already on S3 — no upload needed
+                        image_s3_key_from_upload = get_s3_key_from_url(image_url)
+                        image_reused = True
+                        # Fetch bytes for thumbnail (unavoidable for pre-existing S3 images)
+                        try:
+                            r = requests.get(image_url, timeout=30)
+                            r.raise_for_status()
+                            image_bytes = r.content
+                        except Exception as e:
+                            print(f"[IMAGE] Could not fetch existing S3 image for thumbnail: {e}")
+                    else:
+                        # Fetch bytes from source (provider URL or data: URI)
+                        resolved_ct = "image/png"
+                        try:
+                            if image_url.startswith("data:"):
+                                header_part, b64data = image_url.split(",", 1)
+                                if ":" in header_part and ";" in header_part:
+                                    resolved_ct = header_part.split(":")[1].split(";")[0] or resolved_ct
+                                image_bytes = base64.b64decode(b64data)
+                            else:
+                                r = requests.get(image_url, timeout=120)
+                                r.raise_for_status()
+                                ct = r.headers.get("Content-Type")
+                                if ct and ct != "application/octet-stream":
+                                    resolved_ct = ct
+                                image_bytes = r.content
+                        except Exception as e:
+                            print(f"[IMAGE] Failed to fetch image bytes from source: {e}")
+                            raise
+
+                        # Upload full image to S3 with content-hash dedup
+                        image_content_hash = compute_sha256(image_bytes)
+                        s3_key = build_hash_s3_key("images", provider, image_content_hash, resolved_ct)
+                        upload_result = upload_bytes_to_s3(
+                            image_bytes,
+                            content_type=resolved_ct,
+                            key=s3_key,
+                            return_hash=True,
+                        )
+                        image_url, _, image_s3_key_from_upload, image_reused = unpack_upload_result(upload_result)
+                        if image_reused is False and image_s3_key_from_upload:
+                            _newly_created_s3_keys.append(image_s3_key_from_upload)
+
                     if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
                         print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
                         image_url = None
@@ -524,6 +566,7 @@ def save_image_to_normalized_db(
                         uploaded_url_cache[original_image_url] = image_url
                     if image_url:
                         uploaded_url_cache[image_url] = image_url
+
                 if image_urls:
                     normalized_urls = []
                     for i, url in enumerate(image_urls):
@@ -547,18 +590,14 @@ def save_image_to_normalized_db(
                     image_urls = normalized_urls
                 image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)
 
-                # ── Generate real thumbnail (400px longest side) ──
+                # ── Generate real thumbnail from in-memory bytes (no extra fetch) ──
                 # Falls back to full image URL if thumbnail generation fails.
                 thumbnail_url = image_url
                 thumbnail_s3_key = get_s3_key_from_url(image_url)
-                if image_url:
+                if image_bytes:
                     try:
-                        # Fetch image bytes from the canonical S3 URL
-                        thumb_source_url = image_url
-                        thumb_resp = requests.get(thumb_source_url, timeout=30)
-                        thumb_resp.raise_for_status()
                         thumb_bytes = generate_image_thumbnail(
-                            thumb_resp.content,
+                            image_bytes,
                             max_size=400,
                             quality=80,
                             output_format="JPEG",
@@ -571,12 +610,14 @@ def save_image_to_normalized_db(
                                 content_type="image/jpeg",
                                 prefix="thumbnails",
                                 key=thumb_s3_key,
-                                return_hash=False,
+                                return_hash=True,
                             )
-                            thumb_url_result = unpack_upload_result(thumb_result)[0]
+                            thumb_url_result, _, thumb_key_result, thumb_reused = unpack_upload_result(thumb_result)
                             if thumb_url_result and is_s3_url(thumb_url_result):
                                 thumbnail_url = thumb_url_result
                                 thumbnail_s3_key = get_s3_key_from_url(thumb_url_result)
+                                if thumb_reused is False and thumb_key_result:
+                                    _newly_created_s3_keys.append(thumb_key_result)
                                 print(f"[THUMBNAIL] Saved image thumbnail: {thumbnail_s3_key}")
                             else:
                                 print(f"[THUMBNAIL] Upload returned non-S3 URL, using full image as fallback")
@@ -966,6 +1007,15 @@ def save_image_to_normalized_db(
         return returned_image_id
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
+        # ── Compensating S3 cleanup: delete newly-created objects on DB failure ──
+        if _newly_created_s3_keys:
+            print(f"[S3_CLEANUP] DB failed for image {image_id}, cleaning up {len(_newly_created_s3_keys)} newly-created S3 objects")
+            try:
+                result = delete_s3_objects_safe(_newly_created_s3_keys, source=f"image_db_failure:{image_id}")
+                print(f"[S3_CLEANUP] Deleted {result.get('deleted', 0)}, errors: {len(result.get('errors', []))}")
+            except Exception as cleanup_err:
+                # Log cleanup failure but preserve the original DB error as the primary signal
+                print(f"[S3_CLEANUP] Cleanup itself failed (original DB error preserved): {cleanup_err}")
         return None
 
 
@@ -1922,10 +1972,11 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
 
             texture_s3_urls: dict[str, str] = {}
             texture_urls: list[str] = []
+            texture_newly_created_keys: list[str] = []
             for idx, (map_type, url) in enumerate(normalized_textures):
                 safe_map_type = sanitize_filename(map_type) or f"texture_{idx}"
                 texture_key_base = f"textures/{job_key}/{s3_key_name}/{safe_map_type}"
-                uploaded_url = safe_upload_to_s3(
+                upload_result = safe_upload_to_s3(
                     url,
                     "image/png",
                     "textures",
@@ -1934,10 +1985,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     key_base=texture_key_base,
                     infer_content_type=False,
                     provider=provider,
+                    return_hash=True,
                 )
-                texture_s3_urls[safe_map_type] = uploaded_url
-                if uploaded_url:
-                    texture_urls.append(uploaded_url)
+                tex_url, _, tex_s3_key, tex_reused = unpack_upload_result(upload_result)
+                texture_s3_urls[safe_map_type] = tex_url
+                if tex_url:
+                    texture_urls.append(tex_url)
+                if tex_reused is False and tex_s3_key:
+                    texture_newly_created_keys.append(tex_s3_key)
 
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
@@ -2777,6 +2832,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     cur.execute("RELEASE SAVEPOINT normalized_save")
                 except Exception as rollback_err:
                     log_db_continue("normalized_save_rollback", rollback_err)
+                # ── Compensating S3 cleanup: delete newly-created objects on DB failure ──
                 cleanup_keys = []
                 if model_reused is False and glb_s3_key:
                     cleanup_keys.append(glb_s3_key)
@@ -2784,17 +2840,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     cleanup_keys.append(thumbnail_s3_key)
                 if image_reused is False and image_s3_key:
                     cleanup_keys.append(image_s3_key)
-                if cleanup_keys and AWS_BUCKET_MODELS:
+                cleanup_keys.extend(texture_newly_created_keys)
+                if cleanup_keys:
+                    print(f"[S3_CLEANUP] DB failed for job {job_id}, cleaning up {len(cleanup_keys)} newly-created S3 objects")
                     try:
-                        _s3.delete_objects(
-                            Bucket=AWS_BUCKET_MODELS,
-                            Delete={"Objects": [{"Key": key} for key in cleanup_keys]},
-                        )
-                        pass  # print(f"[S3] cleanup: deleted {len(cleanup_keys)} objects after DB failure")
+                        result = delete_s3_objects_safe(cleanup_keys, source=f"model_db_failure:{job_id}")
+                        print(f"[S3_CLEANUP] Deleted {result.get('deleted', 0)}, errors: {len(result.get('errors', []))}")
                     except Exception as cleanup_err:
-                        print(f"[S3] cleanup failed: {cleanup_err}")
-                else:
-                    pass  # print(f"[S3] cleanup skipped; keys={cleanup_keys}")
+                        print(f"[S3_CLEANUP] Cleanup itself failed (original DB error preserved): {cleanup_err}")
 
             cur.close()
             conn.commit()
