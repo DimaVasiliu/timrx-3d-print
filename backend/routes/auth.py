@@ -938,6 +938,16 @@ def verify_email():
     except Exception as notif_err:
         print(f"[AUTH] Email verified notification failed (non-fatal): {notif_err}")
 
+    # ── Welcome bonus: check if user has a paid purchase that now qualifies ──
+    # Covers the case where user bought credits before verifying email.
+    try:
+        from backend.services.welcome_bonus_service import try_welcome_bonus
+        bonus = try_welcome_bonus(identity_id)
+        if bonus and bonus.get("granted"):
+            print(f"[AUTH] Welcome bonus granted after verification: +{bonus['credits']} to {identity_id}")
+    except Exception as bonus_err:
+        print(f"[AUTH] Welcome bonus check failed (non-fatal): {bonus_err}")
+
     # IDENT-3: Always include identity_changed and identity_id to normalize
     # response shape (same keys as cross-identity path).
     return jsonify({

@@ -37,16 +37,20 @@ WELCOME_BONUS_CREDIT_TYPE = "general"
 
 def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
     """
-    Attempt to grant the one-time welcome bonus after a successful paid purchase.
+    Attempt to grant the one-time welcome bonus.
 
     Checks:
       1. Identity has email_verified = TRUE
-      2. No welcome bonus has been granted before (DB-enforced uniqueness)
+      2. Identity has at least one completed paid purchase
+      3. No welcome bonus has been granted before (DB-enforced uniqueness)
 
-    If both pass, grants 50 general credits and creates an in-app notification.
+    If all pass, grants 50 general credits and creates an in-app notification.
+
+    Safe to call from both purchase finalization and email verification paths.
+    The DB unique index guarantees at-most-once granting regardless of caller.
 
     Args:
-        identity_id: The identity that just completed a purchase
+        identity_id: The identity to check
 
     Returns:
         Dict with grant details if bonus was granted,
@@ -54,21 +58,29 @@ def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
         None on error (non-fatal, logged)
     """
     try:
-        # 1. Check verified status
-        identity = query_one(
+        # 1. Check verified status + paid purchase existence in one query
+        row = query_one(
             f"""
-            SELECT id, email, email_verified
-            FROM {Tables.IDENTITIES}
-            WHERE id = %s
+            SELECT i.email_verified,
+                   EXISTS (
+                       SELECT 1 FROM {Tables.PURCHASES} p
+                       WHERE p.identity_id = i.id AND p.status = 'completed'
+                   ) AS has_paid_purchase
+            FROM {Tables.IDENTITIES} i
+            WHERE i.id = %s
             """,
             (identity_id,),
         )
-        if not identity:
+        if not row:
             logger.debug("[WELCOME_BONUS] Identity not found: %s", identity_id)
             return None
 
-        if not identity.get("email_verified"):
+        if not row.get("email_verified"):
             logger.debug("[WELCOME_BONUS] Not verified, skipping: %s", identity_id)
+            return None
+
+        if not row.get("has_paid_purchase"):
+            logger.debug("[WELCOME_BONUS] No paid purchase, skipping: %s", identity_id)
             return None
 
         # 2. Attempt idempotent grant inside a transaction

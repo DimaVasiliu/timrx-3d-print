@@ -1021,6 +1021,18 @@ class MollieService:
                     except Exception as admin_err:
                         print(f"[MOLLIE] WARNING: Admin notification failed: {admin_err}")
 
+                # ── Welcome bonus: +50 credits on first verified purchase ──
+                # Called AFTER _record_mollie_purchase transaction has committed
+                # to avoid wallet row lock contention.
+                if not was_existing:
+                    try:
+                        from backend.services.welcome_bonus_service import try_welcome_bonus
+                        bonus = try_welcome_bonus(identity_id)
+                        if bonus and bonus.get("granted"):
+                            print(f"[MOLLIE] Welcome bonus granted: +{bonus['credits']} to {identity_id}")
+                    except Exception as bonus_err:
+                        print(f"[MOLLIE] Welcome bonus check failed (non-fatal): {bonus_err}")
+
                 return {
                     "purchase_id": purchase_id,
                     "was_existing": was_existing,
@@ -1493,10 +1505,17 @@ class MollieService:
                 (new_balance, identity_id),
             )
 
-            # NOTE: Email is NOT auto-attached during webhook purchase grant.
-            # Checkout requires verified email before billing, so the purchasing
-            # identity already has a verified email. The email in metadata is
-            # for receipt/invoice purposes only.
+            # 5. Auto-verify email on successful purchase
+            # A completed payment proves the user is real — mark email verified
+            # so they get full access (and welcome bonus eligibility) immediately.
+            cur.execute(
+                f"""
+                UPDATE {Tables.IDENTITIES}
+                SET email_verified = TRUE, last_seen_at = NOW()
+                WHERE id = %s AND email IS NOT NULL AND NOT COALESCE(email_verified, FALSE)
+                """,
+                (identity_id,),
+            )
 
             print(
                 f"[MOLLIE] Purchase recorded: purchase_id={purchase_id}, identity={identity_id}, "
@@ -1504,20 +1523,11 @@ class MollieService:
                 f"balance: {current_balance} -> {new_balance}"
             )
 
-            # ── Welcome bonus: one-time +50 credits on first verified purchase ──
-            try:
-                from backend.services.welcome_bonus_service import try_welcome_bonus
-                bonus = try_welcome_bonus(identity_id)
-                if bonus and bonus.get("granted"):
-                    new_balance = bonus["new_balance"]
-                    print(f"[MOLLIE] Welcome bonus granted: +{bonus['credits']} to {identity_id}")
-            except Exception as bonus_err:
-                print(f"[MOLLIE] Welcome bonus check failed (non-fatal): {bonus_err}")
-
             return {
                 "purchase": PurchaseService._format_purchase(purchase),
                 "ledger_entry_id": str(ledger_entry["id"]),
                 "balance": new_balance,
+                "_identity_id": identity_id,
             }
 
     # ─────────────────────────────────────────────────────────────

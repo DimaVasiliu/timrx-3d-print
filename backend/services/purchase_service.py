@@ -510,6 +510,17 @@ class PurchaseService:
                     f"email={normalized_email} (rows={cur.rowcount})"
                 )
 
+            # 5b. Auto-verify email on successful purchase
+            # A completed payment proves the user is real — mark email verified
+            cur.execute(
+                f"""
+                UPDATE {Tables.IDENTITIES}
+                SET email_verified = TRUE, last_seen_at = NOW()
+                WHERE id = %s AND email IS NOT NULL AND NOT COALESCE(email_verified, FALSE)
+                """,
+                (identity_id,),
+            )
+
             # 6. Queue purchase emails (durable - within same transaction)
             # This ensures emails are never lost even if the process crashes after commit
             email_queued = False
@@ -565,23 +576,27 @@ class PurchaseService:
             except Exception as notif_err:
                 print(f"[PURCHASE] Notification failed (non-fatal): {notif_err}")
 
-            # ── Welcome bonus: one-time +50 credits on first verified purchase ──
-            try:
-                from backend.services.welcome_bonus_service import try_welcome_bonus
-                bonus = try_welcome_bonus(identity_id)
-                if bonus and bonus.get("granted"):
-                    new_balance = bonus["new_balance"]
-                    print(f"[PURCHASE] Welcome bonus granted: +{bonus['credits']} to {identity_id}")
-            except Exception as bonus_err:
-                print(f"[PURCHASE] Welcome bonus check failed (non-fatal): {bonus_err}")
-
-            return {
+            result = {
                 "purchase": PurchaseService._format_purchase(purchase),
                 "ledger_entry_id": str(ledger_entry["id"]),
                 "balance": new_balance,
                 "email_attached": email_attached,
                 "email_queued": email_queued,
             }
+
+        # ── Welcome bonus: +50 credits on first verified purchase ──
+        # Called AFTER the purchase transaction has committed to avoid
+        # wallet row lock contention (welcome bonus opens its own txn).
+        try:
+            from backend.services.welcome_bonus_service import try_welcome_bonus
+            bonus = try_welcome_bonus(identity_id)
+            if bonus and bonus.get("granted"):
+                result["balance"] = bonus["new_balance"]
+                print(f"[PURCHASE] Welcome bonus granted: +{bonus['credits']} to {identity_id}")
+        except Exception as bonus_err:
+            print(f"[PURCHASE] Welcome bonus check failed (non-fatal): {bonus_err}")
+
+        return result
 
     # ─────────────────────────────────────────────────────────────
     # Read Operations
