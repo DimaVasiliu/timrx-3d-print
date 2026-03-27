@@ -3828,3 +3828,253 @@ def video_quota_user(identity_id):
     except Exception as e:
         print(f"[ADMIN] User quota error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTIFICATION CAMPAIGN ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/campaigns", methods=["GET"])
+@require_admin
+def list_campaigns():
+    """List notification campaigns with optional status filter."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        status = request.args.get("status")
+        limit = int(request.args.get("limit", 50))
+        offset = int(request.args.get("offset", 0))
+        data = NotificationCampaignService.list_campaigns(
+            status=status, limit=limit, offset=offset
+        )
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] List campaigns error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns", methods=["POST"])
+@require_admin
+def create_campaign():
+    """Create a new notification campaign (draft)."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        body["created_by"] = getattr(g, "admin_email", None) or "admin"
+        campaign = NotificationCampaignService.create_campaign(**body)
+        return jsonify({"ok": True, "campaign": campaign}), 201
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Create campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>", methods=["GET"])
+@require_admin
+def get_campaign(campaign_id):
+    """Get campaign details with analytics."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        campaign = NotificationCampaignService.get_campaign(campaign_id)
+        if not campaign:
+            return jsonify({"ok": False, "error": "Campaign not found"}), 404
+        return jsonify({"ok": True, "campaign": campaign})
+    except Exception as e:
+        print(f"[ADMIN] Get campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>", methods=["PUT"])
+@require_admin
+def update_campaign(campaign_id):
+    """Update a draft/scheduled campaign."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        campaign = NotificationCampaignService.update_campaign(campaign_id, **body)
+        return jsonify({"ok": True, "campaign": campaign})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Update campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/publish", methods=["POST"])
+@require_admin
+def publish_campaign(campaign_id):
+    """Publish a campaign: resolve audience and deliver notifications."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        result = NotificationCampaignService.publish_campaign(campaign_id)
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Publish campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/test-send", methods=["POST"])
+@require_admin
+def test_send_campaign(campaign_id):
+    """Send a test notification to a specific user."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        identity_id = body.get("identity_id")
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id required"}), 400
+        result = NotificationCampaignService.test_send(campaign_id, identity_id)
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Test send error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/duplicate", methods=["POST"])
+@require_admin
+def duplicate_campaign(campaign_id):
+    """Duplicate a campaign as a new draft."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        created_by = getattr(g, "admin_email", None) or "admin"
+        campaign = NotificationCampaignService.duplicate_campaign(campaign_id, created_by)
+        return jsonify({"ok": True, "campaign": campaign}), 201
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Duplicate campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/archive", methods=["POST"])
+@require_admin
+def archive_campaign(campaign_id):
+    """Archive a campaign."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        campaign = NotificationCampaignService.archive_campaign(campaign_id)
+        return jsonify({"ok": True, "campaign": campaign})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Archive campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/analytics", methods=["GET"])
+@require_admin
+def campaign_analytics(campaign_id):
+    """Get detailed analytics for a campaign."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        data = NotificationCampaignService.get_campaign_analytics(campaign_id)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Campaign analytics error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/overview", methods=["GET"])
+@require_admin
+def campaigns_overview():
+    """Get aggregate notification center overview stats."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        data = NotificationCampaignService.get_overview_stats()
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Campaigns overview error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/preview-audience", methods=["POST"])
+@require_admin
+def preview_audience():
+    """Preview audience count for given rules."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        rules = body.get("audience_rules", {"target": "all"})
+        count = NotificationCampaignService.preview_audience_count(rules)
+        return jsonify({"ok": True, "count": count})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Preview audience error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─── Direct User Notification + Credit Actions ──────────────────────────
+
+@bp.route("/notifications/send-direct", methods=["POST"])
+@require_admin
+def send_direct_notification():
+    """Send a notification directly to a single user."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        identity_id = body.pop("identity_id", None)
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id required"}), 400
+        title = body.pop("title", None)
+        if not title:
+            return jsonify({"ok": False, "error": "title required"}), 400
+
+        body["admin_email"] = getattr(g, "admin_email", None) or "admin"
+        result = NotificationCampaignService.send_direct_notification(
+            identity_id=identity_id, title=title, **body
+        )
+        return jsonify({"ok": True, "notification": result})
+    except Exception as e:
+        print(f"[ADMIN] Direct notification error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/notifications/grant-credits", methods=["POST"])
+@require_admin
+def grant_credits_direct():
+    """Grant credits to a user with optional notification."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        identity_id = body.get("identity_id")
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id required"}), 400
+
+        result = NotificationCampaignService.grant_credits_direct(
+            identity_id=identity_id,
+            general_credits=int(body.get("general_credits", 0)),
+            video_credits=int(body.get("video_credits", 0)),
+            reason=body.get("reason", "admin_grant"),
+            admin_email=getattr(g, "admin_email", None) or "admin",
+            send_notification=body.get("send_notification", True),
+            notification_title=body.get("notification_title"),
+            notification_body=body.get("notification_body"),
+        )
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Grant credits error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/notifications/user/<identity_id>", methods=["GET"])
+@require_admin
+def get_user_notifications(identity_id):
+    """Get recent notifications for a specific user (admin view)."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        limit = int(request.args.get("limit", 20))
+        offset = int(request.args.get("offset", 0))
+        notifs = NotificationCampaignService.get_user_notifications(
+            identity_id, limit=limit, offset=offset
+        )
+        return jsonify({"ok": True, "notifications": notifs})
+    except Exception as e:
+        print(f"[ADMIN] User notifications error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500

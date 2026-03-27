@@ -1,324 +1,4080 @@
 """
-Notification Center API Routes.
+/api/admin routes - Admin-only endpoints.
+
+Standard admin endpoints require authentication via:
+  1. X-Admin-Token header (for scripts/automation)
+  2. Session with email in ADMIN_EMAILS list (for browser)
 
 Endpoints:
-  GET  /notifications              — paginated list (filterable by category, unread_only)
-  GET  /notifications/unread-count — { count: N } for badge
-  POST /notifications/<id>/read    — mark single notification as read
-  POST /notifications/read-all     — mark all unread as read
-  GET  /notifications/preferences  — get user prefs
-  PUT  /notifications/preferences  — update user prefs
-  GET  /notifications/broadcasts   — active broadcasts for user
-  POST /notifications/broadcasts/<id>/dismiss — dismiss a broadcast
+- GET  /api/admin/overview           - System overview (alias for stats)
+- GET  /api/admin/stats              - System statistics
+- GET  /api/admin/identities         - List identities
+- GET  /api/admin/identities/<id>    - Get identity detail
+- GET  /api/admin/purchases          - List purchases
+- GET  /api/admin/purchases/export.csv - CSV export of purchases
+- POST /api/admin/credits/grant      - Grant/deduct credits (requires reason, audit trail)
+- POST /api/admin/wallet/adjust      - Adjust wallet (alias for credits/grant)
+- GET  /api/admin/reservations       - List credit reservations
+- POST /api/admin/reservations/<id>/release - Release a reservation
+- GET  /api/admin/jobs               - List jobs
+- GET  /api/admin/health             - Admin health check
+- GET  /api/admin/debug/user         - Internal debug: user summary (masked email, wallet, history)
+- POST /api/admin/jobs/rescue        - Rescue late-completed Seedance jobs
+- GET  /api/admin/provider-health    - Aggregated provider health (success rates, spend, alerts)
+- GET  /api/admin/provider-balances  - Provider balance summary (snapshots, spend since, wallet alerts)
+- GET  /api/admin/alerts             - List admin alerts (filterable)
+- POST /api/admin/alerts/<id>/resolve - Mark an alert as resolved
+- GET  /api/admin/refunds/review     - Refund decision-support (failure candidates, suspicious purchases)
+- POST /api/admin/refunds/execute    - Execute an admin refund (credit reversal + audit)
+- GET  /api/admin/refunds            - List refund history
+- GET  /api/admin/provider-ledger    - List provider ledger entries (filterable)
+- POST /api/admin/provider-ledger    - Create a provider ledger entry
+- GET  /api/admin/provider-spend/monthly - Monthly provider spend report
+- GET  /api/admin/refunds/export.csv              - CSV export of refund history
+- GET  /api/admin/disputes/export.csv             - CSV export of disputes
+- GET  /api/admin/provider-ledger/export.csv      - CSV export of provider ledger
+- GET  /api/admin/provider-spend/monthly/export.csv - CSV export of monthly spend
+- POST /api/admin/refunds/<id>/send-review-email - Send refund-under-review email
+- POST /api/admin/refunds/<id>/resolve           - Resolve a manual-review refund (approve/deny/close)
+- POST /api/admin/refunds/<id>/execute-approved  - Execute an already-approved refund (credit reversal + payment)
+- POST /api/admin/purchases/<id>/start-refund    - Create refund record from purchase (enters review workflow)
+- GET  /api/admin/purchases/<id>                 - Purchase detail with timeline, refunds, jobs, disputes
+- GET  /api/admin/disputes                       - List payment disputes / chargebacks
+- POST /api/admin/purchases/<id>/mark-dispute    - Record a dispute against a purchase
+- POST /api/admin/disputes/<id>/update           - Update dispute status
+
+Environment variables:
+  ADMIN_TOKEN=your-secret-token      # For token-based auth (X-Admin-Token)
+  ADMIN_EMAILS=admin@example.com     # Comma-separated list for email-based auth
 """
 
-import logging
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, request, jsonify, g, Response
 
-from backend.middleware import with_session
-from backend.services.identity_service import require_identity
-from backend.services.notification_service import NotificationService
+from backend.middleware import require_admin
+from backend.services.admin_service import AdminService
+from backend.db import DatabaseError, query_all, query_one
 
-logger = logging.getLogger(__name__)
-
-bp = Blueprint("notifications", __name__)
+bp = Blueprint("admin", __name__)
 
 
-# ─── List notifications ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN ENDPOINTS (X-Admin-Token or email-based auth)
+# ─────────────────────────────────────────────────────────────────────────────
 
-@bp.route("/notifications", methods=["GET", "OPTIONS"])
-def list_notifications():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
+@bp.route("/overview", methods=["GET"])
+@bp.route("/stats", methods=["GET"])
+@require_admin
+def get_stats():
+    """
+    Get system statistics / overview.
 
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
+    Returns:
+        - total_identities: Total user count
+        - identities_with_email: Users with email attached
+        - total_purchases: Completed purchase count
+        - total_credits_purchased: Sum of credits bought
+        - total_credits_spent: Sum of credits used
+        - active_reservations: Currently held reservations
+        - jobs_by_status: Job counts grouped by status
+        - total_jobs: Total job count
+        - job_success_rate: Percentage of completed vs failed jobs
+        - total_revenue_gbp: Total revenue in GBP
+    """
+    try:
+        stats = AdminService.get_stats()
+        return jsonify({"ok": True, **stats})
+    except DatabaseError as e:
+        print(f"[ADMIN] Stats error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
 
-        try:
-            limit = min(int(request.args.get("limit", 20)), 50)
-            offset = max(int(request.args.get("offset", 0)), 0)
-            category = request.args.get("category")  # optional filter
-            unread_only = request.args.get("unread_only", "false").lower() == "true"
 
-            notifications = NotificationService.get_notifications(
-                identity_id,
-                limit=limit,
-                offset=offset,
-                category=category,
-                unread_only=unread_only,
+@bp.route("/metrics/video", methods=["GET"])
+@require_admin
+def video_metrics():
+    """
+    Get video generation operational metrics.
+
+    Returns:
+        active_jobs, queue_length, videos_generated_today,
+        provider_spend_today, average_generation_time,
+        active_workers, max_workers
+    """
+    try:
+        from backend.services.video_limits import get_video_metrics
+        metrics = get_video_metrics()
+        return jsonify({"ok": True, **metrics})
+    except Exception as e:
+        print(f"[ADMIN] Video metrics error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/identities", methods=["GET"])
+@require_admin
+def list_identities():
+    """
+    List identities with pagination.
+
+    Query params:
+        - limit: Max results (default 50, max 100)
+        - offset: Pagination offset (default 0)
+        - email: Filter by email contains
+        - has_email: 'true' or 'false' to filter by email presence
+    """
+    try:
+        limit = request.args.get("limit", 50, type=int)
+        offset = request.args.get("offset", 0, type=int)
+        email_filter = request.args.get("email")
+        has_email_str = request.args.get("has_email")
+
+        has_email = None
+        if has_email_str == "true":
+            has_email = True
+        elif has_email_str == "false":
+            has_email = False
+
+        result = AdminService.list_identities(
+            limit=limit,
+            offset=offset,
+            email_filter=email_filter,
+            has_email=has_email
+        )
+        return jsonify({"ok": True, **result})
+    except DatabaseError as e:
+        print(f"[ADMIN] List identities error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/identities/<identity_id>", methods=["GET"])
+@require_admin
+def get_identity_detail(identity_id):
+    """
+    Get detailed information about a specific identity.
+
+    Returns identity with wallet, recent purchases, recent jobs.
+    """
+    try:
+        detail = AdminService.get_identity_detail(identity_id)
+        if not detail:
+            return jsonify({"ok": False, "error": "Identity not found"}), 404
+        return jsonify({"ok": True, "identity": detail})
+    except DatabaseError as e:
+        print(f"[ADMIN] Identity detail error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/purchases", methods=["GET"])
+@require_admin
+def list_purchases():
+    """
+    List purchases with filtering + refund eligibility enrichment.
+
+    Query params:
+        - status: Filter by status (pending, completed, failed, refunded)
+        - identity_id: Filter by identity
+        - email: Partial email match
+        - purchase_id: Partial purchase ID match
+        - date_from: YYYY-MM-DD
+        - date_to: YYYY-MM-DD
+        - limit: Max results (default 50)
+        - offset: Pagination offset
+    """
+    try:
+        result = AdminService.list_purchases(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            email=request.args.get("email"),
+            purchase_id=request.args.get("purchase_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=request.args.get("limit", 50, type=int),
+            offset=request.args.get("offset", 0, type=int),
+        )
+        return jsonify({"ok": True, **result})
+    except DatabaseError as e:
+        print(f"[ADMIN] List purchases error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/purchases/<purchase_id>", methods=["GET"])
+@require_admin
+def get_purchase_detail(purchase_id):
+    """Full purchase investigation view: summary, timeline, refunds, jobs, disputes."""
+    try:
+        result = AdminService.get_purchase_detail(purchase_id)
+        status_code = 200 if result.get("ok") else 404
+        return jsonify(result), status_code
+    except Exception as e:
+        print(f"[ADMIN] Purchase detail error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/disputes", methods=["GET"])
+@require_admin
+def disputes_list():
+    """List payment disputes / chargebacks."""
+    try:
+        from backend.services.dispute_service import list_disputes
+
+        result = list_disputes(
+            status=request.args.get("status"),
+            purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            identity_id=request.args.get("identity_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 50)), 100),
+            offset=max(int(request.args.get("offset", 0)), 0),
+        )
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Disputes list error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/purchases/<purchase_id>/mark-dispute", methods=["POST"])
+@require_admin
+def purchases_mark_dispute(purchase_id):
+    """Record a payment dispute / chargeback against a purchase."""
+    try:
+        from backend.services.dispute_service import create_dispute
+
+        data = request.get_json(silent=True) or {}
+
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = create_dispute(
+            purchase_id=purchase_id,
+            dispute_reason=data.get("dispute_reason"),
+            admin_note=data.get("admin_note"),
+            executed_by=executed_by,
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+    except Exception as e:
+        print(f"[ADMIN] Mark dispute error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/disputes/<dispute_id>/update", methods=["POST"])
+@require_admin
+def disputes_update(dispute_id):
+    """Update a dispute status."""
+    try:
+        from backend.services.dispute_service import update_dispute_status
+
+        data = request.get_json(silent=True) or {}
+        if not data.get("status"):
+            return jsonify({"ok": False, "error": "status is required"}), 400
+
+        # Evidence links: accept list of strings, cap at 20 items
+        evidence_links = data.get("evidence_links")
+        if evidence_links is not None:
+            if not isinstance(evidence_links, list):
+                return jsonify({"ok": False, "error": "evidence_links must be a list"}), 400
+            evidence_links = [str(l)[:2000] for l in evidence_links[:20]]
+
+        # Evidence flags: accept dict of booleans
+        evidence_flags = data.get("evidence_flags")
+        if evidence_flags is not None:
+            if not isinstance(evidence_flags, dict):
+                return jsonify({"ok": False, "error": "evidence_flags must be an object"}), 400
+            evidence_flags = {str(k)[:100]: bool(v) for k, v in evidence_flags.items()}
+
+        result = update_dispute_status(
+            dispute_id=dispute_id,
+            new_status=data["status"],
+            admin_note=data.get("admin_note"),
+            evidence_summary=data.get("evidence_summary"),
+            evidence_links=evidence_links,
+            evidence_flags=evidence_flags,
+        )
+
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
+    except Exception as e:
+        print(f"[ADMIN] Dispute update error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet/adjust", methods=["POST"])
+@bp.route("/credits/grant", methods=["POST"])
+@require_admin
+def grant_credits():
+    """
+    Grant or deduct credits from an identity.
+
+    Body:
+        - identity_id: Target user UUID (required)
+        - amount or delta: Credits to add (positive) or remove (negative) (required)
+        - reason: Reason for adjustment (required)
+
+    Returns updated wallet state.
+    """
+    try:
+        data = request.get_json() or {}
+
+        identity_id = data.get("identity_id")
+        # Accept both 'amount' and 'delta' for flexibility
+        amount = data.get("amount") or data.get("delta")
+        reason = data.get("reason", "").strip()
+
+        # Validation
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id is required"}), 400
+
+        if amount is None or not isinstance(amount, int):
+            return jsonify({"ok": False, "error": "amount must be an integer"}), 400
+
+        if amount == 0:
+            return jsonify({"ok": False, "error": "amount cannot be zero"}), 400
+
+        if not reason:
+            return jsonify({"ok": False, "error": "reason is required"}), 400
+
+        # Get admin email from session (if email-based auth)
+        admin_email = getattr(g, "admin_email", None)
+
+        result = AdminService.grant_credits(
+            identity_id=identity_id,
+            amount=amount,
+            reason=reason,
+            admin_email=admin_email
+        )
+
+        action = "granted" if amount > 0 else "deducted"
+        print(f"[ADMIN] Credits {action}: {abs(amount)} to {identity_id} by {admin_email or 'token'} - {reason}")
+
+        return jsonify({"ok": True, **result})
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except DatabaseError as e:
+        print(f"[ADMIN] Grant credits error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/reservations", methods=["GET"])
+@require_admin
+def list_reservations():
+    """
+    List credit reservations.
+
+    Query params:
+        - status: 'held', 'released', or 'all' (default 'held')
+        - limit: Max results (default 50)
+        - offset: Pagination offset
+    """
+    try:
+        status = request.args.get("status", "held")
+        limit = request.args.get("limit", 50, type=int)
+        offset = request.args.get("offset", 0, type=int)
+
+        result = AdminService.list_reservations(
+            status=status,
+            limit=limit,
+            offset=offset
+        )
+        return jsonify({"ok": True, **result})
+    except DatabaseError as e:
+        print(f"[ADMIN] List reservations error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/reservations/<reservation_id>/release", methods=["POST"])
+@require_admin
+def release_reservation(reservation_id):
+    """
+    Manually release a held credit reservation.
+    Returns the credits to the user's wallet.
+
+    Use this for stuck/orphaned reservations.
+    """
+    try:
+        data = request.get_json() or {}
+        reason = data.get("reason", "admin_release")
+
+        success = AdminService.release_reservation(reservation_id, reason)
+
+        if not success:
+            return jsonify({
+                "ok": False,
+                "error": "Reservation not found or already released"
+            }), 404
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reservation released: {reservation_id} by {admin_email or 'token'}")
+
+        return jsonify({"ok": True, "reservation_id": reservation_id})
+    except DatabaseError as e:
+        print(f"[ADMIN] Release reservation error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/jobs", methods=["GET"])
+@require_admin
+def list_jobs():
+    """
+    List jobs with filtering.
+
+    Query params:
+        - status: Filter by status (queued, pending, completed, failed)
+        - identity_id: Filter by identity
+        - limit: Max results (default 50)
+        - offset: Pagination offset
+    """
+    try:
+        status = request.args.get("status")
+        identity_id = request.args.get("identity_id")
+        limit = request.args.get("limit", 50, type=int)
+        offset = request.args.get("offset", 0, type=int)
+
+        result = AdminService.list_jobs(
+            status=status,
+            identity_id=identity_id,
+            limit=limit,
+            offset=offset
+        )
+        return jsonify({"ok": True, **result})
+    except DatabaseError as e:
+        print(f"[ADMIN] List jobs error: {e}")
+        return jsonify({"ok": False, "error": "Database error"}), 500
+
+
+@bp.route("/health", methods=["GET"])
+@require_admin
+def admin_health():
+    """
+    Admin health check - verifies admin auth is working.
+    """
+    return jsonify({
+        "ok": True,
+        "auth_method": getattr(g, "admin_auth_method", None),
+        "admin_email": getattr(g, "admin_email", None),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL DIAGNOSTICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/email/health", methods=["GET"])
+@require_admin
+def email_health():
+    """
+    Check email service health.
+
+    Performs:
+    - DNS resolution of SMTP_HOST
+    - TCP connection test to SMTP_HOST:SMTP_PORT
+
+    Returns detailed status for debugging.
+    """
+    try:
+        from backend.services.email_service import EmailService
+        result = EmailService.healthcheck()
+        return jsonify({"ok": result.get("status") == "healthy", **result})
+    except ImportError:
+        return jsonify({
+            "ok": False,
+            "error": "email_service not available",
+            "message": "EmailService module not found"
+        }), 500
+    except Exception as e:
+        print(f"[ADMIN] Email health check error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/email/test", methods=["POST"])
+@require_admin
+def email_test():
+    """
+    Send a test email to verify SMTP configuration.
+
+    Body:
+        - to: Recipient email address (required)
+
+    Returns send result with success/failure details.
+    """
+    try:
+        data = request.get_json() or {}
+        to_email = data.get("to", "").strip()
+
+        if not to_email:
+            return jsonify({
+                "ok": False,
+                "error": "VALIDATION_ERROR",
+                "message": "'to' email address is required"
+            }), 400
+
+        if "@" not in to_email or "." not in to_email:
+            return jsonify({
+                "ok": False,
+                "error": "VALIDATION_ERROR",
+                "message": "Invalid email format"
+            }), 400
+
+        from backend.services.email_service import EmailService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Sending test email to {to_email} (requested by {admin_email or 'token'})")
+
+        result = EmailService.send_test(to_email)
+
+        return jsonify({
+            "ok": result.success,
+            "message": result.message,
+            "error": result.error,
+            "to": to_email,
+        })
+
+    except ImportError:
+        return jsonify({
+            "ok": False,
+            "error": "email_service not available",
+            "message": "EmailService module not found"
+        }), 500
+    except Exception as e:
+        print(f"[ADMIN] Email test error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/run_grants", methods=["POST"])
+@require_admin
+def run_subscription_grants():
+    """
+    Admin endpoint: run pending subscription credit grants.
+
+    Finds active subscriptions that haven't had credits granted for the
+    current period and grants them.  Safe to call repeatedly (idempotent).
+
+    Response: { ok: true, granted: 3 }
+    """
+    from backend.services.subscription_service import SubscriptionService
+    granted = SubscriptionService.run_pending_grants()
+    return jsonify({"ok": True, "granted": granted})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL OUTBOX / CRON ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/email/outbox/stats", methods=["GET"])
+@require_admin
+def email_outbox_stats():
+    """
+    Get email outbox statistics.
+
+    Returns:
+        - pending: Emails waiting to be sent
+        - sent: Successfully sent emails
+        - failed: Permanently failed emails (after max retries)
+        - total: Total emails in outbox
+    """
+    try:
+        from backend.services.email_outbox_service import EmailOutboxService
+        stats = EmailOutboxService.get_outbox_stats()
+        return jsonify({"ok": True, **stats})
+    except Exception as e:
+        print(f"[ADMIN] Email outbox stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/email/outbox/send-pending", methods=["POST"])
+@bp.route("/email/send-pending", methods=["POST"])
+@require_admin
+def send_pending_emails():
+    """
+    Process pending emails from the outbox (cron-callable endpoint).
+
+    Call this endpoint periodically (e.g., every minute) from:
+    - A Render cron job
+    - An external scheduler (e.g., cron.org, EasyCron)
+    - A background worker
+
+    Query params:
+        - limit: Max emails to process (default 50, max 200)
+
+    Returns:
+        - sent: Number of emails successfully sent
+        - failed: Number of emails that failed this attempt
+        - remaining: Number of emails still pending
+
+    Safe to call frequently - processes oldest pending emails first.
+    Failed emails are automatically retried until max_attempts reached.
+    """
+    try:
+        from backend.services.email_outbox_service import EmailOutboxService
+
+        limit = request.args.get("limit", 50, type=int)
+        limit = min(limit, 200)  # Cap at 200 to prevent timeout
+
+        result = EmailOutboxService.send_pending_emails(limit=limit)
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Email outbox processed by {admin_email or 'token'}: {result}")
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Email send-pending error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/email/outbox/retry-failed", methods=["POST"])
+@require_admin
+def retry_failed_emails():
+    """
+    Reset failed emails to pending for retry.
+
+    Use this to manually retry emails that permanently failed.
+    Resets status to 'pending' and clears attempt counter.
+
+    Query params:
+        - limit: Max emails to reset (default 10, max 50)
+
+    Returns:
+        - reset: Number of emails reset to pending
+    """
+    try:
+        from backend.db import execute
+
+        limit = request.args.get("limit", 10, type=int)
+        limit = min(limit, 50)
+
+        count = execute(
+            """
+            UPDATE timrx_billing.email_outbox
+            SET status = 'pending', attempts = 0, last_error = NULL,
+                failed_at = NULL
+            WHERE status = 'failed'
+            AND id IN (
+                SELECT id FROM timrx_billing.email_outbox
+                WHERE status = 'failed'
+                ORDER BY created_at ASC
+                LIMIT %s
+            )
+            """,
+            (limit,),
+        )
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reset {count} failed emails to pending by {admin_email or 'token'}")
+
+        return jsonify({"ok": True, "reset": count})
+    except Exception as e:
+        print(f"[ADMIN] Email retry-failed error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECONCILIATION / SAFETY JOB ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/reconcile", methods=["POST"])
+@bp.route("/reconcile/run", methods=["POST"])
+@require_admin
+def run_reconciliation():
+    """
+    Run the safety reconciliation job.
+
+    This job detects and fixes data inconsistencies:
+    - Purchases missing ledger entries
+    - Wallet balance mismatches
+    - Stale held reservations (job terminal or missing)
+    - Completed jobs missing history_items
+
+    Query params:
+        - dry_run: If 'true', detect issues but don't fix them (default: false)
+        - send_alert: If 'true', send admin email on fixes (default: true)
+
+    Returns:
+        Summary of all checks and fixes applied
+
+    Safe to call frequently (every 15 minutes recommended via cron).
+    All fixes are idempotent.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+        send_alert = request.args.get("send_alert", "true").lower() != "false"
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reconciliation triggered by {admin_email or 'token'} (dry_run={dry_run})")
+
+        result = ReconciliationService.reconcile_safety(
+            dry_run=dry_run,
+            send_alert=send_alert,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/stats", methods=["GET"])
+@require_admin
+def reconciliation_stats():
+    """
+    Get current reconciliation stats without applying fixes.
+
+    Returns counts of issues that would be fixed:
+    - purchases_missing_ledger: Paid purchases without ledger entry
+    - wallet_mismatches: Wallets where balance != ledger sum
+    - stale_reservations: Held reservations with terminal/missing jobs
+
+    Useful for monitoring dashboards.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        stats = ReconciliationService.get_stats()
+        return jsonify({"ok": True, **stats})
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/dry-run", methods=["POST"])
+@require_admin
+def reconciliation_dry_run():
+    """
+    Run reconciliation in dry-run mode (detect but don't fix).
+
+    Alias for POST /reconcile?dry_run=true
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Reconciliation dry-run by {admin_email or 'token'}")
+
+        result = ReconciliationService.reconcile_safety(
+            dry_run=True,
+            send_alert=False,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation dry-run error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/detect", methods=["GET"])
+@require_admin
+def reconciliation_detect():
+    """
+    Detect data anomalies (detection only, no fixes).
+
+    This endpoint identifies inconsistencies in the data without applying
+    any fixes. Use this for auditing and monitoring.
+
+    Query params:
+        - stale_minutes: Threshold for stale held reservations (default: 30)
+        - check_s3: If 'true', also check for orphan S3 objects (slow, default: false)
+        - limit: Max results per category (default: 100)
+
+    Returns:
+        - jobs_missing_history: Jobs with success status but no history item
+        - finalized_reservations_missing_ledger: Finalized reservations without ledger entry
+        - stale_held_reservations: Held reservations older than stale_minutes
+        - orphan_s3_objects: S3 objects with no DB reference (if check_s3=true)
+        - summary: Counts and totals
+
+    Detections:
+    1. Jobs with status=ready/succeeded/done but no history_items row
+       - May indicate: save_finished_job_to_normalized_db() failed silently
+       - Impact: User doesn't see their generation in history
+
+    2. Finalized reservations without ledger entries
+       - May indicate: finalize_reservation() updated status but ledger insert failed
+       - Impact: Credits deducted from available but wallet balance unchanged
+
+    3. Held reservations older than X minutes
+       - May indicate: Job never completed, or finalize/release never called
+       - Impact: Credits stuck in "held" state, reducing user's available balance
+
+    4. S3 objects with no DB references (optional, slow)
+       - May indicate: DB delete succeeded but S3 delete failed
+       - Impact: Orphan storage costs, potential data inconsistency
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        stale_minutes = request.args.get("stale_minutes", 30, type=int)
+        check_s3 = request.args.get("check_s3", "false").lower() == "true"
+        limit = min(request.args.get("limit", 100, type=int), 500)
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Anomaly detection by {admin_email or 'token'} (stale_minutes={stale_minutes}, check_s3={check_s3})")
+
+        result = ReconciliationService.detect_anomalies(
+            stale_minutes=stale_minutes,
+            check_s3=check_s3,
+            limit=limit,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Anomaly detection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/mollie", methods=["POST"])
+@require_admin
+def reconcile_mollie():
+    """
+    Run Mollie payment reconciliation.
+
+    Fetches payments from Mollie API and compares to database. Creates missing
+    purchases, grants missing subscription credits, and applies missing refunds.
+
+    Query params:
+        - days: How many days back to scan (default: 30, max: 90)
+        - dry_run: If 'true', detect issues but don't fix them (default: false)
+        - run_type: Type of run - 'full', 'mollie_only', 'subscriptions_only' (default: full)
+
+    Returns:
+        Summary of reconciliation run including:
+        - scanned_count: Total payments scanned from Mollie
+        - fixed_count: Total fixes applied
+        - purchases_fixed: One-time purchases created
+        - subscriptions_fixed: Subscription credits granted
+        - refunds_fixed: Refund entries applied
+
+    Safe to call frequently - all fixes are idempotent via unique constraint.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        days = min(request.args.get("days", 30, type=int), 90)
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+        run_type = request.args.get("run_type", "full")
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Mollie reconciliation triggered by {admin_email or 'token'} (days={days}, dry_run={dry_run}, run_type={run_type})")
+
+        result = ReconciliationService.reconcile_mollie_payments(
+            days_back=days,
+            dry_run=dry_run,
+            run_type=run_type,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Mollie reconciliation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/full", methods=["POST"])
+@require_admin
+def reconcile_full():
+    """
+    Run full reconciliation (safety checks + Mollie API comparison).
+
+    Combines both reconciliation types:
+    1. Safety reconciliation: DB internal consistency checks
+    2. Mollie reconciliation: Compare Mollie payments to DB
+
+    Query params:
+        - days: How many days back to scan Mollie (default: 30, max: 90)
+        - dry_run: If 'true', detect issues but don't fix them (default: false)
+        - send_alert: If 'true', send admin email on fixes (default: true)
+
+    Returns:
+        Combined summary from both reconciliation types.
+
+    This is the recommended endpoint for daily cron jobs.
+    """
+    try:
+        from backend.services.reconciliation_service import ReconciliationService
+
+        days = min(request.args.get("days", 30, type=int), 90)
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+        send_alert = request.args.get("send_alert", "true").lower() != "false"
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Full reconciliation triggered by {admin_email or 'token'} (days={days}, dry_run={dry_run})")
+
+        result = ReconciliationService.reconcile_full(
+            days_back=days,
+            dry_run=dry_run,
+            send_alert=send_alert,
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Full reconciliation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/reconcile/runs", methods=["GET"])
+@require_admin
+def reconciliation_runs():
+    """
+    Get recent reconciliation run history.
+
+    Query params:
+        - limit: Number of runs to return (default: 20, max: 100)
+        - status: Filter by status - 'running', 'completed', 'failed' (optional)
+
+    Returns:
+        List of recent reconciliation runs with their statistics.
+    """
+    try:
+        from backend.db import query_all
+
+        limit = min(request.args.get("limit", 20, type=int), 100)
+        status_filter = request.args.get("status")
+
+        if status_filter:
+            runs = query_all(
+                """
+                SELECT id, started_at, finished_at, status, run_type, days_back,
+                       scanned_count, fixed_count, errors_count,
+                       purchases_fixed, subscriptions_fixed, refunds_fixed, wallets_fixed,
+                       notes
+                FROM timrx_billing.reconciliation_runs
+                WHERE status = %s
+                ORDER BY started_at DESC
+                LIMIT %s
+                """,
+                [status_filter, limit],
+            )
+        else:
+            runs = query_all(
+                """
+                SELECT id, started_at, finished_at, status, run_type, days_back,
+                       scanned_count, fixed_count, errors_count,
+                       purchases_fixed, subscriptions_fixed, refunds_fixed, wallets_fixed,
+                       notes
+                FROM timrx_billing.reconciliation_runs
+                ORDER BY started_at DESC
+                LIMIT %s
+                """,
+                [limit],
             )
 
-            # Serialize timestamps
-            for n in notifications:
-                if n.get("created_at"):
-                    n["created_at"] = n["created_at"].isoformat()
-                if n.get("read_at"):
-                    n["read_at"] = n["read_at"].isoformat()
+        return jsonify({
+            "ok": True,
+            "runs": [
+                {
+                    "id": str(r["id"]),
+                    "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                    "finished_at": r["finished_at"].isoformat() if r["finished_at"] else None,
+                    "status": r["status"],
+                    "run_type": r["run_type"],
+                    "days_back": r["days_back"],
+                    "scanned_count": r["scanned_count"],
+                    "fixed_count": r["fixed_count"],
+                    "errors_count": r["errors_count"],
+                    "purchases_fixed": r["purchases_fixed"],
+                    "subscriptions_fixed": r["subscriptions_fixed"],
+                    "refunds_fixed": r["refunds_fixed"],
+                    "wallets_fixed": r["wallets_fixed"],
+                    "notes": r["notes"],
+                }
+                for r in runs
+            ],
+        })
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation runs error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-            return jsonify({"ok": True, "notifications": notifications})
 
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] list_notifications error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to fetch notifications"}}), 500
+@bp.route("/reconcile/fixes", methods=["GET"])
+@require_admin
+def reconciliation_fixes():
+    """
+    Get recent reconciliation fixes applied.
 
-    return _inner()
+    Query params:
+        - limit: Number of fixes to return (default: 50, max: 200)
+        - run_id: Filter by specific run ID (optional)
+        - identity_id: Filter by identity ID (optional)
+        - fix_type: Filter by fix type (optional)
+
+    Returns:
+        List of individual fixes applied during reconciliation.
+    """
+    try:
+        from backend.db import query_all
+
+        limit = min(request.args.get("limit", 50, type=int), 200)
+        run_id = request.args.get("run_id")
+        identity_id = request.args.get("identity_id")
+        fix_type = request.args.get("fix_type")
+
+        conditions = []
+        params = []
+
+        if run_id:
+            conditions.append("run_id = %s")
+            params.append(run_id)
+        if identity_id:
+            conditions.append("identity_id = %s")
+            params.append(identity_id)
+        if fix_type:
+            conditions.append("fix_type = %s")
+            params.append(fix_type)
+
+        where_clause = " AND ".join(conditions) if conditions else "TRUE"
+        params.append(limit)
+
+        fixes = query_all(
+            f"""
+            SELECT id, run_id, provider, provider_payment_id, fix_type,
+                   identity_id, credits_delta, plan_code, amount_gbp,
+                   mollie_status, created_at
+            FROM timrx_billing.reconciliation_fixes
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            params,
+        )
+
+        return jsonify({
+            "ok": True,
+            "fixes": [
+                {
+                    "id": str(f["id"]),
+                    "run_id": str(f["run_id"]) if f["run_id"] else None,
+                    "provider": f["provider"],
+                    "provider_payment_id": f["provider_payment_id"],
+                    "fix_type": f["fix_type"],
+                    "identity_id": str(f["identity_id"]) if f["identity_id"] else None,
+                    "credits_delta": f["credits_delta"],
+                    "plan_code": f["plan_code"],
+                    "amount_gbp": float(f["amount_gbp"]) if f["amount_gbp"] else None,
+                    "mollie_status": f["mollie_status"],
+                    "created_at": f["created_at"].isoformat() if f["created_at"] else None,
+                }
+                for f in fixes
+            ],
+        })
+    except Exception as e:
+        print(f"[ADMIN] Reconciliation fixes error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─── Unread count ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL DEBUG ENDPOINT
+# ─────────────────────────────────────────────────────────────────────────────
 
-@bp.route("/notifications/unread-count", methods=["GET", "OPTIONS"])
-def unread_count():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
+def _mask_email(email: str) -> str:
+    """Mask email for debug output: jo***@ex***.com"""
+    if not email or "@" not in email:
+        return email
+    local, domain = email.rsplit("@", 1)
+    domain_parts = domain.split(".")
+    masked_local = local[:2] + "***" if len(local) > 2 else local[0] + "***"
+    masked_domain = domain_parts[0][:2] + "***" if len(domain_parts[0]) > 2 else domain_parts[0]
+    return f"{masked_local}@{masked_domain}.{'.'.join(domain_parts[1:])}"
 
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
 
+@bp.route("/debug/user", methods=["GET"])
+@require_admin
+def debug_user():
+    """
+    Internal debug endpoint for user troubleshooting.
+
+    Query params:
+        - identity_id: The identity UUID to lookup
+        - email: Email address to lookup (alternative to identity_id)
+
+    Returns (non-sensitive data only):
+        - identity_id
+        - email (masked)
+        - wallet.balance_credits
+        - reserved_credits
+        - last_purchase summary
+        - last 10 history items summary
+    """
+    from backend.db import query_one, query_all, Tables
+
+    identity_id = request.args.get("identity_id")
+    email = request.args.get("email")
+
+    if not identity_id and not email:
+        return jsonify({"ok": False, "error": "Provide identity_id or email"}), 400
+
+    try:
+        # ── Lookup identity ────────────────────────────────────────
+        if email and not identity_id:
+            identity = query_one(
+                f"SELECT id, email, email_verified, created_at FROM {Tables.IDENTITIES} WHERE email = %s",
+                (email,),
+            )
+            if not identity:
+                return jsonify({"ok": False, "error": "Identity not found"}), 404
+            identity_id = str(identity["id"])
+        else:
+            identity = query_one(
+                f"SELECT id, email, email_verified, created_at FROM {Tables.IDENTITIES} WHERE id = %s",
+                (identity_id,),
+            )
+            if not identity:
+                return jsonify({"ok": False, "error": "Identity not found"}), 404
+
+        # ── Get wallet ─────────────────────────────────────────────
+        wallet = query_one(
+            f"SELECT balance_credits, updated_at FROM {Tables.WALLETS} WHERE identity_id = %s",
+            (identity_id,),
+        )
+
+        # ── Get reserved credits ───────────────────────────────────
+        reserved_row = query_one(
+            f"""
+            SELECT COALESCE(SUM(cost_credits), 0) as total
+            FROM {Tables.CREDIT_RESERVATIONS}
+            WHERE identity_id = %s AND status = 'held' AND expires_at > NOW()
+            """,
+            (identity_id,),
+        )
+        reserved_credits = int(reserved_row["total"]) if reserved_row else 0
+
+        # ── Get last purchase ──────────────────────────────────────
+        last_purchase = query_one(
+            f"""
+            SELECT id, amount_gbp, credits_granted, status, created_at
+            FROM {Tables.PURCHASES}
+            WHERE identity_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (identity_id,),
+        )
+        last_purchase_summary = None
+        if last_purchase:
+            last_purchase_summary = {
+                "id": str(last_purchase["id"]),
+                "amount_gbp": float(last_purchase["amount_gbp"]) if last_purchase["amount_gbp"] else None,
+                "credits": last_purchase["credits_granted"],
+                "status": last_purchase["status"],
+                "created_at": last_purchase["created_at"].isoformat() if last_purchase["created_at"] else None,
+            }
+
+        # ── Get last 10 history items ──────────────────────────────
+        history_items = query_all(
+            f"""
+            SELECT id, item_type, status, created_at
+            FROM {Tables.HISTORY_ITEMS}
+            WHERE identity_id = %s
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            (identity_id,),
+        )
+        history_summary = [
+            {
+                "id": str(h["id"]),
+                "kind": h["item_type"],
+                "status": h["status"],
+                "created_at": h["created_at"].isoformat() if h["created_at"] else None,
+            }
+            for h in history_items
+        ]
+
+        # ── Build response ─────────────────────────────────────────
+        result = {
+            "ok": True,
+            "identity_id": identity_id,
+            "email": _mask_email(identity.get("email")) if identity.get("email") else None,
+            "email_verified": identity.get("email_verified", False),
+            "identity_created_at": identity["created_at"].isoformat() if identity.get("created_at") else None,
+            "wallet": {
+                "balance_credits": wallet["balance_credits"] if wallet else 0,
+                "reserved_credits": reserved_credits,
+                "available_credits": max(0, (wallet["balance_credits"] if wallet else 0) - reserved_credits),
+                "updated_at": wallet["updated_at"].isoformat() if wallet and wallet.get("updated_at") else None,
+            },
+            "last_purchase": last_purchase_summary,
+            "history_items": history_summary,
+            "history_count": len(history_summary),
+        }
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Debug user lookup: {identity_id[:8]}... by {admin_email or 'token'}")
+
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[ADMIN] Debug user error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG: OpenAI Image Credit Flow Verification
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/debug/openai-credits", methods=["GET"])
+@require_admin
+def debug_openai_credits():
+    """
+    DEBUG: Verify credit flow for OpenAI image jobs.
+
+    Query params:
+        - identity_id: User UUID (optional - shows all OPENAI_IMAGE entries if not provided)
+        - job_id: Specific job ID to trace (optional)
+        - limit: Max results (default 20)
+
+    Returns:
+        - reservations: Recent OPENAI_IMAGE reservations with status
+        - ledger_entries: Recent OPENAI_IMAGE ledger entries (should be negative)
+        - jobs: Recent OpenAI image jobs
+        - wallet: Current wallet state if identity_id provided
+        - diagnosis: Analysis of whether credits are being deducted
+    """
+    from backend.db import query_one, query_all, Tables, USE_DB
+
+    if not USE_DB:
+        return jsonify({
+            "ok": False,
+            "error": "Database not configured",
+            "diagnosis": "DATABASE NOT AVAILABLE - credits cannot be tracked"
+        }), 500
+
+    identity_id = request.args.get("identity_id")
+    job_id = request.args.get("job_id")
+    limit = min(request.args.get("limit", 20, type=int), 100)
+
+    try:
+        result = {"ok": True, "diagnosis": []}
+
+        # ── Check reservations for OPENAI_IMAGE ────────────────────
+        if job_id:
+            reservations = query_all(
+                f"""
+                SELECT id, identity_id, action_code, cost_credits, status,
+                       ref_job_id, created_at, captured_at, released_at
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE ref_job_id = %s OR id::text = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (job_id, job_id, limit),
+            )
+        elif identity_id:
+            reservations = query_all(
+                f"""
+                SELECT id, identity_id, action_code, cost_credits, status,
+                       ref_job_id, created_at, captured_at, released_at
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE identity_id = %s AND action_code = 'OPENAI_IMAGE'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, limit),
+            )
+        else:
+            reservations = query_all(
+                f"""
+                SELECT id, identity_id, action_code, cost_credits, status,
+                       ref_job_id, created_at, captured_at, released_at
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE action_code = 'OPENAI_IMAGE'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        result["reservations"] = [
+            {
+                "id": str(r["id"]),
+                "identity_id": str(r["identity_id"]),
+                "action_code": r["action_code"],
+                "cost_credits": r["cost_credits"],
+                "status": r["status"],
+                "job_id": str(r["ref_job_id"]) if r.get("ref_job_id") else None,
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "captured_at": r["captured_at"].isoformat() if r.get("captured_at") else None,
+                "released_at": r["released_at"].isoformat() if r.get("released_at") else None,
+            }
+            for r in reservations
+        ]
+
+        # Count by status
+        held_count = sum(1 for r in reservations if r["status"] == "held")
+        finalized_count = sum(1 for r in reservations if r["status"] == "finalized")
+        released_count = sum(1 for r in reservations if r["status"] == "released")
+
+        result["reservation_stats"] = {
+            "total": len(reservations),
+            "held": held_count,
+            "finalized": finalized_count,
+            "released": released_count,
+        }
+
+        if len(reservations) == 0:
+            result["diagnosis"].append("⚠️ NO RESERVATIONS FOUND for OPENAI_IMAGE - credits are NOT being held")
+        elif finalized_count == 0:
+            result["diagnosis"].append("⚠️ NO FINALIZED RESERVATIONS - credits are being held but NOT captured")
+        else:
+            result["diagnosis"].append(f"✓ Found {finalized_count} finalized reservations - credits ARE being deducted")
+
+        # ── Check ledger entries ───────────────────────────────────
+        if identity_id:
+            ledger_entries = query_all(
+                f"""
+                SELECT id, identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at
+                FROM {Tables.LEDGER_ENTRIES}
+                WHERE identity_id = %s
+                  AND (entry_type = 'RESERVATION_FINALIZE' OR meta::text LIKE '%%OPENAI_IMAGE%%' OR meta::text LIKE '%%image-studio%%')
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, limit),
+            )
+        else:
+            ledger_entries = query_all(
+                f"""
+                SELECT id, identity_id, entry_type, amount_credits, ref_type, ref_id, meta, created_at
+                FROM {Tables.LEDGER_ENTRIES}
+                WHERE entry_type = 'RESERVATION_FINALIZE'
+                  AND meta::text LIKE '%%OPENAI_IMAGE%%'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        result["ledger_entries"] = [
+            {
+                "id": str(le["id"]),
+                "identity_id": str(le["identity_id"]),
+                "entry_type": le["entry_type"],
+                "amount_credits": le["amount_credits"],
+                "ref_type": le["ref_type"],
+                "ref_id": str(le["ref_id"]) if le.get("ref_id") else None,
+                "meta": le["meta"],
+                "created_at": le["created_at"].isoformat() if le.get("created_at") else None,
+            }
+            for le in ledger_entries
+        ]
+
+        openai_debits = [le for le in ledger_entries if le["amount_credits"] < 0]
+        if len(openai_debits) == 0:
+            result["diagnosis"].append("⚠️ NO LEDGER DEBITS found - wallet balance is NOT being reduced")
+        else:
+            total_deducted = sum(abs(le["amount_credits"]) for le in openai_debits)
+            result["diagnosis"].append(f"✓ Found {len(openai_debits)} ledger debits totaling -{total_deducted} credits")
+
+        # ── Check jobs ──────────────────────────────────���──────────
+        if job_id:
+            jobs = query_all(
+                f"""
+                SELECT id, identity_id, provider, action_code, status, reservation_id, created_at, updated_at
+                FROM {Tables.JOBS}
+                WHERE id::text = %s OR reservation_id::text = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (job_id, job_id, limit),
+            )
+        elif identity_id:
+            jobs = query_all(
+                f"""
+                SELECT id, identity_id, provider, action_code, status, reservation_id, created_at, updated_at
+                FROM {Tables.JOBS}
+                WHERE identity_id = %s AND (provider = 'openai' OR action_code = 'OPENAI_IMAGE')
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, limit),
+            )
+        else:
+            jobs = query_all(
+                f"""
+                SELECT id, identity_id, provider, action_code, status, reservation_id, created_at, updated_at
+                FROM {Tables.JOBS}
+                WHERE provider = 'openai' OR action_code = 'OPENAI_IMAGE'
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        result["jobs"] = [
+            {
+                "id": str(j["id"]),
+                "identity_id": str(j["identity_id"]),
+                "provider": j["provider"],
+                "action_code": j["action_code"],
+                "status": j["status"],
+                "reservation_id": str(j["reservation_id"]) if j.get("reservation_id") else None,
+                "created_at": j["created_at"].isoformat() if j.get("created_at") else None,
+            }
+            for j in jobs
+        ]
+
+        jobs_without_reservation = [j for j in jobs if not j.get("reservation_id")]
+        if jobs_without_reservation:
+            result["diagnosis"].append(f"⚠️ {len(jobs_without_reservation)} jobs have NO reservation_id - credits not tracked")
+
+        # ── Get wallet if identity provided ────────────────────────
+        if identity_id:
+            wallet = query_one(
+                f"SELECT balance_credits, updated_at FROM {Tables.WALLETS} WHERE identity_id = %s",
+                (identity_id,),
+            )
+            reserved = query_one(
+                f"""
+                SELECT COALESCE(SUM(cost_credits), 0) as total
+                FROM {Tables.CREDIT_RESERVATIONS}
+                WHERE identity_id = %s AND status = 'held'
+                """,
+                (identity_id,),
+            )
+
+            result["wallet"] = {
+                "balance_credits": wallet["balance_credits"] if wallet else 0,
+                "reserved_credits": int(reserved["total"]) if reserved else 0,
+                "available_credits": max(0, (wallet["balance_credits"] if wallet else 0) - int(reserved["total"] if reserved else 0)),
+                "updated_at": wallet["updated_at"].isoformat() if wallet and wallet.get("updated_at") else None,
+            }
+
+        # ── Final diagnosis ────────────────────────────────────────
+        if len(reservations) > 0 and finalized_count > 0 and len(openai_debits) > 0:
+            result["diagnosis"].append("✓ CREDITS ARE BEING DEDUCTED for OpenAI images")
+        else:
+            result["diagnosis"].append("❌ CREDITS ARE NOT BEING DEDUCTED - see individual checks above")
+
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[ADMIN] Debug openai-credits error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG: Magic Code Retrieval (for acceptance testing only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/debug/magic-code", methods=["GET"])
+@require_admin
+def debug_magic_code():
+    """
+    DEBUG: Retrieve the most recent magic code for an email.
+
+    WARNING: This endpoint is for TESTING ONLY. It bypasses email verification.
+    In production, this should be disabled or heavily rate-limited.
+
+    Query params:
+        - email: Email address to get code for (required)
+
+    Returns:
+        - code: The plain-text code (if found)
+        - expires_at: When the code expires
+        - attempts: Number of failed attempts
+    """
+    from backend.db import query_one, Tables, USE_DB
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": "Database not configured"}), 500
+
+    email = request.args.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"ok": False, "error": "email parameter required"}), 400
+
+    try:
+        # For testing, we store a copy of the plain code in a test-only column
+        # OR we generate a new code and return it
+        # Since we hash codes, we can't retrieve them - so generate a fresh one
+
+        from backend.services.magic_code_service import MagicCodeService
+
+        # Check if identity exists
+        identity = query_one(
+            f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
+            (email,),
+        )
+
+        if not identity:
+            return jsonify({
+                "ok": False,
+                "error": "No identity found for this email",
+            }), 404
+
+        # Generate a fresh code for testing
+        plain_code = MagicCodeService.generate_code()
+        code_hash = MagicCodeService.hash_code(plain_code)
+
+        # Store it
+        from backend.db import execute
+        from backend.config import config
+
+        execute(
+            f"""
+            INSERT INTO {Tables.MAGIC_CODES}
+            (email, code_hash, expires_at, attempts, consumed, created_at)
+            VALUES (%s, %s, NOW() + %s * INTERVAL '1 minute', 0, FALSE, NOW())
+            """,
+            (email, code_hash, config.MAGIC_CODE_EXPIRY_MINUTES),
+        )
+
+        print(f"[ADMIN:DEBUG] Generated test magic code for {email}: {plain_code}")
+
+        return jsonify({
+            "ok": True,
+            "code": plain_code,
+            "email": email,
+            "expires_in_minutes": config.MAGIC_CODE_EXPIRY_MINUTES,
+            "warning": "TEST ONLY - bypasses email verification",
+        })
+
+    except Exception as e:
+        print(f"[ADMIN] Debug magic-code error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBSCRIPTION CRON ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/subscriptions/process-credits", methods=["POST"])
+@require_admin
+def process_subscription_credits():
+    """
+    Process due credit allocations for subscriptions (cron-callable endpoint).
+
+    Call this endpoint periodically (e.g., every hour) from:
+    - A Render cron job
+    - An external scheduler (e.g., cron.org, EasyCron)
+    - A background worker
+
+    This finds subscriptions where next_credit_date <= NOW() and:
+    1. Grants the monthly credits
+    2. Updates next_credit_date to next month
+    3. Sends notification email
+    4. For yearly plans, decrements credits_remaining_months
+
+    Returns:
+        - processed: Number of subscriptions checked
+        - granted: Number of successful credit grants
+        - errors: Number of errors encountered
+
+    Safe to call frequently - idempotent credit grants.
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Subscription credit processing triggered by {admin_email or 'token'}")
+
+        result = SubscriptionService.process_due_credit_allocations()
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Subscription credit processing error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/check-expired", methods=["POST"])
+@require_admin
+def check_expired_subscriptions():
+    """
+    Check and expire cancelled subscriptions past their period (cron-callable endpoint).
+
+    Call this endpoint periodically (e.g., every hour) to:
+    - Find cancelled subscriptions past their current_period_end
+    - Mark them as 'expired'
+    - Send expiration notification emails
+
+    Returns:
+        - expired: Number of subscriptions expired
+
+    Safe to call frequently - only processes subscriptions once.
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Subscription expiration check triggered by {admin_email or 'token'}")
+
+        expired = SubscriptionService.check_expired_subscriptions()
+
+        return jsonify({"ok": True, "expired": expired})
+    except Exception as e:
+        print(f"[ADMIN] Subscription expiration check error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/run-all", methods=["POST"])
+@require_admin
+def run_all_subscription_jobs():
+    """
+    Run all subscription maintenance jobs (cron-callable endpoint).
+
+    This is a convenience endpoint that runs:
+    1. Credit allocation processing (process_due_credit_allocations)
+    2. Expired subscription check (check_expired_subscriptions)
+    3. Past-due subscription expiry (check_and_expire_past_due_subscriptions)
+    4. Past-due reminder emails (send_past_due_reminders)
+
+    Recommended frequency: every 1-6 hours
+
+    Returns:
+        - credits: Credit allocation results
+        - expired: Number of subscriptions expired
+        - past_due_expired: Past-due subscriptions that timed out
+        - reminders: Past-due reminder email results
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] All subscription jobs triggered by {admin_email or 'token'}")
+
+        # Process credit allocations
+        credit_result = SubscriptionService.process_due_credit_allocations()
+
+        # Check expired subscriptions (cancelled past period_end)
+        expired_count = SubscriptionService.check_expired_subscriptions()
+
+        # Expire past_due subscriptions that have timed out
+        past_due_result = SubscriptionService.check_and_expire_past_due_subscriptions()
+
+        # Send past_due reminder emails (day 3 + day 5, idempotent)
+        reminder_result = SubscriptionService.send_past_due_reminders()
+
+        return jsonify({
+            "ok": True,
+            "credits": {
+                "processed": credit_result.get("processed", 0),
+                "granted": credit_result.get("granted", 0),
+                "errors": credit_result.get("errors", 0),
+            },
+            "expired": expired_count,
+            "past_due_expired": {
+                "period_end_expired": past_due_result.get("period_end_expired", 0),
+                "past_due_expired": past_due_result.get("past_due_expired", 0),
+            },
+            "reminders": {
+                "sent": reminder_result.get("sent", 0),
+                "skipped": reminder_result.get("skipped", 0),
+            },
+        })
+    except Exception as e:
+        print(f"[ADMIN] Subscription jobs error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/stats", methods=["GET"])
+@require_admin
+def subscription_stats():
+    """
+    Get subscription statistics for monitoring.
+
+    Returns:
+        - total: Total subscription count
+        - by_status: Subscription counts by status (active, past_due, cancelled, expired)
+        - by_plan: Subscription counts by plan_code
+        - due_for_credits: Subscriptions due for credit allocation (next_credit_date <= NOW)
+        - past_due_count: Number of subscriptions with failed payments
+    """
+    try:
+        # Get counts by status
+        stats_row = query_one(
+            """
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'active') as active,
+                COUNT(*) FILTER (WHERE status = 'past_due') as past_due,
+                COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled,
+                COUNT(*) FILTER (WHERE status = 'expired') as expired,
+                COUNT(*) FILTER (WHERE status = 'active' AND next_credit_date <= NOW()) as due_for_credits
+            FROM timrx_billing.subscriptions
+            """,
+        )
+
+        # Get counts by plan
+        plan_rows = query_all(
+            """
+            SELECT plan_code, COUNT(*) as count
+            FROM timrx_billing.subscriptions
+            WHERE status = 'active'
+            GROUP BY plan_code
+            ORDER BY count DESC
+            """,
+        )
+
+        by_plan = {row["plan_code"]: row["count"] for row in (plan_rows or [])}
+
+        return jsonify({
+            "ok": True,
+            "total": stats_row["total"] if stats_row else 0,
+            "by_status": {
+                "active": stats_row["active"] if stats_row else 0,
+                "past_due": stats_row["past_due"] if stats_row else 0,
+                "cancelled": stats_row["cancelled"] if stats_row else 0,
+                "expired": stats_row["expired"] if stats_row else 0,
+            },
+            "by_plan": by_plan,
+            "due_for_credits": stats_row["due_for_credits"] if stats_row else 0,
+            "past_due_count": stats_row["past_due"] if stats_row else 0,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Subscription stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/subscriptions/audit", methods=["GET"])
+@require_admin
+def subscription_audit():
+    """
+    Audit a specific subscription or identity for debugging/support.
+
+    Query params:
+        - identity_id: User's identity UUID (optional)
+        - subscription_id: Subscription UUID (optional)
+
+    Returns detailed subscription info including:
+        - Active plan, status, Mollie subscription ID
+        - Current period start/end
+        - Last 5 subscription grant ledger entries
+        - Next refill date
+        - Anomalies: duplicates/missing periods
+
+    Example:
+        GET /api/admin/subscriptions/audit?identity_id=123e4567-...
+    """
+    try:
+        from backend.services.subscription_service import SubscriptionService
+        from backend.db import query_one, query_all, Tables
+
+        identity_id = request.args.get("identity_id")
+        subscription_id = request.args.get("subscription_id")
+
+        if not identity_id and not subscription_id:
+            return jsonify({
+                "ok": False,
+                "error": "Provide identity_id or subscription_id parameter",
+            }), 400
+
+        result = {
+            "ok": True,
+            "identity_id": identity_id,
+            "subscription": None,
+            "cycles": [],
+            "anomalies": [],
+            "tier_perks": None,
+        }
+
+        # Get subscription (by ID or by identity)
+        if subscription_id:
+            sub = query_one(
+                f"""
+                SELECT s.*, i.email as identity_email, i.email_verified
+                FROM {Tables.SUBSCRIPTIONS} s
+                LEFT JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
+                WHERE s.id::text = %s
+                """,
+                (subscription_id,),
+            )
+            if sub:
+                identity_id = str(sub["identity_id"])
+        else:
+            sub = query_one(
+                f"""
+                SELECT s.*, i.email as identity_email, i.email_verified
+                FROM {Tables.SUBSCRIPTIONS} s
+                LEFT JOIN {Tables.IDENTITIES} i ON i.id = s.identity_id
+                WHERE s.identity_id::text = %s
+                  AND s.status IN ('active', 'cancelled', 'past_due')
+                ORDER BY s.created_at DESC
+                LIMIT 1
+                """,
+                (identity_id,),
+            )
+
+        if sub:
+            result["identity_id"] = str(sub["identity_id"])
+            result["subscription"] = {
+                "id": str(sub["id"]),
+                "plan_code": sub["plan_code"],
+                "status": sub["status"],
+                "is_past_due": sub["status"] == "past_due",
+                "provider": sub.get("provider"),
+                "provider_subscription_id": sub.get("provider_subscription_id"),
+                "mollie_customer_id": sub.get("mollie_customer_id"),
+                "current_period_start": sub["current_period_start"].isoformat() if sub.get("current_period_start") else None,
+                "current_period_end": sub["current_period_end"].isoformat() if sub.get("current_period_end") else None,
+                "next_credit_date": sub["next_credit_date"].isoformat() if sub.get("next_credit_date") else None,
+                "billing_day": sub.get("billing_day"),
+                "credits_remaining_months": sub.get("credits_remaining_months"),
+                "customer_email": sub.get("customer_email"),
+                "identity_email": sub.get("identity_email"),
+                "email_verified": sub.get("email_verified"),
+                "failure_count": sub.get("failure_count", 0) or 0,
+                "failed_at": sub["failed_at"].isoformat() if sub.get("failed_at") else None,
+                "suspended_at": sub["suspended_at"].isoformat() if sub.get("suspended_at") else None,
+                "expired_at": sub["expired_at"].isoformat() if sub.get("expired_at") else None,
+                "ends_at": sub["ends_at"].isoformat() if sub.get("ends_at") else None,
+                "prepaid_until": sub["prepaid_until"].isoformat() if sub.get("prepaid_until") else None,
+                "cancelled_at": sub["cancelled_at"].isoformat() if sub.get("cancelled_at") else None,
+                "created_at": sub["created_at"].isoformat() if sub.get("created_at") else None,
+            }
+
+            # Get last 5 cycles
+            cycles = query_all(
+                f"""
+                SELECT id, period_start, period_end, credits_granted, granted_at,
+                       provider, provider_payment_id
+                FROM {Tables.SUBSCRIPTION_CYCLES}
+                WHERE subscription_id::text = %s
+                ORDER BY period_start DESC
+                LIMIT 5
+                """,
+                (str(sub["id"]),),
+            )
+            result["cycles"] = [
+                {
+                    "id": str(c["id"]),
+                    "period_start": c["period_start"].isoformat() if c.get("period_start") else None,
+                    "period_end": c["period_end"].isoformat() if c.get("period_end") else None,
+                    "credits_granted": c["credits_granted"],
+                    "granted_at": c["granted_at"].isoformat() if c.get("granted_at") else None,
+                    "provider_payment_id": c.get("provider_payment_id"),
+                }
+                for c in (cycles or [])
+            ]
+
+            # Check for anomalies
+            anomalies = []
+
+            # 1. Check for duplicate periods
+            dup_check = query_one(
+                f"""
+                SELECT period_start, COUNT(*) as cnt
+                FROM {Tables.SUBSCRIPTION_CYCLES}
+                WHERE subscription_id::text = %s
+                GROUP BY period_start
+                HAVING COUNT(*) > 1
+                LIMIT 1
+                """,
+                (str(sub["id"]),),
+            )
+            if dup_check:
+                anomalies.append({
+                    "type": "duplicate_period",
+                    "message": f"Duplicate grants found for period {dup_check['period_start']}",
+                    "period_start": str(dup_check["period_start"]),
+                })
+
+            # 2. Check for missing months (gaps > 35 days between cycles)
+            gap_check = query_all(
+                f"""
+                SELECT period_start, LAG(period_start) OVER (ORDER BY period_start) as prev_start,
+                       period_start - LAG(period_start) OVER (ORDER BY period_start) as gap
+                FROM {Tables.SUBSCRIPTION_CYCLES}
+                WHERE subscription_id::text = %s
+                ORDER BY period_start
+                """,
+                (str(sub["id"]),),
+            )
+            for gap in (gap_check or []):
+                if gap.get("gap") and gap["gap"].days > 35:
+                    anomalies.append({
+                        "type": "missing_period",
+                        "message": f"Gap of {gap['gap'].days} days between cycles",
+                        "gap_after": str(gap["prev_start"]) if gap.get("prev_start") else None,
+                    })
+
+            # 3. Check for future next_credit_date being too far out
+            if sub.get("next_credit_date"):
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                days_until = (sub["next_credit_date"] - now).days
+                if days_until > 35:
+                    anomalies.append({
+                        "type": "next_credit_far",
+                        "message": f"Next credit date is {days_until} days away",
+                        "next_credit_date": sub["next_credit_date"].isoformat(),
+                    })
+
+            # 4. Check email verification status
+            if not sub.get("email_verified"):
+                anomalies.append({
+                    "type": "email_unverified",
+                    "message": "Identity email is not verified - credits may be paused",
+                })
+
+            result["anomalies"] = anomalies
+
+        # Get tier perks for identity
+        if identity_id:
+            perks = SubscriptionService.get_tier_perks(identity_id)
+            result["tier_perks"] = perks
+
+        return jsonify(result)
+
+    except Exception as e:
+        print(f"[ADMIN] Subscription audit error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WALLET DRIFT AUDIT ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/wallet-drift/audit", methods=["POST"])
+@require_admin
+def wallet_drift_audit():
+    """
+    Run wallet drift audit (cron-callable endpoint).
+
+    Detects wallets where balance_credits != SUM(ledger_entries) and repairs them.
+    The ledger is the immutable source of truth; the wallet balance is a cache.
+
+    Query params:
+        - dry_run: If 'true', detect drifts but don't repair (default: false)
+
+    Returns:
+        - total_wallets: Number of wallets checked
+        - drifts_found: Number of wallets with drift
+        - repairs_applied: Number of repairs made (0 if dry_run)
+        - total_drift_amount: Sum of absolute drift values
+
+    Safe to call frequently - all repairs are idempotent.
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Wallet drift audit triggered by {admin_email or 'token'} (dry_run={dry_run})")
+
+        result = WalletDriftService.run_daily_wallet_audit(dry_run=dry_run)
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift audit error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/drifts", methods=["GET"])
+@require_admin
+def wallet_drift_list():
+    """
+    List wallets with drift (detection only).
+
+    Query params:
+        - limit: Max results (default: 100, max: 500)
+        - offset: Pagination offset (default: 0)
+
+    Returns:
+        - drifts: List of wallets where balance != ledger_sum
+        - count: Total drifts found (up to limit)
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        limit = min(request.args.get("limit", 100, type=int), 500)
+        offset = request.args.get("offset", 0, type=int)
+
+        drifts = WalletDriftService.find_drifts(limit=limit, offset=offset)
+        total = WalletDriftService.count_drifts()
+
+        return jsonify({
+            "ok": True,
+            "drifts": [
+                {
+                    "identity_id": str(d["identity_id"]),
+                    "wallet_id": str(d["wallet_id"]) if d.get("wallet_id") else None,
+                    "cached_balance": d.get("cached_balance", 0),
+                    "ledger_sum": d.get("ledger_sum", 0),
+                    "drift": d.get("drift", 0),
+                    "entry_count": d.get("entry_count", 0),
+                }
+                for d in drifts
+            ],
+            "count": len(drifts),
+            "total": total,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift list error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/repair/<identity_id>", methods=["POST"])
+@require_admin
+def wallet_drift_repair(identity_id):
+    """
+    Repair drift for a specific wallet.
+
+    Args:
+        identity_id: The identity UUID to repair
+
+    Body (optional):
+        - reason: Reason for repair (default: 'admin_repair')
+
+    Returns:
+        - repaired: bool - True if repair was applied
+        - old_balance: Balance before repair
+        - new_balance: Balance after repair
+        - drift_amount: Difference corrected
+        - repair_id: UUID of repair record (if applied)
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        data = request.get_json() or {}
+        reason = data.get("reason", "admin_repair")
+
+        admin_email = getattr(g, "admin_email", None)
+        print(f"[ADMIN] Wallet drift repair for {identity_id} by {admin_email or 'token'}")
+
+        result = WalletDriftService.repair_wallet(
+            identity_id=identity_id,
+            reason=reason,
+            trigger_source="admin_endpoint",
+        )
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift repair error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/check/<identity_id>", methods=["GET"])
+@require_admin
+def wallet_drift_check(identity_id):
+    """
+    Check drift for a specific identity.
+
+    Returns wallet vs ledger comparison without making any changes.
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        comparison = WalletDriftService.get_wallet_comparison(identity_id)
+        if not comparison:
+            return jsonify({
+                "ok": False,
+                "error": "Wallet not found for this identity"
+            }), 404
+
+        return jsonify({
+            "ok": True,
+            "identity_id": str(comparison["identity_id"]),
+            "wallet_id": str(comparison["wallet_id"]) if comparison.get("wallet_id") else None,
+            "cached_balance": comparison.get("cached_balance", 0),
+            "ledger_sum": comparison.get("ledger_sum", 0),
+            "drift": comparison.get("drift", 0),
+            "has_drift": comparison.get("has_drift", False),
+            "entry_count": comparison.get("entry_count", 0),
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift check error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/repairs", methods=["GET"])
+@require_admin
+def wallet_drift_repairs():
+    """
+    Get recent wallet repair history.
+
+    Query params:
+        - identity_id: Filter by identity (optional)
+        - limit: Max results (default: 50, max: 200)
+        - offset: Pagination offset (default: 0)
+
+    Returns:
+        - repairs: List of repair records
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        identity_id = request.args.get("identity_id")
+        limit = min(request.args.get("limit", 50, type=int), 200)
+        offset = request.args.get("offset", 0, type=int)
+
+        repairs = WalletDriftService.get_recent_repairs(
+            identity_id=identity_id,
+            limit=limit,
+            offset=offset,
+        )
+
+        return jsonify({
+            "ok": True,
+            "repairs": [
+                {
+                    "id": str(r["id"]),
+                    "identity_id": str(r["identity_id"]),
+                    "wallet_id": str(r["wallet_id"]) if r.get("wallet_id") else None,
+                    "old_balance": r.get("old_balance", 0),
+                    "new_balance": r.get("new_balance", 0),
+                    "drift_amount": r.get("drift_amount", 0),
+                    "reason": r.get("reason"),
+                    "trigger_source": r.get("trigger_source"),
+                    "ledger_entry_count": r.get("ledger_entry_count"),
+                    "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                }
+                for r in repairs
+            ],
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift repairs error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/wallet-drift/stats", methods=["GET"])
+@require_admin
+def wallet_drift_stats():
+    """
+    Get wallet drift and repair statistics.
+
+    Query params:
+        - days: Number of days to look back (default: 30)
+
+    Returns:
+        - current_drifts: Number of wallets currently with drift
+        - total_repairs: Repairs in the period
+        - total_drift_corrected: Sum of absolute drift amounts corrected
+        - by_reason: Breakdown by repair reason
+        - by_trigger: Breakdown by trigger source
+    """
+    try:
+        from backend.services.wallet_drift_service import WalletDriftService
+
+        days = request.args.get("days", 30, type=int)
+
+        current_drifts = WalletDriftService.count_drifts()
+        stats = WalletDriftService.get_repair_stats(days=days)
+
+        return jsonify({
+            "ok": True,
+            "current_drifts": current_drifts,
+            **stats,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Wallet drift stats error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BILLING HEALTH VIEW (UI + Read-Only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/billing/health", methods=["GET"])
+@require_admin
+def billing_health():
+    """
+    Get billing health overview for admin dashboard.
+
+    Returns the last 200 subscriptions with status indicators for monitoring.
+    This is a read-only endpoint for the admin billing health UI.
+
+    Query params:
+        - limit: Max subscriptions to return (default: 200, max: 500)
+        - status: Filter by status (active, cancelled, past_due, suspended, expired)
+        - offset: Pagination offset (default: 0)
+
+    Returns:
+        - subscriptions: List of subscription records with row_hint colors
+        - stats: Summary counts by status
+        - total: Total subscription count
+
+    Row hints (for UI color coding):
+        - "green": active subscriptions
+        - "amber": cancelled (still has access until period end)
+        - "red": past_due, suspended, or expired
+    """
+    try:
+        limit = min(request.args.get("limit", 200, type=int), 500)
+        offset = request.args.get("offset", 0, type=int)
+        status_filter = request.args.get("status")
+
+        # Build query with optional status filter
+        conditions = []
+        params = []
+
+        if status_filter:
+            conditions.append("s.status = %s")
+            params.append(status_filter)
+
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        # Fetch subscriptions with identity email
+        subscriptions = query_all(
+            f"""
+            SELECT
+                s.id,
+                s.identity_id,
+                i.email,
+                s.plan_code,
+                s.status,
+                s.provider,
+                s.provider_subscription_id,
+                s.mollie_customer_id,
+                s.current_period_start,
+                s.current_period_end,
+                s.next_credit_date,
+                s.billing_day,
+                s.credits_remaining_months,
+                s.customer_email,
+                s.cancelled_at,
+                s.suspend_reason,
+                s.suspended_at,
+                s.expired_at,
+                s.ends_at,
+                s.prepaid_until,
+                s.failure_count,
+                s.failed_at,
+                s.created_at
+            FROM timrx_billing.subscriptions s
+            LEFT JOIN timrx_billing.identities i ON i.id = s.identity_id
+            {where_clause}
+            ORDER BY s.created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            params + [limit, offset],
+        )
+
+        # Get status counts for summary
+        stats_rows = query_all(
+            """
+            SELECT status, COUNT(*) as count
+            FROM timrx_billing.subscriptions
+            GROUP BY status
+            """,
+        )
+        stats = {row["status"]: row["count"] for row in (stats_rows or [])}
+
+        # Get filtered total for pagination
+        total_row = query_one(
+            f"SELECT COUNT(*) as total FROM timrx_billing.subscriptions s {where_clause}",
+            params,
+        )
+        total = total_row["total"] if total_row else 0
+
+        # Get global total for summary cards
+        total_all_row = query_one("SELECT COUNT(*) as total FROM timrx_billing.subscriptions")
+        total_all = total_all_row["total"] if total_all_row else 0
+
+        # Format response with row hints
+        def get_row_hint(status):
+            if status == "active":
+                return "green"
+            elif status == "cancelled":
+                return "amber"
+            elif status in ("past_due", "suspended", "expired"):
+                return "red"
+            return "default"
+
+        formatted_subscriptions = [
+            {
+                "id": str(s["id"]),
+                "identity_id": str(s["identity_id"]),
+                "email": _mask_email(s["email"]) if s.get("email") else None,
+                "plan_code": s["plan_code"],
+                "status": s["status"],
+                "provider": s.get("provider"),
+                "provider_subscription_id": s.get("provider_subscription_id"),
+                "current_period_start": s["current_period_start"].isoformat() if s.get("current_period_start") else None,
+                "current_period_end": s["current_period_end"].isoformat() if s.get("current_period_end") else None,
+                "next_credit_date": s["next_credit_date"].isoformat() if s.get("next_credit_date") else None,
+                "billing_day": s.get("billing_day"),
+                "credits_remaining_months": s.get("credits_remaining_months"),
+                "customer_email": _mask_email(s["customer_email"]) if s.get("customer_email") else None,
+                "cancelled_at": s["cancelled_at"].isoformat() if s.get("cancelled_at") else None,
+                "suspend_reason": s.get("suspend_reason"),
+                "suspended_at": s["suspended_at"].isoformat() if s.get("suspended_at") else None,
+                "expired_at": s["expired_at"].isoformat() if s.get("expired_at") else None,
+                "ends_at": s["ends_at"].isoformat() if s.get("ends_at") else None,
+                "prepaid_until": s["prepaid_until"].isoformat() if s.get("prepaid_until") else None,
+                "mollie_customer_id": s.get("mollie_customer_id"),
+                "failure_count": s.get("failure_count", 0) or 0,
+                "failed_at": s["failed_at"].isoformat() if s.get("failed_at") else None,
+                "is_past_due": s["status"] == "past_due",
+                "created_at": s["created_at"].isoformat() if s.get("created_at") else None,
+                "row_hint": get_row_hint(s["status"]),
+            }
+            for s in (subscriptions or [])
+        ]
+
+        return jsonify({
+            "ok": True,
+            "subscriptions": formatted_subscriptions,
+            "stats": {
+                "active": stats.get("active", 0),
+                "cancelled": stats.get("cancelled", 0),
+                "past_due": stats.get("past_due", 0),
+                "suspended": stats.get("suspended", 0),
+                "expired": stats.get("expired", 0),
+                "pending_payment": stats.get("pending_payment", 0),
+            },
+            "total": total,
+            "total_all": total_all,
+            "stats_scope": "global",
+            "filter_status": status_filter,
+            "limit": limit,
+            "offset": offset,
+        })
+
+    except Exception as e:
+        print(f"[ADMIN] Billing health error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/billing/credit-analytics", methods=["GET"])
+@require_admin
+def credit_analytics():
+    """
+    Get comprehensive credit usage analytics for admin dashboard.
+
+    Query params:
+        - days: Number of days to look back (default: 30, max: 90)
+
+    Returns:
+        - summary: Total purchased, spent, usage rate
+        - by_action_type: Credits grouped by category (image, 3d_model, video)
+        - top_users: Top 20 users by credit usage (with masked emails)
+        - over_time: Daily credit usage time series
+    """
+    try:
+        days = min(request.args.get("days", 30, type=int), 90)
+
+        data = AdminService.get_credit_analytics(days=days)
+
+        return jsonify({"ok": True, **data})
+
+    except Exception as e:
+        print(f"[ADMIN] Credit analytics error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB RESCUE — Recover late-completed Seedance jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/jobs/rescue", methods=["POST"])
+@require_admin
+def rescue_jobs():
+    """
+    Rescue locally-failed Seedance jobs that completed upstream at PiAPI.
+
+    Query params / JSON body:
+        hours: Look-back window in hours (default: 72, max: 720)
+        dry_run: If true, report candidates without modifying (default: false)
+        max_jobs: Max jobs to process (default: 50, max: 200)
+
+    Credit safety:
+        - If reservation still held: finalize (charge credits)
+        - If reservation was released (refunded): user keeps video free
+        - If reservation was finalized: already charged, skip
+
+    Returns rescue summary with per-job details.
+    """
+    try:
+        from backend.services.job_rescue import rescue_late_completed_jobs
+
+        data = request.get_json(silent=True) or {}
+        hours = min(int(data.get("hours", request.args.get("hours", 72))), 720)
+        dry_run = bool(data.get("dry_run", request.args.get("dry_run", "false").lower() == "true"))
+        max_jobs = min(int(data.get("max_jobs", request.args.get("max_jobs", 50))), 200)
+
+        result = rescue_late_completed_jobs(
+            hours=hours,
+            dry_run=dry_run,
+            max_jobs=max_jobs,
+        )
+
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Job rescue error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider health, alerts, refund review
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/provider-health", methods=["GET"])
+@require_admin
+def provider_health():
+    """Aggregated provider health: success rates, spend, active alerts."""
+    try:
+        from backend.services.admin_ops_service import get_provider_health
+
+        result = get_provider_health()
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider health error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-balances", methods=["GET"])
+@require_admin
+def provider_balances():
+    """Provider balance summary: snapshots, estimated spend, wallet alerts, status."""
+    try:
+        from backend.services.provider_ledger_service import get_provider_balances
+
+        result = get_provider_balances()
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider balances error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/alerts", methods=["GET"])
+@require_admin
+def alerts_list():
+    """List admin alerts with optional filters."""
+    try:
+        from backend.services.admin_ops_service import list_alerts
+
+        result = list_alerts(
+            active_only=request.args.get("active_only", "true").lower() == "true",
+            provider=request.args.get("provider"),
+            alert_type=request.args.get("alert_type"),
+            severity=request.args.get("severity"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 50)), 200),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Alerts list error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/alerts/<alert_id>/resolve", methods=["POST"])
+@require_admin
+def alert_resolve(alert_id):
+    """Mark an alert as resolved (is_active = false)."""
+    try:
+        from backend.services.admin_ops_service import resolve_alert
+
+        resolved = resolve_alert(alert_id)
+        if resolved:
+            return jsonify({"ok": True, "resolved": True, "alert_id": alert_id})
+        else:
+            return jsonify({"ok": False, "error": "Alert not found or already resolved"}), 404
+
+    except Exception as e:
+        print(f"[ADMIN] Alert resolve error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds/review", methods=["GET"])
+@require_admin
+def refunds_review():
+    """Refund decision-support: failure candidates, suspicious purchases, recent refunds."""
+    try:
+        from backend.services.admin_ops_service import get_refund_review
+
+        days = min(int(request.args.get("days", 30)), 90)
+        limit = min(int(request.args.get("limit", 20)), 100)
+        result = get_refund_review(days=days, limit=limit)
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Refund review error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider ledger + monthly spend
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/provider-ledger", methods=["GET"])
+@require_admin
+def provider_ledger_list():
+    """List provider ledger entries with optional filters."""
+    try:
+        from backend.services.provider_ledger_service import list_ledger_entries
+
+        result = list_ledger_entries(
+            provider=request.args.get("provider"),
+            entry_type=request.args.get("entry_type"),
+            month=request.args.get("month"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 50)), 200),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider ledger list error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-ledger", methods=["POST"])
+@require_admin
+def provider_ledger_create():
+    """Create a manual provider ledger entry."""
+    try:
+        from backend.services.provider_ledger_service import create_ledger_entry
+
+        data = request.get_json(silent=True) or {}
+
+        # Get admin identity for recorded_by
+        recorded_by = None
+        if hasattr(g, "admin_email"):
+            recorded_by = g.admin_email
+        elif hasattr(g, "identity"):
+            recorded_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        entry = create_ledger_entry(
+            provider=data.get("provider", ""),
+            entry_type=data.get("entry_type", ""),
+            amount_gbp=data.get("amount_gbp"),
+            currency=data.get("currency", "GBP"),
+            balance_snapshot_gbp=data.get("balance_snapshot_gbp"),
+            description=data.get("description"),
+            reference=data.get("reference"),
+            period_month=data.get("period_month"),
+            metadata=data.get("metadata"),
+            recorded_by=recorded_by or data.get("recorded_by"),
+        )
+        return jsonify({"ok": True, "entry": entry}), 201
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Provider ledger create error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-spend/monthly", methods=["GET"])
+@require_admin
+def provider_spend_monthly():
+    """Monthly provider spend report: estimated usage + manual ledger entries."""
+    try:
+        from backend.services.provider_ledger_service import get_monthly_spend_report
+
+        result = get_monthly_spend_report(
+            months=min(int(request.args.get("months", 3)), 24),
+            provider=request.args.get("provider"),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Provider spend monthly error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refund execution + history
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/refunds/execute", methods=["POST"])
+@require_admin
+def refunds_execute():
+    """Execute an admin refund with credit reversal and audit trail."""
+    try:
+        from backend.services.refund_service import execute_refund
+
+        data = request.get_json(silent=True) or {}
+
+        if not data.get("purchase_id"):
+            return jsonify({"ok": False, "error": "purchase_id is required"}), 400
+
+        # Get admin identity for executed_by
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
+
+        result = execute_refund(
+            purchase_id=data["purchase_id"],
+            refund_type=data.get("refund_type", "full_purchase_refund"),
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            allow_credit_reversal=data.get("allow_credit_reversal", True),
+            manual_record_only=data.get("manual_record_only", False),
+            execute_external_refund=bool(data.get("execute_external_refund", False)),
+            executed_by=executed_by or data.get("executed_by"),
+        )
+
+        # The service returns {"ok": True/False, ...} directly
+        if result.get("ok"):
+            return jsonify(result)
+        else:
+            return jsonify(result), 422
+
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Refund execute error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds", methods=["GET"])
+@require_admin
+def refunds_list():
+    """List refund history with optional filters."""
+    try:
+        from backend.services.refund_service import list_refunds
+
+        result = list_refunds(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 50)), 200),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify({"ok": True, **result})
+
+    except Exception as e:
+        print(f"[ADMIN] Refunds list error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Refund review email
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/refunds/<refund_id>/send-review-email", methods=["POST"])
+@require_admin
+def refunds_send_review_email(refund_id):
+    """Send a 'refund under review' email for a manual-review refund."""
+    try:
+        from backend.db import query_one, transaction, Tables
+        from backend.services.email_outbox_service import EmailOutboxService, EmailTemplate
+
+        # Fetch refund
+        refund = query_one(
+            f"SELECT id, identity_id, purchase_id, refund_status, amount_gbp, currency, reason FROM {Tables.REFUNDS} WHERE id = %s::uuid",
+            (refund_id,),
+        )
+        if not refund:
+            return jsonify({"ok": False, "error": "Refund not found"}), 404
+
+        if refund["refund_status"] != "manual_review_required":
+            return jsonify({"ok": False, "error": f"Refund status is '{refund['refund_status']}', not 'manual_review_required'"}), 400
+
+        # Resolve email
+        identity = query_one(
+            f"SELECT email FROM {Tables.IDENTITIES} WHERE id = %s",
+            (refund["identity_id"],),
+        )
+        if not identity or not identity.get("email"):
+            return jsonify({"ok": False, "error": "No email found for this user"}), 400
+
+        user_email = identity["email"]
+
+        # Duplicate check
+        existing = query_one(
+            f"""
+            SELECT id, status FROM {Tables.EMAIL_OUTBOX}
+            WHERE template = 'refund_review'
+              AND payload->>'refund_id' = %s
+              AND status IN ('pending', 'sent')
+            LIMIT 1
+            """,
+            (str(refund["id"]),),
+        )
+        if existing:
+            st = existing["status"]
+            return jsonify({"ok": True, "already_sent": True, "status": st, "message": f"Review email already {st} for this refund"})
+
+        # Queue email
+        payload = {
+            "refund_id": str(refund["id"]),
+            "amount_gbp": float(refund["amount_gbp"]) if refund["amount_gbp"] else 0,
+            "currency": refund["currency"] or "GBP",
+            "purchase_id": str(refund["purchase_id"]) if refund["purchase_id"] else None,
+            "reason": refund["reason"],
+        }
+
+        with transaction() as cur:
+            outbox_row = EmailOutboxService.queue_email(
+                cur,
+                to_email=user_email,
+                template=EmailTemplate.REFUND_REVIEW,
+                payload=payload,
+            )
+        outbox_id = str(outbox_row["id"])
+
+        # Send THIS specific email immediately (not any random pending email)
+        sent = False
         try:
-            count = NotificationService.get_unread_count(identity_id)
-            return jsonify({"ok": True, "count": count})
+            print(f"[EMAIL_OUTBOX] Sending by id: template=refund_review to={user_email} outbox_id={outbox_id[:8]}")
+            sent = EmailOutboxService.send_by_id(outbox_id)
+            print(f"[EMAIL_OUTBOX] Send result: sent={sent}")
+        except Exception as flush_err:
+            print(f"[EMAIL_OUTBOX] Inline send failed (cron will retry): {flush_err}")
 
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] unread_count error: %s", e)
-            return jsonify({"ok": True, "count": 0})  # Degrade gracefully
+        return jsonify({"ok": True, "queued": True, "sent": sent, "email": user_email, "message": "Review email queued and send attempted"})
 
-    return _inner()
-
-
-# ─── Mark single as read ─────────────────────────────────────────────────────
-
-@bp.route("/notifications/<notification_id>/read", methods=["POST", "OPTIONS"])
-def mark_read(notification_id):
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
-
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
-
-        try:
-            success = NotificationService.mark_read(identity_id, notification_id)
-            return jsonify({"ok": True, "updated": success})
-
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] mark_read error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to mark read"}}), 500
-
-    return _inner()
+    except Exception as e:
+        print(f"[ADMIN] Send review email error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─── Mark all as read ─────────────────────────────────────────────────────────
+@bp.route("/refunds/<refund_id>/resolve", methods=["POST"])
+@require_admin
+def refunds_resolve(refund_id):
+    """Resolve a manual-review refund (approve/deny/close)."""
+    try:
+        from backend.services.refund_service import resolve_refund
 
-@bp.route("/notifications/read-all", methods=["POST", "OPTIONS"])
-def mark_all_read():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        data = request.get_json(silent=True) or {}
+        resolution = data.get("resolution", "").strip()
+        if not resolution:
+            return jsonify({"ok": False, "error": "resolution is required"}), 400
 
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
+        # Get admin identity
+        resolved_by = None
+        if hasattr(g, "admin_email"):
+            resolved_by = g.admin_email
+        elif hasattr(g, "identity"):
+            resolved_by = g.identity.get("email") if isinstance(g.identity, dict) else None
 
-        try:
-            count = NotificationService.mark_all_read(identity_id)
-            return jsonify({"ok": True, "updated": count})
+        result = resolve_refund(
+            refund_id=refund_id,
+            resolution=resolution,
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            resolved_by=resolved_by,
+            send_email=bool(data.get("send_email", False)),
+        )
 
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] mark_all_read error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to mark all read"}}), 500
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
 
-    return _inner()
-
-
-# ─── Dismiss single notification ──────────────────────────────────────────────
-
-@bp.route("/notifications/<notification_id>", methods=["DELETE", "OPTIONS"])
-def dismiss_notification(notification_id):
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
-
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
-
-        try:
-            success = NotificationService.dismiss(identity_id, notification_id)
-            return jsonify({"ok": True, "deleted": success})
-
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] dismiss error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to dismiss"}}), 500
-
-    return _inner()
+    except Exception as e:
+        print(f"[ADMIN] Refund resolve error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─── Dismiss all read notifications ──────────────────────────────────────────
+@bp.route("/refunds/<refund_id>/execute-approved", methods=["POST"])
+@require_admin
+def refunds_execute_approved(refund_id):
+    """Execute an already-approved refund (credit reversal + optional payment refund)."""
+    try:
+        from backend.services.refund_service import execute_approved_refund
 
-@bp.route("/notifications/dismiss-read", methods=["POST", "OPTIONS"])
-def dismiss_all_read():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
+        data = request.get_json(silent=True) or {}
 
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
+        # Get admin identity
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
 
-        try:
-            count = NotificationService.dismiss_all_read(identity_id)
-            return jsonify({"ok": True, "deleted": count})
+        result = execute_approved_refund(
+            refund_id=refund_id,
+            execute_external_refund=bool(data.get("execute_external_refund", False)),
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            executed_by=executed_by,
+        )
 
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] dismiss_all_read error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to dismiss read"}}), 500
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
 
-    return _inner()
-
-
-# ─── Preferences ──────────────────────────────────────────────────────────────
-
-@bp.route("/notifications/preferences", methods=["GET", "OPTIONS"])
-def get_preferences():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
-
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
-
-        try:
-            prefs = NotificationService.get_preferences(identity_id)
-            if prefs:
-                if prefs.get("updated_at"):
-                    prefs["updated_at"] = prefs["updated_at"].isoformat()
-                return jsonify({"ok": True, "preferences": prefs})
-            else:
-                # Return defaults
-                return jsonify({"ok": True, "preferences": {
-                    "identity_id": identity_id,
-                    "in_app_enabled": True,
-                    "email_enabled": True,
-                    "email_frequency": "instant",
-                    "muted_categories": [],
-                }})
-
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] get_preferences error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to fetch preferences"}}), 500
-
-    return _inner()
+    except Exception as e:
+        print(f"[ADMIN] Execute approved refund error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-@bp.route("/notifications/preferences", methods=["PUT", "OPTIONS"])
-def update_preferences():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
+@bp.route("/purchases/<purchase_id>/start-refund", methods=["POST"])
+@require_admin
+def purchases_start_refund(purchase_id):
+    """Create a refund record from a purchase — enters refund review workflow."""
+    try:
+        from backend.services.refund_service import start_refund_from_purchase
 
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
+        data = request.get_json(silent=True) or {}
 
-        try:
-            data = request.get_json(silent=True) or {}
+        executed_by = None
+        if hasattr(g, "admin_email"):
+            executed_by = g.admin_email
+        elif hasattr(g, "identity"):
+            executed_by = g.identity.get("email") if isinstance(g.identity, dict) else None
 
-            kwargs = {}
-            if "in_app_enabled" in data:
-                kwargs["in_app_enabled"] = bool(data["in_app_enabled"])
-            if "email_enabled" in data:
-                kwargs["email_enabled"] = bool(data["email_enabled"])
-            if "email_frequency" in data:
-                freq = data["email_frequency"]
-                if freq not in ("instant", "daily", "weekly", "none"):
-                    return jsonify({"ok": False, "error": {"code": "INVALID_FIELD",
-                        "message": "email_frequency must be one of: instant, daily, weekly, none"}}), 400
-                kwargs["email_frequency"] = freq
-            if "muted_categories" in data:
-                cats = data["muted_categories"]
-                if not isinstance(cats, list):
-                    return jsonify({"ok": False, "error": {"code": "INVALID_FIELD",
-                        "message": "muted_categories must be an array"}}), 400
-                kwargs["muted_categories"] = cats
+        result = start_refund_from_purchase(
+            purchase_id=purchase_id,
+            reason=data.get("reason"),
+            admin_note=data.get("admin_note"),
+            executed_by=executed_by,
+        )
 
-            if not kwargs:
-                return jsonify({"ok": False, "error": {"code": "NO_CHANGES",
-                    "message": "No valid fields to update"}}), 400
+        status_code = 200 if result.get("ok") else 400
+        return jsonify(result), status_code
 
-            prefs = NotificationService.update_preferences(identity_id, **kwargs)
-            if prefs and prefs.get("updated_at"):
-                prefs["updated_at"] = prefs["updated_at"].isoformat()
-
-            return jsonify({"ok": True, "preferences": prefs})
-
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] update_preferences error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to update preferences"}}), 500
-
-    return _inner()
+    except Exception as e:
+        print(f"[ADMIN] Start refund error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# ─── Broadcasts ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV EXPORTS
+# ─────────────────────────────────────────────────────────────────────────────
 
-@bp.route("/notifications/broadcasts", methods=["GET", "OPTIONS"])
-def get_broadcasts():
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
-
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
-
-        try:
-            broadcasts = NotificationService.get_active_broadcasts(identity_id)
-            for b in broadcasts:
-                if b.get("starts_at"):
-                    b["starts_at"] = b["starts_at"].isoformat()
-                if b.get("expires_at"):
-                    b["expires_at"] = b["expires_at"].isoformat()
-
-            return jsonify({"ok": True, "broadcasts": broadcasts})
-
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] get_broadcasts error: %s", e)
-            return jsonify({"ok": True, "broadcasts": []})
-
-    return _inner()
+def _csv_response(rows, fieldnames, filename):
+    """Build a CSV Response from a list of dicts."""
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
-@bp.route("/notifications/broadcasts/<broadcast_id>/dismiss", methods=["POST", "OPTIONS"])
-def dismiss_broadcast(broadcast_id):
-    @with_session
-    def _inner():
-        if request.method == "OPTIONS":
-            return ("", 204)
+@bp.route("/purchases/export.csv", methods=["GET"])
+@require_admin
+def purchases_export_csv():
+    """Export purchases as CSV with same filters as list endpoint."""
+    try:
+        result = AdminService.list_purchases(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            email=request.args.get("email"),
+            purchase_id=request.args.get("purchase_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+            _max_limit=5000,
+        )
 
-        identity_id, auth_error = require_identity()
-        if auth_error:
-            return auth_error
+        fieldnames = [
+            "purchase_id", "created_at", "paid_at", "status",
+            "email", "identity_id", "plan_code", "plan_name",
+            "provider", "payment_reference", "payment_id",
+            "amount_gbp", "currency", "credits_granted", "credits_remaining",
+            "credit_type", "is_subscription_purchase",
+            "refund_exists", "latest_refund_status", "latest_refund_id",
+            "refund_action_state", "refund_risk_level", "refund_risk_reason",
+        ]
 
-        try:
-            success = NotificationService.dismiss_broadcast(identity_id, broadcast_id)
-            return jsonify({"ok": True, "dismissed": success})
+        rows = []
+        for p in result.get("purchases", []):
+            risk = p.get("refund_risk") or {}
+            rows.append({
+                "purchase_id": p.get("id", ""),
+                "created_at": p.get("created_at", ""),
+                "paid_at": p.get("paid_at", ""),
+                "status": p.get("status", ""),
+                "email": p.get("email", ""),
+                "identity_id": p.get("identity_id", ""),
+                "plan_code": p.get("plan_code", ""),
+                "plan_name": p.get("plan_name", ""),
+                "provider": p.get("provider", ""),
+                "payment_reference": p.get("payment_reference", ""),
+                "payment_id": p.get("payment_id", ""),
+                "amount_gbp": p.get("amount_gbp", ""),
+                "currency": p.get("currency", ""),
+                "credits_granted": p.get("credits_granted", ""),
+                "credits_remaining": p.get("credits_remaining", ""),
+                "credit_type": p.get("credit_type", ""),
+                "is_subscription_purchase": p.get("is_subscription_purchase", ""),
+                "refund_exists": p.get("refund_exists", ""),
+                "latest_refund_status": p.get("latest_refund_status", ""),
+                "latest_refund_id": p.get("latest_refund_id", ""),
+                "refund_action_state": p.get("refund_action_state", ""),
+                "refund_risk_level": risk.get("level", ""),
+                "refund_risk_reason": risk.get("reason", ""),
+            })
 
-        except Exception as e:
-            logger.error("[NOTIF_ROUTE] dismiss_broadcast error: %s", e)
-            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to dismiss"}}), 500
+        return _csv_response(rows, fieldnames, "purchases.csv")
 
-    return _inner()
+    except Exception as e:
+        print(f"[ADMIN] Purchases CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/refunds/export.csv", methods=["GET"])
+@require_admin
+def refunds_export_csv():
+    """Export refund history as CSV with same filters as list endpoint."""
+    try:
+        from backend.services.refund_service import list_refunds
+
+        result = list_refunds(
+            status=request.args.get("status"),
+            identity_id=request.args.get("identity_id"),
+            purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+        )
+
+        fieldnames = [
+            "refund_id", "created_at", "executed_at", "refund_status", "refund_type",
+            "email", "identity_id", "purchase_id", "subscription_id", "purchase_type",
+            "amount_gbp", "currency", "credits_reversed", "credits_granted", "credits_used",
+            "credit_type", "payment_provider",
+            "external_refund_attempted", "external_refund_executed", "external_refund_id", "external_refund_error",
+            "executed_by", "reason", "admin_note", "display_summary",
+        ]
+
+        rows = []
+        for rf in result.get("refunds", []):
+            ext = rf.get("external_refund") or {}
+            rows.append({
+                "refund_id": rf.get("id", ""),
+                "created_at": rf.get("created_at", ""),
+                "executed_at": rf.get("executed_at", ""),
+                "refund_status": rf.get("refund_status", ""),
+                "refund_type": rf.get("refund_type", ""),
+                "email": rf.get("email", ""),
+                "identity_id": rf.get("identity_id", ""),
+                "purchase_id": rf.get("purchase_id", ""),
+                "subscription_id": rf.get("subscription_id", ""),
+                "purchase_type": rf.get("purchase_type", ""),
+                "amount_gbp": rf.get("amount_gbp", ""),
+                "currency": rf.get("currency", ""),
+                "credits_reversed": rf.get("credits_reversed", ""),
+                "credits_granted": rf.get("credits_granted", ""),
+                "credits_used": rf.get("credits_used", ""),
+                "credit_type": rf.get("credit_type", ""),
+                "payment_provider": rf.get("payment_provider", ""),
+                "external_refund_attempted": ext.get("attempted", ""),
+                "external_refund_executed": ext.get("executed", ""),
+                "external_refund_id": ext.get("external_refund_id", ""),
+                "external_refund_error": ext.get("error", ""),
+                "executed_by": rf.get("executed_by", ""),
+                "reason": rf.get("reason", ""),
+                "admin_note": rf.get("admin_note", ""),
+                "display_summary": rf.get("display_summary", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "refund_history.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Refunds CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/disputes/export.csv", methods=["GET"])
+@require_admin
+def disputes_export_csv():
+    """Export disputes as CSV with same filters as list endpoint."""
+    try:
+        from backend.services.dispute_service import list_disputes
+
+        result = list_disputes(
+            status=request.args.get("status"),
+            purchase_id=request.args.get("purchase_id"),
+            email=request.args.get("email"),
+            identity_id=request.args.get("identity_id"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+        )
+
+        _evd_flag_cols = [
+            "flag_purchase_paid", "flag_credits_granted", "flag_credits_used",
+            "flag_refund_offered", "flag_refund_executed", "flag_account_access_confirmed",
+        ]
+
+        fieldnames = [
+            "dispute_id", "created_at", "updated_at", "dispute_status",
+            "email", "identity_id", "purchase_id",
+            "payment_provider", "payment_reference",
+            "amount_gbp", "currency",
+            "dispute_reason", "admin_note", "evidence_summary",
+        ] + _evd_flag_cols + ["evidence_links"]
+
+        rows = []
+        for d in result.get("disputes", []):
+            flags = d.get("evidence_flags") or {}
+            links = d.get("evidence_links") or []
+            rows.append({
+                "dispute_id": d.get("id", ""),
+                "created_at": d.get("created_at", ""),
+                "updated_at": d.get("updated_at", ""),
+                "dispute_status": d.get("dispute_status", ""),
+                "email": d.get("email", ""),
+                "identity_id": d.get("identity_id", ""),
+                "purchase_id": d.get("purchase_id", ""),
+                "payment_provider": d.get("payment_provider", ""),
+                "payment_reference": d.get("payment_reference", ""),
+                "amount_gbp": d.get("amount_gbp", ""),
+                "currency": d.get("currency", ""),
+                "dispute_reason": d.get("dispute_reason", ""),
+                "admin_note": d.get("admin_note", ""),
+                "evidence_summary": d.get("evidence_summary", ""),
+                "flag_purchase_paid": flags.get("purchase_paid", ""),
+                "flag_credits_granted": flags.get("credits_granted", ""),
+                "flag_credits_used": flags.get("credits_used", ""),
+                "flag_refund_offered": flags.get("refund_offered", ""),
+                "flag_refund_executed": flags.get("refund_executed", ""),
+                "flag_account_access_confirmed": flags.get("account_access_confirmed", ""),
+                "evidence_links": " | ".join(links) if links else "",
+            })
+
+        return _csv_response(rows, fieldnames, "disputes.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Disputes CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-ledger/export.csv", methods=["GET"])
+@require_admin
+def provider_ledger_export_csv():
+    """Export provider ledger entries as CSV."""
+    try:
+        from backend.services.provider_ledger_service import list_ledger_entries
+
+        result = list_ledger_entries(
+            provider=request.args.get("provider"),
+            entry_type=request.args.get("entry_type"),
+            month=request.args.get("month"),
+            date_from=request.args.get("date_from"),
+            date_to=request.args.get("date_to"),
+            limit=min(int(request.args.get("limit", 5000)), 5000),
+            offset=0,
+        )
+
+        fieldnames = [
+            "id", "created_at", "provider", "entry_type", "amount_gbp", "currency",
+            "balance_snapshot_gbp", "description", "reference", "period_month", "recorded_by",
+        ]
+
+        rows = []
+        for e in result.get("entries", []):
+            rows.append({
+                "id": e.get("id", ""),
+                "created_at": e.get("created_at", ""),
+                "provider": e.get("provider", ""),
+                "entry_type": e.get("entry_type", ""),
+                "amount_gbp": e.get("amount_gbp", ""),
+                "currency": e.get("currency", ""),
+                "balance_snapshot_gbp": e.get("balance_snapshot_gbp", ""),
+                "description": e.get("description", ""),
+                "reference": e.get("reference", ""),
+                "period_month": e.get("period_month", ""),
+                "recorded_by": e.get("recorded_by", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "provider_ledger.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Provider ledger CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/provider-spend/monthly/export.csv", methods=["GET"])
+@require_admin
+def provider_spend_monthly_export_csv():
+    """Export monthly provider spend report as CSV."""
+    try:
+        from backend.services.provider_ledger_service import get_monthly_spend_report
+
+        result = get_monthly_spend_report(
+            months=min(int(request.args.get("months", 6)), 24),
+        )
+
+        fieldnames = [
+            "month", "provider", "estimated_usage_gbp", "job_count",
+            "topups_gbp", "topup_count", "invoices_gbp", "invoice_count",
+            "adjustments_gbp", "adjustment_count",
+            "latest_balance_snapshot_gbp", "latest_balance_snapshot_recorded_at",
+        ]
+
+        snapshots = result.get("latest_snapshots", {})
+        rows = []
+        for row in result.get("report", []):
+            provider = row.get("provider", "")
+            snap = snapshots.get(provider, {})
+            rows.append({
+                "month": row.get("month", ""),
+                "provider": provider,
+                "estimated_usage_gbp": row.get("estimated_usage_gbp", ""),
+                "job_count": row.get("job_count", ""),
+                "topups_gbp": row.get("topups_gbp", ""),
+                "topup_count": row.get("topup_count", ""),
+                "invoices_gbp": row.get("invoices_gbp", ""),
+                "invoice_count": row.get("invoice_count", ""),
+                "adjustments_gbp": row.get("adjustments_gbp", ""),
+                "adjustment_count": row.get("adjustment_count", ""),
+                "latest_balance_snapshot_gbp": snap.get("balance_gbp", ""),
+                "latest_balance_snapshot_recorded_at": snap.get("recorded_at", ""),
+            })
+
+        return _csv_response(rows, fieldnames, "monthly_provider_spend.csv")
+
+    except Exception as e:
+        print(f"[ADMIN] Monthly spend CSV export error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Identity Fragmentation Inspection (Phase 2 — read-only, no mutations)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/identity/inspect/<identity_id>", methods=["GET"])
+@require_admin
+def inspect_identity(identity_id):
+    """
+    Deep inspection of a single identity: wallet, history counts, jobs,
+    models, images, videos, purchases, subscriptions, active sessions.
+    """
+    from backend.services.admin_service import IdentityInspectionService
+
+    try:
+        result = IdentityInspectionService.inspect_identity(identity_id)
+        if not result:
+            return jsonify({"ok": False, "error": "Identity not found"}), 404
+        return jsonify({"ok": True, "identity": result})
+    except Exception as e:
+        print(f"[ADMIN] Identity inspect error: {e}")
+        return jsonify({"ok": False, "error": "Inspection failed"}), 500
+
+
+@bp.route("/identity/fragments", methods=["GET"])
+@require_admin
+def find_fragments():
+    """
+    Find identities that likely belong to the same real user (shared IP+UA
+    fingerprint across multiple identities). Only returns groups where at
+    least one identity has meaningful data (history or credits).
+
+    Query params:
+        - limit: Max groups to return (default 50)
+    """
+    from backend.services.admin_service import IdentityInspectionService
+
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        results = IdentityInspectionService.find_fragmented_identities(limit=limit)
+        return jsonify({
+            "ok": True,
+            "fragment_groups": results,
+            "total_groups": len(results),
+        })
+    except Exception as e:
+        print(f"[ADMIN] Fragment detection error: {e}")
+        return jsonify({"ok": False, "error": "Fragment detection failed"}), 500
+
+
+@bp.route("/identity/merge-preview", methods=["POST"])
+@require_admin
+def merge_preview():
+    """
+    Full merge preview combining identity inspection + real merge-engine
+    blocker checks.  No data is changed.
+
+    Request body:
+        { "source_id": "uuid", "target_id": "uuid" }
+
+    Response (200):
+        {
+          "ok": true,
+          "merge_preview": {
+            "source": { identity_id, email, email_verified },
+            "target": { identity_id, email, email_verified },
+            "would_transfer": { history_items, jobs, models, ... },
+            "target_after_merge": { history_items, jobs, credit_balance },
+            "conflicts": [ { type, severity, detail } ],
+            "safe_to_merge": bool,
+            "engine": {
+              "valid": bool,
+              "blocked_reason": str|null,
+              "row_counts": { table: count },
+              "subscription_conflict": bool,
+              "inflight_block": {...},
+              "idempotency_conflicts": [...],
+              "wallet_preview": { source_general, source_video, target_general, target_video }
+            }
+          }
+        }
+    """
+    from backend.services.admin_service import IdentityInspectionService
+    from backend.services.merge_service import MergeService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        source_id = data.get("source_id", "").strip()
+        target_id = data.get("target_id", "").strip()
+
+        if not source_id or not target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id required"}), 400
+        if source_id == target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id must be different"}), 400
+
+        # Identity-level inspection (emails, counts, conflict hints)
+        inspection = IdentityInspectionService.dry_run_merge(source_id, target_id)
+        if not inspection:
+            return jsonify({"ok": False, "error": "One or both identities not found"}), 404
+
+        # Real merge-engine preview (canonical resolution, real blockers)
+        engine = MergeService.preview_merge(source_id, target_id)
+
+        # Combine: if the engine finds a blocker the inspection missed, mark unsafe
+        if engine.get("blocked_reason"):
+            inspection["safe_to_merge"] = False
+            inspection["conflicts"].append({
+                "type": "ENGINE_BLOCK",
+                "severity": "BLOCKER",
+                "detail": engine["blocked_reason"],
+            })
+
+        inspection["engine"] = engine
+
+        return jsonify({"ok": True, "merge_preview": inspection})
+    except Exception as e:
+        print(f"[ADMIN] Merge preview error: {e}")
+        return jsonify({"ok": False, "error": "Merge preview failed"}), 500
+
+
+@bp.route("/identity/merge-execute", methods=["POST"])
+@require_admin
+def merge_execute():
+    """
+    Admin-triggered identity merge.  Calls the same MergeService.execute_merge()
+    used by automatic restore/verify merges but records the admin as initiator.
+
+    Request body:
+        {
+          "source_id": "uuid",
+          "target_id": "uuid",
+          "reason": "optional free-text reason (default: admin_manual)"
+        }
+
+    Response (200 success):
+        {
+          "ok": true,
+          "merge_result": {
+            "success": true,
+            "source_id": "canonical-uuid",
+            "target_id": "canonical-uuid",
+            "tables_migrated": { table: count },
+            "wallet_result": {...},
+            "subscription_result": {...},
+            "sessions_revoked": int,
+            "warnings": [...]
+          }
+        }
+
+    Response (409 blocked):
+        {
+          "ok": false,
+          "error": "Merge blocked",
+          "blocked_reason": "...",
+          "next_step": "..."
+        }
+    """
+    from backend.services.merge_service import MergeService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        source_id = data.get("source_id", "").strip()
+        target_id = data.get("target_id", "").strip()
+        reason = data.get("reason", "").strip() or "admin_manual"
+
+        if not source_id or not target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id required"}), 400
+        if source_id == target_id:
+            return jsonify({"ok": False, "error": "source_id and target_id must be different"}), 400
+
+        print(
+            f"[ADMIN] Merge execute requested: "
+            f"source={source_id[:8]}... → target={target_id[:8]}..., reason={reason}"
+        )
+
+        result = MergeService.execute_merge(
+            source_id=source_id,
+            target_id=target_id,
+            merged_by="admin",
+            reason=reason,
+            mode="full",
+            metadata={
+                "trigger": "admin_merge_execute",
+                "admin_reason": reason,
+            },
+        )
+
+        if not result["success"]:
+            blocked = result.get("blocked_reason", "unknown")
+            print(f"[ADMIN] Merge BLOCKED: {source_id[:8]}... → {target_id[:8]}...: {blocked}")
+            return jsonify({
+                "ok": False,
+                "error": "Merge blocked",
+                "blocked_reason": blocked,
+                "next_step": MergeService._suggest_next_step(blocked),
+            }), 409
+
+        print(
+            f"[ADMIN] Merge OK: {source_id[:8]}... → {target_id[:8]}... | "
+            f"tables={result.get('tables_migrated', {})}, "
+            f"sessions_revoked={result.get('sessions_revoked', 0)}"
+        )
+
+        return jsonify({"ok": True, "merge_result": result})
+    except Exception as e:
+        print(f"[ADMIN] Merge execute error: {e}")
+        return jsonify({"ok": False, "error": f"Merge execution failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/identity/merge-history", methods=["GET"])
+@require_admin
+def merge_history():
+    """
+    List recent identity merges from the audit table.
+
+    Query params:
+        - limit: Max rows (default 50, max 200)
+        - identity_id: Filter by source OR target identity
+
+    Response (200):
+        {
+          "ok": true,
+          "merges": [
+            {
+              "id": "uuid",
+              "source_identity_id": "uuid",
+              "target_identity_id": "uuid",
+              "merged_by": "system"|"admin",
+              "merge_reason": "restore"|"verify_email"|"admin_manual",
+              "merge_mode": "full",
+              "created_at": "ISO timestamp",
+              "metadata": { tables_migrated, total_rows_migrated, ... }
+            }
+          ],
+          "total": int
+        }
+    """
+    from backend.db import query_all, query_one, Tables
+
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+        identity_id = request.args.get("identity_id", "").strip()
+
+        if identity_id:
+            rows = query_all(
+                f"""
+                SELECT id, source_identity_id, target_identity_id,
+                       merged_by, merge_reason, merge_mode, created_at, metadata
+                FROM {Tables.IDENTITY_MERGES}
+                WHERE source_identity_id::text = %s OR target_identity_id::text = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (identity_id, identity_id, limit),
+            )
+            count_row = query_one(
+                f"""
+                SELECT COUNT(*) as cnt FROM {Tables.IDENTITY_MERGES}
+                WHERE source_identity_id::text = %s OR target_identity_id::text = %s
+                """,
+                (identity_id, identity_id),
+            )
+        else:
+            rows = query_all(
+                f"""
+                SELECT id, source_identity_id, target_identity_id,
+                       merged_by, merge_reason, merge_mode, created_at, metadata
+                FROM {Tables.IDENTITY_MERGES}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            count_row = query_one(
+                f"SELECT COUNT(*) as cnt FROM {Tables.IDENTITY_MERGES}"
+            )
+
+        merges = []
+        for row in (rows or []):
+            merges.append({
+                "id": str(row["id"]),
+                "source_identity_id": str(row["source_identity_id"]),
+                "target_identity_id": str(row["target_identity_id"]),
+                "merged_by": row["merged_by"],
+                "merge_reason": row["merge_reason"],
+                "merge_mode": row["merge_mode"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "metadata": row.get("metadata") or {},
+            })
+
+        return jsonify({
+            "ok": True,
+            "merges": merges,
+            "total": count_row["cnt"] if count_row else 0,
+        })
+    except Exception as e:
+        print(f"[ADMIN] Merge history error: {e}")
+        return jsonify({"ok": False, "error": "Merge history failed"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IDENT-5: Orphaned Asset Audit & Cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/orphans/summary", methods=["GET"])
+@require_admin
+def orphan_summary():
+    """
+    Quick count of orphan candidates per asset type and category.
+
+    Query params:
+        - age_days: Min age in days (default 30)
+
+    Response:
+        {
+          "ok": true,
+          "summary": {
+            "models": { "ownerless": 0, "merged_away": 2, ... "total": 5 },
+            "images": { ... },
+            "videos": { ... },
+            "age_threshold_days": 30
+          }
+        }
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        age_days = int(request.args.get("age_days", 30))
+        result = OrphanAuditService.summary(age_threshold_days=age_days)
+        return jsonify({"ok": True, "summary": result})
+    except Exception as e:
+        print(f"[ADMIN] Orphan summary error: {e}")
+        return jsonify({"ok": False, "error": f"Orphan summary failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/audit", methods=["GET"])
+@require_admin
+def orphan_audit():
+    """
+    Row-level orphan detail for a given asset_type + category.
+
+    Query params:
+        - asset_type: "models" | "images" | "videos" (required)
+        - category: "ownerless" | "merged_away" | "soft_deleted" | "unlinked" | "failed" (required)
+        - age_days: Min age in days (default 30)
+        - limit: Max rows (default 100, max 500)
+
+    Response:
+        {
+          "ok": true,
+          "orphans": [
+            {
+              "id": "uuid",
+              "asset_type": "models",
+              "category": "ownerless",
+              "identity_id": null,
+              "s3_bucket": "timrx-assets",
+              "s3_keys": { "glb_s3_key": "models/meshy/abc.glb", ... },
+              "status": "completed",
+              "created_at": "...",
+              "deleted_at": null,
+              "has_active_job": false,
+              "safe_to_quarantine": true
+            }
+          ],
+          "count": 5
+        }
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        asset_type = request.args.get("asset_type", "").strip()
+        category = request.args.get("category", "").strip()
+        age_days = int(request.args.get("age_days", 30))
+        limit = min(int(request.args.get("limit", 100)), 500)
+
+        if not asset_type or not category:
+            return jsonify({"ok": False, "error": "asset_type and category required"}), 400
+
+        if asset_type not in ("models", "images", "videos"):
+            return jsonify({"ok": False, "error": "asset_type must be models, images, or videos"}), 400
+
+        if category not in ("ownerless", "merged_away", "soft_deleted", "unlinked", "failed"):
+            return jsonify({"ok": False, "error": "Invalid category"}), 400
+
+        rows = OrphanAuditService.audit(
+            asset_type=asset_type,
+            category=category,
+            age_threshold_days=age_days,
+            limit=limit,
+        )
+
+        return jsonify({"ok": True, "orphans": rows, "count": len(rows)})
+    except Exception as e:
+        print(f"[ADMIN] Orphan audit error: {e}")
+        return jsonify({"ok": False, "error": f"Orphan audit failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/quarantine", methods=["POST"])
+@require_admin
+def orphan_quarantine():
+    """
+    Quarantine (soft-delete) orphan candidates.
+
+    Request body:
+        {
+          "asset_type": "models" | "images" | "videos",
+          "category": "ownerless" | "failed",
+          "age_days": 30,
+          "limit": 100,
+          "dry_run": true  (default: true)
+        }
+
+    Only ownerless and failed categories can be auto-quarantined.
+    merged_away should use the merge tool. unlinked requires manual review.
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        asset_type = data.get("asset_type", "").strip()
+        category = data.get("category", "").strip()
+        age_days = int(data.get("age_days", 30))
+        limit = min(int(data.get("limit", 100)), 500)
+        dry_run = data.get("dry_run", True)
+
+        if not asset_type or not category:
+            return jsonify({"ok": False, "error": "asset_type and category required"}), 400
+
+        result = OrphanAuditService.quarantine_orphans(
+            asset_type=asset_type,
+            category=category,
+            age_threshold_days=age_days,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+        if "error" in result:
+            return jsonify({"ok": False, "error": result["error"]}), 400
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Orphan quarantine error: {e}")
+        return jsonify({"ok": False, "error": f"Quarantine failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/fix-merged", methods=["POST"])
+@require_admin
+def orphan_fix_merged():
+    """
+    Re-migrate assets from merged-away identities to canonical owners.
+
+    Request body:
+        {
+          "asset_type": "models" | "images" | "videos",
+          "limit": 500,
+          "dry_run": true  (default: true)
+        }
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        data = request.get_json(silent=True) or {}
+        asset_type = data.get("asset_type", "").strip()
+        limit = min(int(data.get("limit", 500)), 1000)
+        dry_run = data.get("dry_run", True)
+
+        if not asset_type:
+            return jsonify({"ok": False, "error": "asset_type required"}), 400
+
+        result = OrphanAuditService.fix_merged_away(
+            asset_type=asset_type,
+            limit=limit,
+            dry_run=dry_run,
+        )
+
+        if "error" in result:
+            return jsonify({"ok": False, "error": result["error"]}), 400
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] Fix merged error: {e}")
+        return jsonify({"ok": False, "error": f"Fix merged failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/orphans/s3-keys", methods=["GET"])
+@require_admin
+def orphan_s3_keys():
+    """
+    Collect S3 keys from soft-deleted assets for optional storage cleanup.
+    Does NOT delete anything — returns keys for review.
+
+    Query params:
+        - asset_type: "models" | "images" | "videos" (required)
+        - age_days: Min days since deletion (default 90)
+        - limit: Max assets (default 200)
+    """
+    from backend.services.orphan_audit_service import OrphanAuditService
+
+    try:
+        asset_type = request.args.get("asset_type", "").strip()
+        age_days = int(request.args.get("age_days", 90))
+        limit = min(int(request.args.get("limit", 200)), 1000)
+
+        if not asset_type:
+            return jsonify({"ok": False, "error": "asset_type required"}), 400
+
+        result = OrphanAuditService.collect_s3_keys_for_cleanup(
+            asset_type=asset_type,
+            age_threshold_days=age_days,
+            limit=limit,
+        )
+
+        if "error" in result:
+            return jsonify({"ok": False, "error": result["error"]}), 400
+
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[ADMIN] S3 keys error: {e}")
+        return jsonify({"ok": False, "error": f"S3 key collection failed: {type(e).__name__}"}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard Summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/dashboard/summary", methods=["GET"])
+@require_admin
+def dashboard_summary():
+    """
+    Unified admin dashboard summary.
+
+    Query params:
+        force  – "true" to bypass 60s cache
+
+    Returns operational, economics, safety, and anomaly data.
+    """
+    force = request.args.get("force", "").lower() == "true"
+    try:
+        from backend.services.admin_dashboard_service import get_dashboard_summary
+        data = get_dashboard_summary(force_refresh=force)
+        return jsonify(data)
+    except Exception as e:
+        print(f"[ADMIN] Dashboard summary error: {e}")
+        return jsonify({"ok": False, "error": f"Dashboard summary failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/safety/summary", methods=["GET"])
+@require_admin
+def safety_summary():
+    """
+    Dedicated safety summary for admin safety tab.
+
+    Query params:
+        hours  – short lookback window (default 24)
+        days   – long lookback window (default 7)
+    """
+    hours = min(int(request.args.get("hours", 24)), 720)
+    days = min(int(request.args.get("days", 7)), 90)
+    try:
+        from backend.services.admin_dashboard_service import get_safety_summary
+        data = get_safety_summary(hours=hours, days=days)
+        return jsonify(data)
+    except Exception as e:
+        print(f"[ADMIN] Safety summary error: {e}")
+        return jsonify({"ok": False, "error": f"Safety summary failed: {type(e).__name__}"}), 500
+
+
+# ── Revenue & Margin Analytics ──────────────────────────────────────────────
+
+@bp.route("/margin-analytics", methods=["GET"])
+@require_admin
+def margin_analytics():
+    """
+    Revenue & margin analytics dashboard.
+
+    Query params:
+        days: Lookback period (default 30, max 365)
+
+    Returns:
+        overview: total/period revenue, cost, profit, margin %
+        by_product: margin breakdown by image/video/3D
+        by_provider: cost breakdown by provider
+        by_user: top 30 users by spend with revenue/cost/margin
+        alerts: users below 40% margin with >£0.50 cost
+    """
+    days = min(int(request.args.get("days", 30)), 365)
+    try:
+        data = AdminService.get_margin_analytics(days=days)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Margin analytics error: {e}")
+        return jsonify({"ok": False, "error": f"Margin analytics failed: {type(e).__name__}"}), 500
+
+
+@bp.route("/video-quota", methods=["GET"])
+@require_admin
+def video_quota_report():
+    """
+    Daily video quota usage report.
+
+    Query params:
+        date: ISO date (default: today UTC)
+        limit: max users (default 50)
+
+    Returns:
+        date, limits config, users with per-provider usage
+    """
+    date_str = request.args.get("date")
+    row_limit = min(int(request.args.get("limit", 50)), 200)
+    try:
+        from backend.services.video_quota_service import get_daily_quota_report
+        data = get_daily_quota_report(usage_date=date_str, limit=row_limit)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Video quota report error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/video-quota/user/<identity_id>", methods=["GET"])
+@require_admin
+def video_quota_user(identity_id):
+    """Get quota summary for a specific user today."""
+    try:
+        from backend.services.video_quota_service import get_user_quota_summary
+        data = get_user_quota_summary(identity_id)
+        return jsonify({"ok": True, "quotas": data})
+    except Exception as e:
+        print(f"[ADMIN] User quota error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTIFICATION CAMPAIGN ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bp.route("/campaigns", methods=["GET"])
+@require_admin
+def list_campaigns():
+    """List notification campaigns with optional status filter."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        status = request.args.get("status")
+        limit = int(request.args.get("limit", 50))
+        offset = int(request.args.get("offset", 0))
+        data = NotificationCampaignService.list_campaigns(
+            status=status, limit=limit, offset=offset
+        )
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] List campaigns error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns", methods=["POST"])
+@require_admin
+def create_campaign():
+    """Create a new notification campaign (draft)."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        body["created_by"] = getattr(g, "admin_email", None) or "admin"
+        campaign = NotificationCampaignService.create_campaign(**body)
+        return jsonify({"ok": True, "campaign": campaign}), 201
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Create campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>", methods=["GET"])
+@require_admin
+def get_campaign(campaign_id):
+    """Get campaign details with analytics."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        campaign = NotificationCampaignService.get_campaign(campaign_id)
+        if not campaign:
+            return jsonify({"ok": False, "error": "Campaign not found"}), 404
+        return jsonify({"ok": True, "campaign": campaign})
+    except Exception as e:
+        print(f"[ADMIN] Get campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>", methods=["PUT"])
+@require_admin
+def update_campaign(campaign_id):
+    """Update a draft/scheduled campaign."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        campaign = NotificationCampaignService.update_campaign(campaign_id, **body)
+        return jsonify({"ok": True, "campaign": campaign})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Update campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/publish", methods=["POST"])
+@require_admin
+def publish_campaign(campaign_id):
+    """Publish a campaign: resolve audience and deliver notifications."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        result = NotificationCampaignService.publish_campaign(campaign_id)
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Publish campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/test-send", methods=["POST"])
+@require_admin
+def test_send_campaign(campaign_id):
+    """Send a test notification to a specific user."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        identity_id = body.get("identity_id")
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id required"}), 400
+        result = NotificationCampaignService.test_send(campaign_id, identity_id)
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Test send error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/duplicate", methods=["POST"])
+@require_admin
+def duplicate_campaign(campaign_id):
+    """Duplicate a campaign as a new draft."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        created_by = getattr(g, "admin_email", None) or "admin"
+        campaign = NotificationCampaignService.duplicate_campaign(campaign_id, created_by)
+        return jsonify({"ok": True, "campaign": campaign}), 201
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Duplicate campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/archive", methods=["POST"])
+@require_admin
+def archive_campaign(campaign_id):
+    """Archive a campaign."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        campaign = NotificationCampaignService.archive_campaign(campaign_id)
+        return jsonify({"ok": True, "campaign": campaign})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Archive campaign error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/<campaign_id>/analytics", methods=["GET"])
+@require_admin
+def campaign_analytics(campaign_id):
+    """Get detailed analytics for a campaign."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        data = NotificationCampaignService.get_campaign_analytics(campaign_id)
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Campaign analytics error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/overview", methods=["GET"])
+@require_admin
+def campaigns_overview():
+    """Get aggregate notification center overview stats."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        data = NotificationCampaignService.get_overview_stats()
+        return jsonify({"ok": True, **data})
+    except Exception as e:
+        print(f"[ADMIN] Campaigns overview error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/campaigns/preview-audience", methods=["POST"])
+@require_admin
+def preview_audience():
+    """Preview audience count for given rules."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        rules = body.get("audience_rules", {"target": "all"})
+        count = NotificationCampaignService.preview_audience_count(rules)
+        return jsonify({"ok": True, "count": count})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Preview audience error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ─── Direct User Notification + Credit Actions ──────────────────────────
+
+@bp.route("/notifications/send-direct", methods=["POST"])
+@require_admin
+def send_direct_notification():
+    """Send a notification directly to a single user."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        identity_id = body.pop("identity_id", None)
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id required"}), 400
+        title = body.pop("title", None)
+        if not title:
+            return jsonify({"ok": False, "error": "title required"}), 400
+
+        body["admin_email"] = getattr(g, "admin_email", None) or "admin"
+        result = NotificationCampaignService.send_direct_notification(
+            identity_id=identity_id, title=title, **body
+        )
+        return jsonify({"ok": True, "notification": result})
+    except Exception as e:
+        print(f"[ADMIN] Direct notification error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/notifications/grant-credits", methods=["POST"])
+@require_admin
+def grant_credits_direct():
+    """Grant credits to a user with optional notification."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        body = request.get_json(force=True)
+        identity_id = body.get("identity_id")
+        if not identity_id:
+            return jsonify({"ok": False, "error": "identity_id required"}), 400
+
+        result = NotificationCampaignService.grant_credits_direct(
+            identity_id=identity_id,
+            general_credits=int(body.get("general_credits", 0)),
+            video_credits=int(body.get("video_credits", 0)),
+            reason=body.get("reason", "admin_grant"),
+            admin_email=getattr(g, "admin_email", None) or "admin",
+            send_notification=body.get("send_notification", True),
+            notification_title=body.get("notification_title"),
+            notification_body=body.get("notification_body"),
+        )
+        return jsonify({"ok": True, **result})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        print(f"[ADMIN] Grant credits error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/notifications/user/<identity_id>", methods=["GET"])
+@require_admin
+def get_user_notifications(identity_id):
+    """Get recent notifications for a specific user (admin view)."""
+    try:
+        from backend.services.notification_campaign_service import NotificationCampaignService
+        limit = int(request.args.get("limit", 20))
+        offset = int(request.args.get("offset", 0))
+        notifs = NotificationCampaignService.get_user_notifications(
+            identity_id, limit=limit, offset=offset
+        )
+        return jsonify({"ok": True, "notifications": notifs})
+    except Exception as e:
+        print(f"[ADMIN] User notifications error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500

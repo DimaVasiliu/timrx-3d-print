@@ -96,6 +96,8 @@ VALID_NOTIF_TYPES = {
         "maintenance_scheduled",   # Downtime notice
         "tutorial_available",      # New tutorial published
         "platform_tip",            # Tip of the day
+        "campaign_broadcast",      # Admin campaign broadcast
+        "admin_direct",            # Admin direct notification
     ],
     "promo": [
         "daily_streak",            # Consecutive-day usage
@@ -292,7 +294,13 @@ class NotificationService:
                 SELECT id::text, identity_id::text, category::text, notif_type,
                        title, body, icon, link, meta,
                        is_read, is_email_sent,
-                       created_at, read_at
+                       created_at, read_at,
+                       rich_body, media_type, media_url, thumbnail_url,
+                       emoji, badge,
+                       action_label, action_link,
+                       secondary_action_label, secondary_action_link,
+                       campaign_id::text, source_kind,
+                       is_dismissed, dismissed_at, clicked_at
                 FROM {T_NOTIFICATIONS}
                 WHERE {where_clause}
                 ORDER BY created_at DESC
