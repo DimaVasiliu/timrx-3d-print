@@ -264,13 +264,24 @@ def community_feed_mod():
                 """, (post_ids,))
                 tips_map: dict = {pid: total_tips for (pid, total_tips) in cursor.fetchall()}
 
+                # Comment counts (efficient batch query)
+                cursor.execute("""
+                    SELECT post_id::text, COUNT(*)::int
+                    FROM timrx_app.community_comments
+                    WHERE post_id = ANY(%s::uuid[]) AND status = 'published'
+                    GROUP BY post_id
+                """, (post_ids,))
+                comments_map: dict = {pid: cnt for (pid, cnt) in cursor.fetchall()}
+
                 for post in posts:
-                    post["reactions"]  = reactions_map.get(post["id"], {})
-                    post["tip_total"]  = tips_map.get(post["id"], 0)
+                    post["reactions"]      = reactions_map.get(post["id"], {})
+                    post["tip_total"]      = tips_map.get(post["id"], 0)
+                    post["comment_count"]  = comments_map.get(post["id"], 0)
             else:
                 for post in posts:
                     post["reactions"] = {}
                     post["tip_total"] = 0
+                    post["comment_count"] = 0
 
             cursor.close()
 
@@ -718,5 +729,279 @@ def community_discord_share():
         except Exception as e:
             logger.error(f"[Discord] Webhook error: {e}")
             return jsonify({"ok": False, "error": {"code": "WEBHOOK_ERROR"}}), 502
+
+    return _inner()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMENTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+COMMENT_MAX_LENGTH = 500
+
+
+@bp.route("/community/post/<post_id>/comments", methods=["GET", "OPTIONS"])
+def list_comments(post_id):
+    """List published comments for a post, oldest first."""
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        # Current viewer (optional — used for is_mine flags)
+        viewer_id = None
+        try:
+            viewer_id, _ = require_identity()
+        except Exception:
+            pass
+
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT
+                            c.id::text, c.post_id::text, c.identity_id::text,
+                            c.display_name, c.body,
+                            c.created_at, c.updated_at
+                        FROM timrx_app.community_comments c
+                        WHERE c.post_id = %s AND c.status = 'published'
+                        ORDER BY c.created_at ASC
+                        """,
+                        (post_id,),
+                    )
+                    rows = cur.fetchall() or []
+
+                    cur.execute(
+                        "SELECT identity_id::text FROM timrx_app.community_posts WHERE id = %s",
+                        (post_id,),
+                    )
+                    post_row = cur.fetchone()
+                    post_owner_id = post_row["identity_id"] if post_row else None
+
+            comments = []
+            for r in rows:
+                is_mine = viewer_id and r["identity_id"] == viewer_id
+                comments.append({
+                    "id": r["id"],
+                    "post_id": r["post_id"],
+                    "display_name": r["display_name"],
+                    "body": r["body"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                    "is_mine": bool(is_mine),
+                    "is_post_owner": r["identity_id"] == post_owner_id if post_owner_id else False,
+                    "can_edit": bool(is_mine),
+                    "can_delete": bool(is_mine),
+                })
+
+            return jsonify({
+                "ok": True,
+                "post_id": post_id,
+                "comment_count": len(comments),
+                "comments": comments,
+            })
+
+        except Exception as e:
+            logger.error(f"[Community] List comments error: {e}")
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR"}}), 500
+
+    return _inner()
+
+
+@bp.route("/community/post/<post_id>/comments", methods=["POST"])
+def create_comment(post_id):
+    """Create a comment on a community post."""
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        identity_id, auth_error = require_identity()
+        if auth_error:
+            return auth_error
+
+        data = request.get_json(silent=True) or {}
+        body = (data.get("body") or "").strip()
+        display_name = (data.get("display_name") or "").strip()
+
+        if not body:
+            return jsonify({"ok": False, "error": {"code": "EMPTY_COMMENT", "message": "Comment cannot be empty"}}), 400
+        if len(body) > COMMENT_MAX_LENGTH:
+            return jsonify({"ok": False, "error": {"code": "COMMENT_TOO_LONG", "message": f"Comment must be {COMMENT_MAX_LENGTH} characters or less"}}), 400
+        if not display_name:
+            return jsonify({"ok": False, "error": {"code": "NAME_REQUIRED", "message": "Display name is required"}}), 400
+
+        try:
+            with transaction() as cur:
+                cur.execute(
+                    """
+                    SELECT id, identity_id::text, display_name
+                    FROM timrx_app.community_posts
+                    WHERE id = %s AND status = 'published' AND deleted_at IS NULL
+                    """,
+                    (post_id,),
+                )
+                post = cur.fetchone()
+                if not post:
+                    return jsonify({"ok": False, "error": {"code": "POST_NOT_FOUND"}}), 404
+
+                post_owner_id = post["identity_id"]
+
+                cur.execute(
+                    """
+                    INSERT INTO timrx_app.community_comments
+                    (post_id, identity_id, display_name, body)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id::text, created_at, updated_at
+                    """,
+                    (post_id, identity_id, display_name, body),
+                )
+                row = cur.fetchone()
+
+            comment_id = row["id"]
+
+            invalidate_community_feed_cache()
+
+            # Notify post owner (not self)
+            if post_owner_id != identity_id:
+                try:
+                    actor = display_name or _lookup_actor_name(identity_id)
+                    NotificationService.create(
+                        identity_id=post_owner_id,
+                        category="community",
+                        notif_type="comment_received",
+                        title=f"{actor} commented on your creation",
+                        body=body[:100] + ("..." if len(body) > 100 else ""),
+                        icon="fa-comment",
+                        link="/3dprint#community",
+                        meta={
+                            "post_id": post_id,
+                            "comment_id": comment_id,
+                            "commenter_id": identity_id,
+                            "actor_name": actor,
+                        },
+                        ref_type="comment",
+                        ref_id=f"{post_id}:{comment_id}",
+                    )
+                except Exception as notif_err:
+                    logger.warning(f"[Community] Comment notification failed: {notif_err}")
+
+            return jsonify({
+                "ok": True,
+                "comment": {
+                    "id": comment_id,
+                    "post_id": post_id,
+                    "display_name": display_name,
+                    "body": body,
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                    "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                    "is_mine": True,
+                    "is_post_owner": post_owner_id == identity_id,
+                    "can_edit": True,
+                    "can_delete": True,
+                },
+            }), 201
+
+        except Exception as e:
+            logger.error(f"[Community] Create comment error: {e}")
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR"}}), 500
+
+    return _inner()
+
+
+@bp.route("/community/comment/<comment_id>", methods=["PATCH", "OPTIONS"])
+def edit_comment(comment_id):
+    """Edit own comment."""
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        identity_id, auth_error = require_identity()
+        if auth_error:
+            return auth_error
+
+        data = request.get_json(silent=True) or {}
+        body = (data.get("body") or "").strip()
+
+        if not body:
+            return jsonify({"ok": False, "error": {"code": "EMPTY_COMMENT"}}), 400
+        if len(body) > COMMENT_MAX_LENGTH:
+            return jsonify({"ok": False, "error": {"code": "COMMENT_TOO_LONG"}}), 400
+
+        try:
+            with transaction() as cur:
+                cur.execute(
+                    """
+                    UPDATE timrx_app.community_comments
+                    SET body = %s
+                    WHERE id = %s AND identity_id = %s AND status = 'published'
+                    RETURNING id::text, post_id::text, display_name, body, created_at, updated_at
+                    """,
+                    (body, comment_id, identity_id),
+                )
+                row = cur.fetchone()
+
+            if not row:
+                return jsonify({"ok": False, "error": {"code": "NOT_FOUND_OR_FORBIDDEN"}}), 404
+
+            return jsonify({
+                "ok": True,
+                "comment": {
+                    "id": row["id"],
+                    "post_id": row["post_id"],
+                    "display_name": row["display_name"],
+                    "body": row["body"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                    "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                    "is_mine": True,
+                    "can_edit": True,
+                    "can_delete": True,
+                },
+            })
+
+        except Exception as e:
+            logger.error(f"[Community] Edit comment error: {e}")
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR"}}), 500
+
+    return _inner()
+
+
+@bp.route("/community/comment/<comment_id>", methods=["DELETE", "OPTIONS"])
+def delete_comment(comment_id):
+    """Soft-delete own comment."""
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        identity_id, auth_error = require_identity()
+        if auth_error:
+            return auth_error
+
+        try:
+            with transaction() as cur:
+                cur.execute(
+                    """
+                    UPDATE timrx_app.community_comments
+                    SET status = 'deleted', deleted_at = NOW()
+                    WHERE id = %s AND identity_id = %s AND status = 'published'
+                    RETURNING id::text
+                    """,
+                    (comment_id, identity_id),
+                )
+                row = cur.fetchone()
+
+            if not row:
+                return jsonify({"ok": False, "error": {"code": "NOT_FOUND_OR_FORBIDDEN"}}), 404
+
+            invalidate_community_feed_cache()
+
+            return jsonify({"ok": True, "deleted": True})
+
+        except Exception as e:
+            logger.error(f"[Community] Delete comment error: {e}")
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR"}}), 500
 
     return _inner()

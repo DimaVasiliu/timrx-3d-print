@@ -79,6 +79,7 @@ VALID_NOTIF_TYPES = {
         "reactions_milestone",     # N+ reactions on a post
         "post_featured",           # Admin featured your post
         "community_milestone",     # Achievement unlocked
+        "comment_received",        # Someone commented on your post
     ],
     "job": [
         "job_complete",            # Generation succeeded
