@@ -565,6 +565,16 @@ class PurchaseService:
             except Exception as notif_err:
                 print(f"[PURCHASE] Notification failed (non-fatal): {notif_err}")
 
+            # ── Welcome bonus: one-time +50 credits on first verified purchase ──
+            try:
+                from backend.services.welcome_bonus_service import try_welcome_bonus
+                bonus = try_welcome_bonus(identity_id)
+                if bonus and bonus.get("granted"):
+                    new_balance = bonus["new_balance"]
+                    print(f"[PURCHASE] Welcome bonus granted: +{bonus['credits']} to {identity_id}")
+            except Exception as bonus_err:
+                print(f"[PURCHASE] Welcome bonus check failed (non-fatal): {bonus_err}")
+
             return {
                 "purchase": PurchaseService._format_purchase(purchase),
                 "ledger_entry_id": str(ledger_entry["id"]),
