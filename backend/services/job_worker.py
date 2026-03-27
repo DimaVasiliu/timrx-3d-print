@@ -1522,6 +1522,8 @@ def _finalize_success(
                 link="/3dprint#history",
                 meta={"job_id": job_id, "provider": provider_name, "task": _task},
                 send_email=True,
+                ref_type="job_complete",
+                ref_id=str(job_id),
             )
     except Exception as _ne:
         print(f"[JOB] Notification failed (non-fatal): {_ne}")
@@ -1758,6 +1760,8 @@ def _fail_job(
                 link="/3dprint#history",
                 meta={"job_id": job_id, "error_code": error_code, "provider": provider_name},
                 send_email=False,  # Don't spam email for failures
+                ref_type="job_failed",
+                ref_id=str(job_id),
             )
     except Exception as _ne:
         print(f"[JOB:FAIL] Notification failed (non-fatal): {_ne}")

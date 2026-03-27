@@ -18,10 +18,11 @@ except ImportError:
     _tuple_row = None
 
 from backend.config import config
-from backend.db import USE_DB, get_conn, transaction
+from backend.db import USE_DB, get_conn, transaction, query_one
 from backend.middleware import with_session
 from backend.services.identity_service import require_identity
 from backend.services.wallet_service import WalletService, CreditType
+from backend.services.notification_service import NotificationService
 
 bp = Blueprint("community", __name__)
 logger = logging.getLogger(__name__)
@@ -414,6 +415,31 @@ def community_react(post_id: str):
 
             # transaction() auto-commits on success.
             invalidate_community_feed_cache()
+
+            # Notify post owner about the reaction (non-blocking, outside txn)
+            if reaction is not None:
+                try:
+                    owner_row = query_one(
+                        "SELECT identity_id::text FROM timrx_app.community_posts WHERE id = %s",
+                        (post_id,),
+                    )
+                    owner_id = owner_row["identity_id"] if owner_row else None
+                    if owner_id and owner_id != identity_id:
+                        NotificationService.create(
+                            identity_id=owner_id,
+                            category="community",
+                            notif_type="reactions_milestone",
+                            title="Your creation received a new reaction!",
+                            body=None,
+                            icon="fa-heart",
+                            link="/3dprint#community",
+                            meta={"post_id": post_id, "reaction": reaction, "reactor_id": identity_id},
+                            ref_type="reaction",
+                            ref_id=f"{post_id}:{identity_id}",
+                        )
+                except Exception as notif_err:
+                    print(f"[COMMUNITY] Reaction notification failed (non-fatal): {notif_err}")
+
             return jsonify({"ok": True, "reactions": reactions, "my_reaction": my_reaction})
 
         except Exception as e:
@@ -528,7 +554,6 @@ def community_tip():
 
             # ── Notification: tip received ──
             try:
-                from backend.services.notification_service import NotificationService
                 NotificationService.create(
                     identity_id=recipient_id,
                     category="tip",
@@ -539,6 +564,8 @@ def community_tip():
                     link="/3dprint#community",
                     meta={"amount": amount, "post_id": post_id, "tipper_id": tipper_id, "tip_total": tip_total},
                     send_email=True,
+                    ref_type="tip",
+                    ref_id=f"{post_id}:{tipper_id}:{amount}",
                 )
             except Exception as notif_err:
                 logger.warning("[COMMUNITY] Tip notification failed (non-fatal): %s", notif_err)

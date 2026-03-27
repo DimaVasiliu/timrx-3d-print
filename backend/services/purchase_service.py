@@ -559,6 +559,8 @@ class PurchaseService:
                         "plan_code": plan_code,
                     },
                     send_email=False,  # Purchase receipt email already sent above
+                    ref_type="purchase",
+                    ref_id=str(purchase_id),
                 )
             except Exception as notif_err:
                 print(f"[PURCHASE] Notification failed (non-fatal): {notif_err}")

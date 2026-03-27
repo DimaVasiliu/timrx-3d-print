@@ -1086,6 +1086,8 @@ def execute_approved_refund(
             link="/hub#billing",
             meta={"refund_id": refund_id, "credits_reversed": credits_to_reverse, "purchase_id": purchase_id},
             send_email=False,  # Refund email already sent above
+            ref_type="refund",
+            ref_id=str(refund_id),
         )
     except Exception as _ne:
         print(f"[REFUND] Notification failed (non-fatal): {_ne}")

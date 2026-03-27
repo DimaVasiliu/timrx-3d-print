@@ -693,6 +693,32 @@ class WalletService:
             # Invalidate cached wallet data so the next read gets fresh balances
             invalidate_wallet_cache(identity_id)
 
+            # ── Low-balance warning (non-blocking, after spend only) ──
+            LOW_BALANCE_THRESHOLD = 10
+            if (
+                delta < 0
+                and credit_type == CreditType.GENERAL
+                and 0 < new_balance <= LOW_BALANCE_THRESHOLD
+                and current_balance > LOW_BALANCE_THRESHOLD
+            ):
+                try:
+                    from backend.services.notification_service import NotificationService
+                    from datetime import date
+                    NotificationService.create(
+                        identity_id=identity_id,
+                        category="credit",
+                        notif_type="low_balance_warning",
+                        title="Low credit balance",
+                        body=f"You have {new_balance} credits remaining. Top up to keep creating.",
+                        icon="fa-triangle-exclamation",
+                        link="/3dprint",
+                        meta={"balance": new_balance},
+                        ref_type="low_balance",
+                        ref_id=f"{identity_id}:{date.today().isoformat()}",
+                    )
+                except Exception:
+                    pass  # Non-fatal
+
             return ledger_entry
 
     @staticmethod

@@ -130,6 +130,8 @@ class NotificationService:
         link: Optional[str] = None,
         meta: Optional[Dict[str, Any]] = None,
         send_email: bool = False,
+        ref_type: Optional[str] = None,
+        ref_id: Optional[str] = None,
         cur=None,
     ) -> Optional[Dict[str, Any]]:
         """
@@ -138,6 +140,10 @@ class NotificationService:
         Can be called inside an existing transaction (pass cur) or standalone.
         If send_email=True AND the user has email + email notifications enabled,
         also queues an email via EmailOutboxService.
+
+        Idempotency: if ref_type + ref_id are provided, duplicate inserts for
+        the same (identity_id, ref_type, ref_id) are silently skipped via
+        ON CONFLICT DO NOTHING.
 
         Args:
             identity_id: Target user UUID
@@ -149,10 +155,12 @@ class NotificationService:
             link: Deep-link path (e.g. '/3dprint#community')
             meta: Extra JSON data (amount, job_id, sender, etc.)
             send_email: Whether to also queue an email notification
+            ref_type: Reference type for dedup (e.g. 'job', 'reaction', 'purchase')
+            ref_id: Reference ID for dedup (e.g. job_id, post_id:user_id)
             cur: Optional existing DB cursor (for transactional use)
 
         Returns:
-            The created notification row as dict, or None on failure
+            The created notification row as dict, or None on failure/skip
         """
         try:
             # Check user preferences — skip if category is muted
@@ -166,15 +174,26 @@ class NotificationService:
 
             meta_json = json.dumps(meta or {})
 
+            # Use ON CONFLICT for idempotent insert when ref_type is provided
+            conflict_clause = ""
+            if ref_type and ref_id:
+                conflict_clause = (
+                    " ON CONFLICT (identity_id, ref_type, ref_id) "
+                    "WHERE ref_type IS NOT NULL DO NOTHING"
+                )
+
             def _insert(cursor):
                 cursor.execute(
                     f"""
                     INSERT INTO {T_NOTIFICATIONS}
-                    (identity_id, category, notif_type, title, body, icon, link, meta)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (identity_id, category, notif_type, title, body, icon, link, meta,
+                     ref_type, ref_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    {conflict_clause}
                     RETURNING *
                     """,
-                    (identity_id, category, notif_type, title, body, icon, link, meta_json),
+                    (identity_id, category, notif_type, title, body, icon, link,
+                     meta_json, ref_type, ref_id),
                 )
                 return fetch_one(cursor)
 
@@ -189,6 +208,9 @@ class NotificationService:
                     "[NOTIF] Created: id=%s type=%s for=%s",
                     row["id"], notif_type, identity_id,
                 )
+            elif ref_type:
+                logger.debug("[NOTIF] Duplicate skipped: ref=%s:%s for=%s", ref_type, ref_id, identity_id)
+                return None
 
             # Optionally queue email
             if send_email and row:

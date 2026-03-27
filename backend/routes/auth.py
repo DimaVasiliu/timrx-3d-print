@@ -932,6 +932,8 @@ def verify_email():
             link="/hub#secure-credits",
             meta={"email_attached": email_attached},
             send_email=True,
+            ref_type="email_verified",
+            ref_id=str(identity_id),
         )
     except Exception as notif_err:
         print(f"[AUTH] Email verified notification failed (non-fatal): {notif_err}")
