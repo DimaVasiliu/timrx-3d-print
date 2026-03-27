@@ -860,6 +860,7 @@ class Tables:
     SUBSCRIPTION_EVENTS = f"{_BILLING_SCHEMA}.subscription_events"
     MOLLIE_CUSTOMERS = f"{_BILLING_SCHEMA}.mollie_customers"
     INVOICES = f"{_BILLING_SCHEMA}.invoices"
+    INVOICE_ITEMS = f"{_BILLING_SCHEMA}.invoice_items"
     RECEIPTS = f"{_BILLING_SCHEMA}.receipts"
     REFUNDS = f"{_BILLING_SCHEMA}.refunds"
     PAYMENT_DISPUTES = f"{_BILLING_SCHEMA}.payment_disputes"
