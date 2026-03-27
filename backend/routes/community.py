@@ -30,6 +30,23 @@ logger = logging.getLogger(__name__)
 VALID_REACTIONS = ('heart', 'fire', 'star', 'clap', 'wow')
 TIP_AMOUNTS     = (5, 10, 25, 50)
 
+# Reaction labels for notification messages
+REACTION_LABELS = {'heart': 'liked', 'fire': 'loved', 'star': 'starred', 'clap': 'applauded', 'wow': 'was wowed by'}
+
+
+def _lookup_actor_name(identity_id: str) -> str:
+    """Best-effort lookup of a user's display name from their community posts."""
+    try:
+        row = query_one(
+            "SELECT display_name FROM timrx_app.community_posts "
+            "WHERE identity_id = %s AND status = 'published' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (identity_id,),
+        )
+        return row["display_name"] if row and row.get("display_name") else "Someone"
+    except Exception:
+        return "Someone"
+
 # ── Community feed response cache ──
 # The feed is public (not per-user), so we can cache aggressively.
 # Keyed by (limit, offset, type) → (response_dict, monotonic_timestamp).
@@ -425,15 +442,17 @@ def community_react(post_id: str):
                     )
                     owner_id = owner_row["identity_id"] if owner_row else None
                     if owner_id and owner_id != identity_id:
+                        actor = _lookup_actor_name(identity_id)
+                        verb = REACTION_LABELS.get(reaction, "reacted to")
                         NotificationService.create(
                             identity_id=owner_id,
                             category="community",
                             notif_type="reactions_milestone",
-                            title="Your creation received a new reaction!",
+                            title=f"{actor} {verb} your creation!",
                             body=None,
                             icon="fa-heart",
                             link="/3dprint#community",
-                            meta={"post_id": post_id, "reaction": reaction, "reactor_id": identity_id},
+                            meta={"post_id": post_id, "reaction": reaction, "reactor_id": identity_id, "actor_name": actor},
                             ref_type="reaction",
                             ref_id=f"{post_id}:{identity_id}",
                         )
@@ -554,15 +573,16 @@ def community_tip():
 
             # ── Notification: tip received ──
             try:
+                actor = _lookup_actor_name(tipper_id)
                 NotificationService.create(
                     identity_id=recipient_id,
                     category="tip",
                     notif_type="tip_received",
-                    title=f"You received a {amount} credit tip!",
-                    body=f"Someone tipped your community post.",
+                    title=f"{actor} tipped you {amount} credits!",
+                    body=f"Your community post received a tip.",
                     icon="fa-hand-holding-dollar",
                     link="/3dprint#community",
-                    meta={"amount": amount, "post_id": post_id, "tipper_id": tipper_id, "tip_total": tip_total},
+                    meta={"amount": amount, "post_id": post_id, "tipper_id": tipper_id, "tip_total": tip_total, "actor_name": actor},
                     send_email=True,
                     ref_type="tip",
                     ref_id=f"{post_id}:{tipper_id}:{amount}",
