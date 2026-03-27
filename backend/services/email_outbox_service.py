@@ -50,6 +50,20 @@ class EmailTemplate:
     REFUND_RESOLUTION_APPROVED = "refund_resolution_approved"   # Refund approved follow-up
     REFUND_RESOLUTION_DENIED = "refund_resolution_denied"       # Refund denied follow-up
 
+    # Notification center email templates (migration 054)
+    NOTIFICATION_TIP_RECEIVED = "notification_tip_received"             # Someone tipped you
+    NOTIFICATION_JOB_COMPLETE = "notification_job_complete"             # Generation ready
+    NOTIFICATION_JOB_FAILED = "notification_job_failed"                 # Generation failed
+    NOTIFICATION_LOW_BALANCE = "notification_low_balance"               # Running low on credits
+    NOTIFICATION_WELCOME_BONUS = "notification_welcome_bonus"           # Welcome + free credits
+    NOTIFICATION_CREDITS_PURCHASED = "notification_credits_purchased"   # Purchase confirmed
+    NOTIFICATION_REFUND_APPROVED = "notification_refund_approved"       # Refund processed
+    NOTIFICATION_EMAIL_VERIFIED = "notification_email_verified"         # Email verified
+    NOTIFICATION_FEATURE_ANNOUNCEMENT = "notification_feature_announcement"  # New feature
+    NOTIFICATION_SUBSCRIPTION_RENEWED = "notification_subscription_renewed"  # Sub renewed
+    NOTIFICATION_SUBSCRIPTION_EXPIRING = "notification_subscription_expiring"  # Sub expiring
+    NOTIFICATION_DIGEST = "notification_digest"                         # Daily/weekly digest
+
 
 # Default max attempts before marking as failed
 DEFAULT_MAX_ATTEMPTS = 5

@@ -55,6 +55,7 @@ def register_blueprints(app):
     from backend.routes.video import bp as video_bp
     from backend.routes.prompt_enhance import bp as prompt_enhance_bp
     from backend.routes.webhooks import bp as webhooks_bp
+    from backend.routes.notifications import bp as notifications_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -104,6 +105,7 @@ def register_blueprints(app):
         print(f"[ROUTES] Inspire routes registered: {inspire_routes}")
     else:
         print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
+    app.register_blueprint(notifications_bp, url_prefix="/api/_mod")
     app.register_blueprint(contact_bp, url_prefix="/api")
     app.register_blueprint(webhooks_bp, url_prefix="/api")
 
@@ -122,6 +124,7 @@ def register_blueprints(app):
     app.register_blueprint(prompt_enhance_bp, url_prefix="/api", name="prompt_enhance_compat")
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
+    app.register_blueprint(notifications_bp, url_prefix="/api", name="notifications_compat")
 
     # Temporarily enable route map to debug inspire registration
     # _print_route_map(app)

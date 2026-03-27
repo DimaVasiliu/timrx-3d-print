@@ -919,6 +919,23 @@ def verify_email():
 
     print(f"[AUTH] Email verified for identity {identity_id}: {_mask_email(email)} (attached={email_attached}, subs_resumed={subscriptions_resumed})")
 
+    # ── Notification: email verified ──
+    try:
+        from backend.services.notification_service import NotificationService
+        NotificationService.create(
+            identity_id=identity_id,
+            category="account",
+            notif_type="email_verified",
+            title="Email verified — full access unlocked!",
+            body="Your email is verified. You can now purchase credits and access all features.",
+            icon="fa-shield-check",
+            link="/hub#secure-credits",
+            meta={"email_attached": email_attached},
+            send_email=True,
+        )
+    except Exception as notif_err:
+        print(f"[AUTH] Email verified notification failed (non-fatal): {notif_err}")
+
     # IDENT-3: Always include identity_changed and identity_id to normalize
     # response shape (same keys as cross-identity path).
     return jsonify({

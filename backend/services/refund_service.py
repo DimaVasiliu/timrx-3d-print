@@ -1073,6 +1073,23 @@ def execute_approved_refund(
         executed_at=now,
     )
 
+    # ── Notification: refund approved ──
+    try:
+        from backend.services.notification_service import NotificationService
+        NotificationService.create(
+            identity_id=identity_id,
+            category="credit",
+            notif_type="refund_approved",
+            title="Your refund has been processed",
+            body=f"{credits_to_reverse} credits reversed. Refund for purchase {purchase_id[:8]}...",
+            icon="fa-money-bill-transfer",
+            link="/hub#billing",
+            meta={"refund_id": refund_id, "credits_reversed": credits_to_reverse, "purchase_id": purchase_id},
+            send_email=False,  # Refund email already sent above
+        )
+    except Exception as _ne:
+        print(f"[REFUND] Notification failed (non-fatal): {_ne}")
+
     # ── 9. Build response ──
     external_refund_summary = {
         "attempted": execute_external_refund,

@@ -1505,6 +1505,27 @@ def _finalize_success(
 
     print(f"[JOB] succeeded job={job_id} provider={provider_name} result_url={persisted_url[:80]}...")
 
+    # ── Notification: job completed ──
+    try:
+        from backend.services.notification_service import NotificationService
+        _identity = str(identity_id) if identity_id else None
+        if _identity:
+            _task = meta.get("task", "generation")
+            _prompt = (meta.get("prompt") or "")[:60]
+            NotificationService.create(
+                identity_id=_identity,
+                category="job",
+                notif_type="job_complete",
+                title=f"Your {_task} is ready!",
+                body=f'"{_prompt}..." has finished processing.' if _prompt else "Your generation is ready to download.",
+                icon="fa-cube" if "3d" in _task.lower() else ("fa-film" if "video" in _task.lower() else "fa-image"),
+                link="/3dprint#history",
+                meta={"job_id": job_id, "provider": provider_name, "task": _task},
+                send_email=True,
+            )
+    except Exception as _ne:
+        print(f"[JOB] Notification failed (non-fatal): {_ne}")
+
 
 def _finalize_success_with_bytes(
     job_id: str,
@@ -1721,6 +1742,25 @@ def _fail_job(
         sm["error"] = user_message
         store[job_id] = sm
         save_store(store)
+
+    # ── Notification: job failed ──
+    try:
+        from backend.services.notification_service import NotificationService
+        _identity = str(meta.get("identity_id") or meta.get("user_id", ""))
+        if _identity:
+            NotificationService.create(
+                identity_id=_identity,
+                category="job",
+                notif_type="job_failed",
+                title="Generation failed — credits refunded",
+                body=user_message[:200],
+                icon="fa-circle-xmark",
+                link="/3dprint#history",
+                meta={"job_id": job_id, "error_code": error_code, "provider": provider_name},
+                send_email=False,  # Don't spam email for failures
+            )
+    except Exception as _ne:
+        print(f"[JOB:FAIL] Notification failed (non-fatal): {_ne}")
 
     # Unregister from ExpenseGuard
     from backend.services.expense_guard import ExpenseGuard

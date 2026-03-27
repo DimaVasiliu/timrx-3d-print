@@ -869,6 +869,12 @@ class Tables:
     CHECKOUT_IDEMPOTENCY = f"{_BILLING_SCHEMA}.checkout_idempotency"
     VIDEO_DAILY_USAGE = f"{_BILLING_SCHEMA}.video_daily_usage"
 
+    # Notification center (migration 054)
+    NOTIFICATIONS = f"{_BILLING_SCHEMA}.notifications"
+    NOTIFICATION_PREFERENCES = f"{_BILLING_SCHEMA}.notification_preferences"
+    NOTIFICATION_BROADCASTS = f"{_BILLING_SCHEMA}.notification_broadcasts"
+    NOTIFICATION_BROADCAST_DISMISSALS = f"{_BILLING_SCHEMA}.notification_broadcast_dismissals"
+
     # App schema
     MODELS = f"{_APP_SCHEMA}.models"
     IMAGES = f"{_APP_SCHEMA}.images"

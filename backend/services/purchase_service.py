@@ -541,6 +541,28 @@ class PurchaseService:
                 f"email_attached={email_attached}, email_queued={email_queued}"
             )
 
+            # ── Notification: credits purchased ──
+            try:
+                from backend.services.notification_service import NotificationService
+                NotificationService.create(
+                    identity_id=identity_id,
+                    category="credit",
+                    notif_type="credits_purchased",
+                    title=f"{credits_granted} credits added to your account!",
+                    body=f"Your purchase is confirmed. New balance: {new_balance} credits.",
+                    icon="fa-circle-check",
+                    link="/3dprint",
+                    meta={
+                        "credits_granted": credits_granted,
+                        "new_balance": new_balance,
+                        "purchase_id": purchase_id,
+                        "plan_code": plan_code,
+                    },
+                    send_email=False,  # Purchase receipt email already sent above
+                )
+            except Exception as notif_err:
+                print(f"[PURCHASE] Notification failed (non-fatal): {notif_err}")
+
             return {
                 "purchase": PurchaseService._format_purchase(purchase),
                 "ledger_entry_id": str(ledger_entry["id"]),

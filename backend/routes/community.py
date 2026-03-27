@@ -525,6 +525,24 @@ def community_tip():
             # transaction() auto-commits on success.
 
             invalidate_community_feed_cache()
+
+            # ── Notification: tip received ──
+            try:
+                from backend.services.notification_service import NotificationService
+                NotificationService.create(
+                    identity_id=recipient_id,
+                    category="tip",
+                    notif_type="tip_received",
+                    title=f"You received a {amount} credit tip!",
+                    body=f"Someone tipped your community post.",
+                    icon="fa-hand-holding-dollar",
+                    link="/3dprint#community",
+                    meta={"amount": amount, "post_id": post_id, "tipper_id": tipper_id, "tip_total": tip_total},
+                    send_email=True,
+                )
+            except Exception as notif_err:
+                logger.warning("[COMMUNITY] Tip notification failed (non-fatal): %s", notif_err)
+
             return jsonify({"ok": True, "tip_total": tip_total})
 
         except Exception as e:
