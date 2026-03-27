@@ -139,6 +139,54 @@ def mark_all_read():
     return _inner()
 
 
+# ─── Dismiss single notification ──────────────────────────────────────────────
+
+@bp.route("/notifications/<notification_id>", methods=["DELETE", "OPTIONS"])
+def dismiss_notification(notification_id):
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        identity_id, auth_error = require_identity()
+        if auth_error:
+            return auth_error
+
+        try:
+            success = NotificationService.dismiss(identity_id, notification_id)
+            return jsonify({"ok": True, "deleted": success})
+
+        except Exception as e:
+            logger.error("[NOTIF_ROUTE] dismiss error: %s", e)
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to dismiss"}}), 500
+
+    return _inner()
+
+
+# ─── Dismiss all read notifications ──────────────────────────────────────────
+
+@bp.route("/notifications/dismiss-read", methods=["POST", "OPTIONS"])
+def dismiss_all_read():
+    @with_session
+    def _inner():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        identity_id, auth_error = require_identity()
+        if auth_error:
+            return auth_error
+
+        try:
+            count = NotificationService.dismiss_all_read(identity_id)
+            return jsonify({"ok": True, "deleted": count})
+
+        except Exception as e:
+            logger.error("[NOTIF_ROUTE] dismiss_all_read error: %s", e)
+            return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Failed to dismiss read"}}), 500
+
+    return _inner()
+
+
 # ─── Preferences ──────────────────────────────────────────────────────────────
 
 @bp.route("/notifications/preferences", methods=["GET", "OPTIONS"])

@@ -345,6 +345,41 @@ class NotificationService:
             logger.error("[NOTIF] mark_all_read failed: %s", e)
             return 0
 
+    @staticmethod
+    def dismiss(identity_id: str, notification_id: str) -> bool:
+        """Delete a single notification for a user. Returns True if deleted."""
+        try:
+            with transaction("notif_dismiss") as cur:
+                cur.execute(
+                    f"""
+                    DELETE FROM {T_NOTIFICATIONS}
+                    WHERE id = %s AND identity_id = %s
+                    RETURNING id
+                    """,
+                    (notification_id, identity_id),
+                )
+                return fetch_one(cur) is not None
+        except Exception as e:
+            logger.error("[NOTIF] dismiss failed: %s", e)
+            return False
+
+    @staticmethod
+    def dismiss_all_read(identity_id: str) -> int:
+        """Delete all read notifications for a user. Returns count deleted."""
+        try:
+            with transaction("notif_dismiss_read") as cur:
+                cur.execute(
+                    f"""
+                    DELETE FROM {T_NOTIFICATIONS}
+                    WHERE identity_id = %s AND is_read = TRUE
+                    """,
+                    (identity_id,),
+                )
+                return cur.rowcount
+        except Exception as e:
+            logger.error("[NOTIF] dismiss_all_read failed: %s", e)
+            return 0
+
     # ─── Preferences ──────────────────────────────────────────────────────
 
     @staticmethod
