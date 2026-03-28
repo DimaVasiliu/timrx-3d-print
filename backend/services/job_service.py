@@ -1833,6 +1833,13 @@ def resolve_meshy_job_id(input_id: str) -> str:
     store = load_store()
     if input_id in store:
         entry = store[input_id]
+        # Remesh and rig tasks ARE valid Meshy task IDs — never resolve them
+        # back to their source.  Doing so would send the original high-poly
+        # model to Meshy instead of the remeshed/rigged one.
+        stage = (entry.get("stage") or "").lower()
+        if stage in ("remesh", "rig"):
+            print(f"[Resolve] store: {input_id} is stage={stage}, keeping as-is")
+            return input_id
         upstream = entry.get("upstream_job_id") or entry.get("meshy_task_id") or entry.get("original_job_id")
         if upstream and upstream != input_id:
             print(f"[Resolve] store: {input_id} -> {upstream}")
@@ -1877,11 +1884,14 @@ def resolve_meshy_job_id(input_id: str) -> str:
                         return row["upstream_job_id"]
 
                     # 4. history_items payload: look for upstream references
+                    #    BUT skip remesh/rig items — they are valid Meshy
+                    #    task IDs and must not resolve to their parent.
                     cur.execute(
                         f"""
                         SELECT payload->>'original_job_id' as original_job_id,
                                payload->>'job_id' as job_id_field,
-                               payload->>'preview_task_id' as preview_task_id
+                               payload->>'preview_task_id' as preview_task_id,
+                               payload->>'stage' as stage
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE id::text = %s
                         LIMIT 1
@@ -1890,6 +1900,10 @@ def resolve_meshy_job_id(input_id: str) -> str:
                     )
                     row = cur.fetchone()
                     if row:
+                        hist_stage = (row.get("stage") or "").lower()
+                        if hist_stage in ("remesh", "rig"):
+                            print(f"[Resolve] history: {input_id} is stage={hist_stage}, keeping as-is")
+                            return input_id
                         candidate = row.get("original_job_id") or row.get("job_id_field") or row.get("preview_task_id")
                         if candidate and candidate != input_id:
                             print(f"[Resolve] history: {input_id} -> {candidate}")

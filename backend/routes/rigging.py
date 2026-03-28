@@ -136,58 +136,47 @@ def rig_preflight():
         except Exception as e:
             print(f"[RIG_PREFLIGHT] already-rigged check failed: {e}")
 
-    # Try to get face count from Meshy task metadata
+    # Try to get face count from Meshy task metadata.
+    # We try multiple endpoints because the source could be text-to-3d,
+    # image-to-3d, OR a remesh result.
     if source_task_id:
-        try:
-            from backend.services.meshy_service import mesh_get
-            task_info = mesh_get(f"/openapi/v1/text-to-3d/{source_task_id}")
-            # Meshy may return topology info in task metadata
-            face_count = None
-            vertex_count = None
-            # Check output containers for topology info
-            for container_key in ["output", "result", ""]:
-                container = task_info.get(container_key, task_info) if container_key else task_info
-                if isinstance(container, dict):
-                    face_count = face_count or container.get("face_count") or container.get("faces")
-                    vertex_count = vertex_count or container.get("vertex_count") or container.get("vertices")
-            if face_count:
-                result["face_count"] = int(face_count)
-                result["vertex_count"] = int(vertex_count) if vertex_count else None
-                if result["face_count"] > 300000:
-                    result["riggable"] = False
-                    result["reason"] = f"Model has {result['face_count']:,} faces (limit: 300,000). Remesh the model first."
-                    result["recommended_action"] = "remesh_first"
-                    print(f"[RIG_PREFLIGHT] too_many_faces: {result['face_count']} > 300K")
-            print(f"[RIG_PREFLIGHT] source={source_task_id} faces={face_count} vertices={vertex_count} riggable={result['riggable']}")
-        except Exception as e:
-            # Non-fatal: can't get face count from this endpoint, proceed anyway
-            err_str = str(e).lower()
-            if "not found" in err_str or "404" in err_str:
-                # Try image-to-3d endpoint
-                try:
-                    task_info = mesh_get(f"/openapi/v1/image-to-3d/{source_task_id}")
-                    print(f"[RIG_PREFLIGHT] found via image-to-3d: task={source_task_id}")
-                    # Extract face count from image-to-3d response (same structure)
-                    face_count = None
-                    vertex_count = None
-                    for container_key in ["output", "result", ""]:
-                        container = task_info.get(container_key, task_info) if container_key else task_info
-                        if isinstance(container, dict):
-                            face_count = face_count or container.get("face_count") or container.get("faces")
-                            vertex_count = vertex_count or container.get("vertex_count") or container.get("vertices")
-                    if face_count:
-                        result["face_count"] = int(face_count)
-                        result["vertex_count"] = int(vertex_count) if vertex_count else None
-                        if result["face_count"] > 300000:
-                            result["riggable"] = False
-                            result["reason"] = f"Model has {result['face_count']:,} faces (limit: 300,000). Remesh the model first."
-                            result["recommended_action"] = "remesh_first"
-                            print(f"[RIG_PREFLIGHT] too_many_faces: {result['face_count']} > 300K")
-                    print(f"[RIG_PREFLIGHT] image-to-3d faces={face_count} vertices={vertex_count}")
-                except Exception:
-                    print(f"[RIG_PREFLIGHT] task_lookup_failed (may be fine for uploaded models): {e}")
-            else:
-                print(f"[RIG_PREFLIGHT] task_info_error: {e}")
+        def _extract_face_info(task_info):
+            """Extract face/vertex counts from a Meshy task response."""
+            fc, vc = None, None
+            for ck in ("output", "result", ""):
+                c = task_info.get(ck, task_info) if ck else task_info
+                if isinstance(c, dict):
+                    fc = fc or c.get("face_count") or c.get("faces")
+                    vc = vc or c.get("vertex_count") or c.get("vertices")
+            return fc, vc
+
+        from backend.services.meshy_service import mesh_get
+        face_count = None
+        vertex_count = None
+        found_endpoint = None
+        for endpoint_tpl, label in (
+            ("/openapi/v1/remesh/{}", "remesh"),
+            ("/openapi/v1/text-to-3d/{}", "text-to-3d"),
+            ("/openapi/v1/image-to-3d/{}", "image-to-3d"),
+        ):
+            try:
+                task_info = mesh_get(endpoint_tpl.format(source_task_id))
+                face_count, vertex_count = _extract_face_info(task_info)
+                found_endpoint = label
+                print(f"[RIG_PREFLIGHT] found via {label}: task={source_task_id}")
+                break
+            except Exception:
+                continue
+
+        if face_count:
+            result["face_count"] = int(face_count)
+            result["vertex_count"] = int(vertex_count) if vertex_count else None
+            if result["face_count"] > 300000:
+                result["riggable"] = False
+                result["reason"] = f"Model has {result['face_count']:,} faces (limit: 300,000). Remesh the model first."
+                result["recommended_action"] = "remesh_first"
+                print(f"[RIG_PREFLIGHT] too_many_faces: {result['face_count']} > 300K")
+        print(f"[RIG_PREFLIGHT] {found_endpoint or 'no-endpoint'} faces={face_count} vertices={vertex_count}")
 
     print(f"[RIG_PREFLIGHT] result: riggable={result['riggable']} action={result['recommended_action']} faces={result['face_count']}")
     return jsonify(result)
@@ -229,6 +218,7 @@ def rig_start():
             from backend.services.meshy_service import mesh_get
             task_info = None
             for endpoint_tpl in (
+                "/openapi/v1/remesh/{}",
                 "/openapi/v1/text-to-3d/{}",
                 "/openapi/v1/image-to-3d/{}",
             ):
@@ -299,12 +289,32 @@ def rig_start():
         status="queued",
     )
 
+    def _fail_job(error_msg: str):
+        """Mark internal job row as failed so it doesn't linger as 'queued'."""
+        try:
+            if USE_DB:
+                from backend.db import execute, Tables
+                execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET status = 'failed',
+                        error_message = %s,
+                        finished_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s AND status IN ('queued', 'pending', 'dispatched')
+                    """,
+                    (error_msg[:500], internal_job_id),
+                )
+        except Exception as fe:
+            print(f"[RIG_SUBMIT] _fail_job error: {fe}")
+
     try:
         resp = create_rigging_task(source, height_meters=height_meters)
         log_event("rig/start:meshy-resp", resp)
         meshy_task_id = resp.get("result") or resp.get("id")
         if not meshy_task_id:
             release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            _fail_job("No task ID returned by provider")
             print(
                 f"[PROVIDER_ERROR] provider=meshy job_id={internal_job_id} "
                 f"error=no_task_id_in_response raw={resp}"
@@ -346,6 +356,7 @@ def rig_start():
                     pass
                 else:
                     release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+                    _fail_job("Source model expired and fallback failed")
                     return jsonify({
                         "ok": False,
                         "error": "MODEL_GENERATION_FAILED",
@@ -353,6 +364,7 @@ def rig_start():
                     }), 502
             else:
                 release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+                _fail_job("Source model expired on provider")
                 return jsonify({
                     "ok": False,
                     "error": "MODEL_GENERATION_FAILED",
@@ -360,6 +372,7 @@ def rig_start():
                 }), 502
         else:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+            _fail_job(str(e)[:500])
             from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
             user_msg = None
             if "face limit" in err_str or "exceeds the" in err_str:
