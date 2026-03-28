@@ -621,7 +621,7 @@ def create_mollie_checkout():
     # If identity has no email yet, attach the provided one inline
     if not g.identity.get("email") and email:
         try:
-            from backend.db import transaction, Tables
+            from backend.db import transaction
             with transaction("checkout_attach_email") as cur:
                 cur.execute(
                     f"""
@@ -1500,7 +1500,7 @@ def subscription_checkout():
     # Attach email inline if identity has none
     if not g.identity.get("email") and email:
         try:
-            from backend.db import transaction, Tables
+            from backend.db import transaction
             with transaction("sub_checkout_attach_email") as cur:
                 cur.execute(
                     f"""
