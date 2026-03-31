@@ -110,59 +110,6 @@ def _check_checkout_rate(identity_id: str) -> bool:
 # EMAIL VALIDATION FOR CHECKOUT (Security hardening)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validate_checkout_email(identity: dict, request_email: str | None) -> tuple[bool, str | None, dict | None]:
-    """
-    Resolve and validate the email to use for checkout.
-
-    Rules:
-    - If identity has a verified email: use it. If request provides a different email, reject.
-    - If identity has an unverified email: use it. Accept matching request email.
-    - If identity has no email but request provides one: accept it (will be attached inline).
-    - If neither has an email: reject.
-
-    Returns:
-        (True, resolved_email, None) on success
-        (False, None, error_dict) on failure
-    """
-    identity_email = (identity.get("email") or "").strip().lower()
-    normalized_request = (request_email or "").strip().lower()
-
-    # Case 1: Identity already has email → use it
-    if identity_email:
-        # If request email is provided and doesn't match, reject
-        if normalized_request and normalized_request != identity_email:
-            return False, None, {
-                "code": "EMAIL_MISMATCH",
-                "message": f"You're logged in as {identity.get('email')}. Use that email to checkout, or switch accounts.",
-                "identity_email": identity.get("email"),
-                "request_email": request_email.strip(),
-            }
-        return True, identity.get("email", "").strip(), None
-
-    # Case 2: Identity has no email → require request email
-    if normalized_request:
-        return True, request_email.strip(), None
-
-    # Case 3: Neither has email
-    return False, None, {
-        "code": "EMAIL_REQUIRED",
-        "message": "Email address required for checkout",
-    }
-
-
-def get_checkout_email(identity: dict) -> str:
-    """
-    Get the identity's email for checkout.
-
-    Args:
-        identity: The identity dict from g.identity
-
-    Returns:
-        The email address (may be unverified)
-    """
-    return (identity.get("email") or "").strip()
-
-
 def _add_cache_headers(response, max_age: int = CACHE_TTL_SECONDS):
     """Add caching headers to response."""
     response.headers["Cache-Control"] = f"public, max-age={max_age}"
@@ -586,11 +533,10 @@ def create_mollie_checkout():
             "message": "Request body must be valid JSON",
         }), 400
 
-    print(f"[BILLING] Checkout request: plan={data.get('plan') or data.get('plan_code')}, request_email={data.get('email', '')[:20]}...")
+    print(f"[BILLING] Checkout request: plan={data.get('plan') or data.get('plan_code')}")
 
     # Accept both "plan" and "plan_code" for flexibility
     plan_code = data.get("plan") or data.get("plan_code")
-    request_email = data.get("email", "").strip()
 
     # Validation with logging
     if not plan_code:
@@ -603,39 +549,20 @@ def create_mollie_checkout():
         }), 400
 
     # ══════════════════════════════════════════════════════════════════════════
-    # EMAIL: Resolve checkout email (attach to identity if needed)
+    # EMAIL: Require verified email before checkout
     # ══════════════════════════════════════════════════════════════════════════
-    is_valid, resolved_email, email_error = validate_checkout_email(g.identity, request_email)
-    if not is_valid and email_error:
-        print(f"[BILLING] Checkout rejected: {email_error['code']} - identity={g.identity.get('email')}, request={request_email}")
+    identity = g.identity
+    if not identity.get("email") or not identity.get("email_verified"):
+        print(f"[BILLING] Checkout rejected: email not verified for identity={g.identity_id}")
         return jsonify({
             "ok": False,
-            "error_code": email_error["code"],
-            "error": email_error["code"].lower(),
-            "message": email_error["message"],
-            "identity_email": email_error.get("identity_email"),
+            "error_code": "EMAIL_NOT_VERIFIED",
+            "error": "email_not_verified",
+            "message": "Please verify your email before purchasing.",
         }), 403
 
-    email = resolved_email
-
-    # If identity has no email yet, attach the provided one inline
-    if not g.identity.get("email") and email:
-        try:
-            from backend.db import transaction
-            with transaction("checkout_attach_email") as cur:
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.IDENTITIES}
-                    SET email = %s, last_seen_at = NOW()
-                    WHERE id = %s AND email IS NULL
-                    """,
-                    (email.lower().strip(), g.identity_id),
-                )
-            print(f"[BILLING] Email attached inline at checkout: {email[:20]}...")
-        except Exception as attach_err:
-            print(f"[BILLING] Email attach failed (non-fatal): {attach_err}")
-
-    print(f"[BILLING] Using email for checkout: {email[:20]}...")
+    email = identity["email"]
+    print(f"[BILLING] Using verified email for checkout: {email[:20]}...")
 
     # Lookup plan by code (uses credit_grant column for credits amount)
     plan = PricingService.get_plan_by_code(plan_code)
@@ -896,7 +823,6 @@ def create_checkout():
 
     data = request.get_json() or {}
     plan_code = data.get("plan_code")
-    request_email = data.get("email", "").strip()
 
     # Optional: allow frontend to specify redirect URLs
     # Default to request origin if not provided
@@ -914,21 +840,18 @@ def create_checkout():
         }), 400
 
     # ══════════════════════════════════════════════════════════════════════════
-    # EMAIL: Resolve checkout email (attach to identity if needed)
+    # EMAIL: Require verified email before checkout
     # ══════════════════════════════════════════════════════════════════════════
-    is_valid, resolved_email, email_error = validate_checkout_email(g.identity, request_email)
-    if not is_valid and email_error:
-        print(f"[BILLING] Stripe checkout rejected: {email_error['code']} - identity={g.identity.get('email')}, request={request_email}")
+    identity = g.identity
+    if not identity.get("email") or not identity.get("email_verified"):
         return jsonify({
             "error": {
-                "code": email_error["code"],
-                "message": email_error["message"],
-                "identity_email": email_error.get("identity_email"),
+                "code": "EMAIL_NOT_VERIFIED",
+                "message": "Please verify your email before purchasing.",
             }
         }), 403
 
-    # Use resolved email for checkout
-    email = get_checkout_email(g.identity)
+    email = identity["email"]
 
     try:
         result = PurchaseService.start_checkout(
@@ -1481,37 +1404,19 @@ def subscription_checkout():
         return jsonify({"error": "payments_unavailable", "message": "Payment service is not available"}), 503
 
     # ══════════════════════════════════════════════════════════════════════════
-    # EMAIL: Resolve checkout email (attach to identity if needed)
+    # EMAIL: Require verified email before subscription checkout
     # ══════════════════════════════════════════════════════════════════════════
-    request_email = body.get("email", "").strip()
-    is_valid, resolved_email, email_error = validate_checkout_email(g.identity, request_email)
-    if not is_valid and email_error:
-        print(f"[BILLING] Subscription checkout rejected: {email_error['code']} - identity={g.identity.get('email')}, request={request_email}")
+    identity = g.identity
+    if not identity.get("email") or not identity.get("email_verified"):
+        print(f"[BILLING] Subscription checkout rejected: email not verified for identity={g.identity_id}")
         return jsonify({
             "ok": False,
-            "error": email_error["code"].lower(),
-            "error_code": email_error["code"],
-            "message": email_error["message"],
-            "identity_email": email_error.get("identity_email"),
+            "error": "email_not_verified",
+            "error_code": "EMAIL_NOT_VERIFIED",
+            "message": "Please verify your email before subscribing.",
         }), 403
 
-    email = resolved_email or get_checkout_email(g.identity)
-
-    # Attach email inline if identity has none
-    if not g.identity.get("email") and email:
-        try:
-            from backend.db import transaction
-            with transaction("sub_checkout_attach_email") as cur:
-                cur.execute(
-                    f"""
-                    UPDATE {Tables.IDENTITIES}
-                    SET email = %s, last_seen_at = NOW()
-                    WHERE id = %s AND email IS NULL
-                    """,
-                    (email.lower().strip(), g.identity_id),
-                )
-        except Exception as attach_err:
-            print(f"[BILLING] Sub email attach failed (non-fatal): {attach_err}")
+    email = identity["email"]
 
     # ══════════════════════════════════════════════════════════════════════════
     # CHECKOUT IDEMPOTENCY: Prevent concurrent double-submit creating two

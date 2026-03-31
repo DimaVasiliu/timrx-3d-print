@@ -3,7 +3,6 @@
 
 Handles:
 - GET /api/me - Get current session info (identity, wallet balance)
-- POST /api/me/email - Attach email to identity
 - GET /api/me/wallet - Get wallet details
 - GET /api/me/ledger - Get billing ledger entries (credits/purchases)
 - POST /api/me/logout - End current session
@@ -88,48 +87,6 @@ def get_me():
             print(f"[ME][STALE_OK] returning cached /api/me: {type(e).__name__}")
             return jsonify(cached[0])
         raise
-
-
-@bp.route("/email", methods=["POST"])
-@no_cache
-@require_session
-def attach_email():
-    """
-    Attach email to current identity.
-    Idempotent: if same email already set, returns OK.
-    Does NOT verify email (verification via magic codes separately).
-    """
-    data = request.get_json() or {}
-    email = data.get("email", "").strip()
-
-    if not email:
-        return jsonify({
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "message": "Email is required",
-            }
-        }), 400
-
-    try:
-        # attach_email is anti-enumeration safe - it returns ok even if email
-        # belongs to another identity (reason is logged internally only)
-        updated, was_changed, _ = IdentityService.attach_email(g.identity_id, email)
-
-        # ANTI-ENUMERATION: Always return ok=true, never reveal if email belongs to another
-        # The reason is for internal logging only
-        return jsonify({
-            "ok": True,
-            "identity_id": g.identity_id,
-            "email": updated.get("email"),  # Returns current email (may be unchanged)
-            "was_changed": was_changed,
-        })
-    except ValueError as e:
-        return jsonify({
-            "error": {
-                "code": "VALIDATION_ERROR",
-                "message": str(e),
-            }
-        }), 400
 
 
 @bp.route("/wallet", methods=["GET"])

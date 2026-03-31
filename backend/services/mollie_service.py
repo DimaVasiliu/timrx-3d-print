@@ -1021,18 +1021,6 @@ class MollieService:
                     except Exception as admin_err:
                         print(f"[MOLLIE] WARNING: Admin notification failed: {admin_err}")
 
-                # ── Welcome bonus: +50 credits on first verified purchase ──
-                # Called AFTER _record_mollie_purchase transaction has committed
-                # to avoid wallet row lock contention.
-                if not was_existing:
-                    try:
-                        from backend.services.welcome_bonus_service import try_welcome_bonus
-                        bonus = try_welcome_bonus(identity_id)
-                        if bonus and bonus.get("granted"):
-                            print(f"[MOLLIE] Welcome bonus granted: +{bonus['credits']} to {identity_id}")
-                    except Exception as bonus_err:
-                        print(f"[MOLLIE] Welcome bonus check failed (non-fatal): {bonus_err}")
-
                 return {
                     "purchase_id": purchase_id,
                     "was_existing": was_existing,
