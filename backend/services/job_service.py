@@ -2199,6 +2199,7 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                         SET status = 'ready',
                             upstream_job_id = COALESCE(upstream_job_id, %s),
                             meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            generation_duration_ms = EXTRACT(EPOCH FROM (NOW() - created_at))::int * 1000,
                             updated_at = NOW()
                         WHERE id = %s
                         """,
@@ -2210,6 +2211,7 @@ def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url
                         UPDATE {Tables.JOBS}
                         SET status = 'ready',
                             meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb,
+                            generation_duration_ms = EXTRACT(EPOCH FROM (NOW() - created_at))::int * 1000,
                             updated_at = NOW()
                         WHERE id = %s
                         """,

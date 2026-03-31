@@ -1,5 +1,7 @@
 """
 Shared in-memory status cache for generation job status endpoints.
+Thread-safe implementation using a lock to protect concurrent access
+from multiple Gunicorn threads.
 
 Cuts DB + provider API calls from status polling by returning cached
 responses for the same job_id within a short TTL window.
@@ -20,7 +22,9 @@ Usage in a status handler:
 """
 
 import time
+import threading
 
+_lock = threading.Lock()
 _status_cache: dict = {}  # job_id -> (monotonic_ts, response_dict, is_terminal)
 
 # In-progress jobs: cache for 3s (status can change)
@@ -32,37 +36,40 @@ _MAX_ENTRIES = 2000
 
 def get_cached_status(job_id: str) -> dict | None:
     """Return cached status response or None if expired/missing."""
-    cached = _status_cache.get(job_id)
-    if not cached:
+    with _lock:
+        cached = _status_cache.get(job_id)
+        if not cached:
+            return None
+        ts, data, is_terminal = cached
+        ttl = _TERMINAL_TTL if is_terminal else _ACTIVE_TTL
+        if (time.monotonic() - ts) < ttl:
+            return data
+        # Expired — remove and return None
+        _status_cache.pop(job_id, None)
         return None
-    ts, data, is_terminal = cached
-    ttl = _TERMINAL_TTL if is_terminal else _ACTIVE_TTL
-    if (time.monotonic() - ts) < ttl:
-        return data
-    # Expired — remove and return None
-    del _status_cache[job_id]
-    return None
 
 
 def cache_status(job_id: str, data: dict, is_terminal: bool = False):
     """Cache a status response. Terminal states get a longer TTL."""
-    _status_cache[job_id] = (time.monotonic(), data, is_terminal)
-    # Periodic eviction to prevent unbounded growth
-    if len(_status_cache) > _MAX_ENTRIES:
-        _evict_expired()
+    with _lock:
+        _status_cache[job_id] = (time.monotonic(), data, is_terminal)
+        # Periodic eviction to prevent unbounded growth
+        if len(_status_cache) > _MAX_ENTRIES:
+            _evict_expired_locked()
 
 
 def invalidate_status(job_id: str):
     """Remove a specific job from the cache (e.g., after a state change)."""
-    _status_cache.pop(job_id, None)
+    with _lock:
+        _status_cache.pop(job_id, None)
 
 
-def _evict_expired():
-    """Remove expired entries."""
+def _evict_expired_locked():
+    """Remove expired entries. Must be called with _lock held."""
     now = time.monotonic()
     expired = [
         k for k, (ts, _, is_terminal) in _status_cache.items()
         if (now - ts) > (_TERMINAL_TTL if is_terminal else _ACTIVE_TTL)
     ]
     for k in expired:
-        del _status_cache[k]
+        _status_cache.pop(k, None)

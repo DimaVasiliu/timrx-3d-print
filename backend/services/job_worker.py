@@ -65,9 +65,15 @@ WORKER_ID = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 # Advisory lock ID for single-worker guarantee (arbitrary fixed integer)
 LEADER_LOCK_ID = 737483
 
+# Multi-worker partitioning: when TOTAL_WORKERS > 1, each worker only claims
+# jobs whose hash falls in its partition. This replaces the advisory lock.
+TOTAL_WORKERS = int(os.getenv("JOB_WORKER_COUNT", "1"))
+WORKER_INDEX = os.getpid() % TOTAL_WORKERS if TOTAL_WORKERS > 1 else 0
+USE_PARTITIONED_CLAIMING = TOTAL_WORKERS > 1
+
 # Timing constants
 HEARTBEAT_INTERVAL = 30          # seconds between heartbeat updates
-HEARTBEAT_TIMEOUT = 90           # seconds before a claim is considered expired
+HEARTBEAT_TIMEOUT = 180          # seconds before a claim is considered expired (increased from 90 for slow provider calls)
 STALL_TIMEOUT = 120              # seconds before marking a job as stalled
 POLL_SLEEP_PENDING = 15          # seconds between provider polls (pending)
 POLL_SLEEP_PROCESSING = 10       # seconds between provider polls (processing)
@@ -252,10 +258,18 @@ def _acquire_leader_lock() -> bool:
     """
     Acquire a PostgreSQL advisory lock for single-worker guarantee.
 
+    When USE_PARTITIONED_CLAIMING is True (JOB_WORKER_COUNT > 1), the
+    advisory lock is skipped — each worker only claims jobs in its
+    hash partition, so no global lock is needed.
+
     Retries with backoff to handle deploy overlap windows where the old
     instance still holds the lock briefly (~90s total).
     """
     if not USE_DB:
+        return True
+
+    if USE_PARTITIONED_CLAIMING:
+        print(f"[JOB] Partitioned mode: worker {WORKER_INDEX}/{TOTAL_WORKERS} — skipping advisory lock")
         return True
 
     retry_delays = [5, 5, 10, 10, 15, 15, 15, 15]
@@ -398,6 +412,12 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
     try:
         with get_conn("job_worker_claim") as conn:
             with conn.cursor() as cur:
+                # Partition filter: when running multiple workers, each worker
+                # only claims jobs whose hash falls in its partition.
+                partition_clause = ""
+                if USE_PARTITIONED_CLAIMING:
+                    partition_clause = f"AND MOD(hashtext(id::text), {TOTAL_WORKERS}) = {WORKER_INDEX}"
+
                 cur.execute(
                     f"""
                     SELECT id, identity_id, provider, action_code, status,
@@ -417,6 +437,7 @@ def _claim_next_job() -> Optional[Dict[str, Any]]:
                       AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
                       AND (claimed_by IS NULL OR heartbeat_at < NOW() - INTERVAL '{HEARTBEAT_TIMEOUT} seconds')
                       AND (next_poll_at IS NULL OR next_poll_at <= NOW())
+                      {partition_clause}
                     ORDER BY
                         CASE WHEN status = 'stalled' THEN 0 ELSE 1 END,
                         created_at ASC

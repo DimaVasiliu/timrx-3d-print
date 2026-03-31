@@ -1639,6 +1639,7 @@ def run_all_subscription_jobs():
     2. Expired subscription check (check_expired_subscriptions)
     3. Past-due subscription expiry (check_and_expire_past_due_subscriptions)
     4. Past-due reminder emails (send_past_due_reminders)
+    5. Expired credit reservation cleanup (cleanup_expired_reservations)
 
     Recommended frequency: every 1-6 hours
 
@@ -1647,9 +1648,11 @@ def run_all_subscription_jobs():
         - expired: Number of subscriptions expired
         - past_due_expired: Past-due subscriptions that timed out
         - reminders: Past-due reminder email results
+        - reservations_cleaned: Number of expired credit reservations released
     """
     try:
         from backend.services.subscription_service import SubscriptionService
+        from backend.services.reservation_service import ReservationService
 
         admin_email = getattr(g, "admin_email", None)
         print(f"[ADMIN] All subscription jobs triggered by {admin_email or 'token'}")
@@ -1665,6 +1668,13 @@ def run_all_subscription_jobs():
 
         # Send past_due reminder emails (day 3 + day 5, idempotent)
         reminder_result = SubscriptionService.send_past_due_reminders()
+
+        # Clean up expired credit reservations (releases held credits back)
+        reservations_cleaned = 0
+        try:
+            reservations_cleaned = ReservationService.cleanup_expired_reservations() or 0
+        except Exception as cleanup_err:
+            print(f"[ADMIN] Reservation cleanup error (non-fatal): {cleanup_err}")
 
         return jsonify({
             "ok": True,
@@ -1682,12 +1692,43 @@ def run_all_subscription_jobs():
                 "sent": reminder_result.get("sent", 0),
                 "skipped": reminder_result.get("skipped", 0),
             },
+            "reservations_cleaned": reservations_cleaned,
         })
     except Exception as e:
         print(f"[ADMIN] Subscription jobs error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/cleanup-reservations", methods=["POST"])
+@require_admin
+def cleanup_reservations():
+    """
+    Release all expired credit reservations.
+
+    Expired reservations reduce users' available balance even though the
+    held credits are no longer needed. This endpoint releases them.
+
+    Can be called independently or as part of /subscriptions/run-all.
+    Recommended frequency: every 5 minutes via cron.
+    """
+    try:
+        from backend.services.reservation_service import ReservationService
+        count = ReservationService.cleanup_expired_reservations() or 0
+        print(f"[ADMIN] Released {count} expired reservations")
+        return jsonify({"ok": True, "released": count})
+    except Exception as e:
+        print(f"[ADMIN] Reservation cleanup error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/circuit-breakers", methods=["GET"])
+@require_admin
+def get_circuit_breakers():
+    """Return the current state of all AI provider circuit breakers."""
+    from backend.services.async_dispatch import get_circuit_breaker_status
+    return jsonify(get_circuit_breaker_status())
 
 
 @bp.route("/subscriptions/stats", methods=["GET"])

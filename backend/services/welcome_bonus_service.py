@@ -1,23 +1,23 @@
 """
-Welcome Bonus Service - One-time +50 credits for first verified paid purchase.
+Welcome Bonus Service - One-time +50 credits on email verification.
 
 Business rules:
   1. User must have email_verified = TRUE
-  2. User must have just completed a real paid credits purchase
-  3. Bonus is granted AT MOST ONCE per identity (enforced by DB unique index)
-  4. Grant goes through the standard wallet ledger (auditable, admin-visible)
-  5. In-app notification is created (also idempotent via ref_type/ref_id)
+  2. Bonus is granted AT MOST ONCE per identity (enforced by DB unique index)
+  3. Grant goes through the standard wallet ledger (auditable, admin-visible)
+  4. In-app notification is created (also idempotent via ref_type/ref_id)
 
 Idempotency:
   - DB partial unique index uq_ledger_welcome_bonus_once prevents double-grant
   - ON CONFLICT DO NOTHING silently skips if already granted
   - Notification uses ref_type='welcome_bonus' with identity-scoped ref_id
   - Safe under webhook replay, duplicate finalization, race conditions
+  - Safe to call from purchase paths too — silently skipped if already granted
 
 Usage:
     from backend.services.welcome_bonus_service import try_welcome_bonus
 
-    # Call after successful purchase credit grant
+    # Call after email verification (primary trigger)
     try_welcome_bonus(identity_id)
 """
 
@@ -41,12 +41,11 @@ def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
 
     Checks:
       1. Identity has email_verified = TRUE
-      2. Identity has at least one completed paid purchase
-      3. No welcome bonus has been granted before (DB-enforced uniqueness)
+      2. No welcome bonus has been granted before (DB-enforced uniqueness)
 
     If all pass, grants 50 general credits and creates an in-app notification.
 
-    Safe to call from both purchase finalization and email verification paths.
+    Safe to call from email verification, purchase finalization, or payment webhooks.
     The DB unique index guarantees at-most-once granting regardless of caller.
 
     Args:
@@ -58,14 +57,10 @@ def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
         None on error (non-fatal, logged)
     """
     try:
-        # 1. Check verified status + paid purchase existence in one query
+        # 1. Check verified status
         row = query_one(
             f"""
-            SELECT i.email_verified,
-                   EXISTS (
-                       SELECT 1 FROM {Tables.PURCHASES} p
-                       WHERE p.identity_id = i.id AND p.status = 'completed'
-                   ) AS has_paid_purchase
+            SELECT i.email_verified
             FROM {Tables.IDENTITIES} i
             WHERE i.id = %s
             """,
@@ -77,10 +72,6 @@ def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
 
         if not row.get("email_verified"):
             logger.debug("[WELCOME_BONUS] Not verified, skipping: %s", identity_id)
-            return None
-
-        if not row.get("has_paid_purchase"):
-            logger.debug("[WELCOME_BONUS] No paid purchase, skipping: %s", identity_id)
             return None
 
         # 2. Attempt idempotent grant inside a transaction
@@ -120,9 +111,9 @@ def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
                 (
                     identity_id,
                     WELCOME_BONUS_CREDITS,
-                    f"first_verified_purchase:{identity_id}",
+                    f"email_verified:{identity_id}",
                     json.dumps({
-                        "reason": "welcome_bonus_first_verified_purchase",
+                        "reason": "welcome_bonus_email_verified",
                         "credits": WELCOME_BONUS_CREDITS,
                     }),
                     WELCOME_BONUS_CREDIT_TYPE,
@@ -165,16 +156,16 @@ def try_welcome_bonus(identity_id: str) -> Optional[Dict[str, Any]]:
                 category="credit",
                 notif_type="welcome_bonus",
                 title="Welcome bonus unlocked!",
-                body=f"Thanks for verifying your account and making your first purchase "
-                     f"— we've added {WELCOME_BONUS_CREDITS} free credits to your wallet.",
+                body=f"Welcome to TimrX! We've added {WELCOME_BONUS_CREDITS} free credits "
+                     f"to your wallet so you can start creating.",
                 icon="fa-gift",
                 link="/3dprint",
                 meta={
                     "credits": WELCOME_BONUS_CREDITS,
-                    "reason": "first_verified_purchase",
+                    "reason": "email_verified",
                 },
                 ref_type="welcome_bonus",
-                ref_id=f"first_verified_purchase:{identity_id}",
+                ref_id=f"email_verified:{identity_id}",
             )
         except Exception as notif_err:
             # Non-fatal: credits are granted, notification is a bonus

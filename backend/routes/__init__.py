@@ -7,7 +7,6 @@ __all__ = [
     "register_blueprints",
 ]
 
-
 def _print_route_map(app):
     """Print all registered /api/* routes at startup for debugging."""
     api_routes = []
@@ -56,6 +55,7 @@ def register_blueprints(app):
     from backend.routes.prompt_enhance import bp as prompt_enhance_bp
     from backend.routes.webhooks import bp as webhooks_bp
     from backend.routes.notifications import bp as notifications_bp
+    from backend.routes.print_check import bp as print_check_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -106,6 +106,7 @@ def register_blueprints(app):
     else:
         print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
     app.register_blueprint(notifications_bp, url_prefix="/api/_mod")
+    app.register_blueprint(print_check_bp, url_prefix="/api/_mod")
     app.register_blueprint(contact_bp, url_prefix="/api")
     app.register_blueprint(webhooks_bp, url_prefix="/api")
 

@@ -21,6 +21,13 @@ from backend.config import config
 def create_app() -> Flask:
     app = Flask(__name__)
 
+    # Initialize structured logging (must be before anything logs)
+    try:
+        from backend.logging_config import setup_logging
+        setup_logging()
+    except ImportError:
+        pass  # structlog not installed yet — fall back to print()
+
     if config.IS_DEV:
         config.print_summary()
     config_warnings = config.validate()
@@ -66,6 +73,19 @@ def create_app() -> Flask:
         g._identity_source = None
         g._identity_touch_done = False
         g._cached_identity = None
+
+    @app.before_request
+    def _add_trace_id():
+        """Bind a trace ID to the request context for structured logging."""
+        import uuid
+        trace_id = request.headers.get('X-Trace-Id') or uuid.uuid4().hex[:8]
+        g.trace_id = trace_id
+        try:
+            import structlog
+            structlog.contextvars.clear_contextvars()
+            structlog.contextvars.bind_contextvars(trace_id=trace_id)
+        except ImportError:
+            pass
 
     # ── Lightweight per-request diagnostic (auth efficiency) ──
     _AUTH_DIAG = os.getenv("AUTH_DIAG", "false").lower() in ("true", "1", "yes")

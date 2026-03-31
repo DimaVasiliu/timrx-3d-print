@@ -44,24 +44,10 @@ from backend.utils.helpers import clamp_int, log_event, log_status_summary, norm
 
 bp = Blueprint("text_to_3d", __name__)
 
-# ── Status response cache (per job_id, 3-second TTL) ──
-# Cuts DB calls from status polling by 50-80%: duplicate/near-duplicate
-# requests within the TTL window get a cached response with zero DB work.
+# ── Status response cache ──
+# Uses the shared thread-safe status cache service (same as all other routes).
 import time as _time
-_status_cache: dict = {}  # job_id -> (monotonic_ts, response_dict)
-_STATUS_CACHE_TTL = 3  # seconds
-
-def _get_cached_status(job_id: str):
-    cached = _status_cache.get(job_id)
-    if cached and (_time.monotonic() - cached[0]) < _STATUS_CACHE_TTL:
-        return cached[1]
-    return None
-
-def _set_status_cache(job_id: str, data: dict):
-    _status_cache[job_id] = (_time.monotonic(), data)
-
-def _clear_status_cache(job_id: str):
-    _status_cache.pop(job_id, None)
+from backend.services.status_cache import get_cached_status as _get_cached_status, cache_status as _set_status_cache, invalidate_status as _clear_status_cache
 
 # ── Finalization short-circuit (TTL-based) ──
 # Prevents duplicate finalize calls from burning 3-4 pool connections each.
@@ -723,6 +709,17 @@ def text_to_3d_status_mod(job_id: str):
                     model_id=s3_result.get("model_id"),
                     glb_url=s3_result.get("glb_url"),
                 )
+                # Include generation duration in the response for frontend display
+                try:
+                    from backend.db import query_one as _q1
+                    _dur_row = _q1(
+                        f"SELECT generation_duration_ms FROM {Tables.JOBS} WHERE id = %s",
+                        (internal_job_id,),
+                    )
+                    if _dur_row and _dur_row.get("generation_duration_ms"):
+                        out["generation_duration_ms"] = _dur_row["generation_duration_ms"]
+                except Exception:
+                    pass  # Non-critical
 
     # If DB has the finalized model, prefer S3 URLs for frontend rendering.
     if USE_DB and identity_id:
@@ -759,9 +756,9 @@ def text_to_3d_status_mod(job_id: str):
         if internal_job_id:
             _update_job_status_failed(internal_job_id, error_msg)
 
-    # Cache non-terminal status responses for 3s to absorb duplicate polls.
-    # Terminal states (done/failed) are cached too — they won't change.
-    _set_status_cache(job_id, out)
+    # Cache status responses via the shared thread-safe cache.
+    # Terminal states (done/failed) get a longer TTL since they won't change.
+    _set_status_cache(job_id, out, is_terminal=(out.get("status") in ("done", "failed")))
 
     return jsonify(out)
 

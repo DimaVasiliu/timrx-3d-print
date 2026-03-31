@@ -16,3 +16,8 @@ cryptography>=41.0.0  # Required for PyJWT RS256 signing (service account auth)
 Pillow==11.1.0
 # Invoice PDF generation
 fpdf2==2.8.1
+# 3D mesh analysis for print-readiness checks
+trimesh>=4.0.0
+numpy>=1.24.0
+# Structured logging
+structlog>=24.0.0

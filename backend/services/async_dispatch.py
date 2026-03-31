@@ -52,6 +52,71 @@ from backend.services.piapi_nano_banana_service import (
 # Video router imports moved to lazy-load inside video functions to avoid
 # image pipeline depending on video dependencies at import time
 
+# ── Circuit Breaker ──────────────────────────────────────────────────────────
+# Stops dispatching to a provider after repeated failures, preventing
+# wasted threads, credit reservations, and user wait time.
+
+import threading as _threading
+
+
+class CircuitBreaker:
+    """Simple circuit breaker for AI provider dispatch."""
+
+    def __init__(self, name: str, failure_threshold: int = 5, reset_timeout: int = 120):
+        self.name = name
+        self.failures = 0
+        self.threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.last_failure_time = 0.0
+        self.state = "closed"  # closed = normal, open = blocking, half-open = testing
+        self._lock = _threading.Lock()
+
+    def allow_request(self) -> bool:
+        with self._lock:
+            if self.state == "closed":
+                return True
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "half-open"
+                print(f"[CIRCUIT-BREAKER] {self.name}: half-open, allowing test request")
+                return True
+            return False
+
+    def record_success(self):
+        with self._lock:
+            if self.state == "half-open":
+                print(f"[CIRCUIT-BREAKER] {self.name}: test succeeded, closing circuit")
+            self.failures = 0
+            self.state = "closed"
+
+    def record_failure(self):
+        with self._lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+            if self.failures >= self.threshold:
+                self.state = "open"
+                print(f"[CIRCUIT-BREAKER] {self.name}: OPEN after {self.failures} failures")
+
+    def get_status(self) -> dict:
+        with self._lock:
+            return {"state": self.state, "failures": self.failures, "name": self.name}
+
+
+# One breaker per provider
+_breakers = {
+    "meshy": CircuitBreaker("meshy"),
+    "openai": CircuitBreaker("openai"),
+    "gemini": CircuitBreaker("gemini"),
+    "piapi": CircuitBreaker("piapi"),
+    "vertex": CircuitBreaker("vertex"),
+    "fal": CircuitBreaker("fal"),
+}
+
+
+def get_circuit_breaker_status() -> dict:
+    """Return status of all circuit breakers (for admin monitoring)."""
+    return {name: b.get_status() for name, b in _breakers.items()}
+
+
 # Shared executor for background tasks
 _dispatch_max_workers = int(os.getenv("DISPATCH_MAX_WORKERS", "12"))
 _background_executor = ThreadPoolExecutor(max_workers=_dispatch_max_workers, thread_name_prefix="job_worker")
@@ -72,7 +137,15 @@ def dispatch_meshy_text_to_3d_async(
 ):
     start_time = time.time()
     stage = store_meta.get("stage", "preview")
+    breaker = _breakers.get("meshy")
     print(f"[TEXT-TO-3D] Starting dispatch job={internal_job_id} stage={stage} reservation={reservation_id}")
+
+    if breaker and not breaker.allow_request():
+        print(f"[TEXT-TO-3D] Circuit breaker OPEN for meshy — failing fast job={internal_job_id}")
+        if reservation_id:
+            release_job_credits(reservation_id, "meshy_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "3D generation service is temporarily unavailable. Please try again in a few minutes.")
+        return
 
     try:
         webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
@@ -90,6 +163,8 @@ def dispatch_meshy_text_to_3d_async(
             return
 
         print(f"[TEXT-TO-3D] Provider accepted job={internal_job_id} meshy_task={meshy_task_id} duration={duration_ms}ms")
+        if breaker:
+            breaker.record_success()
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
@@ -110,6 +185,8 @@ def dispatch_meshy_text_to_3d_async(
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[TEXT-TO-3D] FAILED job={internal_job_id} stage={stage} duration={duration_ms}ms error={e}")
+        if breaker:
+            breaker.record_failure()
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_job_error_message
@@ -125,7 +202,15 @@ def dispatch_meshy_refine_async(
 ):
     start_time = time.time()
     preview_id = payload.get("preview_task_id", "?")
+    breaker = _breakers.get("meshy")
     print(f"[REFINE] Starting dispatch job={internal_job_id} preview={preview_id} reservation={reservation_id}")
+
+    if breaker and not breaker.allow_request():
+        print(f"[REFINE] Circuit breaker OPEN for meshy — failing fast job={internal_job_id}")
+        if reservation_id:
+            release_job_credits(reservation_id, "meshy_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "3D generation service is temporarily unavailable. Please try again in a few minutes.")
+        return
 
     try:
         webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
@@ -167,6 +252,8 @@ def dispatch_meshy_refine_async(
             return
 
         print(f"[REFINE] Provider accepted job={internal_job_id} meshy_task={meshy_task_id} duration={duration_ms}ms")
+        if breaker:
+            breaker.record_success()
 
         update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
@@ -188,6 +275,8 @@ def dispatch_meshy_refine_async(
         duration_ms = int((time.time() - start_time) * 1000)
         err_text = str(e)
         print(f"[REFINE] FAILED job={internal_job_id} duration={duration_ms}ms error={err_text}")
+        if breaker:
+            breaker.record_failure()
         if reservation_id:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_job_error_message
@@ -351,8 +440,15 @@ def dispatch_openai_image_async(
     store_meta: dict,
 ):
     start_time = time.time()
-    # print(f"[ASYNC] Starting OpenAI image dispatch for job {internal_job_id}")
-    # print(f"[JOB] provider_started job_id={internal_job_id} provider=openai action=image-gen reservation_id={reservation_id}")
+    breaker = _breakers.get("openai")
+
+    if breaker and not breaker.allow_request():
+        print(f"[OPENAI] Circuit breaker OPEN — failing fast job={internal_job_id}")
+        if reservation_id:
+            release_job_credits(reservation_id, "openai_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "Image generation service is temporarily unavailable. Please try again in a few minutes.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
 
     try:
         resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
@@ -416,17 +512,20 @@ def dispatch_openai_image_async(
             image_url=urls[0],
         )
 
+        if breaker:
+            breaker.record_success()
+
         # Post to Discord
         send_to_discord("🖼️ New AI Image Generated", prompt, urls[0], identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
 
-        # print(f"[ASYNC] OpenAI image job {internal_job_id} completed successfully")
-
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[PROVIDER_ERROR] provider=openai job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        if breaker:
+            breaker.record_failure()
         if reservation_id:
             release_job_credits(reservation_id, "openai_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_job_error_message
@@ -452,8 +551,15 @@ def dispatch_gemini_image_async(
     with job_id + reservation_id, so frontend can see the held credits.
     """
     start_time = time.time()
-    # print(f"[ASYNC] Starting Gemini image dispatch for job {internal_job_id}")
-    # print(f"[JOB] provider_started job_id={internal_job_id} provider=google action=image-gen reservation_id={reservation_id}")
+    breaker = _breakers.get("gemini")
+
+    if breaker and not breaker.allow_request():
+        print(f"[GEMINI] Circuit breaker OPEN — failing fast job={internal_job_id}")
+        if reservation_id:
+            release_job_credits(reservation_id, "gemini_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "Image generation service is temporarily unavailable. Please try again in a few minutes.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
 
     try:
         # Call Gemini API
@@ -518,17 +624,20 @@ def dispatch_gemini_image_async(
             image_url=image_url or image_urls[0],
         )
 
+        if breaker:
+            breaker.record_success()
+
         # Post to Discord
         send_to_discord("🖼️ New AI Image Generated", prompt, image_url or image_urls[0], identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
 
-        # print(f"[ASYNC] Gemini image job {internal_job_id} completed successfully")
-
     except GeminiImageConfigError as e:
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} type=config error={e}")
+        if breaker:
+            breaker.record_failure()
         if reservation_id:
             release_job_credits(reservation_id, "gemini_config_error", internal_job_id)
         update_job_status_failed(internal_job_id, "Image generation temporarily unavailable. Please try again shortly.")
@@ -537,6 +646,7 @@ def dispatch_gemini_image_async(
     except GeminiImageValidationError as e:
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} type=validation error={e.message}")
+        # Validation errors are user-input issues, not provider failures — don't trip circuit breaker
         if reservation_id:
             release_job_credits(reservation_id, "gemini_validation_error", internal_job_id)
         update_job_status_failed(internal_job_id, "Image generation failed. Please try again.")
@@ -545,6 +655,8 @@ def dispatch_gemini_image_async(
     except GeminiImageAuthError as e:
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} type=auth error={e}")
+        if breaker:
+            breaker.record_failure()
         if reservation_id:
             release_job_credits(reservation_id, "gemini_auth_error", internal_job_id)
         update_job_status_failed(internal_job_id, "Image generation temporarily unavailable. Please try again shortly.")
@@ -553,6 +665,8 @@ def dispatch_gemini_image_async(
     except Exception as e:
         duration_ms = int((time.time() - start_time) * 1000)
         print(f"[PROVIDER_ERROR] provider=gemini job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        if breaker:
+            breaker.record_failure()
         if reservation_id:
             release_job_credits(reservation_id, "gemini_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_job_error_message
