@@ -1888,6 +1888,12 @@ class MollieService:
 
             sub_id = str(sub["id"])
 
+            try:
+                from backend.routes.billing import invalidate_subscription_cache
+                invalidate_subscription_cache(identity_id)
+            except Exception:
+                pass
+
             # Grant first month credits (payment already confirmed)
             first_period_end = SubscriptionService.calculate_next_credit_date(now, billing_day)
             cycle_result = SubscriptionService.grant_subscription_credits(
@@ -2474,6 +2480,11 @@ class MollieService:
                         "reason": "new_checkout_started",
                         "new_plan_code": plan_code,
                     })
+                try:
+                    from backend.routes.billing import invalidate_subscription_cache
+                    invalidate_subscription_cache(identity_id)
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[SUB] Warning: Could not expire old pending subscriptions: {e}")
 
@@ -2610,6 +2621,11 @@ class MollieService:
                         f"[SUB] Created pending subscription: sub_id={subscription_id} "
                         f"payment_id={payment_id} plan={plan_code} status=pending_payment"
                     )
+                    try:
+                        from backend.routes.billing import invalidate_subscription_cache
+                        invalidate_subscription_cache(identity_id)
+                    except Exception:
+                        pass
                     # Log event
                     SubscriptionService._log_event(subscription_id, "checkout_started", {
                         "plan_code": plan_code,
