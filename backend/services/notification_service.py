@@ -21,7 +21,7 @@ Usage:
         title="You received a tip!",
         body=f"Someone tipped your post {amount} credits",
         icon="fa-hand-holding-dollar",
-        link="/3dprint#community",
+        link="/community",
         meta={"amount": amount, "post_id": post_id, "tipper_id": tipper_id},
         send_email=True,
     )
@@ -155,7 +155,7 @@ class NotificationService:
             title: Short notification title (max 256 chars)
             body: Optional longer description
             icon: Font Awesome icon class (e.g. 'fa-hand-holding-dollar')
-            link: Deep-link path (e.g. '/3dprint#community')
+            link: Deep-link path (e.g. '/community')
             meta: Extra JSON data (amount, job_id, sender, etc.)
             send_email: Whether to also queue an email notification
             ref_type: Reference type for dedup (e.g. 'job', 'reaction', 'purchase')
