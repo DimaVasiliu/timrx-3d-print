@@ -53,6 +53,20 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
     "PIAPI_IMAGE_GENERATE":     0.048,
     "PIAPI_IMAGE_GENERATE_2K":  0.064,
     "PIAPI_IMAGE_GENERATE_4K":  0.096,
+    # Direct Google Nano (Gemini 2.5 Flash Image)
+    "GOOGLE_NANO_IMAGE":              0.031,
+    "GOOGLE_NANO_IMAGE_GENERATE":     0.031,
+    # BFL FLUX.2 Pro
+    "FLUX_PRO_IMAGE":                 0.044,
+    "FLUX_PRO_IMAGE_GENERATE":        0.044,
+    # Ideogram V3
+    "IDEOGRAM_V3_IMAGE":              0.032,
+    "IDEOGRAM_V3_IMAGE_GENERATE":     0.032,
+    # Recraft V4 raster / vector
+    "RECRAFT_V4_IMAGE":               0.064,
+    "RECRAFT_V4_IMAGE_GENERATE":      0.064,
+    "RECRAFT_V4_VECTOR":              0.064,
+    "RECRAFT_V4_VECTOR_GENERATE":     0.064,
 }
 
 
@@ -130,7 +144,7 @@ def estimate_provider_cost(
     Estimate upstream provider cost in GBP for any job.
 
     Args:
-        provider:    Provider name (meshy, openai, google, vertex, seedance, fal_seedance)
+        provider:    Provider name (meshy, openai, google, google_nano, flux_pro, ideogram_v3, recraft_v4, vertex, seedance, fal_seedance)
         action_code: Action code from the jobs table
         meta:        Job metadata (used for video duration/tier)
 

@@ -18,7 +18,18 @@ from flask import Blueprint, Response, jsonify, request
 from backend.config import OPENAI_API_KEY, config
 from backend.db import USE_DB, get_conn, dict_row, Tables
 from backend.middleware import with_session, with_session_readonly
-from backend.services.async_dispatch import get_executor, _dispatch_openai_image_async, dispatch_gemini_image_async, dispatch_piapi_nano_banana_async, update_job_status_ready, update_job_status_failed
+from backend.services.async_dispatch import (
+    get_executor,
+    _dispatch_openai_image_async,
+    dispatch_flux_pro_image_async,
+    dispatch_gemini_image_async,
+    dispatch_google_nano_image_async,
+    dispatch_ideogram_v3_image_async,
+    dispatch_piapi_nano_banana_async,
+    dispatch_recraft_v4_image_async,
+    update_job_status_ready,
+    update_job_status_failed,
+)
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.expense_guard import ExpenseGuard
 from backend.services.gemini_image_service import (
@@ -30,10 +41,37 @@ from backend.services.gemini_image_service import (
     ALLOWED_ASPECT_RATIOS,
     ALLOWED_IMAGE_SIZES,
 )
+from backend.services.google_nano_image_service import (
+    check_google_nano_configured,
+    ALLOWED_ASPECT_RATIOS as GOOGLE_NANO_ALLOWED_ASPECT_RATIOS,
+    ALLOWED_IMAGE_SIZES as GOOGLE_NANO_ALLOWED_IMAGE_SIZES,
+)
+from backend.services.flux_pro_service import check_flux_pro_configured
+from backend.services.ideogram_v3_service import check_ideogram_v3_configured
 from backend.services.piapi_nano_banana_service import (
     check_piapi_configured,
     ALLOWED_ASPECT_RATIOS as PIAPI_ALLOWED_ASPECT_RATIOS,
     ALLOWED_RESOLUTIONS as PIAPI_ALLOWED_RESOLUTIONS,
+)
+from backend.services.recraft_image_service import (
+    check_recraft_v4_configured,
+    ALLOWED_OUTPUT_MODES as RECRAFT_ALLOWED_OUTPUT_MODES,
+)
+from backend.services.image_asset_utils import (
+    coerce_bool,
+    coerce_float,
+    coerce_int,
+    ensure_asset_url,
+    normalize_asset_list,
+    normalize_string_list,
+)
+from backend.services.image_provider_registry import (
+    IMAGE_PROVIDER_REGISTRY,
+    get_allowed_image_providers,
+    get_enabled_image_providers,
+    get_image_action_key as get_registry_image_action_key,
+    get_image_provider_spec,
+    is_image_provider_enabled,
 )
 from backend.services.history_service import get_canonical_image_row, save_image_to_normalized_db
 from backend.services.identity_service import require_identity
@@ -45,45 +83,79 @@ from backend.utils.helpers import now_s, log_event
 bp = Blueprint("image_gen", __name__)
 
 
-# ── Provider-aware image action key mapping ──────────────────
-# Each provider has its own DB action code with distinct pricing:
-#   OpenAI:      image_generate (4c), image_generate_2k (8c) — no 4K
-#   Gemini:      gemini_image_generate (4c), gemini_image_generate_2k (8c) — no 4K
-#   Nano Banana: piapi_image_generate (7c), piapi_image_generate_2k (12c), piapi_image_generate_4k (18c)
-# NOTE: 4K is EXCLUSIVE to Nano Banana. OpenAI/Gemini only support Standard + 2K.
-_IMAGE_ACTION_BY_PROVIDER_SIZE = {
-    "openai": {
-        "1K": "image_generate",
-        "2K": "image_generate_2k",
-    },
-    "google": {
-        "1K": "gemini_image_generate",
-        "2K": "gemini_image_generate_2k",
-    },
-    "nano_banana": {
-        "1K": "piapi_image_generate",
-        "2K": "piapi_image_generate_2k",
-        "4K": "piapi_image_generate_4k",
-    },
+def _get_image_action_key(image_size: str = "1K", provider: str = "openai") -> str:
+    """Return the provider-specific canonical action key for the given quality tier."""
+    return get_registry_image_action_key(provider=provider, image_size=image_size)
+
+
+def _validate_provider_image_size(image_size: str, provider: str):
+    """Reject unsupported size tiers per provider. Returns error response or None."""
+    spec = get_image_provider_spec(provider)
+    requested = (image_size or "").upper()
+    if not spec or not requested:
+        return None
+    allowed = list(spec.image_sizes)
+    if requested not in spec.image_sizes:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"{requested} resolution is not available with provider '{provider}'.",
+            "field": "image_size",
+            "allowed": allowed,
+        }), 400
+    return None
+
+
+FLUX_PRO_RESOLUTION_MAP = {
+    "square": (1024, 1024),
+    "portrait": (1024, 1536),
+    "landscape": (1536, 1024),
+}
+
+IDEOGRAM_RESOLUTION_MAP = {
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+    "landscape": "1536x1024",
+}
+
+RECRAFT_SIZE_MAP = {
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+    "landscape": "1536x1024",
 }
 
 
-def _get_image_action_key(image_size: str = "1K", provider: str = "openai") -> str:
-    """Return the provider-specific canonical action key for the given quality tier."""
-    provider_map = _IMAGE_ACTION_BY_PROVIDER_SIZE.get(provider, _IMAGE_ACTION_BY_PROVIDER_SIZE["openai"])
-    return provider_map.get(image_size, provider_map.get("1K", "image_generate"))
+def _provider_disabled_response(provider: str):
+    return jsonify({
+        "error": "provider_disabled",
+        "message": f"Image provider '{provider}' is disabled.",
+        "allowed": get_enabled_image_providers(),
+    }), 400
 
 
-def _validate_4k_provider(image_size: str, provider: str):
-    """Reject 4K requests for non-Nano-Banana providers. Returns error response or None."""
-    if image_size == "4K" and provider != "nano_banana":
-        return jsonify({
-            "error": "invalid_params",
-            "message": "4K resolution is only available with the Nano Banana provider.",
-            "field": "image_size",
-            "allowed_for_4k": ["nano_banana"]
-        }), 400
-    return None
+def _parse_resolution_pair(raw: str | None, fallback: tuple[int, int]) -> tuple[int, int]:
+    text = (raw or "").strip().lower()
+    if "x" in text:
+        try:
+            width_text, height_text = text.split("x", 1)
+            return int(width_text), int(height_text)
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _body_value(body: dict, *keys: str, default=None):
+    for key in keys:
+        if key in body and body.get(key) is not None:
+            return body.get(key)
+    return default
+
+
+def _normalize_image_inputs(body: dict, *keys: str) -> list[str]:
+    for key in keys:
+        value = body.get(key)
+        if value is not None:
+            return normalize_asset_list(value)
+    return []
 
 
 # OpenAI blob hosts (from monolith)
@@ -92,6 +164,53 @@ ALLOWED_IMAGE_HOSTS = {
     "oaidalleapiprodscus.bblob.core.windows.net",
     "oaidalleapiprodscus.blob.core.windows.net:443",
 }
+
+_IMAGE_PROVIDER_PUBLIC_ORDER = (
+    "nano_banana",
+    "openai",
+    "google",
+    "google_nano",
+    "flux_pro",
+    "ideogram_v3",
+    "recraft_v4",
+)
+
+
+@bp.route("/image/providers", methods=["GET"])
+@with_session_readonly
+def image_provider_catalog():
+    enabled_set = set(get_enabled_image_providers())
+    ordered_enabled = [provider for provider in _IMAGE_PROVIDER_PUBLIC_ORDER if provider in enabled_set]
+    if not ordered_enabled:
+        ordered_enabled = [provider for provider in IMAGE_PROVIDER_REGISTRY if provider in enabled_set]
+
+    providers = []
+    for provider in ordered_enabled:
+        spec = get_image_provider_spec(provider)
+        if not spec:
+            continue
+        providers.append(
+            {
+                "id": spec.provider,
+                "name": spec.display_name,
+                "image_sizes": list(spec.image_sizes),
+                "default_image_size": spec.default_image_size,
+                "output_modes": list(spec.output_modes),
+                "provider_variant": spec.provider_variant,
+                "model": spec.model,
+            }
+        )
+
+    default_provider = ordered_enabled[0] if ordered_enabled else None
+
+    return jsonify(
+        {
+            "ok": True,
+            "providers": providers,
+            "enabled_providers": ordered_enabled,
+            "default_provider": default_provider,
+        }
+    )
 
 
 @bp.route("/image/generate", methods=["POST", "OPTIONS"])
@@ -102,12 +221,12 @@ def image_generate_unified():
 
     Request body:
     {
-        "provider": "google" | "openai",  # Default: "openai"
+        "provider": "google" | "openai" | "nano_banana" | "google_nano" | "flux_pro" | "ideogram_v3" | "recraft_v4",
         "prompt": "A beautiful sunset...",
         "aspect_ratio": "16:9",           # For Google: "1:1", "3:4", "4:3", "9:16", "16:9"
         "image_size": "1K",               # For Google: "1K" or "2K"
         "size": "1024x1024",              # For OpenAI
-        "model": "gpt-image-1",           # For OpenAI
+        "model": "gpt-image-1.5",          # For OpenAI (default; gpt-image-1 still supported)
         "n": 1                            # Number of images
     }
 
@@ -133,10 +252,19 @@ def image_generate_unified():
     body = request.get_json(silent=True) or {}
     provider = (body.get("provider") or "openai").lower()
 
-    # 4K is exclusive to Nano Banana — reject early for other providers
-    req_size = (body.get("image_size") or body.get("imageSize") or body.get("resolution") or "").upper()
-    if req_size == "4K":
-        err = _validate_4k_provider(req_size, provider)
+    spec = get_image_provider_spec(provider)
+    if not spec:
+        return jsonify({
+            "error": "invalid_provider",
+            "message": f"Unknown image provider: {provider}",
+            "allowed": get_allowed_image_providers(),
+        }), 400
+    if not is_image_provider_enabled(provider):
+        return _provider_disabled_response(provider)
+
+    req_size = (body.get("image_size") or body.get("imageSize") or body.get("quality_tier") or "").upper()
+    if req_size:
+        err = _validate_provider_image_size(req_size, provider)
         if err:
             return err
 
@@ -160,6 +288,14 @@ def image_generate_unified():
     elif provider == "google":
         # Route to Gemini Imagen
         return _handle_gemini_image_generate(body)
+    elif provider == "google_nano":
+        return _handle_google_nano_image_generate(body)
+    elif provider == "flux_pro":
+        return _handle_flux_pro_image_generate(body)
+    elif provider == "ideogram_v3":
+        return _handle_ideogram_v3_image_generate(body)
+    elif provider == "recraft_v4":
+        return _handle_recraft_v4_image_generate(body)
     elif provider == "openai":
         # Route to OpenAI (via existing endpoint logic)
         return _handle_openai_image_generate(body)
@@ -167,7 +303,7 @@ def image_generate_unified():
         return jsonify({
             "error": "invalid_provider",
             "message": f"Unknown image provider: {provider}",
-            "allowed": ["nano_banana", "google", "openai"]
+            "allowed": get_allowed_image_providers(),
         }), 400
 
 
@@ -243,7 +379,7 @@ def _handle_nano_banana_image_generate(body: dict):
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "model": "nano-banana-2", "provider": "nano_banana"},
+        {"prompt": prompt[:100], "model": "gemini-2.5-flash-image", "provider": "nano_banana"},
     )
     if credit_error:
         return credit_error
@@ -253,7 +389,7 @@ def _handle_nano_banana_image_generate(body: dict):
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": "nano-banana-2",
+        "model": "gemini-2.5-flash-image",
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "output_format": output_format,
@@ -309,7 +445,7 @@ def _handle_nano_banana_image_generate(body: dict):
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
-        "model": "nano-banana-2",
+        "model": "gemini-2.5-flash-image",
         "provider": "nano_banana",
     }
 
@@ -466,6 +602,562 @@ def _handle_gemini_image_generate(body: dict):
     return jsonify(response_data)
 
 
+def _handle_google_nano_image_generate(body: dict):
+    """Handle direct Google Nano image generation (async)."""
+    is_configured, config_error = check_google_nano_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "google_nano_not_configured",
+            "message": "Google Nano image provider is not configured. Set GEMINI_API_KEY.",
+            "details": {"hint": config_error},
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
+
+    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
+    image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
+
+    guard_error = ExpenseGuard.check_image_request(n=1)
+    if guard_error:
+        return guard_error
+
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="google_nano", aspect_ratio=aspect_ratio, image_size=image_size,
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
+    if aspect_ratio not in GOOGLE_NANO_ALLOWED_ASPECT_RATIOS:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid aspect_ratio: {aspect_ratio}",
+            "field": "aspect_ratio",
+            "allowed": list(GOOGLE_NANO_ALLOWED_ASPECT_RATIOS),
+        }), 400
+    if image_size not in GOOGLE_NANO_ALLOWED_IMAGE_SIZES:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid image_size: {image_size}",
+            "field": "image_size",
+            "allowed": list(GOOGLE_NANO_ALLOWED_IMAGE_SIZES),
+        }), 400
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = get_registry_image_action_key("google_nano", image_size)
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "model": "gemini-2.5-flash-image", "provider": "google_nano"},
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": "gemini-2.5-flash-image",
+        "aspect_ratio": aspect_ratio,
+        "image_size": image_size,
+        "provider_variant": "direct_google",
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "google_nano",
+    }
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="google_nano",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
+    get_executor().submit(
+        dispatch_google_nano_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        prompt,
+        aspect_ratio,
+        image_size,
+        store_meta,
+    )
+
+    balance_info = get_current_balance(identity_id)
+    response_data = {
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": "gemini-2.5-flash-image",
+        "provider": "google_nano",
+        "provider_variant": "direct_google",
+    }
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+    return jsonify(response_data)
+
+
+def _handle_flux_pro_image_generate(body: dict):
+    """Handle BFL FLUX.2 image generation / editing (async)."""
+    is_configured, config_error = check_flux_pro_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "flux_pro_not_configured",
+            "message": "FLUX.2 Pro is not configured. Set BFL_API_KEY and enable IMAGE_PROVIDER_FLUX_PRO_ENABLED.",
+            "details": {"hint": config_error},
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
+
+    shape = body.get("shape") or "square"
+    width, height = _parse_resolution_pair(
+        _body_value(body, "resolution", "size"),
+        FLUX_PRO_RESOLUTION_MAP.get(shape, FLUX_PRO_RESOLUTION_MAP["square"]),
+    )
+    model_variant = str(_body_value(body, "model_variant", "modelVariant", default="pro") or "pro").strip().lower()
+    operation = str(_body_value(body, "operation", default="generate") or "generate").strip().lower()
+    source_images = _normalize_image_inputs(body, "source_image", "sourceImage", "input_image")
+    extra_references = _normalize_image_inputs(body, "reference_images", "referenceImages", "input_images")
+    reference_images = []
+    for index, asset in enumerate(source_images + extra_references, start=1):
+        asset_url = ensure_asset_url(
+            asset,
+            provider="flux_pro",
+            identity_id=identity_id,
+            prefix="source_images",
+            name=f"flux-ref-{index}",
+        )
+        if asset_url:
+            if asset_url.startswith("data:"):
+                return jsonify({
+                    "error": "invalid_params",
+                    "message": "FLUX reference images must resolve to accessible URLs. AWS-backed uploads are required for local data URLs.",
+                    "field": "source_image",
+                }), 400
+            reference_images.append(asset_url)
+    if reference_images and operation == "generate":
+        operation = "edit"
+
+    request_options = {
+        "prompt": prompt,
+        "operation": operation,
+        "model_variant": model_variant,
+        "width": width,
+        "height": height,
+        "reference_images": reference_images,
+        "prompt_upsampling": coerce_bool(_body_value(body, "prompt_upsampling", "promptUpsampling"), True),
+        "seed": coerce_int(body.get("seed")),
+        "guidance": coerce_float(body.get("guidance")),
+        "steps": coerce_int(body.get("steps")),
+        "safety_tolerance": coerce_int(_body_value(body, "safety_tolerance", "safetyTolerance"), 2),
+        "output_format": str(_body_value(body, "output_format", "outputFormat", default="jpeg") or "jpeg").strip().lower(),
+        "transparent_background": coerce_bool(_body_value(body, "transparent_background", "transparentBackground"), False),
+    }
+
+    guard_error = ExpenseGuard.check_image_request(n=1)
+    if guard_error:
+        return guard_error
+
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="flux_pro",
+        width=width,
+        height=height,
+        model_variant=model_variant,
+        operation=operation,
+        source=(reference_images[0] or "")[:96],
+        refs=len(reference_images),
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = get_registry_image_action_key("flux_pro", "1K")
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "model": f"flux-2-{model_variant}", "provider": "flux_pro", "operation": operation},
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": f"flux-2-{model_variant}",
+        "width": width,
+        "height": height,
+        "operation": operation,
+        "model_variant": model_variant,
+        "reference_count": len(reference_images),
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "flux_pro",
+    }
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="flux_pro",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
+    get_executor().submit(
+        dispatch_flux_pro_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        request_options,
+        store_meta,
+    )
+
+    balance_info = get_current_balance(identity_id)
+    response_data = {
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": f"flux-2-{model_variant}",
+        "provider": "flux_pro",
+        "provider_variant": model_variant,
+        "operation": operation,
+    }
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+    return jsonify(response_data)
+
+
+def _handle_ideogram_v3_image_generate(body: dict):
+    """Handle Ideogram V3 generation/edit operations (async wrapper over sync upstream)."""
+    is_configured, config_error = check_ideogram_v3_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "ideogram_v3_not_configured",
+            "message": "Ideogram V3 is not configured. Set IDEOGRAM_API_KEY and enable IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED.",
+            "details": {"hint": config_error},
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    operation = str(_body_value(body, "operation", default="generate") or "generate").strip().lower()
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt and operation not in {"reframe", "upscale"}:
+        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
+
+    shape = body.get("shape") or "square"
+    aspect_ratio = str(_body_value(body, "aspect_ratio", "aspectRatio", default="") or "").strip()
+    resolution = str(
+        _body_value(body, "resolution", "size", default=IDEOGRAM_RESOLUTION_MAP.get(shape, IDEOGRAM_RESOLUTION_MAP["square"])) or ""
+    ).strip()
+    if not aspect_ratio and not resolution and operation != "upscale":
+        resolution = IDEOGRAM_RESOLUTION_MAP.get(shape, IDEOGRAM_RESOLUTION_MAP["square"])
+
+    request_options = {
+        "prompt": prompt,
+        "operation": operation,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "source_image": _body_value(body, "source_image", "sourceImage", "input_image"),
+        "mask_image": _body_value(body, "mask_image", "maskImage"),
+        "style_reference_images": _body_value(body, "style_reference_images", "styleReferenceImages"),
+        "character_reference_images": _body_value(body, "character_reference_images", "characterReferenceImages"),
+        "character_reference_masks": _body_value(body, "character_reference_masks", "characterReferenceMasks"),
+        "seed": coerce_int(body.get("seed")),
+        "rendering_speed": str(_body_value(body, "rendering_speed", "renderingSpeed", default="DEFAULT") or "DEFAULT").strip().upper(),
+        "magic_prompt": str(_body_value(body, "magic_prompt", "magicPrompt", default="AUTO") or "AUTO").strip().upper(),
+        "negative_prompt": str(_body_value(body, "negative_prompt", "negativePrompt", default="") or "").strip(),
+        "style_type": str(_body_value(body, "style_type", "styleType", default="") or "").strip().upper(),
+        "style_preset": str(_body_value(body, "style_preset", "stylePreset", default="") or "").strip(),
+        "style_codes": _body_value(body, "style_codes", "styleCodes"),
+        "color_palette_name": str(_body_value(body, "color_palette_name", "colorPaletteName", default="") or "").strip(),
+        "color_palette_members": _body_value(body, "color_palette_members", "colorPaletteMembers"),
+        "image_weight": coerce_float(_body_value(body, "image_weight", "imageWeight")),
+        "upscale_factor": str(_body_value(body, "upscale_factor", "upscaleFactor", default="X1") or "X1").strip().upper(),
+        "detail": coerce_int(body.get("detail"), 50),
+        "resemblance": coerce_int(body.get("resemblance"), 50),
+        "num_images": 1,
+    }
+
+    guard_error = ExpenseGuard.check_image_request(n=1)
+    if guard_error:
+        return guard_error
+
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="ideogram_v3",
+        resolution=resolution,
+        operation=operation,
+        source=str(request_options.get("source_image") or "")[:96],
+        mask=str(request_options.get("mask_image") or "")[:96],
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = get_registry_image_action_key("ideogram_v3", "1K")
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {"prompt": prompt[:100], "model": "ideogram-v3", "provider": "ideogram_v3", "operation": operation},
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": "ideogram-v3",
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio,
+        "operation": operation,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "ideogram_v3",
+    }
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="ideogram_v3",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
+    get_executor().submit(
+        dispatch_ideogram_v3_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        request_options,
+        store_meta,
+    )
+
+    balance_info = get_current_balance(identity_id)
+    response_data = {
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": "ideogram-v3",
+        "provider": "ideogram_v3",
+        "provider_variant": operation,
+        "operation": operation,
+    }
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+    return jsonify(response_data)
+
+
+def _handle_recraft_v4_image_generate(body: dict):
+    """Handle Recraft generation/edit/vector operations."""
+    is_configured, config_error = check_recraft_v4_configured()
+    if not is_configured:
+        return jsonify({
+            "error": "recraft_v4_not_configured",
+            "message": "Recraft V4 is not configured. Set RECRAFT_API_KEY and enable IMAGE_PROVIDER_RECRAFT_V4_ENABLED.",
+            "details": {"hint": config_error},
+        }), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    operation = str(_body_value(body, "operation", default="generate") or "generate").strip().lower()
+    prompt = (body.get("prompt") or "").strip()
+    if operation in {"generate", "image_to_image", "inpaint", "replace_background", "generate_background"} and not prompt:
+        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
+
+    shape = body.get("shape") or "square"
+    size = str(_body_value(body, "size", "resolution", default=RECRAFT_SIZE_MAP.get(shape, RECRAFT_SIZE_MAP["square"])) or "").strip()
+    model_variant = str(_body_value(body, "model_variant", "modelVariant", default="") or "").strip()
+    output_mode = (body.get("output_mode") or body.get("outputMode") or "raster").lower()
+    if not model_variant:
+        model_variant = "recraftv4_vector" if output_mode == "vector_svg" else "recraftv4"
+    if operation == "vectorize":
+        output_mode = "vector_svg"
+    if "vector" in model_variant.lower():
+        output_mode = "vector_svg"
+    if output_mode not in RECRAFT_ALLOWED_OUTPUT_MODES:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Invalid output_mode: {output_mode}",
+            "field": "output_mode",
+            "allowed": list(RECRAFT_ALLOWED_OUTPUT_MODES),
+        }), 400
+
+    request_options = {
+        "prompt": prompt,
+        "operation": operation,
+        "size": size,
+        "shape": shape,
+        "model_variant": model_variant,
+        "output_mode": output_mode,
+        "style": str(body.get("style") or "").strip(),
+        "style_id": str(_body_value(body, "style_id", "styleId", default="") or "").strip(),
+        "negative_prompt": str(_body_value(body, "negative_prompt", "negativePrompt", default="") or "").strip(),
+        "source_image": _body_value(body, "source_image", "sourceImage", "input_image"),
+        "mask_image": _body_value(body, "mask_image", "maskImage"),
+        "strength": coerce_float(body.get("strength")),
+        "seed": coerce_int(body.get("seed")),
+        "response_format": str(_body_value(body, "response_format", "responseFormat", default="url") or "url").strip(),
+        "background_color": str(_body_value(body, "background_color", "backgroundColor", default="") or "").strip(),
+        "preferred_colors": _body_value(body, "preferred_colors", "preferredColors"),
+        "artistic_level": coerce_int(_body_value(body, "artistic_level", "artisticLevel")),
+        "no_text": coerce_bool(_body_value(body, "no_text", "noText"), False),
+        "svg_compression": coerce_bool(_body_value(body, "svg_compression", "svgCompression"), False),
+        "limit_num_shapes": coerce_bool(_body_value(body, "limit_num_shapes", "limitNumShapes"), False),
+        "max_num_shapes": coerce_int(_body_value(body, "max_num_shapes", "maxNumShapes")),
+        "text_layout": _body_value(body, "text_layout", "textLayout"),
+    }
+
+    guard_error = ExpenseGuard.check_image_request(n=1)
+    if guard_error:
+        return guard_error
+
+    idempotency_key = ExpenseGuard.compute_idempotency_key(
+        identity_id or "", "image_generate", prompt,
+        provider="recraft_v4",
+        size=size,
+        output_mode=output_mode,
+        operation=operation,
+        model_variant=model_variant,
+        source=str(request_options.get("source_image") or "")[:96],
+        mask=str(request_options.get("mask_image") or "")[:96],
+    )
+    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
+    if cached:
+        return jsonify(cached)
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = get_registry_image_action_key("recraft_v4", "1K", output_mode)
+    reservation_id, credit_error = start_paid_job(
+        identity_id,
+        action_key,
+        internal_job_id,
+        {
+            "prompt": prompt[:100],
+            "model": model_variant,
+            "provider": "recraft_v4",
+            "output_mode": output_mode,
+            "operation": operation,
+        },
+    )
+    if credit_error:
+        return credit_error
+
+    store_meta = {
+        "stage": "image",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "model": model_variant,
+        "size": size,
+        "output_mode": output_mode,
+        "operation": operation,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+        "status": "queued",
+        "provider": "recraft_v4",
+    }
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="recraft_v4",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+    ExpenseGuard.register_active_job(internal_job_id, identity_id)
+    get_executor().submit(
+        dispatch_recraft_v4_image_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        request_options,
+        store_meta,
+    )
+
+    balance_info = get_current_balance(identity_id)
+    response_data = {
+        "ok": True,
+        "job_id": internal_job_id,
+        "image_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "model": model_variant,
+        "provider": "recraft_v4",
+        "output_mode": output_mode,
+        "provider_variant": operation,
+        "operation": operation,
+    }
+    ExpenseGuard.cache_response(idempotency_key, response_data)
+    return jsonify(response_data)
+
+
 def _handle_openai_image_generate(body: dict):
     """Handle OpenAI image generation (async, returns job_id for polling)."""
     if not OPENAI_API_KEY:
@@ -498,7 +1190,7 @@ def _handle_openai_image_generate(body: dict):
             size = size_map[key]
             break
 
-    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1").strip()
+    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5").strip()
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
@@ -786,7 +1478,7 @@ def openai_image_mod():
             size = size_map[key]
             break
 
-    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1").strip()
+    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5").strip()
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
@@ -928,6 +1620,12 @@ def _image_status_handler(job_id: str, identity_id: str):
                 if job["status"] == "ready":
                     image_url = meta.get("image_url") or job_meta.get("image_url")
                     image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
+                    artifact_format = meta.get("artifact_format") or job_meta.get("artifact_format")
+                    provider_variant = meta.get("provider_variant") or job_meta.get("provider_variant")
+                    output_mode = meta.get("output_mode") or job_meta.get("output_mode") or "raster"
+                    upstream_request_id = meta.get("upstream_request_id") or job_meta.get("upstream_request_id")
+                    upstream_cost = meta.get("upstream_cost") or job_meta.get("upstream_cost")
+                    mime_type = meta.get("mime_type") or job_meta.get("mime_type")
 
                     canonical = get_canonical_image_row(
                         identity_id,
@@ -941,6 +1639,20 @@ def _image_status_handler(job_id: str, identity_id: str):
                             image_urls = [image_url]
                         if canonical.get("thumbnail_url"):
                             thumbnail_url = canonical["thumbnail_url"]
+                        canonical_meta = canonical.get("meta") or {}
+                        if isinstance(canonical_meta, str):
+                            try:
+                                import json as _json
+                                canonical_meta = _json.loads(canonical_meta)
+                            except Exception:
+                                canonical_meta = {}
+                        if isinstance(canonical_meta, dict):
+                            artifact_format = canonical_meta.get("artifact_format") or canonical_meta.get("format") or artifact_format
+                            provider_variant = canonical_meta.get("provider_variant") or provider_variant
+                            output_mode = canonical_meta.get("output_mode") or output_mode
+                            upstream_request_id = canonical_meta.get("upstream_request_id") or upstream_request_id
+                            upstream_cost = canonical_meta.get("upstream_cost") or upstream_cost
+                            mime_type = canonical_meta.get("mime_type") or mime_type
 
                     balance_info = get_current_balance(identity_id) if identity_id else None
 
@@ -953,8 +1665,14 @@ def _image_status_handler(job_id: str, identity_id: str):
                         "image_urls": image_urls,
                         "thumbnail_url": thumbnail_url,
                         "image_base64": meta.get("image_base64") or job_meta.get("image_base64"),
+                        "mime_type": mime_type,
                         "model": meta.get("model") or job_meta.get("model"),
                         "provider": provider,
+                        "artifact_format": artifact_format,
+                        "provider_variant": provider_variant,
+                        "output_mode": output_mode,
+                        "upstream_request_id": upstream_request_id,
+                        "upstream_cost": upstream_cost,
                         "new_balance": balance_info["available"] if balance_info else None,
                     })
         except Exception as e:
@@ -975,6 +1693,20 @@ def _image_status_handler(job_id: str, identity_id: str):
                 meta["image_urls"] = [canonical["image_url"]]
             if canonical.get("thumbnail_url"):
                 thumbnail_url = canonical["thumbnail_url"]
+            canonical_meta = canonical.get("meta") or {}
+            if isinstance(canonical_meta, str):
+                try:
+                    import json as _json
+                    canonical_meta = _json.loads(canonical_meta)
+                except Exception:
+                    canonical_meta = {}
+            if isinstance(canonical_meta, dict):
+                meta.setdefault("artifact_format", canonical_meta.get("artifact_format") or canonical_meta.get("format"))
+                meta.setdefault("provider_variant", canonical_meta.get("provider_variant"))
+                meta.setdefault("output_mode", canonical_meta.get("output_mode"))
+                meta.setdefault("upstream_request_id", canonical_meta.get("upstream_request_id"))
+                meta.setdefault("upstream_cost", canonical_meta.get("upstream_cost"))
+                meta.setdefault("mime_type", canonical_meta.get("mime_type"))
 
         balance_info = get_current_balance(identity_id) if identity_id else None
 
@@ -987,8 +1719,14 @@ def _image_status_handler(job_id: str, identity_id: str):
             "image_urls": meta.get("image_urls", []),
             "thumbnail_url": thumbnail_url,
             "image_base64": meta.get("image_base64"),
+            "mime_type": meta.get("mime_type"),
             "model": meta.get("model"),
             "provider": provider,
+            "artifact_format": meta.get("artifact_format"),
+            "provider_variant": meta.get("provider_variant"),
+            "output_mode": meta.get("output_mode") or "raster",
+            "upstream_request_id": meta.get("upstream_request_id"),
+            "upstream_cost": meta.get("upstream_cost"),
             "new_balance": balance_info["available"] if balance_info else None,
         })
 

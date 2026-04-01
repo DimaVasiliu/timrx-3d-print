@@ -482,6 +482,14 @@ class Config:
     GEMINI_API_KEY: str = field(default_factory=lambda: _get_env("GEMINI_API_KEY") or _get_env("GOOGLE_API_KEY"))
     # PiAPI (Nano Banana 2 image generation)
     PIAPI_API_KEY: str = field(default_factory=lambda: _get_env("PIAPI_API_KEY"))
+    # Additional image providers
+    BFL_API_KEY: str = field(default_factory=lambda: _get_env("BFL_API_KEY"))
+    IDEOGRAM_API_KEY: str = field(default_factory=lambda: _get_env("IDEOGRAM_API_KEY"))
+    RECRAFT_API_KEY: str = field(default_factory=lambda: _get_env("RECRAFT_API_KEY"))
+    IMAGE_PROVIDER_GOOGLE_NANO_ENABLED: bool = field(default_factory=lambda: _get_env_bool("IMAGE_PROVIDER_GOOGLE_NANO_ENABLED", False))
+    IMAGE_PROVIDER_FLUX_PRO_ENABLED: bool = field(default_factory=lambda: _get_env_bool("IMAGE_PROVIDER_FLUX_PRO_ENABLED", False))
+    IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED: bool = field(default_factory=lambda: _get_env_bool("IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED", False))
+    IMAGE_PROVIDER_RECRAFT_V4_ENABLED: bool = field(default_factory=lambda: _get_env_bool("IMAGE_PROVIDER_RECRAFT_V4_ENABLED", False))
 
     # Discord webhook for community share notifications
     DISCORD_WEBHOOK_URL: str = field(default_factory=lambda: _get_env("DISCORD_WEBHOOK_URL"))
@@ -757,6 +765,14 @@ class Config:
                 warnings.append("VIDEO_PROVIDER=vertex but Vertex AI is not fully configured")
             if self.VIDEO_PROVIDER == "seedance" and not self.PIAPI_API_KEY:
                 warnings.append("VIDEO_PROVIDER=seedance but PIAPI_API_KEY is not set")
+            if self.IMAGE_PROVIDER_GOOGLE_NANO_ENABLED and not self.GEMINI_API_KEY:
+                warnings.append("IMAGE_PROVIDER_GOOGLE_NANO_ENABLED=true but GEMINI_API_KEY is not set")
+            if self.IMAGE_PROVIDER_FLUX_PRO_ENABLED and not self.BFL_API_KEY:
+                warnings.append("IMAGE_PROVIDER_FLUX_PRO_ENABLED=true but BFL_API_KEY is not set")
+            if self.IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED and not self.IDEOGRAM_API_KEY:
+                warnings.append("IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED=true but IDEOGRAM_API_KEY is not set")
+            if self.IMAGE_PROVIDER_RECRAFT_V4_ENABLED and not self.RECRAFT_API_KEY:
+                warnings.append("IMAGE_PROVIDER_RECRAFT_V4_ENABLED=true but RECRAFT_API_KEY is not set")
             if self.MESHY_WEBHOOK_ENABLED and not self.PUBLIC_BASE_URL:
                 warnings.append("MESHY_WEBHOOK_ENABLED=true but PUBLIC_BASE_URL is not set")
             if self.PIAPI_WEBHOOK_ENABLED and not self.PUBLIC_BASE_URL:
@@ -858,6 +874,9 @@ MESHY_API_BASE = config.MESHY_API_BASE
 OPENAI_API_KEY = config.OPENAI_API_KEY
 GEMINI_API_KEY = config.GEMINI_API_KEY
 PIAPI_API_KEY = config.PIAPI_API_KEY
+BFL_API_KEY = config.BFL_API_KEY
+IDEOGRAM_API_KEY = config.IDEOGRAM_API_KEY
+RECRAFT_API_KEY = config.RECRAFT_API_KEY
 DEFAULT_MODEL_TITLE = config.DEFAULT_MODEL_TITLE
 ACTION_KEYS = config.ACTION_KEYS
 PROXY_ALLOWED_HOSTS = config.PROXY_ALLOWED_HOSTS

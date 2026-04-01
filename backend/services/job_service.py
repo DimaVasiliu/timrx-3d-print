@@ -844,7 +844,7 @@ class JobService:
 
         # Normalize size
         size = payload.get("size") or payload.get("resolution") or "1024x1024"
-        model = payload.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1"
+        model = payload.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5"
         n = int(payload.get("n") or 1)
 
         openai_payload = {

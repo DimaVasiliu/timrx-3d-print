@@ -1,20 +1,15 @@
 """
-Gemini Image Generation Service (Imagen 4.0).
+Gemini Image Generation Service (Imagen 4.0 Fast).
 
 Uses the Gemini Developer API for image generation via Imagen model.
 Authentication: GEMINI_API_KEY only (via x-goog-api-key header).
 
-Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict
+Model history:
+  - imagen-4.0-generate-001      : original (DEPRECATED — shutting down June 24, 2026)
+  - imagen-4.0-fast-generate-001 : fast variant — $0.02/image, 10x faster (current default)
+  - imagen-4.0-ultra              : highest quality — $0.06/image
 
-CURL Test Example:
-    curl -X POST \
-      'https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict' \
-      -H 'x-goog-api-key: YOUR_GEMINI_API_KEY' \
-      -H 'Content-Type: application/json' \
-      -d '{
-        "instances": [{"prompt": "A cute robot painting a sunset"}],
-        "parameters": {"sampleCount": 1, "imageSize": "1K", "aspectRatio": "1:1"}
-      }'
+Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-fast-generate-001:predict
 
 NOTE: Requires Gemini API Paid tier. Get your key from https://aistudio.google.com/apikey
 """
@@ -39,7 +34,8 @@ BASE_RETRY_DELAY = 2
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 # Imagen model for image generation
-IMAGEN_MODEL = "imagen-4.0-generate-001"
+# Was "imagen-4.0-generate-001" — deprecated, shutting down June 24, 2026
+IMAGEN_MODEL = "imagen-4.0-fast-generate-001"
 
 # Allowed parameter values
 ALLOWED_ASPECT_RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9"}

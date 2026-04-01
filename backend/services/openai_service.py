@@ -1,4 +1,11 @@
-"""OpenAI image generation service migrated from app.py."""
+"""
+OpenAI image generation service.
+
+Model history:
+  - gpt-image-1   : original (still works)
+  - gpt-image-1.5 : latest — faster, better instruction following (March 2026)
+  - DALL·E 2/3    : deprecated, shutting down May 12, 2026
+"""
 
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ class OpenAIServerError(Exception):
 def openai_image_generate(
     prompt: str,
     size: str = "1024x1024",
-    model: str = "gpt-image-1",
+    model: str = "gpt-image-1.5",
     n: int = 1,
     response_format: str = "url",
 ) -> dict:
@@ -42,7 +49,8 @@ def openai_image_generate(
         "size": size,
         "n": max(1, min(4, int(n or 1))),
     }
-    if model != "gpt-image-1":
+    # gpt-image-1 and gpt-image-1.5 don't support response_format param
+    if model not in ("gpt-image-1", "gpt-image-1.5"):
         payload["response_format"] = response_format
 
     last_error = None

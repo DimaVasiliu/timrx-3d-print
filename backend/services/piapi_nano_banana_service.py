@@ -19,7 +19,7 @@ from typing import Dict, Any, Optional, Tuple
 from backend.config import config
 
 # Timeouts
-PIAPI_TIMEOUT = (15, 120)  # (connect_timeout, read_timeout)
+PIAPI_TIMEOUT = (15, 180)  # (connect_timeout, read_timeout) — increased for slow generations
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 2
 
@@ -29,7 +29,7 @@ PIAPI_API_BASE = "https://api.piapi.ai/api/v1"
 # Polling settings for get-task
 POLL_INTERVAL_INITIAL = 3       # seconds
 POLL_INTERVAL_MAX = 8           # seconds
-POLL_TIMEOUT = 180              # seconds total before giving up
+POLL_TIMEOUT = 300              # seconds total before giving up (was 180, PiAPI recommends 300+ for 1K/2K)
 
 # Allowed parameter values
 ALLOWED_ASPECT_RATIOS = {"1:1", "9:16", "16:9", "3:4", "4:3"}
@@ -137,7 +137,7 @@ def create_nano_banana_task(
     url = f"{PIAPI_API_BASE}/task"
     payload = {
         "model": "gemini",
-        "task_type": "nano-banana-2",
+        "task_type": "gemini-2.5-flash-image",  # was "nano-banana-2" (deprecated by PiAPI)
         "input": {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,

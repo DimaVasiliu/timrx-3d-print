@@ -41,6 +41,32 @@ from backend.services.gemini_image_service import (
     GeminiConfigError as GeminiImageConfigError,
     GeminiValidationError as GeminiImageValidationError,
 )
+from backend.services.google_nano_image_service import (
+    google_nano_generate_image,
+    GoogleNanoAuthError,
+    GoogleNanoConfigError,
+    GoogleNanoValidationError,
+)
+from backend.services.flux_pro_service import (
+    create_flux_pro_task,
+    poll_flux_pro_task,
+    FluxProAuthError,
+    FluxProConfigError,
+    FluxProValidationError,
+    FluxProTaskError,
+)
+from backend.services.ideogram_v3_service import (
+    ideogram_v3_generate_image,
+    IdeogramAuthError,
+    IdeogramConfigError,
+    IdeogramValidationError,
+)
+from backend.services.recraft_image_service import (
+    recraft_v4_generate_image,
+    RecraftAuthError,
+    RecraftConfigError,
+    RecraftValidationError,
+)
 from backend.services.piapi_nano_banana_service import (
     create_nano_banana_task,
     poll_nano_banana_task,
@@ -106,7 +132,11 @@ _breakers = {
     "meshy": CircuitBreaker("meshy"),
     "openai": CircuitBreaker("openai"),
     "gemini": CircuitBreaker("gemini"),
+    "google_nano": CircuitBreaker("google_nano"),
     "piapi": CircuitBreaker("piapi"),
+    "flux_pro": CircuitBreaker("flux_pro"),
+    "ideogram_v3": CircuitBreaker("ideogram_v3"),
+    "recraft_v4": CircuitBreaker("recraft_v4"),
     "vertex": CircuitBreaker("vertex"),
     "fal": CircuitBreaker("fal"),
 }
@@ -124,6 +154,94 @@ _background_executor = ThreadPoolExecutor(max_workers=_dispatch_max_workers, thr
 
 def get_executor() -> ThreadPoolExecutor:
     return _background_executor
+
+
+def _complete_image_job(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    prompt: str,
+    store_meta: dict,
+    *,
+    provider: str,
+    ai_model: str,
+    image_url: str,
+    image_urls: Optional[list] = None,
+    image_base64: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    size: str = "",
+    upstream_job_id: Optional[str] = None,
+    artifact_format: str = "png",
+    provider_variant: Optional[str] = None,
+    output_mode: str = "raster",
+    operation: Optional[str] = None,
+    upstream_request_id: Optional[str] = None,
+    upstream_cost: Optional[float] = None,
+    discord_title: str = "🖼️ New AI Image Generated",
+):
+    image_urls = image_urls or ([image_url] if image_url else [])
+    extra_meta = {
+        "artifact_format": artifact_format,
+        "provider_variant": provider_variant,
+        "output_mode": output_mode,
+        "operation": operation,
+        "upstream_request_id": upstream_request_id,
+        "upstream_cost": upstream_cost,
+        "mime_type": mime_type,
+    }
+
+    save_image_to_normalized_db(
+        image_id=internal_job_id,
+        image_url=image_url,
+        prompt=prompt,
+        ai_model=ai_model,
+        size=size,
+        image_urls=image_urls,
+        user_id=identity_id,
+        provider=provider,
+        extra_meta=extra_meta,
+    )
+
+    store = load_store()
+    store_meta.update({
+        "status": "done",
+        "image_url": image_url,
+        "image_urls": image_urls,
+        "image_base64": image_base64,
+        "mime_type": mime_type,
+        "artifact_format": artifact_format,
+        "provider_variant": provider_variant,
+        "output_mode": output_mode,
+        "operation": operation,
+        "upstream_request_id": upstream_request_id,
+        "upstream_cost": upstream_cost,
+    })
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    finalize_job_credits(reservation_id, internal_job_id, identity_id)
+
+    update_job_status_ready(
+        internal_job_id,
+        upstream_job_id=upstream_job_id,
+        image_id=internal_job_id,
+        image_url=image_url,
+        extra_meta={
+            "image_urls": image_urls,
+            "image_base64": image_base64,
+            "mime_type": mime_type,
+            "artifact_format": artifact_format,
+            "provider_variant": provider_variant,
+            "output_mode": output_mode,
+            "operation": operation,
+            "upstream_request_id": upstream_request_id,
+            "upstream_cost": upstream_cost,
+            "model": ai_model,
+        },
+    )
+
+    send_to_discord(discord_title, prompt, image_url, identity_id)
+    ExpenseGuard.unregister_active_job(internal_job_id)
 
 
 
@@ -735,7 +853,7 @@ def dispatch_piapi_nano_banana_async(
             image_id=internal_job_id,
             image_url=image_url,
             prompt=prompt,
-            ai_model="nano-banana-2",
+            ai_model="gemini-2.5-flash-image",
             size=f"{aspect_ratio}@{resolution}",
             image_urls=image_urls,
             user_id=identity_id,
@@ -811,6 +929,290 @@ def dispatch_piapi_nano_banana_async(
         ExpenseGuard.unregister_active_job(internal_job_id)
 
 
+def dispatch_google_nano_image_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    prompt: str,
+    aspect_ratio: str,
+    image_size: str,
+    store_meta: dict,
+):
+    start_time = time.time()
+    breaker = _breakers.get("google_nano")
+
+    if breaker and not breaker.allow_request():
+        if reservation_id:
+            release_job_credits(reservation_id, "google_nano_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "Google Nano is temporarily unavailable. Please try again in a few minutes.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
+
+    try:
+        result = google_nano_generate_image(prompt=prompt, aspect_ratio=aspect_ratio, image_size=image_size)
+        _complete_image_job(
+            internal_job_id,
+            identity_id,
+            reservation_id,
+            prompt,
+            store_meta,
+            provider="google_nano",
+            ai_model=result.get("model") or "gemini-2.5-flash-image",
+            image_url=result.get("image_url"),
+            image_urls=result.get("image_urls"),
+            image_base64=result.get("image_base64"),
+            mime_type=result.get("mime_type"),
+            size=f"{aspect_ratio}@{image_size}",
+            artifact_format="png",
+            provider_variant=result.get("provider_variant") or "direct_google",
+            upstream_request_id=internal_job_id,
+            discord_title="🖼️ New AI Image Generated (Google Nano)",
+        )
+        if breaker:
+            breaker.record_success()
+    except (GoogleNanoConfigError, GoogleNanoAuthError):
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "google_nano_config_error", internal_job_id)
+        update_job_status_failed(internal_job_id, "Google Nano is temporarily unavailable. Please try again shortly.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except GoogleNanoValidationError as e:
+        if reservation_id:
+            release_job_credits(reservation_id, "google_nano_validation_error", internal_job_id)
+        update_job_status_failed(internal_job_id, e.message)
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[PROVIDER_ERROR] provider=google_nano job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "google_nano_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed. Please try again.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+def dispatch_flux_pro_image_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    request_options: dict,
+    store_meta: dict,
+):
+    start_time = time.time()
+    breaker = _breakers.get("flux_pro")
+
+    if breaker and not breaker.allow_request():
+        if reservation_id:
+            release_job_credits(reservation_id, "flux_pro_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "FLUX.2 Pro is temporarily unavailable. Please try again in a few minutes.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
+
+    try:
+        prompt = str(request_options.get("prompt") or "")
+        created = create_flux_pro_task(request_options)
+        task_id = created.get("task_id")
+        polling_url = created.get("polling_url")
+        update_job_with_upstream_id(internal_job_id, task_id)
+
+        store = load_store()
+        store_meta["upstream_request_id"] = task_id
+        store_meta["polling_url"] = polling_url
+        store_meta["status"] = "processing"
+        store[internal_job_id] = store_meta
+        save_store(store)
+
+        result = poll_flux_pro_task(task_id=task_id, polling_url=polling_url)
+        output_format = str(request_options.get("output_format") or "jpeg").strip().lower()
+        artifact_format = "jpg" if output_format == "jpeg" else output_format or "jpg"
+        width = int(request_options.get("width") or 1024)
+        height = int(request_options.get("height") or 1024)
+        _complete_image_job(
+            internal_job_id,
+            identity_id,
+            reservation_id,
+            prompt,
+            store_meta,
+            provider="flux_pro",
+            ai_model=result.get("model") or created.get("model") or "flux-2-pro",
+            image_url=result.get("image_url"),
+            image_urls=[result.get("image_url")] if result.get("image_url") else None,
+            mime_type=f"image/{'jpeg' if artifact_format == 'jpg' else artifact_format}",
+            size=f"{width}x{height}",
+            upstream_job_id=task_id,
+            artifact_format=artifact_format,
+            provider_variant=str(created.get("model_variant") or request_options.get("model_variant") or "pro"),
+            operation=str(request_options.get("operation") or "generate"),
+            upstream_request_id=task_id,
+            upstream_cost=created.get("cost") or result.get("upstream_cost"),
+            discord_title="🖼️ New AI Image Generated (FLUX.2)",
+        )
+        if breaker:
+            breaker.record_success()
+    except (FluxProConfigError, FluxProAuthError):
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "flux_pro_config_error", internal_job_id)
+        update_job_status_failed(internal_job_id, "FLUX.2 Pro is temporarily unavailable. Please try again shortly.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except (FluxProValidationError, FluxProTaskError) as e:
+        if reservation_id:
+            release_job_credits(reservation_id, "flux_pro_task_failed", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[PROVIDER_ERROR] provider=flux_pro job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "flux_pro_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed. Please try again.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+def dispatch_ideogram_v3_image_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    request_options: dict,
+    store_meta: dict,
+):
+    start_time = time.time()
+    breaker = _breakers.get("ideogram_v3")
+
+    if breaker and not breaker.allow_request():
+        if reservation_id:
+            release_job_credits(reservation_id, "ideogram_v3_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "Ideogram V3 is temporarily unavailable. Please try again in a few minutes.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
+
+    try:
+        prompt = str(request_options.get("prompt") or "")
+        result = ideogram_v3_generate_image(request_options)
+        size = (
+            str(request_options.get("resolution") or "").strip()
+            or str(request_options.get("aspect_ratio") or "").strip()
+            or str(request_options.get("shape") or "")
+        )
+        _complete_image_job(
+            internal_job_id,
+            identity_id,
+            reservation_id,
+            prompt,
+            store_meta,
+            provider="ideogram_v3",
+            ai_model=result.get("model") or "ideogram-v3",
+            image_url=result.get("image_url"),
+            image_urls=result.get("image_urls"),
+            size=size,
+            artifact_format="png",
+            provider_variant=str(result.get("operation") or request_options.get("operation") or "generate"),
+            operation=str(result.get("operation") or request_options.get("operation") or "generate"),
+            upstream_request_id=internal_job_id,
+            discord_title="🖼️ New AI Image Generated (Ideogram V3)",
+        )
+        if breaker:
+            breaker.record_success()
+    except (IdeogramConfigError, IdeogramAuthError):
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "ideogram_v3_config_error", internal_job_id)
+        update_job_status_failed(internal_job_id, "Ideogram V3 is temporarily unavailable. Please try again shortly.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except IdeogramValidationError as e:
+        if reservation_id:
+            release_job_credits(reservation_id, "ideogram_v3_validation_error", internal_job_id)
+        update_job_status_failed(internal_job_id, str(e))
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[PROVIDER_ERROR] provider=ideogram_v3 job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "ideogram_v3_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed. Please try again.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+
+def dispatch_recraft_v4_image_async(
+    internal_job_id: str,
+    identity_id: str,
+    reservation_id: Optional[str],
+    request_options: dict,
+    store_meta: dict,
+):
+    start_time = time.time()
+    breaker = _breakers.get("recraft_v4")
+
+    if breaker and not breaker.allow_request():
+        if reservation_id:
+            release_job_credits(reservation_id, "recraft_v4_circuit_open", internal_job_id)
+        update_job_status_failed(internal_job_id, "Recraft V4 is temporarily unavailable. Please try again in a few minutes.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+        return
+
+    try:
+        prompt = str(request_options.get("prompt") or "")
+        result = recraft_v4_generate_image(request_options)
+        size = str(request_options.get("size") or request_options.get("resolution") or "").strip()
+        output_mode = str(result.get("output_mode") or request_options.get("output_mode") or "raster")
+        _complete_image_job(
+            internal_job_id,
+            identity_id,
+            reservation_id,
+            prompt,
+            store_meta,
+            provider="recraft_v4",
+            ai_model=result.get("model") or "recraftv4",
+            image_url=result.get("image_url"),
+            image_urls=result.get("image_urls"),
+            image_base64=result.get("image_base64"),
+            mime_type=result.get("mime_type"),
+            size=size,
+            artifact_format=result.get("artifact_format") or ("svg" if output_mode == "vector_svg" else "png"),
+            output_mode=output_mode,
+            provider_variant=str(result.get("operation") or request_options.get("operation") or "generate"),
+            operation=str(result.get("operation") or request_options.get("operation") or "generate"),
+            upstream_request_id=internal_job_id,
+            discord_title="🖼️ New AI Image Generated (Recraft V4)",
+        )
+        if breaker:
+            breaker.record_success()
+    except (RecraftConfigError, RecraftAuthError):
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "recraft_v4_config_error", internal_job_id)
+        update_job_status_failed(internal_job_id, "Recraft V4 is temporarily unavailable. Please try again shortly.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except RecraftValidationError as e:
+        if reservation_id:
+            release_job_credits(reservation_id, "recraft_v4_validation_error", internal_job_id)
+        update_job_status_failed(internal_job_id, e.message)
+        ExpenseGuard.unregister_active_job(internal_job_id)
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        print(f"[PROVIDER_ERROR] provider=recraft_v4 job_id={internal_job_id} duration_ms={duration_ms} error={e}")
+        if breaker:
+            breaker.record_failure()
+        if reservation_id:
+            release_job_credits(reservation_id, "recraft_v4_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_job_error_message
+        update_job_status_failed(internal_job_id, sanitize_job_error_message(str(e)) or "Image generation failed. Please try again.")
+        ExpenseGuard.unregister_active_job(internal_job_id)
+
+
 def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
     """Update job with upstream provider ID. Returns True if updated, False otherwise."""
     if not USE_DB:
@@ -877,6 +1279,7 @@ def update_job_status_ready(
     glb_url: str = None,
     image_url: str = None,
     progress: int = 100,
+    extra_meta: Optional[dict] = None,
 ):
     if not USE_DB:
         return
@@ -892,6 +1295,8 @@ def update_job_status_ready(
                     meta_updates["glb_url"] = glb_url
                 if image_url:
                     meta_updates["image_url"] = image_url
+                if extra_meta:
+                    meta_updates.update({k: v for k, v in extra_meta.items() if v is not None})
 
                 if upstream_job_id:
                     cursor.execute(
@@ -1167,7 +1572,7 @@ def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, p
     payload = payload or {}
     prompt = payload.get("prompt") or store_meta.get("prompt") or ""
     size = payload.get("size") or store_meta.get("size") or "1024x1024"
-    model = payload.get("model") or store_meta.get("model") or "gpt-image-1"
+    model = payload.get("model") or store_meta.get("model") or "gpt-image-1.5"
     n = int(payload.get("n") or store_meta.get("n") or 1)
     response_format = payload.get("response_format") or store_meta.get("response_format") or "url"
     return dispatch_openai_image_async(
@@ -2753,5 +3158,3 @@ def _finalize_video_success(
 def _dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta):
     """Adapter for video dispatch (monolith-compatible name)."""
     return dispatch_gemini_video_async(internal_job_id, identity_id, reservation_id, payload, store_meta)
-
-

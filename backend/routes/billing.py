@@ -227,6 +227,12 @@ def get_action_costs():
                 {"action_key": "piapi_image_generate", "credits": 7},
                 {"action_key": "piapi_image_generate_2k", "credits": 12},
                 {"action_key": "piapi_image_generate_4k", "credits": 18},
+                # Image generation — additional providers
+                {"action_key": "google_nano_image_generate", "credits": 5},
+                {"action_key": "flux_pro_image_generate", "credits": 8},
+                {"action_key": "ideogram_v3_image_generate", "credits": 6},
+                {"action_key": "recraft_v4_image_generate", "credits": 8},
+                {"action_key": "recraft_v4_vector_generate", "credits": 10},
                 # Video — Vertex Veo 3.1 (12 c/s, equalized across all modes)
                 {"action_key": "video_generate", "credits": 96},
                 {"action_key": "video_text_generate", "credits": 96},

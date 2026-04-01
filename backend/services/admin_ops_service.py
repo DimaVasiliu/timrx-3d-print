@@ -20,6 +20,10 @@ _PROVIDER_FEATURES: Dict[str, str] = {
     "openai":       "image",
     "google":       "image",
     "nano_banana":  "image",
+    "google_nano":  "image",
+    "flux_pro":     "image",
+    "ideogram_v3":  "image",
+    "recraft_v4":   "image",
     "vertex":       "video",
     "seedance":     "video",
     "fal_seedance": "video",
@@ -92,6 +96,22 @@ def get_provider_health() -> Dict[str, Any]:
             errors_by_provider[p] = []
         if len(errors_by_provider[p]) < 5:
             errors_by_provider[p].append({"code": r["code"], "count": r["cnt"]})
+
+    # 3b. Average latency per provider (last 24h, succeeded only)
+    latency_rows = query_all(f"""
+        SELECT provider,
+               ROUND(AVG(EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000))::bigint AS avg_latency_ms
+        FROM {Tables.JOBS}
+        WHERE created_at > NOW() - INTERVAL '24 hours'
+          AND status IN ('succeeded', 'ready')
+          AND provider IS NOT NULL
+        GROUP BY provider
+    """)
+    latency_map = {
+        r["provider"]: int(r["avg_latency_ms"])
+        for r in latency_rows
+        if r.get("avg_latency_ms") is not None
+    }
 
     # 4. Active alerts from provider_alerts
     active_alerts = query_all(f"""
@@ -209,6 +229,7 @@ def get_provider_health() -> Dict[str, Any]:
             "wallet_alert_count_24h": wallet_24h_map.get(prov, 0),
             "active_alerts": alert_info.get("count", 0),
             "credits_consumed_24h": credits_today_map.get(prov, 0),
+            "avg_success_latency_ms_24h": latency_map.get(prov),
             "estimated_spend_today_gbp": round(spend_today_map.get(prov, 0), 2),
             "estimated_spend_month_gbp": round(spend_month_map.get(prov, 0), 2),
         })
@@ -266,6 +287,18 @@ def _check_provider_configs() -> Dict[str, Dict]:
     except Exception:
         results["google"] = {"configured": False, "error": "check failed"}
 
+    # Direct Google Nano
+    try:
+        import os
+        key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        enabled = os.getenv("IMAGE_PROVIDER_GOOGLE_NANO_ENABLED", "").lower() in ("1", "true", "yes", "on")
+        results["google_nano"] = {
+            "configured": bool(enabled and key),
+            "error": None if (enabled and key) else ("provider disabled" if not enabled else "GEMINI_API_KEY not set"),
+        }
+    except Exception:
+        results["google_nano"] = {"configured": False, "error": "check failed"}
+
     # Nano Banana (PiAPI) — shares PIAPI_API_KEY with Seedance
     try:
         import os
@@ -275,6 +308,42 @@ def _check_provider_configs() -> Dict[str, Dict]:
         }
     except Exception:
         results["nano_banana"] = {"configured": False, "error": "check failed"}
+
+    # FLUX.2 Pro (BFL)
+    try:
+        import os
+        enabled = os.getenv("IMAGE_PROVIDER_FLUX_PRO_ENABLED", "").lower() in ("1", "true", "yes", "on")
+        key = os.getenv("BFL_API_KEY")
+        results["flux_pro"] = {
+            "configured": bool(enabled and key),
+            "error": None if (enabled and key) else ("provider disabled" if not enabled else "BFL_API_KEY not set"),
+        }
+    except Exception:
+        results["flux_pro"] = {"configured": False, "error": "check failed"}
+
+    # Ideogram V3
+    try:
+        import os
+        enabled = os.getenv("IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED", "").lower() in ("1", "true", "yes", "on")
+        key = os.getenv("IDEOGRAM_API_KEY")
+        results["ideogram_v3"] = {
+            "configured": bool(enabled and key),
+            "error": None if (enabled and key) else ("provider disabled" if not enabled else "IDEOGRAM_API_KEY not set"),
+        }
+    except Exception:
+        results["ideogram_v3"] = {"configured": False, "error": "check failed"}
+
+    # Recraft V4
+    try:
+        import os
+        enabled = os.getenv("IMAGE_PROVIDER_RECRAFT_V4_ENABLED", "").lower() in ("1", "true", "yes", "on")
+        key = os.getenv("RECRAFT_API_KEY")
+        results["recraft_v4"] = {
+            "configured": bool(enabled and key),
+            "error": None if (enabled and key) else ("provider disabled" if not enabled else "RECRAFT_API_KEY not set"),
+        }
+    except Exception:
+        results["recraft_v4"] = {"configured": False, "error": "check failed"}
 
     # Vertex
     try:

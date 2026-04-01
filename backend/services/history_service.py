@@ -179,7 +179,7 @@ def get_canonical_image_row(
                 if image_id:
                     cur.execute(
                         f"""
-                        SELECT id, title, image_url, thumbnail_url
+                        SELECT id, title, image_url, thumbnail_url, meta
                         FROM {Tables.IMAGES}
                         WHERE id = %s AND identity_id = %s
                         LIMIT 1
@@ -194,7 +194,7 @@ def get_canonical_image_row(
                         continue
                     cur.execute(
                         f"""
-                        SELECT id, title, image_url, thumbnail_url
+                        SELECT id, title, image_url, thumbnail_url, meta
                         FROM {Tables.IMAGES}
                         WHERE identity_id = %s AND upstream_id = %s
                         ORDER BY updated_at DESC
@@ -460,6 +460,17 @@ def _lookup_asset_id_for_history(
 # Normalized DB persistence
 # ─────────────────────────────────────────────────────────────
 
+def _artifact_format_from_content_type(content_type: str | None) -> str:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized == "image/svg+xml":
+        return "svg"
+    if normalized == "image/webp":
+        return "webp"
+    if normalized in ("image/jpeg", "image/jpg"):
+        return "jpg"
+    return "png"
+
+
 def save_image_to_normalized_db(
     image_id: str,
     image_url: str,
@@ -469,6 +480,7 @@ def save_image_to_normalized_db(
     image_urls: list | None = None,
     user_id: str | None = None,
     provider: str = "openai",
+    extra_meta: dict | None = None,
 ):
     if not USE_DB:
         print("[DB] USE_DB is False, skipping save_image_to_normalized_db")
@@ -483,6 +495,7 @@ def save_image_to_normalized_db(
     _newly_created_s3_keys: list[str] = []
 
     try:
+        extra_meta = dict(extra_meta or {})
         with get_conn() as conn:
             with conn.cursor() as cur:
                 existing_history_id = None
@@ -512,6 +525,7 @@ def save_image_to_normalized_db(
                 original_image_url = image_url
                 uploaded_url_cache: dict[str, str] = {}
                 image_bytes = None  # kept in memory for thumbnail generation
+                resolved_ct = extra_meta.get("mime_type") or "image/png"
 
                 if image_url:
                     # ── Fetch image bytes once, use for both upload and thumbnail ──
@@ -523,12 +537,14 @@ def save_image_to_normalized_db(
                         try:
                             r = requests.get(image_url, timeout=30)
                             r.raise_for_status()
+                            ct = r.headers.get("Content-Type")
+                            if ct and ct != "application/octet-stream":
+                                resolved_ct = ct
                             image_bytes = r.content
                         except Exception as e:
                             print(f"[IMAGE] Could not fetch existing S3 image for thumbnail: {e}")
                     else:
                         # Fetch bytes from source (provider URL or data: URI)
-                        resolved_ct = "image/png"
                         try:
                             if image_url.startswith("data:"):
                                 header_part, b64data = image_url.split(",", 1)
@@ -567,6 +583,12 @@ def save_image_to_normalized_db(
                     if image_url:
                         uploaded_url_cache[image_url] = image_url
 
+                artifact_format = str(
+                    extra_meta.get("artifact_format")
+                    or _artifact_format_from_content_type(resolved_ct)
+                    or "png"
+                ).lower()
+
                 if image_urls:
                     normalized_urls = []
                     for i, url in enumerate(image_urls):
@@ -594,7 +616,7 @@ def save_image_to_normalized_db(
                 # Falls back to full image URL if thumbnail generation fails.
                 thumbnail_url = image_url
                 thumbnail_s3_key = get_s3_key_from_url(image_url)
-                if image_bytes:
+                if image_bytes and artifact_format != "svg":
                     try:
                         thumb_bytes = generate_image_thumbnail(
                             image_bytes,
@@ -658,17 +680,28 @@ def save_image_to_normalized_db(
                     "s3_bucket": AWS_BUCKET_MODELS if AWS_BUCKET_MODELS else None,
                     "image_url": image_url,
                     "thumbnail_url": thumbnail_url,
+                    "artifact_format": artifact_format,
+                    "provider_variant": extra_meta.get("provider_variant"),
+                    "output_mode": extra_meta.get("output_mode"),
+                    "upstream_request_id": extra_meta.get("upstream_request_id"),
+                    "upstream_cost": extra_meta.get("upstream_cost"),
                 }
 
-                image_meta = json.dumps(
-                    {
-                        "prompt": prompt,
-                        "ai_model": ai_model,
-                        "size": size,
-                        "format": "png",
-                        "image_urls": image_urls or [image_url],
-                    }
-                )
+                image_meta_dict = {
+                    "prompt": prompt,
+                    "ai_model": ai_model,
+                    "size": size,
+                    "format": artifact_format,
+                    "artifact_format": artifact_format,
+                    "image_urls": image_urls or [image_url],
+                    "provider_variant": extra_meta.get("provider_variant"),
+                    "output_mode": extra_meta.get("output_mode"),
+                    "upstream_request_id": extra_meta.get("upstream_request_id"),
+                    "upstream_cost": extra_meta.get("upstream_cost"),
+                    "mime_type": resolved_ct,
+                }
+                image_meta_dict.update({k: v for k, v in extra_meta.items() if v is not None})
+                image_meta = json.dumps(image_meta_dict)
 
                 existing_by_hash_id = None
                 if image_content_hash:

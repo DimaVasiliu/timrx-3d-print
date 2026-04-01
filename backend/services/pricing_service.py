@@ -15,6 +15,11 @@ CANONICAL ACTION KEYS (use these in new code):
 - piapi_image_generate    (7c)  - Nano Banana standard image (1K) — PREMIUM
 - piapi_image_generate_2k (12c) - Nano Banana 2K image — PREMIUM
 - piapi_image_generate_4k (18c) - Nano Banana 4K image — PREMIUM EXCLUSIVE
+- google_nano_image_generate (5c) - Direct Google Nano standard image (1K)
+- flux_pro_image_generate    (8c) - FLUX.2 Pro standard image
+- ideogram_v3_image_generate (6c) - Ideogram V3 standard image
+- recraft_v4_image_generate  (8c) - Recraft V4 raster image
+- recraft_v4_vector_generate (10c) - Recraft V4 SVG vector image
 - text_to_3d_generate  (20c) - Text to 3D preview generation
 - image_to_3d_generate (30c) - Image to 3D conversion
 - refine               (6c)  - Refine/upscale 3D model
@@ -59,6 +64,12 @@ class CanonicalActions:
     PIAPI_IMAGE_GENERATE = "piapi_image_generate"          # Nano Banana standard 1K (7c)
     PIAPI_IMAGE_GENERATE_2K = "piapi_image_generate_2k"    # Nano Banana 2K (12c)
     PIAPI_IMAGE_GENERATE_4K = "piapi_image_generate_4k"    # Nano Banana 4K (18c) — EXCLUSIVE
+    # Image generation — direct Google Nano / BFL / Ideogram / Recraft
+    GOOGLE_NANO_IMAGE_GENERATE = "google_nano_image_generate"
+    FLUX_PRO_IMAGE_GENERATE = "flux_pro_image_generate"
+    IDEOGRAM_V3_IMAGE_GENERATE = "ideogram_v3_image_generate"
+    RECRAFT_V4_IMAGE_GENERATE = "recraft_v4_image_generate"
+    RECRAFT_V4_VECTOR_GENERATE = "recraft_v4_vector_generate"
     # 3D generation
     TEXT_TO_3D_GENERATE = "text_to_3d_generate"
     IMAGE_TO_3D_GENERATE = "image_to_3d_generate"
@@ -86,6 +97,11 @@ CANONICAL_TO_DB = {
     CanonicalActions.PIAPI_IMAGE_GENERATE: "PIAPI_IMAGE",
     CanonicalActions.PIAPI_IMAGE_GENERATE_2K: "PIAPI_IMAGE_2K",
     CanonicalActions.PIAPI_IMAGE_GENERATE_4K: "PIAPI_IMAGE_4K",
+    CanonicalActions.GOOGLE_NANO_IMAGE_GENERATE: "GOOGLE_NANO_IMAGE",
+    CanonicalActions.FLUX_PRO_IMAGE_GENERATE: "FLUX_PRO_IMAGE",
+    CanonicalActions.IDEOGRAM_V3_IMAGE_GENERATE: "IDEOGRAM_V3_IMAGE",
+    CanonicalActions.RECRAFT_V4_IMAGE_GENERATE: "RECRAFT_V4_IMAGE",
+    CanonicalActions.RECRAFT_V4_VECTOR_GENERATE: "RECRAFT_V4_VECTOR",
     # 3D generation
     CanonicalActions.TEXT_TO_3D_GENERATE: "MESHY_TEXT_TO_3D",
     CanonicalActions.IMAGE_TO_3D_GENERATE: "MESHY_IMAGE_TO_3D",
@@ -286,6 +302,12 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "PIAPI_IMAGE", "cost_credits": 7, "provider": "nano_banana"},        # Standard 1K
     {"action_code": "PIAPI_IMAGE_2K", "cost_credits": 12, "provider": "nano_banana"},    # 2K
     {"action_code": "PIAPI_IMAGE_4K", "cost_credits": 18, "provider": "nano_banana"},    # 4K — EXCLUSIVE
+    # ── Image Generation — direct Google Nano / FLUX / Ideogram / Recraft ──
+    {"action_code": "GOOGLE_NANO_IMAGE", "cost_credits": 5, "provider": "google_nano"},
+    {"action_code": "FLUX_PRO_IMAGE", "cost_credits": 8, "provider": "flux_pro"},
+    {"action_code": "IDEOGRAM_V3_IMAGE", "cost_credits": 6, "provider": "ideogram_v3"},
+    {"action_code": "RECRAFT_V4_IMAGE", "cost_credits": 8, "provider": "recraft_v4"},
+    {"action_code": "RECRAFT_V4_VECTOR", "cost_credits": 10, "provider": "recraft_v4"},
     # ── Video — Vertex (Veo 3.1) — 12 credits/sec (margin-stabilized) ──
     # All modes equalized: text→video == image→video == transition (API cost identical)
     # Text-to-Video

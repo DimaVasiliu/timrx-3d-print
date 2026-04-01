@@ -5,13 +5,16 @@ POST /api/_mod/print-check/<job_id>
 Free analysis (0 credits) to encourage the print workflow.
 """
 
-from flask import Blueprint, jsonify, g, request
+import logging
+
+from flask import Blueprint, jsonify, request
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import with_session_readonly
 from backend.services.identity_service import require_identity
 
 bp = Blueprint("print_check", __name__)
+logger = logging.getLogger(__name__)
 
 
 @bp.route("/print-check/<job_id>", methods=["POST", "OPTIONS"])
@@ -28,15 +31,23 @@ def print_check(job_id: str):
     if not USE_DB:
         return jsonify({"error": "Database not configured"}), 503
 
-    # Look up the GLB URL for this job from history or models
-    glb_url = None
+    # Prefer the durable stored model URL first, then fall back through other saved Meshy URLs.
+    model_url = None
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 # Check history_items first
                 cur.execute(
                     f"""
-                    SELECT payload->>'glb_url' as glb_url
+                    SELECT COALESCE(
+                        glb_url,
+                        payload->>'glb_url',
+                        payload->>'textured_glb_url',
+                        payload->'model_urls'->>'glb',
+                        payload->'textured_model_urls'->>'glb',
+                        payload->'model_urls'->>'stl',
+                        payload->'textured_model_urls'->>'stl'
+                    ) AS model_url
                     FROM {Tables.HISTORY_ITEMS}
                     WHERE (id = %s OR payload->>'original_job_id' = %s)
                       AND identity_id = %s
@@ -47,13 +58,21 @@ def print_check(job_id: str):
                 )
                 row = cur.fetchone()
                 if row:
-                    glb_url = row[0] if isinstance(row, tuple) else row.get("glb_url")
+                    model_url = row[0] if isinstance(row, tuple) else row.get("model_url")
 
                 # Fallback: check models table
-                if not glb_url:
+                if not model_url:
                     cur.execute(
                         f"""
-                        SELECT glb_url
+                        SELECT COALESCE(
+                            glb_url,
+                            meta->>'glb_url',
+                            meta->>'textured_glb_url',
+                            meta->'model_urls'->>'glb',
+                            meta->'textured_model_urls'->>'glb',
+                            meta->'model_urls'->>'stl',
+                            meta->'textured_model_urls'->>'stl'
+                        ) AS model_url
                         FROM {Tables.MODELS}
                         WHERE (id = %s OR upstream_job_id = %s)
                           AND identity_id = %s
@@ -64,19 +83,20 @@ def print_check(job_id: str):
                     )
                     row = cur.fetchone()
                     if row:
-                        glb_url = row[0] if isinstance(row, tuple) else row.get("glb_url")
+                        model_url = row[0] if isinstance(row, tuple) else row.get("model_url")
     except Exception as e:
         return jsonify({"error": f"Database lookup failed: {e}"}), 500
 
-    if not glb_url:
-        return jsonify({"error": "Model not found or no GLB URL available"}), 404
+    if not model_url:
+        return jsonify({"error": "Model not found or no printable model URL available"}), 404
 
     # Run analysis
     try:
         from backend.services.print_analysis_service import PrintAnalysisService
-        result = PrintAnalysisService.analyze_from_url(glb_url)
+        result = PrintAnalysisService.analyze_from_url(model_url)
         return jsonify(result)
     except ImportError:
         return jsonify({"error": "Print analysis not available (trimesh not installed)"}), 503
     except Exception as e:
+        logger.exception("[PRINT_CHECK] Analysis failed for job_id=%s", job_id)
         return jsonify({"error": f"Analysis failed: {e}"}), 500

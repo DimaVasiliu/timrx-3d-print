@@ -146,7 +146,8 @@ def history_mod():
 
                 _image_cols = """,
                         i.id AS i_id, i.title AS i_title, i.image_url AS i_image_url,
-                        i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt"""
+                        i.thumbnail_url AS i_thumbnail_url, i.prompt AS i_prompt,
+                        i.meta AS i_meta"""
                 _image_join = f"""LEFT JOIN {Tables.IMAGES} i ON (
                         (h.image_id IS NOT NULL AND h.image_id = i.id) OR
                         (h.image_id IS NULL AND i.upstream_id = COALESCE(
@@ -170,7 +171,7 @@ def history_mod():
 
                 # Null placeholders for columns not selected (keeps enrichment code safe)
                 _model_nulls = ",\n                        NULL AS m_id, NULL AS m_title, NULL AS m_glb_url, NULL AS m_thumbnail_url, NULL AS m_meta, NULL AS m_prompt, NULL AS m_status"
-                _image_nulls = ",\n                        NULL AS i_id, NULL AS i_title, NULL AS i_image_url, NULL AS i_thumbnail_url, NULL AS i_prompt"
+                _image_nulls = ",\n                        NULL AS i_id, NULL AS i_title, NULL AS i_image_url, NULL AS i_thumbnail_url, NULL AS i_prompt, NULL AS i_meta"
                 _video_nulls = ",\n                        NULL AS v_id, NULL AS v_title, NULL AS v_video_url, NULL AS v_thumbnail_url, NULL AS v_duration_seconds, NULL AS v_resolution, NULL AS v_aspect_ratio, NULL AS v_meta, NULL AS v_prompt"
 
                 if item_type_filter == "model":
@@ -346,6 +347,12 @@ def history_mod():
                                 item["title"] = r["i_title"]
                             if r.get("i_prompt") and not item.get("prompt"):
                                 item["prompt"] = r["i_prompt"]
+                            image_meta = _parse_meta(r.get("i_meta"))
+                            if image_meta:
+                                item["meta"] = image_meta
+                                for key in ("artifact_format", "provider_variant", "output_mode", "operation", "upstream_request_id", "upstream_cost", "format"):
+                                    if image_meta.get(key) is not None:
+                                        item[key] = image_meta.get(key)
 
                         # Hydrate from joined VIDEO data
                         if r.get("v_id"):
