@@ -156,6 +156,32 @@ def get_executor() -> ThreadPoolExecutor:
     return _background_executor
 
 
+def _resolve_persisted_image_result(
+    persisted_result,
+    image_url: Optional[str],
+    image_urls: Optional[list],
+):
+    final_image_url = image_url
+    final_image_urls = image_urls or ([image_url] if image_url else [])
+    discord_image_url = final_image_url
+
+    if isinstance(persisted_result, dict):
+        persisted_image_url = persisted_result.get("image_url")
+        persisted_image_urls = persisted_result.get("image_urls")
+        persisted_thumbnail_url = persisted_result.get("thumbnail_url")
+
+        if persisted_image_url:
+            final_image_url = persisted_image_url
+        if isinstance(persisted_image_urls, list) and persisted_image_urls:
+            final_image_urls = persisted_image_urls
+        elif final_image_url:
+            final_image_urls = [final_image_url]
+
+        discord_image_url = persisted_thumbnail_url or final_image_url
+
+    return final_image_url, final_image_urls, discord_image_url
+
+
 def _complete_image_job(
     internal_job_id: str,
     identity_id: str,
@@ -190,7 +216,7 @@ def _complete_image_job(
         "mime_type": mime_type,
     }
 
-    save_image_to_normalized_db(
+    persisted_result = save_image_to_normalized_db(
         image_id=internal_job_id,
         image_url=image_url,
         prompt=prompt,
@@ -201,12 +227,17 @@ def _complete_image_job(
         provider=provider,
         extra_meta=extra_meta,
     )
+    final_image_url, final_image_urls, discord_image_url = _resolve_persisted_image_result(
+        persisted_result,
+        image_url,
+        image_urls,
+    )
 
     store = load_store()
     store_meta.update({
         "status": "done",
-        "image_url": image_url,
-        "image_urls": image_urls,
+        "image_url": final_image_url,
+        "image_urls": final_image_urls,
         "image_base64": image_base64,
         "mime_type": mime_type,
         "artifact_format": artifact_format,
@@ -225,9 +256,9 @@ def _complete_image_job(
         internal_job_id,
         upstream_job_id=upstream_job_id,
         image_id=internal_job_id,
-        image_url=image_url,
+        image_url=final_image_url,
         extra_meta={
-            "image_urls": image_urls,
+            "image_urls": final_image_urls,
             "image_base64": image_base64,
             "mime_type": mime_type,
             "artifact_format": artifact_format,
@@ -240,7 +271,7 @@ def _complete_image_job(
         },
     )
 
-    send_to_discord(discord_title, prompt, image_url, identity_id)
+    send_to_discord(discord_title, prompt, discord_image_url, identity_id)
     ExpenseGuard.unregister_active_job(internal_job_id)
 
 
@@ -595,7 +626,7 @@ def dispatch_openai_image_async(
             update_job_status_failed(internal_job_id, "Image generation failed. Please try again.")
             return
 
-        save_image_to_normalized_db(
+        persisted_result = save_image_to_normalized_db(
             image_id=internal_job_id,
             image_url=urls[0],
             prompt=prompt,
@@ -605,12 +636,17 @@ def dispatch_openai_image_async(
             user_id=identity_id,
             provider="openai",  # Explicit: saves to images/openai/{hash}.png
         )
+        final_image_url, final_image_urls, discord_image_url = _resolve_persisted_image_result(
+            persisted_result,
+            urls[0],
+            urls,
+        )
         # print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=openai")
 
         store = load_store()
         store_meta["status"] = "done"
-        store_meta["image_url"] = urls[0]
-        store_meta["image_urls"] = urls
+        store_meta["image_url"] = final_image_url
+        store_meta["image_urls"] = final_image_urls
         store_meta["image_base64"] = b64_first
         store[internal_job_id] = store_meta
         save_store(store)
@@ -627,14 +663,15 @@ def dispatch_openai_image_async(
             internal_job_id,
             upstream_job_id=None,
             image_id=internal_job_id,
-            image_url=urls[0],
+            image_url=final_image_url,
+            extra_meta={"image_urls": final_image_urls},
         )
 
         if breaker:
             breaker.record_success()
 
         # Post to Discord
-        send_to_discord("🖼️ New AI Image Generated", prompt, urls[0], identity_id)
+        send_to_discord("🖼️ New AI Image Generated", prompt, discord_image_url, identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
@@ -705,7 +742,7 @@ def dispatch_gemini_image_async(
             return
 
         # Save to normalized DB (creates images row + history_items row)
-        save_image_to_normalized_db(
+        persisted_result = save_image_to_normalized_db(
             image_id=internal_job_id,
             image_url=image_url or image_urls[0],
             prompt=prompt,
@@ -715,13 +752,18 @@ def dispatch_gemini_image_async(
             user_id=identity_id,
             provider="google",
         )
+        final_image_url, final_image_urls, discord_image_url = _resolve_persisted_image_result(
+            persisted_result,
+            image_url or image_urls[0],
+            image_urls,
+        )
         # print(f"[JOB] asset_saved job_id={internal_job_id} image_id={internal_job_id} provider=google")
 
         # Update in-memory store
         store = load_store()
         store_meta["status"] = "done"
-        store_meta["image_url"] = image_url or image_urls[0]
-        store_meta["image_urls"] = image_urls
+        store_meta["image_url"] = final_image_url
+        store_meta["image_urls"] = final_image_urls
         store_meta["image_base64"] = image_base64
         store[internal_job_id] = store_meta
         save_store(store)
@@ -739,14 +781,15 @@ def dispatch_gemini_image_async(
             internal_job_id,
             upstream_job_id=None,
             image_id=internal_job_id,
-            image_url=image_url or image_urls[0],
+            image_url=final_image_url,
+            extra_meta={"image_urls": final_image_urls},
         )
 
         if breaker:
             breaker.record_success()
 
         # Post to Discord
-        send_to_discord("🖼️ New AI Image Generated", prompt, image_url or image_urls[0], identity_id)
+        send_to_discord("🖼️ New AI Image Generated", prompt, discord_image_url, identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)
@@ -849,7 +892,7 @@ def dispatch_piapi_nano_banana_async(
         image_url = image_urls[0]
 
         # Save to normalized DB (creates images row + history_items row)
-        save_image_to_normalized_db(
+        persisted_result = save_image_to_normalized_db(
             image_id=internal_job_id,
             image_url=image_url,
             prompt=prompt,
@@ -859,12 +902,17 @@ def dispatch_piapi_nano_banana_async(
             user_id=identity_id,
             provider="nano_banana",
         )
+        final_image_url, final_image_urls, discord_image_url = _resolve_persisted_image_result(
+            persisted_result,
+            image_url,
+            image_urls,
+        )
 
         # Update in-memory store
         store = load_store()
         store_meta["status"] = "done"
-        store_meta["image_url"] = image_url
-        store_meta["image_urls"] = image_urls
+        store_meta["image_url"] = final_image_url
+        store_meta["image_urls"] = final_image_urls
         store[internal_job_id] = store_meta
         save_store(store)
 
@@ -876,11 +924,12 @@ def dispatch_piapi_nano_banana_async(
             internal_job_id,
             upstream_job_id=upstream_task_id,
             image_id=internal_job_id,
-            image_url=image_url,
+            image_url=final_image_url,
+            extra_meta={"image_urls": final_image_urls},
         )
 
         # Post to Discord
-        send_to_discord("🖼️ New AI Image Generated (Nano Banana)", prompt, image_url, identity_id)
+        send_to_discord("🖼️ New AI Image Generated (Nano Banana)", prompt, discord_image_url, identity_id)
 
         # Unregister active job
         ExpenseGuard.unregister_active_job(internal_job_id)

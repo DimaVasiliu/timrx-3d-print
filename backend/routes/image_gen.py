@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import os
 import time
+import traceback
 import uuid
 from urllib.parse import urlparse
 
@@ -282,29 +283,38 @@ def image_generate_unified():
                 "safety": safety,
             }), status_code
 
-    if provider == "nano_banana":
-        # Route to PiAPI Nano Banana 2
-        return _handle_nano_banana_image_generate(body)
-    elif provider == "google":
-        # Route to Gemini Imagen
-        return _handle_gemini_image_generate(body)
-    elif provider == "google_nano":
-        return _handle_google_nano_image_generate(body)
-    elif provider == "flux_pro":
-        return _handle_flux_pro_image_generate(body)
-    elif provider == "ideogram_v3":
-        return _handle_ideogram_v3_image_generate(body)
-    elif provider == "recraft_v4":
-        return _handle_recraft_v4_image_generate(body)
-    elif provider == "openai":
-        # Route to OpenAI (via existing endpoint logic)
-        return _handle_openai_image_generate(body)
-    else:
+    try:
+        if provider == "nano_banana":
+            # Route to PiAPI Nano Banana 2
+            return _handle_nano_banana_image_generate(body)
+        elif provider == "google":
+            # Route to Gemini Imagen
+            return _handle_gemini_image_generate(body)
+        elif provider == "google_nano":
+            return _handle_google_nano_image_generate(body)
+        elif provider == "flux_pro":
+            return _handle_flux_pro_image_generate(body)
+        elif provider == "ideogram_v3":
+            return _handle_ideogram_v3_image_generate(body)
+        elif provider == "recraft_v4":
+            return _handle_recraft_v4_image_generate(body)
+        elif provider == "openai":
+            # Route to OpenAI (via existing endpoint logic)
+            return _handle_openai_image_generate(body)
+        else:
+            return jsonify({
+                "error": "invalid_provider",
+                "message": f"Unknown image provider: {provider}",
+                "allowed": get_allowed_image_providers(),
+            }), 400
+    except Exception as e:
+        print(f"[IMAGE_API] Unhandled error provider={provider}: {e}")
+        print(traceback.format_exc())
         return jsonify({
-            "error": "invalid_provider",
-            "message": f"Unknown image provider: {provider}",
-            "allowed": get_allowed_image_providers(),
-        }), 400
+            "error": "image_generate_internal_error",
+            "message": "Image generation failed before dispatch. Please try again.",
+            "details": {"provider": provider},
+        }), 500
 
 
 def _handle_nano_banana_image_generate(body: dict):
@@ -764,6 +774,12 @@ def _handle_flux_pro_image_generate(body: dict):
             reference_images.append(asset_url)
     if reference_images and operation == "generate":
         operation = "edit"
+    if operation == "edit" and not reference_images:
+        return jsonify({
+            "error": "invalid_params",
+            "message": "FLUX Reference / Edit mode requires at least one source or reference image.",
+            "field": "source_image",
+        }), 400
 
     request_options = {
         "prompt": prompt,
@@ -792,7 +808,7 @@ def _handle_flux_pro_image_generate(body: dict):
         height=height,
         model_variant=model_variant,
         operation=operation,
-        source=(reference_images[0] or "")[:96],
+        source=(reference_images[0] if reference_images else "")[:96],
         refs=len(reference_images),
     )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)

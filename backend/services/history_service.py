@@ -1037,7 +1037,14 @@ def save_image_to_normalized_db(
             invalidate_history_cache(user_id)
         except Exception:
             pass
-        return returned_image_id
+        return {
+            "image_id": returned_image_id,
+            "history_id": history_uuid,
+            "image_url": image_url,
+            "image_urls": image_urls or ([image_url] if image_url else []),
+            "thumbnail_url": thumbnail_url,
+            "artifact_format": artifact_format,
+        }
     except Exception as e:
         print(f"[DB] Failed to save image {image_id}: {e}")
         # ── Compensating S3 cleanup: delete newly-created objects on DB failure ──

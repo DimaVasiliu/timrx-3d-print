@@ -89,6 +89,7 @@ def validate_flux_dimensions(width: int, height: int) -> None:
 
 def validate_flux_request(options: Dict[str, Any]) -> None:
     model_variant = str(options.get("model_variant") or "pro").strip().lower()
+    operation = str(options.get("operation") or "generate").strip().lower()
     if model_variant not in FLUX_MODEL_ENDPOINTS:
         raise FluxProValidationError(
             f"Unsupported FLUX model variant '{model_variant}'. Allowed: {sorted(FLUX_MODEL_ENDPOINTS)}"
@@ -109,6 +110,8 @@ def validate_flux_request(options: Dict[str, Any]) -> None:
     reference_images = list(options.get("reference_images") or [])
     if len(reference_images) > 8:
         raise FluxProValidationError("FLUX supports at most 8 reference images")
+    if operation == "edit" and not reference_images:
+        raise FluxProValidationError("FLUX edit mode requires at least one source or reference image")
 
     if model_variant == "flex":
         guidance = options.get("guidance")

@@ -139,6 +139,8 @@ def send_to_discord(title: str, prompt: str = "", image_url: str = None, identit
 
     if image_url and _is_valid_embed_url(image_url):
         embed["image"] = {"url": image_url}
+    elif isinstance(image_url, str) and image_url.startswith("data:"):
+        pass
     elif image_url:
         logger.info("[Discord] Dropping non-HTTP image_url (type=%s, prefix=%s)",
                      type(image_url).__name__, str(image_url)[:30])

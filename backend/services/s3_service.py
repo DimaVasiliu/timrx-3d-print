@@ -55,7 +55,21 @@ def build_hash_s3_key(prefix: str, provider: str | None, content_hash: str, cont
     """
     # Normalize provider - default to "unknown" if not provided
     # All video/image/3D providers must be listed here
-    KNOWN_PROVIDERS = {"openai", "google", "vertex", "seedance", "fal_seedance", "meshy", "nano_banana", "user", "unknown"}
+    KNOWN_PROVIDERS = {
+        "openai",
+        "google",
+        "google_nano",
+        "nano_banana",
+        "flux_pro",
+        "ideogram_v3",
+        "recraft_v4",
+        "vertex",
+        "seedance",
+        "fal_seedance",
+        "meshy",
+        "user",
+        "unknown",
+    }
     raw_provider = (provider or "").lower().strip()
     safe_provider = sanitize_filename(raw_provider) if raw_provider else "unknown"
 
