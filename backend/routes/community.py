@@ -168,6 +168,7 @@ def community_feed_mod():
                     cp.id, cp.display_name, cp.prompt_public, cp.show_prompt, cp.created_at,
                     cp.model_id, cp.image_id, cp.history_item_id,
                     m.title          AS model_title,
+                    m.glb_url        AS model_glb_url,
                     m.thumbnail_url  AS model_thumbnail,
                     i.image_url      AS image_url,
                     i.thumbnail_url  AS image_thumbnail,
@@ -194,7 +195,7 @@ def community_feed_mod():
             for row in rows:
                 (post_id, display_name, prompt_public, show_prompt, created_at,
                  model_id, image_id, history_item_id,
-                 model_title, model_thumbnail,
+                 model_title, model_glb_url, model_thumbnail,
                  image_url, image_thumbnail,
                  history_title, history_thumbnail, history_glb_url, history_image_url,
                  history_item_type, history_video_url, gen_action,
@@ -215,7 +216,10 @@ def community_feed_mod():
 
                 if model_id:
                     post["asset_type"] = "model"
-                    post["asset"] = {"id": str(model_id), "title": model_title, "thumbnail_url": model_thumbnail}
+                    asset = {"id": str(model_id), "title": model_title, "thumbnail_url": model_thumbnail}
+                    if model_glb_url:
+                        asset["glb_url"] = model_glb_url
+                    post["asset"] = asset
                 elif image_id:
                     post["asset_type"] = "image"
                     asset = {"id": str(image_id), "thumbnail_url": image_thumbnail}
