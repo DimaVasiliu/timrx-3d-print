@@ -5,7 +5,7 @@ POST /api/_mod/print-check/<job_id>
 Free analysis (0 credits) to encourage the print workflow.
 """
 
-from flask import Blueprint, jsonify, g
+from flask import Blueprint, jsonify, g, request
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import with_session_readonly
@@ -18,6 +18,9 @@ bp = Blueprint("print_check", __name__)
 @with_session_readonly
 def print_check(job_id: str):
     """Analyze a completed model for 3D printing readiness."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     identity_id = require_identity()
     if not identity_id:
         return jsonify({"error": "Authentication required"}), 401
