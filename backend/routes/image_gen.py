@@ -57,6 +57,8 @@ from backend.services.piapi_nano_banana_service import (
 from backend.services.recraft_image_service import (
     check_recraft_v4_configured,
     ALLOWED_OUTPUT_MODES as RECRAFT_ALLOWED_OUTPUT_MODES,
+    RecraftValidationError,
+    validate_recraft_params,
 )
 from backend.services.image_asset_utils import (
     coerce_bool,
@@ -112,10 +114,16 @@ FLUX_PRO_RESOLUTION_MAP = {
     "landscape": (1536, 1024),
 }
 
-IDEOGRAM_RESOLUTION_MAP = {
+IDEOGRAM_ASPECT_RATIO_MAP = {
+    "square": "1x1",
+    "portrait": "2x3",
+    "landscape": "3x2",
+}
+
+IDEOGRAM_REFRAME_RESOLUTION_MAP = {
     "square": "1024x1024",
-    "portrait": "1024x1536",
-    "landscape": "1536x1024",
+    "portrait": "512x1536",
+    "landscape": "1280x800",
 }
 
 RECRAFT_SIZE_MAP = {
@@ -905,11 +913,18 @@ def _handle_ideogram_v3_image_generate(body: dict):
 
     shape = body.get("shape") or "square"
     aspect_ratio = str(_body_value(body, "aspect_ratio", "aspectRatio", default="") or "").strip()
-    resolution = str(
-        _body_value(body, "resolution", "size", default=IDEOGRAM_RESOLUTION_MAP.get(shape, IDEOGRAM_RESOLUTION_MAP["square"])) or ""
-    ).strip()
-    if not aspect_ratio and not resolution and operation != "upscale":
-        resolution = IDEOGRAM_RESOLUTION_MAP.get(shape, IDEOGRAM_RESOLUTION_MAP["square"])
+    resolution = str(_body_value(body, "resolution", "size", default="") or "").strip()
+
+    if operation == "reframe":
+        if not aspect_ratio and not resolution:
+            resolution = IDEOGRAM_REFRAME_RESOLUTION_MAP.get(shape, IDEOGRAM_REFRAME_RESOLUTION_MAP["square"])
+    elif operation != "upscale":
+        # Ideogram V3 standard generate/edit/remix flows should use aspect ratios.
+        # Older frontends may still send generic 1024x1536-style resolutions, which
+        # Ideogram rejects, so ignore those here and normalize to provider ratios.
+        resolution = ""
+        if not aspect_ratio:
+            aspect_ratio = IDEOGRAM_ASPECT_RATIO_MAP.get(shape, IDEOGRAM_ASPECT_RATIO_MAP["square"])
 
     request_options = {
         "prompt": prompt,
@@ -1081,6 +1096,18 @@ def _handle_recraft_v4_image_generate(body: dict):
         "max_num_shapes": coerce_int(_body_value(body, "max_num_shapes", "maxNumShapes")),
         "text_layout": _body_value(body, "text_layout", "textLayout"),
     }
+
+    try:
+        validate_recraft_params(request_options)
+    except RecraftValidationError as e:
+        payload = {
+            "error": "invalid_params",
+            "message": e.message,
+            "field": e.field,
+        }
+        if e.allowed:
+            payload["allowed"] = e.allowed
+        return jsonify(payload), 400
 
     guard_error = ExpenseGuard.check_image_request(n=1)
     if guard_error:

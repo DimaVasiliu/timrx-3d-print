@@ -31,6 +31,8 @@ RECRAFT_TIMEOUT = (15, 180)
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 2
 ALLOWED_OUTPUT_MODES = {"raster", "vector_svg"}
+RECRAFT_V3_MODELS = {"recraftv3", "recraftv3_vector"}
+RECRAFT_V2_V3_GENERATE_MODELS = {"recraftv2", "recraftv2_vector", "recraftv3", "recraftv3_vector"}
 RECRAFT_OPERATIONS = {
     "generate": {"path": "/images/generations", "multipart": False},
     "image_to_image": {"path": "/images/imageToImage", "multipart": True},
@@ -93,10 +95,66 @@ def validate_recraft_params(options: Dict[str, Any]) -> None:
     if output_mode not in ALLOWED_OUTPUT_MODES:
         raise RecraftValidationError("output_mode", output_mode, sorted(ALLOWED_OUTPUT_MODES))
 
+    resolved_model = (
+        _resolve_edit_model(options) if operation in {"image_to_image", "inpaint", "replace_background", "generate_background"}
+        else _resolve_generate_model(options)
+    ).strip().lower()
+
     style = str(options.get("style") or "").strip()
     style_id = str(options.get("style_id") or "").strip()
+    negative_prompt = str(options.get("negative_prompt") or "").strip()
+    text_layout = _parse_json_or_passthrough(options.get("text_layout"))
     if style and style_id:
         raise RecraftValidationError("style", style, [], "Use either style or style_id, not both.")
+
+    if operation == "generate":
+        supports_styles = resolved_model in RECRAFT_V2_V3_GENERATE_MODELS
+        supports_negative_prompt = resolved_model in RECRAFT_V2_V3_GENERATE_MODELS
+        supports_text_layout = resolved_model in RECRAFT_V3_MODELS
+    elif operation in {"image_to_image", "inpaint", "replace_background", "generate_background"}:
+        if resolved_model not in RECRAFT_V3_MODELS:
+            raise RecraftValidationError(
+                "model_variant",
+                resolved_model,
+                sorted(RECRAFT_V3_MODELS),
+                f"{operation} is available only with Recraft V3 or Recraft V3 Vector.",
+            )
+        supports_styles = True
+        supports_negative_prompt = True
+        supports_text_layout = True
+    else:
+        supports_styles = False
+        supports_negative_prompt = False
+        supports_text_layout = False
+
+    if style and not supports_styles:
+        raise RecraftValidationError(
+            "style",
+            style,
+            [],
+            f"Styles are not supported for {resolved_model or operation} in {operation}.",
+        )
+    if style_id and not supports_styles:
+        raise RecraftValidationError(
+            "style_id",
+            style_id,
+            [],
+            f"style_id is not supported for {resolved_model or operation} in {operation}.",
+        )
+    if negative_prompt and not supports_negative_prompt:
+        raise RecraftValidationError(
+            "negative_prompt",
+            negative_prompt,
+            [],
+            f"negative_prompt is not supported for {resolved_model or operation} in {operation}.",
+        )
+    if text_layout and not supports_text_layout:
+        raise RecraftValidationError(
+            "text_layout",
+            text_layout,
+            [],
+            f"text_layout is available only for Recraft V3 and Recraft V3 Vector generation/edit modes.",
+        )
 
     if operation in {"image_to_image", "inpaint", "replace_background", "generate_background", "erase_region", "remix"}:
         if not normalize_asset_list(options.get("source_image")):
