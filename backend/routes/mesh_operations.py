@@ -80,14 +80,25 @@ def mesh_remesh_mod():
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
-    # Default to GLB + STL so the print panel can offer direct STL download
-    requested_formats = body.get("target_formats")
-    if not requested_formats:
-        requested_formats = ["glb", "stl"]
-    # Ensure both glb and stl are always included for print workflow
-    if "glb" not in requested_formats:
-        requested_formats.append("glb")
-    payload = {**source, "target_formats": requested_formats}
+    raw_target_formats = body.get("target_formats")
+    allowed_target_formats = {"glb", "fbx", "obj", "usdz", "blend", "stl"}
+    target_formats = []
+    if isinstance(raw_target_formats, str):
+        raw_target_formats = [raw_target_formats]
+    if isinstance(raw_target_formats, list):
+        seen_formats = set()
+        for item in raw_target_formats:
+            value = str(item or "").strip().lower()
+            if not value:
+                continue
+            if value not in allowed_target_formats:
+                return jsonify({"ok": False, "error": f"Unsupported target format: {value}"}), 400
+            if value in seen_formats:
+                continue
+            seen_formats.add(value)
+            target_formats.append(value)
+
+    payload = {**source}
 
     topology = (body.get("topology") or "").strip().lower()
     if topology in {"triangle", "quad"}:
@@ -120,8 +131,22 @@ def mesh_remesh_mod():
     if origin_at in {"bottom", "center"}:
         payload["origin_at"] = origin_at
 
+    convert_format_only = False
     if body.get("convert_format_only") is not None:
-        payload["convert_format_only"] = bool(body.get("convert_format_only"))
+        convert_format_only = bool(body.get("convert_format_only"))
+        payload["convert_format_only"] = convert_format_only
+
+    if convert_format_only and not target_formats:
+        return jsonify({"ok": False, "error": "target_formats required when convert_format_only is enabled"}), 400
+
+    if not target_formats:
+        target_formats = ["glb"]
+
+    # Keep GLB in the job so the workspace always has a previewable model.
+    if "glb" not in target_formats:
+        target_formats.insert(0, "glb")
+
+    payload["target_formats"] = target_formats
 
     # Check for source task ID in various field names (frontend sends input_task_id)
     source_task_id_input = body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id")
@@ -151,8 +176,12 @@ def mesh_remesh_mod():
         "title": title,
         "stage": "remesh",
         "source_task_id": source_task_id,  # Use resolved ID
-        "topology": topology,
+        "topology": payload.get("topology"),
         "target_polycount": payload.get("target_polycount"),
+        "target_formats": target_formats,
+        "resize_height": payload.get("resize_height"),
+        "origin_at": payload.get("origin_at"),
+        "convert_format_only": convert_format_only,
         "print_height_mm": print_height_mm,
     }
 
@@ -201,8 +230,13 @@ def mesh_remesh_mod():
         "prompt": original_prompt,
         "root_prompt": root_prompt,
         "title": title,
-        "topology": topology,
+        "topology": payload.get("topology"),
         "target_polycount": payload.get("target_polycount"),
+        "target_formats": target_formats,
+        "resize_height": payload.get("resize_height"),
+        "origin_at": payload.get("origin_at"),
+        "convert_format_only": convert_format_only,
+        "print_height_mm": print_height_mm,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -471,6 +505,29 @@ def mesh_retexture_mod():
         enable_original_uv = False
 
     enable_pbr = bool(body.get("enable_pbr", False))
+    remove_lighting = bool(body.get("remove_lighting", True))
+    ai_model = (body.get("ai_model") or "").strip() or "latest"
+
+    raw_target_formats = body.get("target_formats")
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz"}
+    target_formats = []
+    if isinstance(raw_target_formats, str):
+        raw_target_formats = [raw_target_formats]
+    if isinstance(raw_target_formats, list):
+        seen_formats = set()
+        for item in raw_target_formats:
+            value = str(item or "").strip().lower()
+            if not value:
+                continue
+            if value not in allowed_target_formats:
+                return jsonify({"error": f"Unsupported target format: {value}"}), 400
+            if value in seen_formats:
+                continue
+            seen_formats.add(value)
+            target_formats.append(value)
+
+    if ai_model == "meshy-5":
+        remove_lighting = False
 
     # ── Final source validation BEFORE reserving credits ─────────────────
     # If after all fallbacks we still have no usable source, fail early
@@ -489,7 +546,13 @@ def mesh_retexture_mod():
         "stage": "texture",
         "source_task_id": source_task_id,
         "texture_prompt": prompt or None,
+        "texture_style_mode": "image" if style_img else "text",
+        "uses_image_style": bool(style_img),
         "enable_pbr": enable_pbr,
+        "enable_original_uv": enable_original_uv,
+        "remove_lighting": remove_lighting,
+        "target_formats": target_formats,
+        "ai_model": ai_model,
     }
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
@@ -512,20 +575,24 @@ def mesh_retexture_mod():
         **source,
         "enable_original_uv": enable_original_uv,
         "enable_pbr": enable_pbr,
+        "remove_lighting": remove_lighting,
     }
     if prompt:
         payload["text_style_prompt"] = prompt
     if style_img:
         payload["image_style_url"] = style_img
-    ai_model = (body.get("ai_model") or "").strip()
     if ai_model:
         payload["ai_model"] = ai_model
+    if target_formats:
+        payload["target_formats"] = target_formats
 
     # ── Structured diagnostics ───────────────────────────────────────────
     _log_retexture_diagnostics(
         source=source, body=body, source_mode=source_mode,
         upstream_info=upstream_info, enable_original_uv=enable_original_uv,
-        enable_pbr=enable_pbr, prompt=prompt, prompt_mode=prompt_mode,
+        enable_pbr=enable_pbr, remove_lighting=remove_lighting,
+        target_formats=target_formats, style_img_present=bool(style_img),
+        prompt=prompt, prompt_mode=prompt_mode,
         original_prompt_len=original_prompt_len, ai_model=ai_model or "default",
     )
 
@@ -601,7 +668,13 @@ def mesh_retexture_mod():
         "root_prompt": root_prompt,
         "title": title,
         "texture_prompt": prompt,
+        "texture_style_mode": "image" if style_img else "text",
+        "uses_image_style": bool(style_img),
         "enable_pbr": enable_pbr,
+        "enable_original_uv": enable_original_uv,
+        "remove_lighting": remove_lighting,
+        "target_formats": target_formats,
+        "ai_model": ai_model,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -744,7 +817,8 @@ def _extract_texture_hints(prompt: str) -> str:
 
 def _log_retexture_diagnostics(
     *, source, body, source_mode, upstream_info, enable_original_uv,
-    enable_pbr, prompt, prompt_mode, original_prompt_len, ai_model,
+    enable_pbr, remove_lighting, target_formats, style_img_present,
+    prompt, prompt_mode, original_prompt_len, ai_model,
 ):
     """Structured diagnostic log block for retexture request."""
     input_id = body.get("input_task_id") or body.get("source_task_id") or ""
@@ -764,6 +838,9 @@ def _log_retexture_diagnostics(
         f"[RETEXTURE:PARAMS] source_mode={source_mode}"
         f" enable_original_uv={enable_original_uv}"
         f" enable_pbr={enable_pbr}"
+        f" remove_lighting={remove_lighting}"
+        f" image_style={'yes' if style_img_present else 'no'}"
+        f" target_formats={','.join(target_formats) if target_formats else 'all'}"
         f" ai_model={ai_model}"
     )
 
