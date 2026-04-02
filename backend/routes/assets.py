@@ -6,8 +6,9 @@ Registered under /api/_mod.
 
 from __future__ import annotations
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 import ipaddress
+import re
 import socket
 
 import boto3
@@ -43,6 +44,29 @@ def _extract_s3_key_from_url(url: str | None) -> str | None:
     if ".s3." in parsed.netloc and ".amazonaws.com" in parsed.netloc:
         return parsed.path.lstrip("/") if parsed.path else None
     return None
+
+
+def _clean_download_filename(requested: str | None, fallback: str = "download") -> str:
+    raw = str(requested or "").strip() or str(fallback or "").strip() or "download"
+    raw = raw.replace("\\", "-").replace("/", "-")
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+    raw = re.sub(r"-{2,}", "-", raw).strip(" .-_")
+    if not raw:
+        raw = "download"
+    if len(raw) > 120:
+        stem, dot, ext = raw.rpartition(".")
+        if dot and ext:
+            max_stem = max(1, 120 - len(ext) - 1)
+            stem = stem[:max_stem].rstrip(" .-_") or "download"
+            raw = f"{stem}.{ext}"
+        else:
+            raw = raw[:120].rstrip(" .-_") or "download"
+    return raw
+
+
+def _attachment_header(filename: str) -> str:
+    safe_name = _clean_download_filename(filename)
+    return f'attachment; filename="{safe_name}"; filename*=UTF-8\'\'{quote(safe_name)}'
 
 
 def _is_our_s3_bucket(url: str) -> bool:
@@ -332,6 +356,7 @@ def proxy_glb_mod():
                     r = requests.get(presigned_url, stream=True, timeout=(5, 60))
                     content_type = r.headers.get("Content-Type", "application/octet-stream")
                     filename = s3_key.rsplit("/", 1)[-1] if "/" in s3_key else s3_key
+                    requested_filename = _clean_download_filename(request.args.get("filename"), filename)
 
                     def s3_gen():
                         for chunk in r.iter_content(chunk_size=8192):
@@ -341,7 +366,7 @@ def proxy_glb_mod():
                     headers = {
                         **cors_headers,
                         "Content-Type": content_type,
-                        "Content-Disposition": f'attachment; filename="{filename}"',
+                        "Content-Disposition": _attachment_header(requested_filename),
                         "Cache-Control": "private, no-cache",
                     }
                     return Response(s3_gen(), status=r.status_code, headers=headers)
@@ -402,7 +427,8 @@ def proxy_glb_mod():
     }
     if force_download:
         filename = p.path.rsplit("/", 1)[-1] or "download"
-        resp_headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        requested_filename = _clean_download_filename(request.args.get("filename"), filename)
+        resp_headers["Content-Disposition"] = _attachment_header(requested_filename)
     return Response(gen(), status=r.status_code, headers=resp_headers)
 
 
