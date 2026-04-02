@@ -24,9 +24,9 @@ def print_check(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
 
-    identity_id = require_identity()
-    if not identity_id:
-        return jsonify({"error": "Authentication required"}), 401
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
 
     if not USE_DB:
         return jsonify({"error": "Database not configured"}), 503
