@@ -32,6 +32,7 @@ from backend.services.meshy_service import (
 def create_rigging_task(
     model_source: dict,
     height_meters: float = 1.7,
+    texture_image_url: str | None = None,
 ) -> dict:
     """
     Create a Meshy rigging task.
@@ -39,11 +40,15 @@ def create_rigging_task(
     Args:
         model_source: dict with either {"input_task_id": ...} or {"model_url": ...}
         height_meters: Character height in meters (default 1.7)
+        texture_image_url: Optional UV-unwrapped base color texture image
+            (public URL or data URI) to help Meshy keep surface guidance.
 
     Returns:
         Raw Meshy response dict (contains "result" or "id" for the task ID).
     """
     payload: dict[str, Any] = {**model_source, "height_meters": height_meters}
+    if texture_image_url:
+        payload["texture_image_url"] = texture_image_url
     return mesh_post("/openapi/v1/rigging", payload)
 
 

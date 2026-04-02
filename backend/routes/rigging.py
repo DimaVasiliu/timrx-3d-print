@@ -100,6 +100,7 @@ def rig_preflight():
         "riggable": True,
         "reason": None,
         "recommended_action": "proceed",
+        "preflight_limited": False,
         "source": {
             "input_task_id": source.get("input_task_id"),
             "model_url": source.get("model_url"),
@@ -108,6 +109,14 @@ def rig_preflight():
         "vertex_count": None,
         "already_rigged": False,
     }
+
+    if source.get("model_url") and not source.get("input_task_id"):
+        result["preflight_limited"] = True
+        result["reason"] = (
+            "Upload sources cannot be deeply inspected before Meshy processes them. "
+            "The final rig submit will still validate humanoid pose and reject unsupported or overly complex models."
+        )
+        result["recommended_action"] = "proceed_with_upload"
 
     # Check if the source is already a rigged model
     source_task_id = source.get("input_task_id")
@@ -252,6 +261,7 @@ def rig_start():
             height_meters = 1.7
     except (TypeError, ValueError):
         height_meters = 1.7
+    texture_image_url = (body.get("texture_image_url") or "").strip() or None
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["rigging"]
@@ -265,6 +275,7 @@ def rig_start():
     job_meta = {
         "stage": "rig",
         "height_meters": height_meters,
+        "uses_texture_image": bool(texture_image_url),
         "source_task_id": source.get("input_task_id"),
         "source_history_id": source_history_id,
         "model_url": source.get("model_url"),
@@ -309,7 +320,11 @@ def rig_start():
             print(f"[RIG_SUBMIT] _fail_job error: {fe}")
 
     try:
-        resp = create_rigging_task(source, height_meters=height_meters)
+        resp = create_rigging_task(
+            source,
+            height_meters=height_meters,
+            texture_image_url=texture_image_url,
+        )
         log_event("rig/start:meshy-resp", resp)
         meshy_task_id = resp.get("result") or resp.get("id")
         if not meshy_task_id:
@@ -337,7 +352,11 @@ def rig_start():
                 )
                 if not fallback_err and fallback_source:
                     try:
-                        resp = create_rigging_task(fallback_source, height_meters=height_meters)
+                        resp = create_rigging_task(
+                            fallback_source,
+                            height_meters=height_meters,
+                            texture_image_url=texture_image_url,
+                        )
                         meshy_task_id = resp.get("result") or resp.get("id")
                         if meshy_task_id:
                             print(f"[RIG_SUBMIT] model_url fallback succeeded: {meshy_task_id}")
@@ -396,6 +415,7 @@ def rig_start():
         "stage": "rig",
         "created_at": now_s() * 1000,
         "height_meters": height_meters,
+        "uses_texture_image": bool(texture_image_url),
         "source_task_id": source.get("input_task_id"),
         "source_history_id": source_history_id,
         "model_url": source.get("model_url"),

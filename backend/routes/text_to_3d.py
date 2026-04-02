@@ -301,7 +301,14 @@ def text_to_3d_refine_mod():
         preview_meta = get_job_metadata(preview_task_id, store)
     original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = preview_meta.get("root_prompt") or original_prompt
-    texture_prompt = body.get("texture_prompt")
+    texture_prompt = (body.get("texture_prompt") or "").strip() or None
+    texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip() or None
+    enable_pbr = bool(body.get("enable_pbr", True))
+    ai_model = (body.get("ai_model") or body.get("model") or "latest").strip() or "latest"
+    remove_lighting = None
+    if body.get("remove_lighting") is not None:
+        remove_lighting = bool(body.get("remove_lighting"))
+    texture_style_mode = "image" if texture_image_url else "text"
     # Derive title from prompt/root_prompt - derive_display_title handles generic titles automatically
     explicit_title = body.get("title") or preview_meta.get("title")
     title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
@@ -314,9 +321,15 @@ def text_to_3d_refine_mod():
         "title": title,
         "stage": "refine",
         "preview_task_id": preview_task_id,
+        "enable_pbr": enable_pbr,
+        "ai_model": ai_model,
+        "texture_style_mode": texture_style_mode,
+        "uses_image_style": texture_style_mode == "image",
     }
     if texture_prompt:
         job_meta["texture_prompt"] = texture_prompt
+    if remove_lighting is not None:
+        job_meta["remove_lighting"] = remove_lighting
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
@@ -325,10 +338,15 @@ def text_to_3d_refine_mod():
     payload = {
         "mode": "refine",
         "preview_task_id": preview_task_id,
-        "enable_pbr": bool(body.get("enable_pbr", True)),
+        "enable_pbr": enable_pbr,
+        "ai_model": ai_model,
     }
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
+    if texture_image_url:
+        payload["texture_image_url"] = texture_image_url
+    if remove_lighting is not None:
+        payload["remove_lighting"] = remove_lighting
 
     store_meta = {
         "stage": "refine",
@@ -338,11 +356,17 @@ def text_to_3d_refine_mod():
         "root_prompt": root_prompt,
         "title": title,
         "texture_prompt": texture_prompt,
+        "enable_pbr": enable_pbr,
+        "ai_model": ai_model,
+        "texture_style_mode": texture_style_mode,
+        "uses_image_style": texture_style_mode == "image",
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
+    if remove_lighting is not None:
+        store_meta["remove_lighting"] = remove_lighting
 
     # Persist immediately so status polling can return queued while dispatch runs
     store = load_store()
