@@ -217,14 +217,26 @@ def proxy_glb_mod():
                         UNION
                         SELECT 'history_items' AS src
                         FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
+                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s OR video_url = %s)
                         UNION
                         SELECT 'images' AS src
                         FROM {Tables.IMAGES}
                         WHERE identity_id = ANY(%s) AND (image_url = %s OR thumbnail_url = %s)
+                        UNION
+                        SELECT 'videos' AS src
+                        FROM {Tables.VIDEOS}
+                        WHERE identity_id = ANY(%s) AND (
+                            video_s3_key = %s OR thumbnail_s3_key = %s
+                            OR video_url = %s OR thumbnail_url = %s
+                        )
                         LIMIT 1
                         """,
-                        (identity_ids, s3_key, s3_key, u, u, identity_ids, u, u, identity_ids, u, u),
+                        (
+                            identity_ids, s3_key, s3_key, u, u,
+                            identity_ids, u, u, u,
+                            identity_ids, u, u,
+                            identity_ids, s3_key, s3_key, u, u,
+                        ),
                     )
                 elif meshy_task_id:
                     # Check active_jobs, jobs, models, history_items, and images for Meshy task ID
@@ -268,14 +280,23 @@ def proxy_glb_mod():
                         UNION
                         SELECT 'history_items' AS src
                         FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s)
+                        WHERE identity_id = ANY(%s) AND (glb_url = %s OR thumbnail_url = %s OR video_url = %s)
                         UNION
                         SELECT 'images' AS src
                         FROM {Tables.IMAGES}
                         WHERE identity_id = ANY(%s) AND (image_url = %s OR thumbnail_url = %s)
+                        UNION
+                        SELECT 'videos' AS src
+                        FROM {Tables.VIDEOS}
+                        WHERE identity_id = ANY(%s) AND (video_url = %s OR thumbnail_url = %s)
                         LIMIT 1
                         """,
-                        (identity_ids, u, u, identity_ids, u, u, identity_ids, u, u),
+                        (
+                            identity_ids, u, u,
+                            identity_ids, u, u, u,
+                            identity_ids, u, u,
+                            identity_ids, u, u,
+                        ),
                     )
                 row = cur.fetchone()
         if row:

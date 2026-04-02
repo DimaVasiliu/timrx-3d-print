@@ -8,6 +8,8 @@ import logging
 from urllib.parse import urlparse
 from typing import Dict, Any
 
+from backend.config import AWS_BUCKET_MODELS, AWS_REGION
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,12 +19,19 @@ class PrintAnalysisService:
     MAX_FACE_COUNT = 500_000     # Very high-poly models are slow to slice
     MIN_WALL_THICKNESS_MM = 0.8  # Minimum for FDM printing
 
-    # Allowed domains for model downloads
-    ALLOWED_MODEL_DOMAINS = {
+    BASE_ALLOWED_MODEL_DOMAINS = {
         "assets.meshy.ai",
         "cdn.meshy.ai",
     }
     MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+    @staticmethod
+    def _allowed_model_domains() -> set[str]:
+        domains = set(PrintAnalysisService.BASE_ALLOWED_MODEL_DOMAINS)
+        if AWS_BUCKET_MODELS:
+            domains.add(f"{AWS_BUCKET_MODELS}.s3.{AWS_REGION}.amazonaws.com")
+            domains.add(f"{AWS_BUCKET_MODELS}.s3.amazonaws.com")
+        return domains
 
     @staticmethod
     def _failed_result(issue: str, suggestions: list[str] | None = None) -> Dict[str, Any]:
@@ -395,9 +404,10 @@ class PrintAnalysisService:
             return f"Unsupported URL scheme: {parsed.scheme}"
 
         # Domain allowlist — if configured, enforce it
-        if PrintAnalysisService.ALLOWED_MODEL_DOMAINS:
+        allowed_domains = PrintAnalysisService._allowed_model_domains()
+        if allowed_domains:
             domain = parsed.hostname or ""
-            if not any(domain == d or domain.endswith("." + d) for d in PrintAnalysisService.ALLOWED_MODEL_DOMAINS):
+            if not any(domain == d or domain.endswith("." + d) for d in allowed_domains):
                 return f"Domain not in allowlist: {domain}"
 
         # Block private/internal IPs
