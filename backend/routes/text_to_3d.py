@@ -107,12 +107,52 @@ def text_to_3d_start_mod():
     if model_type in {"standard", "lowpoly"}:
         payload["model_type"] = model_type
 
+    should_remesh = None
     if body.get("should_remesh") is not None:
-        payload["should_remesh"] = bool(body["should_remesh"])
-    if body.get("should_texture") is not None:
-        payload["should_texture"] = bool(body["should_texture"])
-    # NOTE: enable_pbr is NOT valid for text-to-3d preview.
-    # It belongs in: refine flows and image-to-3d (when should_texture=true).
+        should_remesh = bool(body["should_remesh"])
+    if model_type != "lowpoly" and should_remesh is not None:
+        payload["should_remesh"] = should_remesh
+
+    if model_type != "lowpoly" and payload.get("should_remesh"):
+        topology = (body.get("topology") or "").strip().lower()
+        if topology in {"triangle", "quad"}:
+            payload["topology"] = topology
+        try:
+            target_polycount = int(body.get("target_polycount"))
+        except (TypeError, ValueError):
+            target_polycount = None
+        if target_polycount is not None and 100 <= target_polycount <= 300000:
+            payload["target_polycount"] = target_polycount
+
+    if body.get("moderation") is not None:
+        payload["moderation"] = bool(body["moderation"])
+
+    raw_target_formats = body.get("target_formats")
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz"}
+    target_formats = []
+    if isinstance(raw_target_formats, str):
+        raw_target_formats = [raw_target_formats]
+    if isinstance(raw_target_formats, list):
+        seen_formats = set()
+        for item in raw_target_formats:
+            value = str(item or "").strip().lower()
+            if not value or value not in allowed_target_formats or value in seen_formats:
+                continue
+            seen_formats.add(value)
+            target_formats.append(value)
+    if target_formats:
+        if "glb" not in target_formats:
+            target_formats.insert(0, "glb")
+        payload["target_formats"] = target_formats
+
+    auto_size = False
+    if body.get("auto_size") is not None:
+        auto_size = bool(body["auto_size"])
+        payload["auto_size"] = auto_size
+
+    origin_at = (body.get("origin_at") or "").strip().lower()
+    if auto_size and origin_at in {"bottom", "center"}:
+        payload["origin_at"] = origin_at
 
     license_choice = normalize_license(body.get("license"))
     batch_count = clamp_int(body.get("batch_count"), 1, 8, 1)
@@ -128,6 +168,14 @@ def text_to_3d_start_mod():
         "license": license_choice,
         "symmetry_mode": payload.get("symmetry_mode", "auto"),
         "pose_mode": pose_mode,
+        "model_type": payload.get("model_type") or "standard",
+        "should_remesh": bool(payload.get("should_remesh")),
+        "topology": payload.get("topology"),
+        "target_polycount": payload.get("target_polycount"),
+        "moderation": bool(payload.get("moderation")),
+        "target_formats": payload.get("target_formats") or [],
+        "auto_size": bool(payload.get("auto_size")),
+        "origin_at": payload.get("origin_at"),
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
@@ -147,6 +195,14 @@ def text_to_3d_start_mod():
         "license": license_choice,
         "symmetry_mode": payload.get("symmetry_mode", "auto"),
         "pose_mode": pose_mode,
+        "model_type": payload.get("model_type") or "standard",
+        "should_remesh": bool(payload.get("should_remesh")),
+        "topology": payload.get("topology"),
+        "target_polycount": payload.get("target_polycount"),
+        "moderation": bool(payload.get("moderation")),
+        "target_formats": payload.get("target_formats") or [],
+        "auto_size": bool(payload.get("auto_size")),
+        "origin_at": payload.get("origin_at"),
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
@@ -660,7 +716,22 @@ def text_to_3d_status_mod(job_id: str):
         meta["identity_id"] = identity_id
         meta["user_id"] = identity_id
 
-    for key in ("batch_count", "batch_slot", "batch_group_id", "license", "symmetry_mode", "pose_mode"):
+    for key in (
+        "batch_count",
+        "batch_slot",
+        "batch_group_id",
+        "license",
+        "symmetry_mode",
+        "pose_mode",
+        "model_type",
+        "should_remesh",
+        "topology",
+        "target_polycount",
+        "moderation",
+        "target_formats",
+        "auto_size",
+        "origin_at",
+    ):
         if key in meta and key not in out:
             out[key] = meta.get(key)
     meta.update({"last_status": out["status"], "last_pct": out["pct"], "stage": out["stage"]})
