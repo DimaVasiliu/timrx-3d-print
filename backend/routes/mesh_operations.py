@@ -80,7 +80,14 @@ def mesh_remesh_mod():
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
-    payload = {**source, "target_formats": body.get("target_formats") or ["glb"]}
+    # Default to GLB + STL so the print panel can offer direct STL download
+    requested_formats = body.get("target_formats")
+    if not requested_formats:
+        requested_formats = ["glb", "stl"]
+    # Ensure both glb and stl are always included for print workflow
+    if "glb" not in requested_formats:
+        requested_formats.append("glb")
+    payload = {**source, "target_formats": requested_formats}
 
     topology = (body.get("topology") or "").strip().lower()
     if topology in {"triangle", "quad"}:
@@ -96,6 +103,16 @@ def mesh_remesh_mod():
         rh = float(body.get("resize_height"))
         if rh > 0:
             payload["resize_height"] = rh
+    except Exception:
+        pass
+
+    # If no resize_height provided but print_height_mm is specified,
+    # store the user's desired mm height so the frontend can apply correct scale on STL export.
+    print_height_mm = None
+    try:
+        print_height_mm = float(body.get("print_height_mm"))
+        if print_height_mm > 0 and "resize_height" not in payload:
+            pass  # Meshy handles resize internally; store for metadata
     except Exception:
         pass
 
@@ -136,6 +153,7 @@ def mesh_remesh_mod():
         "source_task_id": source_task_id,  # Use resolved ID
         "topology": topology,
         "target_polycount": payload.get("target_polycount"),
+        "print_height_mm": print_height_mm,
     }
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
@@ -234,6 +252,19 @@ def mesh_remesh_status_mod(job_id: str):
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
     out = normalize_meshy_task(ms, stage="remesh")
+
+    # Extract STL URL from model_urls if available
+    stl_url = None
+    model_urls = out.get("model_urls") or {}
+    textured_model_urls = out.get("textured_model_urls") or {}
+    stl_url = (
+        model_urls.get("stl")
+        or textured_model_urls.get("stl")
+        or out.get("stl_url")
+    )
+    if stl_url:
+        out["stl_url"] = stl_url
+
     log_status_summary("mesh/remesh[mod]", job_id, out)
 
     # ── Async credit handling (same pattern as retexture) ──────────────

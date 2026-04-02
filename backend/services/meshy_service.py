@@ -35,11 +35,11 @@ class MeshyTaskNotFoundError(RuntimeError):
 
 
 def _filter_model_urls(urls: Any) -> dict:
-    """Filter model URLs dict to only include glb and obj formats."""
+    """Filter model URLs dict to include glb, obj, and stl formats."""
     if not isinstance(urls, dict):
         return {}
     filtered: dict[str, str] = {}
-    for key in ("glb", "obj"):
+    for key in ("glb", "obj", "stl"):
         val = urls.get(key)
         if val:
             filtered[key] = val

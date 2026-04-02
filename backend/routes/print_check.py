@@ -6,12 +6,41 @@ Free analysis (0 credits) to encourage the print workflow.
 """
 
 import logging
+import time
+from collections import defaultdict
 
 from flask import Blueprint, jsonify, request
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import with_session_readonly
 from backend.services.identity_service import require_identity
+
+# Simple per-identity rate limiter: max 10 print checks per minute
+_print_check_timestamps: dict[str, list[float]] = defaultdict(list)
+PRINT_CHECK_RATE_LIMIT = 10  # requests
+PRINT_CHECK_RATE_WINDOW = 60  # seconds
+_last_cleanup = time.time()
+
+
+def _check_rate_limit(identity_id: str) -> bool:
+    """Return True if rate limit exceeded."""
+    global _last_cleanup
+    now = time.time()
+
+    # Periodic cleanup: every 5 minutes, purge stale entries
+    if now - _last_cleanup > 300:
+        stale_keys = [k for k, v in _print_check_timestamps.items()
+                      if not v or now - max(v) > PRINT_CHECK_RATE_WINDOW * 2]
+        for k in stale_keys:
+            del _print_check_timestamps[k]
+        _last_cleanup = now
+
+    timestamps = _print_check_timestamps[identity_id]
+    _print_check_timestamps[identity_id] = [t for t in timestamps if now - t < PRINT_CHECK_RATE_WINDOW]
+    if len(_print_check_timestamps[identity_id]) >= PRINT_CHECK_RATE_LIMIT:
+        return True
+    _print_check_timestamps[identity_id].append(now)
+    return False
 
 bp = Blueprint("print_check", __name__)
 logger = logging.getLogger(__name__)
@@ -27,6 +56,12 @@ def print_check(job_id: str):
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
+
+    if _check_rate_limit(identity_id):
+        return jsonify({"error": "Rate limit exceeded. Please wait before running another print check."}), 429
+
+    body = request.get_json(silent=True) or {}
+    printer_type = body.get("printer_type", "fdm")  # "fdm" or "resin"
 
     if not USE_DB:
         return jsonify({"error": "Database not configured"}), 503
@@ -93,7 +128,7 @@ def print_check(job_id: str):
     # Run analysis
     try:
         from backend.services.print_analysis_service import PrintAnalysisService
-        result = PrintAnalysisService.analyze_from_url(model_url)
+        result = PrintAnalysisService.analyze_from_url(model_url, printer_type=printer_type)
         return jsonify(result)
     except ImportError:
         return jsonify({"error": "Print analysis not available (trimesh not installed)"}), 503
