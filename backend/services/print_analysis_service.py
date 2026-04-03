@@ -113,6 +113,7 @@ class PrintAnalysisService:
             }
         """
         import numpy as np
+        import trimesh
 
         try:
             mesh = PrintAnalysisService._load_mesh(file_path, file_type=file_type)
