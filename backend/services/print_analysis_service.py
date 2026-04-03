@@ -145,7 +145,10 @@ class PrintAnalysisService:
             if not mesh.is_watertight:
                 score -= 30
                 issues.append("Mesh is not watertight (has holes or open edges)")
-                suggestions.append("Use Remesh to repair the mesh before printing")
+                suggestions.append(
+                    "Use Remesh (triangle topology) to close open edges and create "
+                    "a watertight mesh — this is the most impactful fix for print quality"
+                )
 
             # 2. Face count
             checks["face_count"] = int(len(mesh.faces))
@@ -399,9 +402,22 @@ class PrintAnalysisService:
 
         score = max(0, min(100, score))
 
+        # Add actionable suggestions for common issues
+        if not mesh.is_watertight:
+            suggestions.append(
+                "Non-watertight meshes cannot be accurately measured for wall thickness "
+                "or volume. Use Remesh with 'triangle' topology to close holes and repair the mesh."
+            )
+
+        if score < 90 and checks.get("is_manifold") and checks.get("min_wall_thickness_mm") is None:
+            suggestions.append(
+                "Wall thickness analysis requires a closed mesh. Remesh the model first, "
+                "then re-run the print check for complete diagnostics."
+            )
+
         return {
             "score": score,
-            "is_printable": score >= 70,
+            "is_printable": score >= 60,
             "checks": checks,
             "issues": issues,
             "suggestions": suggestions,
