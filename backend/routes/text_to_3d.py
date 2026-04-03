@@ -299,6 +299,27 @@ def text_to_3d_refine_mod():
                         resolved = True
                         print(f"[REFINE_RESOLVE] fallback jobs lookup: {preview_task_id_input} -> {preview_task_id}")
                     else:
+                        # Check history_items — older models may only exist here
+                        cur.execute(
+                            f"""
+                            SELECT COALESCE(
+                                payload->>'preview_task_id',
+                                payload->>'source_task_id',
+                                payload->>'original_job_id'
+                            ) AS resolved_id
+                            FROM {Tables.HISTORY_ITEMS}
+                            WHERE id::text = %s AND identity_id = %s
+                            LIMIT 1
+                            """,
+                            (preview_task_id_input, identity_id),
+                        )
+                        hi_row = cur.fetchone()
+                        if hi_row and hi_row.get("resolved_id"):
+                            preview_task_id = hi_row["resolved_id"]
+                            resolved = True
+                            print(f"[REFINE_RESOLVE] fallback history_items lookup: {preview_task_id_input} -> {preview_task_id}")
+
+                    if not resolved:
                         # Input might be a Meshy task ID that's valid on the provider side
                         # Verify it exists as an upstream_job_id somewhere
                         cur.execute(
