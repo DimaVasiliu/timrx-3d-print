@@ -19,5 +19,9 @@ fpdf2==2.8.1
 # 3D mesh analysis for print-readiness checks
 trimesh>=4.0.0
 numpy>=1.24.0
+# Spatial indexing for trimesh ray queries (wall thickness analysis)
+rtree>=1.0.0
+# Fallback spatial engine when rtree C lib is unavailable
+scipy>=1.11.0
 # Structured logging
 structlog>=24.0.0

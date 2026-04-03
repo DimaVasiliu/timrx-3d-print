@@ -211,8 +211,6 @@ class PrintAnalysisService:
 
             # 7. Wall thickness analysis (ray-based sampling)
             try:
-                import trimesh.proximity
-
                 # Sample surface points for thickness measurement
                 sample_count = min(2000, max(500, len(mesh.faces) // 10))
                 points, face_indices = trimesh.sample.sample_surface(mesh, sample_count)
@@ -223,10 +221,26 @@ class PrintAnalysisService:
 
                 # Cast rays inward from surface to find opposing wall
                 ray_origins = points + inward_normals * 0.001  # Offset slightly to avoid self-intersection
-                locations, index_ray, index_tri = mesh.ray.intersects_location(
-                    ray_origins=ray_origins,
-                    ray_directions=inward_normals,
-                )
+
+                # Try the default ray engine (rtree-backed), fall back to
+                # the slower embree-less engine that ships with trimesh.
+                try:
+                    locations, index_ray, index_tri = mesh.ray.intersects_location(
+                        ray_origins=ray_origins,
+                        ray_directions=inward_normals,
+                    )
+                except (ImportError, ModuleNotFoundError) as ray_dep_err:
+                    logger.info(
+                        "[PRINT_ANALYSIS] Default ray engine unavailable (%s), "
+                        "falling back to triangle-based intersection",
+                        ray_dep_err,
+                    )
+                    from trimesh.ray.ray_triangle import RayMeshIntersector
+                    ray_engine = RayMeshIntersector(mesh)
+                    locations, index_ray, index_tri = ray_engine.intersects_location(
+                        ray_origins=ray_origins,
+                        ray_directions=inward_normals,
+                    )
 
                 if len(locations) > 0:
                     # Compute distances from origin points to hit points
@@ -271,7 +285,7 @@ class PrintAnalysisService:
                     checks["min_wall_thickness_mm"] = None
                     checks["wall_thickness_ok"] = None
             except Exception as wall_exc:
-                logger.warning("[PRINT_ANALYSIS] Wall thickness check failed: %s", wall_exc)
+                logger.error("[PRINT_ANALYSIS] Wall thickness check failed: %s", wall_exc, exc_info=True)
                 checks["min_wall_thickness_mm"] = None
                 checks["wall_thickness_ok"] = None
 
