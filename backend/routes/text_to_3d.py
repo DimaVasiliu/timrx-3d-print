@@ -159,6 +159,42 @@ def text_to_3d_start_mod():
     batch_slot = clamp_int(body.get("batch_slot"), 1, batch_count, 1)
     batch_group_id = (body.get("batch_group_id") or "").strip() or None
 
+    # ── Generation group for multi-model batches ──
+    generation_group_id = None
+    if batch_count > 1 and batch_group_id:
+        try:
+            conn = get_conn()
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Try to find existing group (created by earlier batch_slot)
+                cur.execute(
+                    """SELECT id FROM timrx_app.generation_groups
+                       WHERE batch_group_id = %s AND identity_id = %s
+                       LIMIT 1""",
+                    (batch_group_id, identity_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    generation_group_id = str(row["id"])
+                else:
+                    # First slot: create the group
+                    generation_group_id = str(uuid.uuid4())
+                    cur.execute(
+                        """INSERT INTO timrx_app.generation_groups
+                           (id, identity_id, prompt, model_count, batch_group_id, ai_model, stage)
+                           VALUES (%s, %s, %s, %s, %s, %s, 'preview')
+                           ON CONFLICT (batch_group_id) WHERE batch_group_id IS NOT NULL
+                           DO UPDATE SET updated_at = NOW()
+                           RETURNING id""",
+                        (generation_group_id, identity_id, prompt, batch_count, batch_group_id, ai_model),
+                    )
+                    result = cur.fetchone()
+                    if result:
+                        generation_group_id = str(result["id"])
+                conn.commit()
+        except Exception as e:
+            print(f"[GEN_GROUP] Warning: failed to create/find generation group: {e}")
+            generation_group_id = None
+
     job_meta = {
         "prompt": prompt,
         "root_prompt": prompt,
@@ -179,6 +215,7 @@ def text_to_3d_start_mod():
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
+        "generation_group_id": generation_group_id,
     }
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
@@ -206,6 +243,7 @@ def text_to_3d_start_mod():
         "batch_count": batch_count,
         "batch_slot": batch_slot,
         "batch_group_id": batch_group_id,
+        "generation_group_id": generation_group_id,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -245,6 +283,7 @@ def text_to_3d_start_mod():
         "ok": True,
         "job_id": internal_job_id,
         "reservation_id": reservation_id,
+        "generation_group_id": generation_group_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
         "source": "modular",

@@ -2825,12 +2825,14 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         thumbnail_url, glb_url, image_url,
                         model_id, image_id,
                         lineage_origin_id,
+                        generation_group_id,
                         payload
                     ) VALUES (
                         %s, %s, %s, %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
                         %s, %s,
+                        %s,
                         %s,
                         %s
                     )
@@ -2853,6 +2855,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         model_id = COALESCE(EXCLUDED.model_id, {Tables.HISTORY_ITEMS}.model_id),
                         image_id = COALESCE(EXCLUDED.image_id, {Tables.HISTORY_ITEMS}.image_id),
                         lineage_origin_id = COALESCE(EXCLUDED.lineage_origin_id, {Tables.HISTORY_ITEMS}.lineage_origin_id),
+                        generation_group_id = COALESCE(EXCLUDED.generation_group_id, {Tables.HISTORY_ITEMS}.generation_group_id),
                         payload = EXCLUDED.payload,
                         updated_at = NOW()
                     RETURNING id
@@ -2872,6 +2875,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         model_id,
                         image_id,
                         lineage_origin_id,
+                        job_meta.get("generation_group_id") or payload.get("generation_group_id"),
                         json.dumps(payload),
                     ),
                 )
@@ -2890,6 +2894,24 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                         """,
                         (history_item_id, history_item_id),
                     )
+
+                # Update generation group counters
+                _gen_group_id = job_meta.get("generation_group_id") or payload.get("generation_group_id")
+                if _gen_group_id:
+                    try:
+                        cur.execute(
+                            """UPDATE timrx_app.generation_groups
+                               SET completed_count = completed_count + 1,
+                                   status = CASE
+                                       WHEN completed_count + 1 >= model_count THEN 'completed'
+                                       ELSE 'partial'
+                                   END,
+                                   updated_at = NOW()
+                               WHERE id = %s""",
+                            (_gen_group_id,),
+                        )
+                    except Exception as e:
+                        print(f"[GEN_GROUP] Warning: failed to update group counters: {e}")
 
                 # Sync model title from prompt if model still has generic title
                 if model_id and (final_prompt or root_prompt):

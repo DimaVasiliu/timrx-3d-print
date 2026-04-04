@@ -130,7 +130,12 @@ def history_mod():
 
                 _h_base_cols = """h.id, h.item_type, h.status, h.stage, h.title, h.prompt,
                         h.thumbnail_url, h.glb_url, h.image_url, h.video_url, h.payload, h.created_at,
-                        h.model_id, h.image_id, h.video_id, h.lineage_origin_id"""
+                        h.model_id, h.image_id, h.video_id, h.lineage_origin_id,
+                        gg.model_count AS group_model_count,
+                        gg.completed_count AS group_completed_count,
+                        gg.failed_count AS group_failed_count,
+                        gg.status AS group_status,
+                        gg.thumbnail_url AS group_thumbnail_url"""
 
                 _model_cols = """,
                         m.id AS m_id, m.title AS m_title, m.glb_url AS m_glb_url,
@@ -168,6 +173,7 @@ def history_mod():
                         ) AND COALESCE(
                             h.payload->>'original_id', h.payload->>'original_job_id'
                         ) IS NOT NULL))"""
+                _generation_group_join = f"""LEFT JOIN timrx_app.generation_groups gg ON h.generation_group_id = gg.id"""
 
                 # Null placeholders for columns not selected (keeps enrichment code safe)
                 _model_nulls = ",\n                        NULL AS m_id, NULL AS m_title, NULL AS m_glb_url, NULL AS m_thumbnail_url, NULL AS m_meta, NULL AS m_prompt, NULL AS m_status"
@@ -176,17 +182,17 @@ def history_mod():
 
                 if item_type_filter == "model":
                     _select_extra = _model_cols + _image_nulls + _video_nulls
-                    _joins = _model_join
+                    _joins = _model_join + "\n                    " + _generation_group_join
                 elif item_type_filter == "image":
                     _select_extra = _model_nulls + _image_cols + _video_nulls
-                    _joins = _image_join
+                    _joins = _image_join + "\n                    " + _generation_group_join
                 elif item_type_filter == "video":
                     _select_extra = _model_nulls + _image_nulls + _video_cols
-                    _joins = _video_join
+                    _joins = _video_join + "\n                    " + _generation_group_join
                 else:
                     # type=all — full 3-way join
                     _select_extra = _model_cols + _image_cols + _video_cols
-                    _joins = f"{_model_join}\n                    {_image_join}\n                    {_video_join}"
+                    _joins = f"{_model_join}\n                    {_image_join}\n                    {_video_join}\n                    {_generation_group_join}"
 
                 _where_type = "AND h.item_type = %s" if item_type_filter != "all" else ""
                 _where_cursor = "AND (h.created_at, h.id) < (%s, %s::uuid)" if use_cursor else ""
@@ -1560,3 +1566,65 @@ def history_item_update_mod(item_id: str):
         return jsonify({"error": "Method not allowed"}), 405
 
     return _inner(item_id)
+
+
+@bp.route("/history/group/<group_id>", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def get_generation_group(group_id):
+    """Return all history items in a generation group."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id = getattr(g, "identity_id", None)
+    if not identity_id:
+        return jsonify({"ok": False, "error": "session required"}), 401
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": "database required"}), 503
+
+    try:
+        conn = get_conn()
+        with conn.cursor(row_factory=dict_row) as cur:
+            # Fetch group metadata
+            cur.execute(
+                """SELECT * FROM timrx_app.generation_groups
+                   WHERE id = %s AND identity_id = %s""",
+                (group_id, identity_id),
+            )
+            group_row = cur.fetchone()
+            if not group_row:
+                return jsonify({"ok": False, "error": "group not found"}), 404
+
+            # Fetch all items in group
+            cur.execute(
+                """SELECT hi.*,
+                          m.glb_url AS model_glb_url,
+                          m.thumbnail_url AS model_thumbnail_url
+                   FROM timrx_app.history_items hi
+                   LEFT JOIN timrx_app.models m ON hi.model_id = m.id
+                   WHERE hi.generation_group_id = %s
+                     AND hi.identity_id = %s
+                     AND hi.deleted_at IS NULL
+                   ORDER BY (hi.payload->>'batch_slot')::int NULLS LAST, hi.created_at""",
+                (group_id, identity_id),
+            )
+            items = cur.fetchall()
+
+            # Serialize
+            def serialize_row(row):
+                d = dict(row)
+                for k, v in d.items():
+                    if hasattr(v, 'isoformat'):
+                        d[k] = v.isoformat()
+                    elif isinstance(v, uuid.UUID):
+                        d[k] = str(v)
+                return d
+
+            return jsonify({
+                "ok": True,
+                "group": serialize_row(group_row),
+                "items": [serialize_row(r) for r in items],
+            })
+    except Exception as e:
+        print(f"[HISTORY_GROUP] Error fetching group {group_id}: {e}")
+        return jsonify({"ok": False, "error": "internal error"}), 500
