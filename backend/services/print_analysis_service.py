@@ -147,8 +147,10 @@ class PrintAnalysisService:
                 score -= 30
                 issues.append("Mesh is not watertight (has holes or open edges)")
                 suggestions.append(
-                    "Use Remesh (triangle topology) to close open edges and create "
-                    "a watertight mesh — this is the most impactful fix for print quality"
+                    "Try Remesh with 'Print Ready' preset to close open edges. "
+                    "If already remeshed, the AI model may have geometry that Meshy's remesh "
+                    "cannot fully repair — use Blender (Mesh > Clean Up > Fill Holes) or "
+                    "Meshmixer (Analysis > Inspector > Auto Repair) for manual repair."
                 )
 
             # 2. Face count
@@ -407,7 +409,10 @@ class PrintAnalysisService:
         if not mesh.is_watertight:
             suggestions.append(
                 "Non-watertight meshes cannot be accurately measured for wall thickness "
-                "or volume. Use Remesh with 'triangle' topology to close holes and repair the mesh."
+                "or volume. If you haven't remeshed yet, try Remesh with 'Print Ready' preset. "
+                "If you already remeshed and the mesh is still not watertight, this is a known "
+                "limitation of AI-generated models — import the STL into Blender or Meshmixer "
+                "and use their automatic mesh repair tools before printing."
             )
 
         if score < 90 and checks.get("is_manifold") and checks.get("min_wall_thickness_mm") is None:
@@ -423,9 +428,9 @@ class PrintAnalysisService:
         )
         if not checks.get("is_manifold"):
             suggestions.append(
-                "Non-watertight meshes often cause slicing failures. "
-                "Use the Remesh tool with the 'Print Ready' preset to close open edges "
-                "and produce a manifold mesh before exporting."
+                "Non-watertight meshes often cause slicing failures. Most slicers "
+                "(PrusaSlicer, Cura) have built-in mesh repair that can fix minor gaps. "
+                "For serious issues, use Meshmixer's 'Inspector' tool for one-click repair."
             )
         if checks.get("min_wall_thickness_mm") is not None:
             min_wt = checks["min_wall_thickness_mm"]
