@@ -416,6 +416,37 @@ class PrintAnalysisService:
                 "then re-run the print check for complete diagnostics."
             )
 
+        # ── Additional production-print guidance ──────────────────
+        suggestions.append(
+            "Always verify the exported STL in a slicer (e.g. PrusaSlicer, Cura, Lychee) "
+            "before sending to a printer. Slicers detect issues that surface analysis cannot."
+        )
+        if not checks.get("is_manifold"):
+            suggestions.append(
+                "Non-watertight meshes often cause slicing failures. "
+                "Use the Remesh tool with the 'Print Ready' preset to close open edges "
+                "and produce a manifold mesh before exporting."
+            )
+        if checks.get("min_wall_thickness_mm") is not None:
+            min_wt = checks["min_wall_thickness_mm"]
+            if printer_type == "fdm" and min_wt < 1.2:
+                suggestions.append(
+                    f"Minimum wall thickness is {min_wt:.1f} mm. For reliable FDM prints, "
+                    "aim for at least 1.2 mm walls (2-3 perimeters). Thin features may "
+                    "break during printing or post-processing."
+                )
+            elif printer_type == "resin" and min_wt < 0.6:
+                suggestions.append(
+                    f"Minimum wall thickness is {min_wt:.1f} mm. For resin prints, "
+                    "aim for at least 0.6 mm walls. Very thin features are fragile "
+                    "and may break during support removal."
+                )
+        suggestions.append(
+            "AI-generated models may contain hidden internal geometry or floating "
+            "fragments. Inspect the mesh in a 3D editor (Blender, Meshmixer) if you "
+            "plan to sell printed copies."
+        )
+
         return {
             "score": score,
             "is_printable": score >= 60,

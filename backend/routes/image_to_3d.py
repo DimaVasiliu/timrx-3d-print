@@ -72,12 +72,42 @@ def image_to_3d_start_mod():
     if credit_error:
         return credit_error
 
+    ai_model = body.get("model") or "latest"
+
     payload = {
         "image_url": image_url,
         "prompt": prompt,
-        "ai_model": body.get("model") or "latest",
+        "ai_model": ai_model,
         "enable_pbr": True,
     }
+
+    # ── Meshy 6+ parameters for print-quality control ──────────────
+    # should_remesh defaults to false in Meshy 6 / "latest", which
+    # preserves the highest-precision triangular mesh.  We intentionally
+    # keep false as default so downstream Remesh panel has full control.
+    should_remesh = body.get("should_remesh")
+    if should_remesh is not None:
+        payload["should_remesh"] = bool(should_remesh)
+
+    # topology + target_polycount only matter when should_remesh is true
+    if payload.get("should_remesh"):
+        topo = (body.get("topology") or "").strip().lower()
+        if topo in ("triangle", "quad"):
+            payload["topology"] = topo
+        tpc = body.get("target_polycount")
+        if tpc is not None:
+            try:
+                tpc = int(tpc)
+                if 100 <= tpc <= 300000:
+                    payload["target_polycount"] = tpc
+            except (ValueError, TypeError):
+                pass
+
+    # image_enhancement — let Meshy optimize the input image or keep
+    # the original.  Default is unset (Meshy decides).
+    img_enhance = body.get("image_enhancement")
+    if img_enhance is not None:
+        payload["image_enhancement"] = bool(img_enhance)
 
     store_meta = {
         "stage": "image3d",
@@ -86,12 +116,14 @@ def image_to_3d_start_mod():
         "root_prompt": prompt,
         "title": title,
         "original_image_url": image_url,
-        "ai_model": payload.get("ai_model"),
+        "ai_model": ai_model,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
         "source_task_id": source_image_history_id,
+        "should_remesh": bool(payload.get("should_remesh", False)),
+        "image_enhancement": payload.get("image_enhancement"),
     }
 
     # Persist immediately so status polling can return queued while dispatch runs
@@ -158,7 +190,7 @@ def image_to_3d_status_mod(job_id: str):
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT id, status, upstream_job_id, error_message
+                        SELECT id, status, upstream_job_id, error_message, meta, reservation_id
                         FROM timrx_billing.jobs
                         WHERE id::text = %s AND identity_id = %s
                         LIMIT 1
@@ -280,7 +312,17 @@ def image_to_3d_status_mod(job_id: str):
             if s3_result.get("texture_urls"):
                 out["texture_urls"] = s3_result["texture_urls"]
 
+            # Resolve reservation_id from store meta first, then fall back to
+            # the DB job row (covers server restart where store was lost).
             reservation_id = meta.get("reservation_id")
+            if not reservation_id and internal_job:
+                _db_meta = internal_job.get("meta") or {}
+                if isinstance(_db_meta, str):
+                    try:
+                        _db_meta = __import__('json').loads(_db_meta)
+                    except Exception:
+                        _db_meta = {}
+                reservation_id = _db_meta.get("reservation_id") or internal_job.get("reservation_id")
             internal_job_id = meta.get("internal_job_id")
             if reservation_id:
                 # Use internal_job_id (not meshy_job_id) for credit finalization tracking
@@ -457,7 +499,7 @@ def multi_image_to_3d_status_mod(job_id: str):
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT id, status, upstream_job_id, error_message
+                        SELECT id, status, upstream_job_id, error_message, meta, reservation_id
                         FROM timrx_billing.jobs
                         WHERE id::text = %s AND identity_id = %s
                         LIMIT 1
