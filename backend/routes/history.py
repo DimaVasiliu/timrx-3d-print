@@ -320,6 +320,18 @@ def history_mod():
                             except Exception:
                                 payload = {}
 
+                        # Promote batch fields to top-level for grouped card rendering
+                        if isinstance(payload, dict):
+                            if payload.get("batch_group_id"):
+                                item["batch_group_id"] = payload["batch_group_id"]
+                            bc = payload.get("batch_count")
+                            if bc is not None:
+                                item["batch_count"] = int(bc) if bc else 1
+                            bs = payload.get("batch_slot")
+                            if bs is not None:
+                                item["batch_slot"] = int(bs) if bs else 1
+                            item["payload"] = payload
+
                         # Hydrate from joined MODEL data
                         if r.get("m_id"):
                             item["model_id"] = str(r["m_id"])
