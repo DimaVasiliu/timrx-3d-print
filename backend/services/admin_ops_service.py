@@ -29,6 +29,20 @@ _PROVIDER_FEATURES: Dict[str, str] = {
     "fal_seedance": "video",
 }
 
+_PROVIDER_LABELS: Dict[str, str] = {
+    "meshy": "Meshy",
+    "openai": "OpenAI",
+    "google": "Google Imagen",
+    "nano_banana": "Nano Banana",
+    "google_nano": "Google Nano",
+    "flux_pro": "FLUX.2 Pro",
+    "ideogram_v3": "Ideogram V3",
+    "recraft_v4": "Recraft V4",
+    "vertex": "Vertex",
+    "seedance": "Seedance",
+    "fal_seedance": "fal Seedance",
+}
+
 _ALERTS_TABLE = "timrx_billing.provider_alerts"
 
 
@@ -183,6 +197,9 @@ def get_provider_health() -> Dict[str, Any]:
     all_providers = set(_PROVIDER_FEATURES.keys())
     for r in jobs_24h:
         all_providers.add(r["provider"])
+    for r in active_alerts:
+        all_providers.add(r["provider"])
+    all_providers.update(config_status.keys())
 
     jobs_24h_map = {r["provider"]: r for r in jobs_24h}
 
@@ -201,7 +218,10 @@ def get_provider_health() -> Dict[str, Any]:
         has_critical = alert_info.get("has_critical", False)
 
         # Status determination
-        if total == 0:
+        if total == 0 and alert_info.get("count", 0) > 0:
+            status = "warning"
+            summary_warning += 1
+        elif total == 0:
             status = "unknown"
         elif rate is not None and rate < 0.50:
             status = "down"
@@ -215,7 +235,9 @@ def get_provider_health() -> Dict[str, Any]:
 
         providers.append({
             "provider": prov,
+            "display_label": _PROVIDER_LABELS.get(prov, prov),
             "configured": config_status.get(prov, {}).get("configured", False),
+            "config_error": config_status.get(prov, {}).get("error"),
             "feature_area": _PROVIDER_FEATURES.get(prov, "unknown"),
             "status": status,
             "jobs_1h": jobs_1h_map.get(prov, 0),

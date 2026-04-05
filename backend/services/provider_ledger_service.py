@@ -25,11 +25,83 @@ _TABLE = Tables.PROVIDER_LEDGER
 _VALID_ENTRY_TYPES = {"topup", "invoice", "balance_snapshot", "adjustment", "note"}
 _AMOUNT_REQUIRED_TYPES = {"topup", "invoice", "adjustment"}
 
+# Finance account aliases. Ops health remains provider-specific, but ledger,
+# balances, and spend reporting should roll up to the actual external billing
+# account where costs land.
+_PROVIDER_ACCOUNT_ALIASES = {
+    "meshy": "meshy",
+    "openai": "openai",
+    "google": "google",
+    "google_nano": "google",
+    "nano_banana": "piapi",
+    "seedance": "piapi",
+    "piapi": "piapi",
+    "vertex": "vertex",
+    "fal_seedance": "fal_seedance",
+    "flux_pro": "flux_pro",
+    "ideogram_v3": "ideogram_v3",
+    "recraft_v4": "recraft_v4",
+}
+
+_ACCOUNT_DISPLAY = {
+    "meshy": {"label": "Meshy"},
+    "openai": {"label": "OpenAI"},
+    "google": {"label": "Google Account", "subtitle": "Imagen + Google Nano"},
+    "piapi": {"label": "PiAPI Account", "subtitle": "Seedance + Nano Banana"},
+    "vertex": {"label": "Vertex"},
+    "fal_seedance": {"label": "fal Seedance"},
+    "flux_pro": {"label": "FLUX.2 Pro"},
+    "ideogram_v3": {"label": "Ideogram V3"},
+    "recraft_v4": {"label": "Recraft V4"},
+}
+
+_ACCOUNT_MEMBERS: Dict[str, set[str]] = {}
+for _raw_provider, _account_provider in _PROVIDER_ACCOUNT_ALIASES.items():
+    _ACCOUNT_MEMBERS.setdefault(_account_provider, set()).add(_raw_provider)
+
+_KNOWN_BALANCE_PROVIDERS = set(_ACCOUNT_MEMBERS.keys())
+
 
 def _iso(val) -> Optional[str]:
     if val and hasattr(val, "isoformat"):
         return val.isoformat()
     return str(val) if val is not None else None
+
+
+def _as_utc_datetime(val: Any) -> Optional[datetime]:
+    if isinstance(val, datetime):
+        dt = val
+    elif isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def normalize_provider_account(provider: Optional[str]) -> str:
+    normalized = (provider or "").strip().lower()
+    return _PROVIDER_ACCOUNT_ALIASES.get(normalized, normalized)
+
+
+def get_provider_account_members(provider: Optional[str]) -> List[str]:
+    account = normalize_provider_account(provider)
+    return sorted(_ACCOUNT_MEMBERS.get(account, {account}))
+
+
+def get_provider_display(provider: Optional[str]) -> Dict[str, Optional[str]]:
+    account = normalize_provider_account(provider)
+    meta = _ACCOUNT_DISPLAY.get(account, {})
+    return {
+        "provider": account,
+        "display_label": meta.get("label") or account,
+        "display_subtitle": meta.get("subtitle"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +123,7 @@ def list_ledger_entries(
     params: list = []
 
     if provider:
+        provider = normalize_provider_account(provider)
         conditions.append("provider = %s")
         params.append(provider)
     if entry_type:
@@ -106,9 +179,12 @@ def list_ledger_entries(
 
     entries = []
     for r in rows:
+        display = get_provider_display(r["provider"])
         entries.append({
             "id": str(r["id"]),
-            "provider": r["provider"],
+            "provider": normalize_provider_account(r["provider"]),
+            "display_label": display["display_label"],
+            "display_subtitle": display["display_subtitle"],
             "entry_type": r["entry_type"],
             "amount_gbp": float(r["amount_gbp"]) if r["amount_gbp"] is not None else None,
             "currency": r["currency"],
@@ -155,7 +231,7 @@ def create_ledger_entry(
     # Validate
     if not provider or not provider.strip():
         raise ValueError("provider is required")
-    provider = provider.strip().lower()
+    provider = normalize_provider_account(provider)
 
     if entry_type not in _VALID_ENTRY_TYPES:
         raise ValueError(f"entry_type must be one of: {', '.join(sorted(_VALID_ENTRY_TYPES))}")
@@ -210,6 +286,8 @@ def create_ledger_entry(
     return {
         "id": entry_id,
         "provider": provider,
+        "display_label": get_provider_display(provider)["display_label"],
+        "display_subtitle": get_provider_display(provider)["display_subtitle"],
         "entry_type": entry_type,
         "amount_gbp": float(amount_gbp) if amount_gbp is not None else None,
         "currency": currency,
@@ -243,11 +321,17 @@ def get_monthly_spend_report(
     """
     months = min(max(months, 1), 24)
 
-    prov_filter = ""
-    prov_params: tuple = ()
-    if provider:
-        prov_filter = "AND provider = %s"
-        prov_params = (provider,)
+    normalized_provider = normalize_provider_account(provider) if provider else None
+    usage_filter = ""
+    usage_params: tuple = ()
+    ledger_filter = ""
+    ledger_params: tuple = ()
+    if normalized_provider:
+        members = get_provider_account_members(normalized_provider)
+        usage_filter = f"AND provider IN ({','.join(['%s'] * len(members))})"
+        usage_params = tuple(members)
+        ledger_filter = "AND provider = %s"
+        ledger_params = (normalized_provider,)
 
     # 1. Estimated usage from jobs (grouped by provider + month)
     usage_rows = query_all(
@@ -261,11 +345,11 @@ def get_monthly_spend_report(
         WHERE status IN ('succeeded', 'ready')
           AND created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '%s months'
           AND provider IS NOT NULL
-          {prov_filter}
+          {usage_filter}
         GROUP BY provider, DATE_TRUNC('month', created_at)::date
         ORDER BY month DESC, provider
         """,
-        (months, *prov_params),
+        (months, *usage_params),
     )
 
     # 2. Ledger entries aggregated by provider + month + entry_type
@@ -279,13 +363,13 @@ def get_monthly_spend_report(
             COUNT(*) AS entry_count
         FROM {_TABLE}
         WHERE created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '%s months'
-          {prov_filter}
+          {ledger_filter}
         GROUP BY provider,
                  COALESCE(period_month, DATE_TRUNC('month', created_at)::date),
                  entry_type
         ORDER BY month DESC, provider
         """,
-        (months, *prov_params),
+        (months, *ledger_params),
     )
 
     # 3. Latest balance snapshots per provider
@@ -298,34 +382,44 @@ def get_monthly_spend_report(
         FROM {_TABLE}
         WHERE entry_type = 'balance_snapshot'
           AND balance_snapshot_gbp IS NOT NULL
-          {prov_filter}
+          {ledger_filter}
         ORDER BY provider, created_at DESC
         """,
-        prov_params if prov_params else (),
+        ledger_params if ledger_params else (),
     )
-    snapshots = {
-        r["provider"]: {
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    for r in snapshot_rows:
+        account = normalize_provider_account(r["provider"])
+        current_dt = _as_utc_datetime(r["created_at"])
+        existing_dt = _as_utc_datetime(snapshots.get(account, {}).get("recorded_at"))
+        if existing_dt and current_dt and existing_dt >= current_dt:
+            continue
+        display = get_provider_display(account)
+        snapshots[account] = {
             "balance_gbp": float(r["balance_snapshot_gbp"]),
             "recorded_at": _iso(r["created_at"]),
+            "display_label": display["display_label"],
+            "display_subtitle": display["display_subtitle"],
         }
-        for r in snapshot_rows
-    }
 
     # 4. Build nested structure: { provider -> { month -> data } }
     data: Dict[str, Dict[str, Dict]] = {}
 
     for r in usage_rows:
-        prov = r["provider"]
+        prov = normalize_provider_account(r["provider"])
         month_str = _iso(r["month"])
         if prov not in data:
             data[prov] = {}
         if month_str not in data[prov]:
             data[prov][month_str] = _empty_month()
-        data[prov][month_str]["estimated_usage_gbp"] = round(float(r["estimated_usage_gbp"]), 2)
-        data[prov][month_str]["job_count"] = r["job_count"]
+        data[prov][month_str]["estimated_usage_gbp"] = round(
+            data[prov][month_str]["estimated_usage_gbp"] + float(r["estimated_usage_gbp"]),
+            2,
+        )
+        data[prov][month_str]["job_count"] += r["job_count"]
 
     for r in ledger_rows:
-        prov = r["provider"]
+        prov = normalize_provider_account(r["provider"])
         month_str = _iso(r["month"])
         if prov not in data:
             data[prov] = {}
@@ -337,14 +431,14 @@ def get_monthly_spend_report(
         count = r["entry_count"]
 
         if et == "topup":
-            data[prov][month_str]["topups_gbp"] = total
-            data[prov][month_str]["topup_count"] = count
+            data[prov][month_str]["topups_gbp"] = round(data[prov][month_str]["topups_gbp"] + total, 2)
+            data[prov][month_str]["topup_count"] += count
         elif et == "invoice":
-            data[prov][month_str]["invoices_gbp"] = total
-            data[prov][month_str]["invoice_count"] = count
+            data[prov][month_str]["invoices_gbp"] = round(data[prov][month_str]["invoices_gbp"] + total, 2)
+            data[prov][month_str]["invoice_count"] += count
         elif et == "adjustment":
-            data[prov][month_str]["adjustments_gbp"] = total
-            data[prov][month_str]["adjustment_count"] = count
+            data[prov][month_str]["adjustments_gbp"] = round(data[prov][month_str]["adjustments_gbp"] + total, 2)
+            data[prov][month_str]["adjustment_count"] += count
 
     # 5. Flatten to list format
     report: List[Dict] = []
@@ -353,6 +447,7 @@ def get_monthly_spend_report(
             entry = data[prov][month_str]
             entry["provider"] = prov
             entry["month"] = month_str
+            entry.update(get_provider_display(prov))
             report.append(entry)
 
     provider_count = len(data)
@@ -383,17 +478,6 @@ def _empty_month() -> Dict[str, Any]:
 # PROVIDER BALANCE SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known providers for balance tracking.
-# Note: nano_banana and seedance are excluded here because their shared external
-# billing account is tracked under 'piapi'.  They remain in admin_ops_service
-# _PROVIDER_FEATURES for health monitoring.
-_KNOWN_BALANCE_PROVIDERS = {"meshy", "openai", "google", "piapi", "vertex", "fal_seedance"}
-
-# PiAPI umbrella: nano_banana + seedance share the same external billing account.
-# Balance snapshots should be recorded under provider='piapi' for the shared account.
-# Individual execution metrics stay under their own provider names (health only).
-_PIAPI_UMBRELLA_PROVIDERS = {"nano_banana", "seedance"}
-
 # Thresholds
 _STALE_SNAPSHOT_DAYS = 7          # snapshot older than this → warning
 _ACTION_NEEDED_SNAPSHOT_DAYS = 14  # snapshot older than this → action_needed
@@ -423,9 +507,14 @@ def get_provider_balances() -> Dict[str, Any]:
           AND balance_snapshot_gbp IS NOT NULL
         ORDER BY provider, created_at DESC
     """)
-    snapshots = {}
+    snapshots: Dict[str, Dict[str, Any]] = {}
     for r in snapshot_rows:
-        snapshots[r["provider"]] = {
+        account = normalize_provider_account(r["provider"])
+        current_dt = _as_utc_datetime(r["created_at"])
+        existing_dt = _as_utc_datetime(snapshots.get(account, {}).get("recorded_at"))
+        if existing_dt and current_dt and existing_dt >= current_dt:
+            continue
+        snapshots[account] = {
             "balance_gbp": float(r["balance_snapshot_gbp"]),
             "recorded_at": r["created_at"],
             "description": r["description"],
@@ -434,13 +523,13 @@ def get_provider_balances() -> Dict[str, Any]:
     # 2. Estimated spend + credits consumed per provider since their last snapshot
     spend_since = {}
     for prov, snap in snapshots.items():
-        # For PiAPI umbrella snapshots, aggregate across nano_banana + seedance
-        if prov == "piapi":
-            provider_clause = "provider IN ('nano_banana', 'seedance')"
-            params = (snap["recorded_at"],)
-        else:
+        members = get_provider_account_members(prov)
+        if len(members) == 1:
             provider_clause = "provider = %s"
-            params = (prov, snap["recorded_at"])
+            params = (members[0], snap["recorded_at"])
+        else:
+            provider_clause = f"provider IN ({','.join(['%s'] * len(members))})"
+            params = (*members, snap["recorded_at"])
         row = query_one(
             f"""
             SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS spend,
@@ -471,10 +560,15 @@ def get_provider_balances() -> Dict[str, Any]:
           AND provider IS NOT NULL
         GROUP BY provider
     """)
-    wallet_alert_map = {
-        r["provider"]: {"count": r["cnt"], "latest": _iso(r["latest"])}
-        for r in wallet_alerts
-    }
+    wallet_alert_map: Dict[str, Dict[str, Any]] = {}
+    for r in wallet_alerts:
+        account = normalize_provider_account(r["provider"])
+        latest = _as_utc_datetime(r["latest"])
+        current = wallet_alert_map.setdefault(account, {"count": 0, "latest": None})
+        current["count"] += r["cnt"]
+        current_latest = _as_utc_datetime(current["latest"])
+        if latest and (current_latest is None or latest > current_latest):
+            current["latest"] = _iso(r["latest"])
 
     # 3b. PiAPI umbrella breakdown (video vs image, image quality mix)
     piapi_breakdown = None
@@ -531,10 +625,7 @@ def get_provider_balances() -> Dict[str, Any]:
         }
 
     # 4. Build per-provider result
-    # Use balance-specific provider set (excludes nano_banana/seedance individually)
-    all_providers = _KNOWN_BALANCE_PROVIDERS | set(snapshots.keys())
-    # Remove individual umbrella providers — they are covered by 'piapi'
-    all_providers -= _PIAPI_UMBRELLA_PROVIDERS
+    all_providers = _KNOWN_BALANCE_PROVIDERS | set(snapshots.keys()) | set(wallet_alert_map.keys())
     providers = []
     action_needed_count = 0
     warning_count = 0
@@ -543,25 +634,26 @@ def get_provider_balances() -> Dict[str, Any]:
         snap = snapshots.get(prov)
         spend = spend_since.get(prov, {"estimated_spend_gbp": 0.0, "job_count": 0})
         wallet = wallet_alert_map.get(prov)
+        display = get_provider_display(prov)
 
         if snap is None:
-            status = "unknown"
+            status = "action_needed" if wallet else "unknown"
             days_since = None
             balance = None
             estimated_remaining = None
         else:
-            days_since = (now - snap["recorded_at"].replace(tzinfo=timezone.utc
-                          if snap["recorded_at"].tzinfo is None else snap["recorded_at"].tzinfo)).days
+            recorded_at = _as_utc_datetime(snap["recorded_at"])
+            days_since = (now - recorded_at).days if recorded_at else None
             balance = snap["balance_gbp"]
             estimated_remaining = round(balance - spend["estimated_spend_gbp"], 2)
 
             # Status determination
             has_wallet_alert = wallet is not None
-            if (days_since >= _ACTION_NEEDED_SNAPSHOT_DAYS
+            if ((days_since is not None and days_since >= _ACTION_NEEDED_SNAPSHOT_DAYS)
                     or estimated_remaining <= _CRITICAL_BALANCE_GBP
                     or has_wallet_alert):
                 status = "action_needed"
-            elif (days_since >= _STALE_SNAPSHOT_DAYS
+            elif ((days_since is not None and days_since >= _STALE_SNAPSHOT_DAYS)
                   or estimated_remaining <= _LOW_BALANCE_GBP):
                 status = "warning"
             else:
@@ -574,6 +666,8 @@ def get_provider_balances() -> Dict[str, Any]:
 
         entry = {
             "provider": prov,
+            "display_label": display["display_label"],
+            "display_subtitle": display["display_subtitle"],
             "balance_status": status,
             "last_snapshot_gbp": balance,
             "last_snapshot_at": _iso(snap["recorded_at"]) if snap else None,
@@ -586,10 +680,7 @@ def get_provider_balances() -> Dict[str, Any]:
             "wallet_alerts_7d": wallet["count"] if wallet else 0,
             "wallet_alert_latest": wallet["latest"] if wallet else None,
         }
-        # Attach PiAPI-specific metadata
         if prov == "piapi":
-            entry["display_label"] = "PiAPI Account"
-            entry["display_subtitle"] = "Seedance + Nano Banana"
             entry["is_umbrella"] = True
             if piapi_breakdown:
                 entry["breakdown"] = piapi_breakdown
