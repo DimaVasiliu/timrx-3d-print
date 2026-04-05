@@ -80,9 +80,17 @@ POLL_SLEEP_PROCESSING = 10       # seconds between provider polls (processing)
 WORKER_LOOP_SLEEP = 10           # seconds between claim attempts when idle (video jobs take minutes; 10s is fine)
 MAX_ATTEMPTS = 5                 # max retry attempts before permanent failure
 MAX_RECOVERY_AGE_HOURS = 48      # don't claim jobs older than this
+MAX_MESHY_AUTO_RETRIES = 2       # auto-resubmit failed Meshy tasks (Meshy refunds credits on failure)
 
 # Stepped backoff for provider errors (indexed by consecutive_errors count)
 BACKOFF_STEPS = [30, 60, 120, 300]  # seconds
+
+# Meshy errors that are transient and worth auto-retrying
+_MESHY_RETRYABLE_ERRORS = {
+    "server is busy", "timeout", "internal server error",
+    "service temporarily unavailable", "rate limit", "too many requests",
+    "generation failed",  # generic Meshy failure — often transient
+}
 
 # ── Provider Configuration ───────────────────────────────────
 # Only these provider/stage combinations are handled by the durable worker.
@@ -630,7 +638,19 @@ def _poll_meshy_once(
 
     elif internal_status == "failed":
         error_msg = task_data.get("task_error", {}).get("message", "Meshy generation failed")
-        _fail_job(job_id, meta, error_msg, "meshy_provider_failed", "meshy")
+        retry_count = meta.get("meshy_retry_count", 0)
+
+        # Check if this is a retryable error and we haven't exhausted retries
+        error_lower = error_msg.lower()
+        is_retryable = any(pattern in error_lower for pattern in _MESHY_RETRYABLE_ERRORS)
+
+        if is_retryable and retry_count < MAX_MESHY_AUTO_RETRIES:
+            # Auto-retry: resubmit the same payload as a new Meshy task
+            _auto_retry_meshy(job_id, job, meta, retry_count, error_msg)
+        else:
+            if retry_count > 0:
+                error_msg = f"{error_msg} (after {retry_count} auto-retries)"
+            _fail_job(job_id, meta, error_msg, "meshy_provider_failed", "meshy")
 
     elif internal_status in ("running", "pending"):
         # Schedule next poll
@@ -652,6 +672,88 @@ def _poll_meshy_once(
         _transition_job(job_id, job["status"], {
             "next_poll_at": f"NOW() + INTERVAL '{POLL_SLEEP_PENDING} seconds'",
         })
+
+
+def _auto_retry_meshy(
+    job_id: str,
+    job: Dict[str, Any],
+    meta: Dict[str, Any],
+    retry_count: int,
+    original_error: str,
+):
+    """
+    Auto-retry a failed Meshy task by resubmitting the same payload.
+
+    Meshy refunds credits on failure, so the credit reservation stays valid.
+    We create a new upstream task and point the existing job at it.
+    """
+    from backend.services.meshy_service import mesh_post
+
+    action_code = job.get("action_code") or meta.get("task", "text-to-3d")
+    new_retry_count = retry_count + 1
+
+    # Reconstruct the original payload
+    payload = meta.get("provider_payload") or {}
+    if not payload:
+        if action_code in ("text-to-3d", "text_to_3d"):
+            payload = {
+                "mode": meta.get("mode", "preview"),
+                "prompt": meta.get("prompt", ""),
+                "art_style": meta.get("art_style", "realistic"),
+                "negative_prompt": meta.get("negative_prompt", ""),
+            }
+            if meta.get("preview_task_id"):
+                payload["preview_task_id"] = meta["preview_task_id"]
+
+    webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+    if webhook_url:
+        payload["webhook_url"] = webhook_url
+
+    # Determine API endpoint
+    if action_code in ("image-to-3d", "image_to_3d"):
+        api_path = "/openapi/v1/image-to-3d"
+    else:
+        api_path = "/openapi/v2/text-to-3d"
+
+    try:
+        resp = mesh_post(api_path, payload)
+        new_upstream_id = resp.get("result")
+        if not new_upstream_id:
+            raise RuntimeError("Meshy returned no task ID on retry")
+
+        print(
+            f"[JOB:RETRY] meshy auto-retry SUCCESS job={job_id} "
+            f"attempt={new_retry_count}/{MAX_MESHY_AUTO_RETRIES} "
+            f"old_upstream={meta.get('upstream_id', '?')[:20]} "
+            f"new_upstream={new_upstream_id} "
+            f"original_error={original_error[:100]}"
+        )
+
+        # Re-point the job at the new upstream task
+        _transition_job(job_id, "dispatched", {
+            "upstream_job_id": new_upstream_id,
+            "last_provider_status": "pending",
+            "progress": 0,
+            "next_poll_at": "NOW() + INTERVAL '10 seconds'",
+        }, meta_patch={
+            "upstream_id": new_upstream_id,
+            "meshy_retry_count": new_retry_count,
+            "consecutive_errors": 0,
+            f"retry_{new_retry_count}_error": original_error[:200],
+            f"retry_{new_retry_count}_at": time.time(),
+        })
+
+    except Exception as e:
+        print(
+            f"[JOB:RETRY] meshy auto-retry FAILED job={job_id} "
+            f"attempt={new_retry_count}: {e}"
+        )
+        meta["meshy_retry_count"] = new_retry_count
+        _fail_job(
+            job_id, meta,
+            f"{original_error} (retry {new_retry_count} also failed: {e})",
+            "meshy_provider_failed", "meshy",
+        )
 
 
 def _finalize_meshy_success(

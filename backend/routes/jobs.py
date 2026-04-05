@@ -747,6 +747,107 @@ def cancel_job(job_id):
         }), 500
 
 
+@bp.route("/<job_id>/retry", methods=["POST"])
+@require_session
+def retry_failed_job(job_id):
+    """
+    Retry a failed Meshy job by resubmitting the same payload.
+
+    Only works for jobs that:
+    - Belong to the current user
+    - Are in 'failed' status
+    - Are Meshy provider jobs
+    - Have original payload stored in meta
+
+    This creates a NEW Meshy task and a NEW job with a fresh credit
+    reservation. The user is charged again (Meshy already refunded
+    credits from the original failure).
+
+    Response (success - 200):
+    {
+        "ok": true,
+        "new_job_id": "uuid",
+        "original_job_id": "uuid",
+        "status": "queued"
+    }
+    """
+    import json as _json
+
+    try:
+        job = JobService.get_job(job_id)
+        if not job:
+            return jsonify({"error": {"code": "NOT_FOUND", "message": "Job not found"}}), 404
+
+        if job.get("identity_id") != g.identity_id:
+            return jsonify({"error": {"code": "NOT_FOUND", "message": "Job not found"}}), 404
+
+        if job.get("status") != "failed":
+            return jsonify({"error": {"code": "NOT_RETRYABLE", "message": "Only failed jobs can be retried"}}), 400
+
+        provider = job.get("provider", "")
+        if provider != "meshy":
+            return jsonify({"error": {"code": "NOT_RETRYABLE", "message": "Retry is only supported for Meshy jobs"}}), 400
+
+        # Extract original payload from job meta
+        meta = job.get("meta") or {}
+        if isinstance(meta, str):
+            meta = _json.loads(meta)
+        original_payload = meta.get("payload") or {}
+        if not original_payload:
+            return jsonify({"error": {"code": "NO_PAYLOAD", "message": "Original job payload not found"}}), 400
+
+        # Determine the action key from the job
+        action_code = job.get("action_code", "")
+        # Map DB action codes back to frontend action keys
+        action_key_map = {
+            "MESHY_TEXT_TO_3D": "text_to_3d_generate",
+            "MESHY_IMAGE_TO_3D": "image_to_3d_generate",
+            "MESHY_REMESH": "remesh",
+            "MESHY_RETEXTURE": "retexture",
+            "MESHY_REFINE": "text_to_3d_refine",
+            "MESHY_RIG": "rig",
+        }
+        action_key = action_key_map.get(action_code)
+        if not action_key:
+            # Try lowercase matching
+            for code, key in action_key_map.items():
+                if action_code.upper() == code:
+                    action_key = key
+                    break
+        if not action_key:
+            return jsonify({"error": {"code": "UNKNOWN_ACTION", "message": f"Cannot retry action: {action_code}"}}), 400
+
+        # Create a new job with the same payload (charges credits)
+        result = JobService.create_job(
+            identity_id=g.identity_id,
+            action_key=action_key,
+            payload=original_payload,
+        )
+
+        print(
+            f"[JOBS:RETRY] user retry job={job_id} -> new_job={result['job_id']} "
+            f"action={action_key} cost={result.get('cost_credits', '?')}"
+        )
+
+        # Invalidate caches
+        invalidate_jobs_active_cache(g.identity_id)
+
+        return jsonify({
+            "ok": True,
+            "new_job_id": result["job_id"],
+            "original_job_id": job_id,
+            "upstream_job_id": result.get("upstream_job_id"),
+            "status": result.get("status", "queued"),
+            "cost_credits": result.get("cost_credits", 0),
+        })
+
+    except ValueError as e:
+        return jsonify({"error": {"code": "RETRY_FAILED", "message": str(e)}}), 400
+    except Exception as e:
+        print(f"[JOBS] Error retrying job: {e}")
+        return jsonify({"error": {"code": "INTERNAL_ERROR", "message": "Failed to retry job"}}), 500
+
+
 @bp.route("/callback", methods=["POST"])
 def job_callback():
     """
