@@ -13,17 +13,23 @@ from backend.config import AWS_BUCKET_MODELS, AWS_REGION
 logger = logging.getLogger(__name__)
 
 
+class _SkipWallThickness(Exception):
+    """Sentinel to skip wall thickness analysis without failing the whole check."""
+    pass
+
+
 class PrintAnalysisService:
     """Analyzes GLB/STL meshes for 3D printing readiness."""
 
     MAX_FACE_COUNT = 500_000     # Very high-poly models are slow to slice
+    WALL_THICKNESS_FACE_LIMIT = 200_000  # Skip ray casting above this to avoid OOM
     MIN_WALL_THICKNESS_MM = 0.8  # Minimum for FDM printing
 
     BASE_ALLOWED_MODEL_DOMAINS = {
         "assets.meshy.ai",
         "cdn.meshy.ai",
     }
-    MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+    MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024  # 30 MB (was 100 MB — reduced to prevent OOM on constrained instances)
 
     @staticmethod
     def _allowed_model_domains() -> set[str]:
@@ -217,6 +223,19 @@ class PrintAnalysisService:
 
             # 7. Wall thickness analysis (ray-based sampling)
             try:
+                if len(mesh.faces) > PrintAnalysisService.WALL_THICKNESS_FACE_LIMIT:
+                    logger.info(
+                        "[PRINT_ANALYSIS] Skipping wall thickness — %d faces exceeds %d limit",
+                        len(mesh.faces), PrintAnalysisService.WALL_THICKNESS_FACE_LIMIT,
+                    )
+                    checks["min_wall_thickness_mm"] = None
+                    checks["wall_thickness_ok"] = None
+                    suggestions.append(
+                        "Wall thickness analysis was skipped because the model has too many "
+                        "polygons. Use Remesh to reduce polygon count, then re-run the print check."
+                    )
+                    raise _SkipWallThickness()
+
                 # Sample surface points for thickness measurement
                 sample_count = min(2000, max(500, len(mesh.faces) // 10))
                 points, face_indices = trimesh.sample.sample_surface(mesh, sample_count)
@@ -290,6 +309,8 @@ class PrintAnalysisService:
                 else:
                     checks["min_wall_thickness_mm"] = None
                     checks["wall_thickness_ok"] = None
+            except _SkipWallThickness:
+                pass  # Already handled above
             except Exception as wall_exc:
                 logger.error("[PRINT_ANALYSIS] Wall thickness check failed: %s", wall_exc, exc_info=True)
                 checks["min_wall_thickness_mm"] = None

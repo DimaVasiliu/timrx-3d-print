@@ -1280,6 +1280,12 @@ class JobService:
         provider_job_id, frontend_resume_id, resume_strategy = (
             JobService._resolve_resume_fields(job)
         )
+        meta = job.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
         return {
             # Existing fields (preserved for compatibility)
             "id": str(job["id"]),
@@ -1291,10 +1297,14 @@ class JobService:
             "reservation_id": str(job["reservation_id"]) if job.get("reservation_id") else None,
             "upstream_job_id": job.get("upstream_job_id"),
             "prompt": job.get("prompt"),
-            "meta": job.get("meta"),
+            "meta": meta,
             "error_message": job.get("error_message"),
             "created_at": job["created_at"].isoformat() if job.get("created_at") else None,
             "updated_at": job["updated_at"].isoformat() if job.get("updated_at") else None,
+            "batch_count": meta.get("batch_count"),
+            "batch_slot": meta.get("batch_slot"),
+            "batch_group_id": meta.get("batch_group_id"),
+            "generation_group_id": meta.get("generation_group_id"),
             # Canonical resume contract (frontend should prefer these)
             "provider_job_id": provider_job_id,
             "frontend_resume_id": frontend_resume_id,
