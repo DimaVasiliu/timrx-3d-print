@@ -9,7 +9,12 @@ import multiprocessing
 from urllib.parse import urlparse
 from typing import Dict, Any
 
-from backend.config import AWS_BUCKET_MODELS, AWS_REGION
+# Lazy import: backend.config is only needed by _allowed_model_domains(),
+# which runs in the parent process. Importing it at module level would
+# force subprocess children (spawn) to re-initialize DB pools, email, etc.
+AWS_BUCKET_MODELS = None  # resolved lazily
+AWS_REGION = None          # resolved lazily
+_config_loaded = False
 
 # Use 'spawn' to avoid forking issues inside gunicorn workers.
 # spawn starts a fresh Python interpreter — no shared state from the parent.
@@ -38,6 +43,12 @@ class PrintAnalysisService:
 
     @staticmethod
     def _allowed_model_domains() -> set[str]:
+        global AWS_BUCKET_MODELS, AWS_REGION, _config_loaded
+        if not _config_loaded:
+            from backend.config import AWS_BUCKET_MODELS as _b, AWS_REGION as _r
+            AWS_BUCKET_MODELS = _b
+            AWS_REGION = _r
+            _config_loaded = True
         domains = set(PrintAnalysisService.BASE_ALLOWED_MODEL_DOMAINS)
         if AWS_BUCKET_MODELS:
             domains.add(f"{AWS_BUCKET_MODELS}.s3.{AWS_REGION}.amazonaws.com")
