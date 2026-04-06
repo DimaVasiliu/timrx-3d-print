@@ -31,8 +31,8 @@ class _SkipWallThickness(Exception):
 class PrintAnalysisService:
     """Analyzes GLB/STL meshes for 3D printing readiness."""
 
-    MAX_FACE_COUNT = 500_000     # Very high-poly models are slow to slice
-    WALL_THICKNESS_FACE_LIMIT = 200_000  # Skip ray casting above this to avoid OOM
+    MAX_FACE_COUNT = 300_000     # Very high-poly models are slow to slice
+    WALL_THICKNESS_FACE_LIMIT = 100_000  # Skip ray casting above this to avoid OOM
     MIN_WALL_THICKNESS_MM = 0.8  # Minimum for FDM printing
 
     BASE_ALLOWED_MODEL_DOMAINS = {
@@ -532,7 +532,7 @@ class PrintAnalysisService:
     # Python never returns that memory to the OS.  Running the heavy
     # analysis in a child process guarantees all mesh memory is freed
     # when the child exits — protecting the main gunicorn workers.
-    SUBPROCESS_TIMEOUT = 120  # seconds — generous for large meshes
+    SUBPROCESS_TIMEOUT = 30  # seconds — if analysis takes longer, model is too complex
 
     @staticmethod
     def _subprocess_analyze(tmp_path: str, file_type: str | None, printer_type: str, result_path: str):
@@ -600,6 +600,25 @@ class PrintAnalysisService:
                 with open(tmp_path, "rb") as f:
                     head = f.read(16)
                 file_type = PrintAnalysisService._detect_file_type(url, resp.headers.get("content-type"), head)
+
+            # ── Memory guard: check available memory before spawning ──
+            # The subprocess needs ~400-500MB for trimesh+numpy. If the
+            # container is already under pressure, skip analysis to prevent OOM.
+            try:
+                import resource
+                # Soft check: if this process already uses >1.5GB, don't spawn
+                usage_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # macOS: bytes, Linux: KB
+                import sys
+                if sys.platform == 'linux':
+                    usage_mb = usage_mb / 1024  # Linux ru_maxrss is in KB
+                if usage_mb > 1500:
+                    logger.warning("[PRINT_ANALYSIS] Skipping subprocess — memory pressure: %.0fMB used", usage_mb)
+                    return PrintAnalysisService._failed_result(
+                        "Server is under memory pressure. Please try again in a moment.",
+                        ["Wait 30 seconds and retry — the server will free memory after other requests complete."],
+                    )
+            except Exception:
+                pass  # resource module not available, continue anyway
 
             # ── Run analysis in a subprocess ──────────────────────
             # All trimesh/numpy memory is freed when the child exits.
