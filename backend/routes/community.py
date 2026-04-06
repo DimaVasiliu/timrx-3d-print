@@ -49,22 +49,33 @@ def _lookup_actor_name(identity_id: str) -> str:
 
 # ── Community feed response cache ──
 # The feed is public (not per-user), so we can cache aggressively.
-# Keyed by (limit, offset, type) → (response_dict, monotonic_timestamp).
+# Keyed by (limit, offset, type, sort, q) → (response_dict, monotonic_timestamp).
 import time as _time
 _feed_cache: dict = {}
 _FEED_CACHE_TTL = 15  # seconds — community content changes slowly
+_stats_cache: tuple[dict, float] | None = None
+_STATS_CACHE_TTL = 30
 
 
-def _get_cached_feed(limit, offset, asset_type):
-    key = (limit, offset, asset_type or "all")
+def _normalize_feed_sort(sort_key: str | None) -> str:
+    sort = (sort_key or "newest").strip().lower()
+    return sort if sort in {"newest", "popular", "trending"} else "newest"
+
+
+def _normalize_search_query(search_query: str | None) -> str:
+    return " ".join((search_query or "").strip().split())
+
+
+def _get_cached_feed(limit, offset, asset_type, sort_key, search_query):
+    key = (limit, offset, asset_type or "all", sort_key, (search_query or "").lower())
     entry = _feed_cache.get(key)
     if entry and (_time.monotonic() - entry[1]) < _FEED_CACHE_TTL:
         return entry[0]
     return None
 
 
-def _set_cached_feed(limit, offset, asset_type, data):
-    key = (limit, offset, asset_type or "all")
+def _set_cached_feed(limit, offset, asset_type, sort_key, search_query, data):
+    key = (limit, offset, asset_type or "all", sort_key, (search_query or "").lower())
     _feed_cache[key] = (data, _time.monotonic())
     # Evict if too many entries
     if len(_feed_cache) > 200:
@@ -76,7 +87,9 @@ def _set_cached_feed(limit, offset, asset_type, data):
 
 def invalidate_community_feed_cache():
     """Call after share, delete, reaction, or tip to refresh feed."""
+    global _stats_cache
     _feed_cache.clear()
+    _stats_cache = None
 
 
 def _cur(conn):
@@ -102,6 +115,112 @@ def _get_gen_type(item_type, glb_url, gen_action, animation_glb_url=None):
         return 'AI Image'
 
 
+def _build_feed_filters(asset_type: str | None, search_query: str) -> tuple[str, list]:
+    filters: list[str] = []
+    params: list[str] = []
+
+    # Everything is stored as history_item_id now, so type-specific filtering
+    # is based on the joined history_items fields.
+    if asset_type == "model":
+        filters.append(
+            "("
+            "cp.model_id IS NOT NULL "
+            "OR ("
+            "cp.history_item_id IS NOT NULL "
+            "AND h.glb_url IS NOT NULL AND h.glb_url != '' "
+            "AND h.item_type != 'video'"
+            ")"
+            ")"
+        )
+    elif asset_type == "image":
+        filters.append(
+            "("
+            "cp.image_id IS NOT NULL "
+            "OR ("
+            "cp.history_item_id IS NOT NULL "
+            "AND h.item_type = 'image'"
+            ")"
+            ")"
+        )
+    elif asset_type == "video":
+        filters.append(
+            "cp.history_item_id IS NOT NULL "
+            "AND h.item_type = 'video'"
+        )
+    elif asset_type == "animated":
+        filters.append(
+            "cp.history_item_id IS NOT NULL "
+            "AND (h.payload->>'animation_glb_url') IS NOT NULL "
+            "AND (h.payload->>'animation_glb_url') != ''"
+        )
+
+    if search_query:
+        like = f"%{search_query}%"
+        filters.append(
+            "("
+            "cp.display_name ILIKE %s "
+            "OR COALESCE(cp.prompt_public, '') ILIKE %s "
+            "OR COALESCE(m.title, '') ILIKE %s "
+            "OR COALESCE(h.title, '') ILIKE %s"
+            ")"
+        )
+        params.extend([like, like, like, like])
+
+    where_sql = f" AND {' AND '.join(filters)}" if filters else ""
+    return where_sql, params
+
+
+def _get_feed_order_by(sort_key: str) -> str:
+    if sort_key == "popular":
+        return (
+            "(reaction_count + (comment_count * 2) + (tip_total * 0.2)) DESC, "
+            "cp.created_at DESC"
+        )
+    if sort_key == "trending":
+        return (
+            "((reaction_count + (comment_count * 2) + (tip_total * 0.2)) / "
+            "GREATEST((EXTRACT(EPOCH FROM (NOW() - cp.created_at)) / 3600.0) + 2.0, 1.0)) DESC, "
+            "cp.created_at DESC"
+        )
+    return "cp.created_at DESC"
+
+
+def _get_community_stats() -> dict:
+    global _stats_cache
+
+    entry = _stats_cache
+    if entry and (_time.monotonic() - entry[1]) < _STATS_CACHE_TTL:
+        return entry[0]
+
+    with get_conn("community_stats") as conn:
+        cursor = _cur(conn)
+        cursor.execute("""
+            WITH published_posts AS (
+                SELECT id, identity_id
+                FROM timrx_app.community_posts
+                WHERE status = 'published' AND deleted_at IS NULL
+            )
+            SELECT
+                (SELECT COUNT(*)::int FROM published_posts) AS total_posts,
+                (SELECT COUNT(DISTINCT identity_id)::int FROM published_posts) AS total_creators,
+                (
+                    SELECT COUNT(*)::int
+                    FROM timrx_app.community_reactions cr
+                    INNER JOIN published_posts pp ON pp.id = cr.post_id
+                ) AS total_reactions
+        """)
+        row = cursor.fetchone()
+        cursor.close()
+
+    stats = {
+        "total_posts": int((row[0] if row else 0) or 0),
+        "total_creators": int((row[1] if row else 0) or 0),
+        "total_reactions": int((row[2] if row else 0) or 0),
+    }
+    _stats_cache = (stats, _time.monotonic())
+    return stats
+
+
 # ─── Feed ─────────────────────────────────────────────────────────────────────
 
 @bp.route("/community/feed", methods=["GET", "OPTIONS"])
@@ -116,50 +235,28 @@ def community_feed_mod():
         limit      = min(int(request.args.get("limit", 20)), 100)
         offset     = int(request.args.get("offset", 0))
         asset_type = request.args.get("type")
+        sort_key   = _normalize_feed_sort(request.args.get("sort"))
+        search_query = _normalize_search_query(request.args.get("q"))
 
         # Short-circuit: return cached response if within TTL
-        cached = _get_cached_feed(limit, offset, asset_type)
+        cached = _get_cached_feed(limit, offset, asset_type, sort_key, search_query)
         if cached is not None:
             return jsonify(cached)
-
-        # Build type filter — everything is stored as history_item_id now, so
-        # filter based on the joined history_items fields.
-        type_filter = ""
-        if asset_type == "model":
-            # 3D content: history item has a glb_url
-            type_filter = (
-                "AND cp.history_item_id IS NOT NULL "
-                "AND h.glb_url IS NOT NULL AND h.glb_url != '' "
-                "AND h.item_type != 'video'"
-            )
-        elif asset_type == "image":
-            # Image content: history item is image type
-            type_filter = (
-                "AND cp.history_item_id IS NOT NULL "
-                "AND h.item_type = 'image'"
-            )
-        elif asset_type == "video":
-            type_filter = (
-                "AND cp.history_item_id IS NOT NULL "
-                "AND h.item_type = 'video'"
-            )
-        elif asset_type == "animated":
-            type_filter = (
-                "AND cp.history_item_id IS NOT NULL "
-                "AND (h.payload->>'animation_glb_url') IS NOT NULL "
-                "AND (h.payload->>'animation_glb_url') != ''"
-            )
+        filter_sql, filter_params = _build_feed_filters(asset_type, search_query)
+        order_by_sql = _get_feed_order_by(sort_key)
 
         with get_conn("community_feed") as conn:
             cursor = _cur(conn)
 
-            # COUNT — always LEFT JOIN history_items so type_filter can reference h
+            # COUNT query uses the same filters as the main feed.
             cursor.execute(f"""
                 SELECT COUNT(*)
                 FROM timrx_app.community_posts cp
+                LEFT JOIN timrx_app.models        m ON cp.model_id        = m.id
+                LEFT JOIN timrx_app.images        i ON cp.image_id        = i.id
                 LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
-                WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
-            """)
+                WHERE cp.status = 'published' AND cp.deleted_at IS NULL {filter_sql}
+            """, tuple(filter_params))
             total = cursor.fetchone()[0]
 
             # Main SELECT
@@ -179,15 +276,34 @@ def community_feed_mod():
                     h.item_type      AS history_item_type,
                     h.video_url      AS history_video_url,
                     h.payload->>'action' AS gen_action,
-                    h.payload->>'animation_glb_url' AS animation_glb_url
+                    h.payload->>'animation_glb_url' AS animation_glb_url,
+                    COALESCE(rc.reaction_count, 0)::int AS reaction_count,
+                    COALESCE(tc.tip_total, 0)::int AS tip_total,
+                    COALESCE(cc.comment_count, 0)::int AS comment_count
                 FROM timrx_app.community_posts cp
                 LEFT JOIN timrx_app.models        m ON cp.model_id        = m.id
                 LEFT JOIN timrx_app.images        i ON cp.image_id        = i.id
                 LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
-                WHERE cp.status = 'published' AND cp.deleted_at IS NULL {type_filter}
-                ORDER BY cp.created_at DESC
+                LEFT JOIN (
+                    SELECT post_id, COUNT(*)::int AS reaction_count
+                    FROM timrx_app.community_reactions
+                    GROUP BY post_id
+                ) rc ON rc.post_id = cp.id
+                LEFT JOIN (
+                    SELECT post_id, COALESCE(SUM(amount), 0)::int AS tip_total
+                    FROM timrx_app.community_tips
+                    GROUP BY post_id
+                ) tc ON tc.post_id = cp.id
+                LEFT JOIN (
+                    SELECT post_id, COUNT(*)::int AS comment_count
+                    FROM timrx_app.community_comments
+                    WHERE status = 'published'
+                    GROUP BY post_id
+                ) cc ON cc.post_id = cp.id
+                WHERE cp.status = 'published' AND cp.deleted_at IS NULL {filter_sql}
+                ORDER BY {order_by_sql}
                 LIMIT %s OFFSET %s
-            """, (limit, offset))
+            """, tuple(filter_params + [limit, offset]))
 
             rows = cursor.fetchall()
 
@@ -199,7 +315,8 @@ def community_feed_mod():
                  image_url, image_thumbnail,
                  history_title, history_thumbnail, history_glb_url, history_image_url,
                  history_item_type, history_video_url, gen_action,
-                 animation_glb_url) = row
+                 animation_glb_url, _reaction_count, tip_total,
+                 comment_count) = row
 
                 gen_type = _get_gen_type(history_item_type or '', history_glb_url, gen_action, animation_glb_url)
 
@@ -209,6 +326,8 @@ def community_feed_mod():
                     "show_prompt":  show_prompt,
                     "created_at":   created_at.isoformat() if created_at else None,
                     "gen_type":     gen_type,
+                    "tip_total":    int(tip_total or 0),
+                    "comment_count": int(comment_count or 0),
                 }
 
                 if show_prompt and prompt_public:
@@ -265,47 +384,45 @@ def community_feed_mod():
                 for (pid, reaction, cnt) in cursor.fetchall():
                     reactions_map.setdefault(pid, {})[reaction] = cnt
 
-                cursor.execute("""
-                    SELECT post_id::text, COALESCE(SUM(amount), 0)::int
-                    FROM timrx_app.community_tips
-                    WHERE post_id = ANY(%s::uuid[])
-                    GROUP BY post_id
-                """, (post_ids,))
-                tips_map: dict = {pid: total_tips for (pid, total_tips) in cursor.fetchall()}
-
-                # Comment counts (efficient batch query)
-                cursor.execute("""
-                    SELECT post_id::text, COUNT(*)::int
-                    FROM timrx_app.community_comments
-                    WHERE post_id = ANY(%s::uuid[]) AND status = 'published'
-                    GROUP BY post_id
-                """, (post_ids,))
-                comments_map: dict = {pid: cnt for (pid, cnt) in cursor.fetchall()}
-
                 for post in posts:
-                    post["reactions"]      = reactions_map.get(post["id"], {})
-                    post["tip_total"]      = tips_map.get(post["id"], 0)
-                    post["comment_count"]  = comments_map.get(post["id"], 0)
+                    post["reactions"] = reactions_map.get(post["id"], {})
             else:
                 for post in posts:
                     post["reactions"] = {}
-                    post["tip_total"] = 0
-                    post["comment_count"] = 0
 
             cursor.close()
 
+        stats = _get_community_stats()
         result = {
             "ok":      True,
             "posts":   posts,
             "total":   total,
             "has_more": offset + len(posts) < total,
+            "stats":   stats,
             "source":  "modular",
         }
-        _set_cached_feed(limit, offset, asset_type, result)
+        _set_cached_feed(limit, offset, asset_type, sort_key, search_query, result)
         return jsonify(result)
 
     except Exception as e:
         print(f"[COMMUNITY][mod] Error in feed: {e}")
+        print(traceback.format_exc())
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
+
+
+@bp.route("/community/stats", methods=["GET", "OPTIONS"])
+def community_stats_mod():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    try:
+        stats = _get_community_stats()
+        return jsonify({"ok": True, "stats": stats, **stats})
+    except Exception as e:
+        print(f"[COMMUNITY][mod] Error in stats: {e}")
         print(traceback.format_exc())
         return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
 
