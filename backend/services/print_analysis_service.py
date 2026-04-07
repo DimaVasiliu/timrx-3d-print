@@ -4,21 +4,14 @@ Analyzes 3D meshes for 3D printing compatibility.
 Uses trimesh for geometry analysis.
 """
 
+import gc
 import logging
-import multiprocessing
 from urllib.parse import urlparse
 from typing import Dict, Any
 
-# Lazy import: backend.config is only needed by _allowed_model_domains(),
-# which runs in the parent process. Importing it at module level would
-# force subprocess children (spawn) to re-initialize DB pools, email, etc.
 AWS_BUCKET_MODELS = None  # resolved lazily
 AWS_REGION = None          # resolved lazily
 _config_loaded = False
-
-# Use 'spawn' to avoid forking issues inside gunicorn workers.
-# spawn starts a fresh Python interpreter — no shared state from the parent.
-_mp_ctx = multiprocessing.get_context("spawn")
 
 logger = logging.getLogger(__name__)
 
@@ -527,30 +520,26 @@ class PrintAnalysisService:
 
         return None
 
-    # ── Subprocess isolation ────────────────────────────────────
-    # trimesh + numpy can balloon a 15 MB GLB to 500 MB+ in RAM and
-    # Python never returns that memory to the OS.  Running the heavy
-    # analysis in a child process guarantees all mesh memory is freed
-    # when the child exits — protecting the main gunicorn workers.
-    SUBPROCESS_TIMEOUT = 30  # seconds — if analysis takes longer, model is too complex
+    ANALYSIS_TIMEOUT = 30  # seconds — if analysis takes longer, model is too complex
 
     @staticmethod
-    def _subprocess_analyze(tmp_path: str, file_type: str | None, printer_type: str, result_path: str):
-        """Entry point executed inside the child process."""
-        import json
+    def _get_available_memory_mb() -> float | None:
+        """Return available system memory in MB, or None if unknown."""
         try:
-            result = PrintAnalysisService.analyze(tmp_path, file_type=file_type, printer_type=printer_type)
-        except Exception as exc:
-            result = PrintAnalysisService._failed_result(f"Analysis subprocess error: {exc}")
-        with open(result_path, "w") as f:
-            json.dump(result, f)
+            with open('/proc/meminfo', 'r') as f:
+                for line in f:
+                    if line.startswith('MemAvailable:'):
+                        return int(line.split()[1]) / 1024  # KB → MB
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def analyze_from_url(url: str, printer_type: str = "fdm") -> Dict[str, Any]:
-        """Download a GLB/STL from URL and analyze it in a subprocess."""
+        """Download a GLB/STL from URL and analyze it in-process."""
         import tempfile
         import os
-        import json
+        import time
         import requests
 
         # Validate URL safety
@@ -560,8 +549,16 @@ class PrintAnalysisService:
             return PrintAnalysisService._failed_result(f"Invalid model URL: {url_error}")
 
         tmp_path = None
-        result_path = None
         try:
+            # ── Memory guard: check available system memory ──
+            avail = PrintAnalysisService._get_available_memory_mb()
+            if avail is not None and avail < 200:
+                logger.warning("[PRINT_ANALYSIS] Skipping — low available memory: %.0fMB", avail)
+                return PrintAnalysisService._failed_result(
+                    "Server is under memory pressure. Please try again in a moment.",
+                    ["Wait 30 seconds and retry — the server will free memory after other requests complete."],
+                )
+
             # Stream download with size limit
             resp = requests.get(url, timeout=30, stream=True)
             resp.raise_for_status()
@@ -601,61 +598,15 @@ class PrintAnalysisService:
                     head = f.read(16)
                 file_type = PrintAnalysisService._detect_file_type(url, resp.headers.get("content-type"), head)
 
-            # ── Memory guard: check available memory before spawning ──
-            # The subprocess needs ~400-500MB for trimesh+numpy. If the
-            # container is already under pressure, skip analysis to prevent OOM.
-            try:
-                import resource
-                # Soft check: if this process already uses >1.5GB, don't spawn
-                usage_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # macOS: bytes, Linux: KB
-                import sys
-                if sys.platform == 'linux':
-                    usage_mb = usage_mb / 1024  # Linux ru_maxrss is in KB
-                if usage_mb > 1500:
-                    logger.warning("[PRINT_ANALYSIS] Skipping subprocess — memory pressure: %.0fMB used", usage_mb)
-                    return PrintAnalysisService._failed_result(
-                        "Server is under memory pressure. Please try again in a moment.",
-                        ["Wait 30 seconds and retry — the server will free memory after other requests complete."],
-                    )
-            except Exception:
-                pass  # resource module not available, continue anyway
-
-            # ── Run analysis in a subprocess ──────────────────────
-            # All trimesh/numpy memory is freed when the child exits.
-            result_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-            result_path = result_file.name
-            result_file.close()
-
-            proc = _mp_ctx.Process(
-                target=PrintAnalysisService._subprocess_analyze,
-                args=(tmp_path, file_type, printer_type, result_path),
-            )
-            proc.start()
-            proc.join(timeout=PrintAnalysisService.SUBPROCESS_TIMEOUT)
-
-            if proc.is_alive():
-                logger.warning("[PRINT_ANALYSIS] Subprocess timed out after %ds, killing", PrintAnalysisService.SUBPROCESS_TIMEOUT)
-                proc.kill()
-                proc.join(5)
-                return PrintAnalysisService._failed_result(
-                    "Analysis timed out — the model may be too complex. "
-                    "Try Remesh to simplify, then re-run the print check."
-                )
-
-            if proc.exitcode != 0:
-                logger.warning("[PRINT_ANALYSIS] Subprocess exited with code %s (likely OOM)", proc.exitcode)
-                return PrintAnalysisService._failed_result(
-                    "Analysis ran out of memory — the model is too complex for server-side analysis. "
-                    "Try Remesh to reduce polygon count, then re-run the print check.",
-                    [
-                        "Use Remesh with 'Print Ready' preset to simplify the mesh",
-                        "Alternatively, download the STL and use a local slicer (PrusaSlicer, Cura) to check printability",
-                    ],
-                )
-
-            # Read result from the child process
-            with open(result_path, "r") as f:
-                return json.load(f)
+            # ── Run analysis in-process ──────────────────────────
+            # Runs inside the gunicorn worker — avoids the ~300 MB overhead
+            # of spawning a separate Python process.  gc.collect() afterwards
+            # frees trimesh/numpy allocations within this process.
+            t0 = time.monotonic()
+            result = PrintAnalysisService.analyze(tmp_path, file_type=file_type, printer_type=printer_type)
+            elapsed = time.monotonic() - t0
+            logger.info("[PRINT_ANALYSIS] Completed in %.1fs", elapsed)
+            return result
 
         except requests.RequestException as e:
             logger.error("[PRINT_ANALYSIS] Failed to download model: %s", e)
@@ -664,10 +615,10 @@ class PrintAnalysisService:
             logger.exception("[PRINT_ANALYSIS] Unexpected error in analyze_from_url")
             return PrintAnalysisService._failed_result(f"Analysis failed: {e}")
         finally:
-            # Clean up temp files
-            for path in (tmp_path, result_path):
-                if path:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            # Free trimesh/numpy memory back to the Python allocator
+            gc.collect()

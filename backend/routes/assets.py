@@ -146,6 +146,7 @@ def proxy_glb_mod():
         "Access-Control-Allow-Origin": "https://timrx.live",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Allow-Credentials": "true",
         "Access-Control-Max-Age": "3600",
     }
 
