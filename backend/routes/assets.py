@@ -409,7 +409,7 @@ def proxy_glb_mod():
 
     # === Meshy/other URLs: Proxy the content ===
     timeout = (5, 30)
-    max_bytes = 100 * 1024 * 1024  # 100MB cap
+    max_bytes = 30 * 1024 * 1024  # 30MB cap — keep low to avoid OOM on constrained instances
 
     if request.method == "HEAD":
         try:
@@ -424,6 +424,18 @@ def proxy_glb_mod():
             "Cache-Control": "public, max-age=3600",
         }
         return Response("", status=r.status_code, headers=headers)
+
+    # Reject oversized files early using Content-Length from a HEAD request
+    try:
+        head_r = requests.head(u, allow_redirects=True, timeout=(5, 10))
+        cl = int(head_r.headers.get("Content-Length", 0))
+        if cl > max_bytes:
+            print(f"[proxy-glb][mod] Rejecting: Content-Length {cl} exceeds {max_bytes} bytes")
+            resp = jsonify({"ok": False, "error": {"code": "TOO_LARGE", "message": f"Model file too large ({cl // (1024*1024)}MB). Maximum is {max_bytes // (1024*1024)}MB."}})
+            resp.headers.update(cors_headers)
+            return resp, 413
+    except Exception:
+        pass  # HEAD failed or no Content-Length — fall through to streaming with cap
 
     try:
         r = requests.get(u, stream=True, timeout=timeout)
