@@ -251,8 +251,79 @@ class MagicCodeService:
         # Hash the provided code
         code_hash = MagicCodeService.hash_code(code)
 
-        # Find matching active code
-        code_record = query_one(
+        invalid_code = False
+        too_many_attempts = False
+
+        # ── Restore = account switch (no merge) ──────────────────
+        # Consume the code and switch session to the target identity.
+        # The current session's identity (if any) keeps its own data —
+        # no wallet reconciliation, no purchase migration, no merge.
+        with transaction("restore_redeem") as cur:
+            code_record = MagicCodeService._lock_matching_code(cur, email, code_hash)
+            if not code_record:
+                invalid_code = True
+            elif code_record["attempts"] >= config.MAGIC_CODE_MAX_ATTEMPTS:
+                too_many_attempts = True
+            else:
+                code_id = str(code_record["id"])
+
+                MagicCodeService._consume_code(cur, code_id)
+
+                # Switch session to the restored identity (account switch, not merge)
+                if session_id is not None:
+                    try:
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.SESSIONS}
+                            SET identity_id = %s, updated_at = NOW()
+                            WHERE id = %s
+                            RETURNING id
+                            """,
+                            (identity_id, session_id),
+                        )
+                    except Exception as e:
+                        if "updated_at" in str(e):
+                            cur.execute(
+                                f"""
+                                UPDATE {Tables.SESSIONS}
+                                SET identity_id = %s
+                                WHERE id = %s
+                                RETURNING id
+                                """,
+                                (identity_id, session_id),
+                            )
+                        else:
+                            raise
+                    updated_session = fetch_one(cur)
+                    if not updated_session:
+                        raise ValueError(f"Session {session_id} not found")
+
+                # Ensure identity is marked as email_verified
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.IDENTITIES}
+                    SET email_verified = TRUE, last_seen_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (identity_id,),
+                )
+
+        if invalid_code:
+            MagicCodeService._increment_attempts(email)
+            return (False, None, "Invalid or expired code", None)
+
+        if too_many_attempts:
+            return (False, None, "Too many failed attempts. Please request a new code", None)
+
+        MagicCodeService.invalidate_codes_for_email(email)
+
+        print(f"[RESTORE] Switched session to identity {identity_id[:8]}... (email: {email})")
+        return (True, identity_id, "Account restored successfully", None)
+
+    @staticmethod
+    def _lock_matching_code(cur, email: str, code_hash: str):
+        """Lock the newest active matching code so only one request can consume it."""
+        cur.execute(
             f"""
             SELECT id, attempts
             FROM {Tables.MAGIC_CODES}
@@ -262,79 +333,23 @@ class MagicCodeService:
               AND expires_at > NOW()
             ORDER BY created_at DESC
             LIMIT 1
+            FOR UPDATE
             """,
             (email, code_hash),
         )
+        return fetch_one(cur)
 
-        if not code_record:
-            # Code not found - increment attempts on most recent code for this email
-            MagicCodeService._increment_attempts(email)
-            return (False, None, "Invalid or expired code", None)
-
-        # Check max attempts on this specific code
-        if code_record["attempts"] >= config.MAGIC_CODE_MAX_ATTEMPTS:
-            return (False, None, "Too many failed attempts. Please request a new code", None)
-
-        code_id = str(code_record["id"])
-
-        # ── Restore = account switch (no merge) ──────────────────
-        # Consume the code and switch session to the target identity.
-        # The current session's identity (if any) keeps its own data —
-        # no wallet reconciliation, no purchase migration, no merge.
-        with transaction("restore_redeem") as cur:
-            # Mark code as consumed
-            cur.execute(
-                f"""
-                UPDATE {Tables.MAGIC_CODES}
-                SET consumed = TRUE, consumed_at = NOW()
-                WHERE id = %s
-                """,
-                (code_id,),
-            )
-
-            # Switch session to the restored identity (account switch, not merge)
-            if session_id is not None:
-                try:
-                    cur.execute(
-                        f"""
-                        UPDATE {Tables.SESSIONS}
-                        SET identity_id = %s, updated_at = NOW()
-                        WHERE id = %s
-                        RETURNING id
-                        """,
-                        (identity_id, session_id),
-                    )
-                except Exception as e:
-                    if "updated_at" in str(e):
-                        cur.execute(
-                            f"""
-                            UPDATE {Tables.SESSIONS}
-                            SET identity_id = %s
-                            WHERE id = %s
-                            RETURNING id
-                            """,
-                            (identity_id, session_id),
-                        )
-                    else:
-                        raise
-                updated_session = fetch_one(cur)
-                if not updated_session:
-                    raise ValueError(f"Session {session_id} not found")
-
-            # Ensure identity is marked as email_verified
-            cur.execute(
-                f"""
-                UPDATE {Tables.IDENTITIES}
-                SET email_verified = TRUE, last_seen_at = NOW()
-                WHERE id = %s
-                """,
-                (identity_id,),
-            )
-
-        MagicCodeService.invalidate_codes_for_email(email)
-
-        print(f"[RESTORE] Switched session to identity {identity_id[:8]}... (email: {email})")
-        return (True, identity_id, "Account restored successfully", None)
+    @staticmethod
+    def _consume_code(cur, code_id: str) -> None:
+        """Mark a previously locked code as consumed inside the current transaction."""
+        cur.execute(
+            f"""
+            UPDATE {Tables.MAGIC_CODES}
+            SET consumed = TRUE, consumed_at = NOW()
+            WHERE id = %s
+            """,
+            (code_id,),
+        )
 
     @staticmethod
     def _increment_attempts(email: str) -> None:

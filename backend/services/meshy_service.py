@@ -381,6 +381,26 @@ def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: 
     if not input_task_id and not model_url:
         return None, "input_task_id or model_url required"
 
+    if model_url.startswith("data:"):
+        try:
+            from backend.services.s3_service import ensure_s3_url_for_data_uri
+
+            uploaded_url = ensure_s3_url_for_data_uri(
+                model_url,
+                "models",
+                f"models/{identity_id or 'anonymous'}/source",
+                user_id=identity_id or "anonymous",
+                name="source-model",
+                provider="user",
+            )
+        except Exception as e:
+            print(f"[build_source_payload] data URL model upload failed: {e}")
+            return None, "Invalid or unsupported model upload"
+
+        if not uploaded_url:
+            return None, "Invalid or unsupported model upload"
+        model_url = uploaded_url
+
     # When caller prefers model_url and we have one, skip input_task_id entirely
     if prefer == "model_url" and model_url:
         input_task_id = ""  # go straight to model_url path below

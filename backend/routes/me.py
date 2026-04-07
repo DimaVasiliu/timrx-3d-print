@@ -12,6 +12,7 @@ import time as _time
 from flask import Blueprint, request, jsonify, g, make_response
 
 from backend.middleware import with_session, require_session, no_cache
+from backend.services.csrf_service import CSRFService
 from backend.services.identity_service import IdentityService
 from backend.services.wallet_service import WalletService
 from backend.db import is_transient_db_error
@@ -63,6 +64,7 @@ def get_me():
             "identity_id": identity_id,
             "email": identity.get("email") if identity else None,
             "email_verified": identity.get("email_verified", False) if identity else False,
+            "csrf_token": CSRFService.issue_token(g.session_id),
             # Wallet fields kept for backward compatibility but always 0.
             # Frontend should use /api/credits/wallet for real balances.
             "balance_credits": 0,

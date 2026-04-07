@@ -868,6 +868,7 @@ class Tables:
     PROVIDER_LEDGER = f"{_BILLING_SCHEMA}.provider_ledger"
     PROVIDER_ALERTS = f"{_BILLING_SCHEMA}.provider_alerts"
     CHECKOUT_IDEMPOTENCY = f"{_BILLING_SCHEMA}.checkout_idempotency"
+    AUTH_RATE_LIMITS = f"{_BILLING_SCHEMA}.auth_rate_limits"
     PROCESSED_WEBHOOK_PAYMENTS = f"{_BILLING_SCHEMA}.processed_webhook_payments"
     CRON_LOCKS = f"{_BILLING_SCHEMA}.cron_locks"
     VIDEO_DAILY_USAGE = f"{_BILLING_SCHEMA}.video_daily_usage"

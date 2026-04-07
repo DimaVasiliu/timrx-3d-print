@@ -20,6 +20,7 @@ Usage:
     conn_str = config.DATABASE_URL
 """
 
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -164,11 +165,16 @@ class Config:
     SESSION_COOKIE_NAME: str = "timrx_sid"
     SESSION_COOKIE_HTTPONLY: bool = True
     SESSION_COOKIE_PATH: str = "/"
+    CSRF_COOKIE_NAME: str = "timrx_csrf"
+    CSRF_HEADER_NAME: str = "X-CSRF-Token"
 
     # Cookie domain for cross-subdomain sharing (e.g., ".timrx.live")
     # Set via SESSION_COOKIE_DOMAIN env var in production
     # Leading dot allows subdomains (timrx.live + 3d.timrx.live + www.timrx.live)
     _SESSION_COOKIE_DOMAIN_RAW: str = field(default_factory=lambda: _get_env("SESSION_COOKIE_DOMAIN"))
+    _SESSION_COOKIE_SAMESITE_RAW: str = field(default_factory=lambda: _get_env("SESSION_COOKIE_SAMESITE"))
+    _CSRF_SECRET_RAW: str = field(default_factory=lambda: _get_env("CSRF_SECRET"))
+    _CSRF_PROTECT_RAW: str = field(default_factory=lambda: _get_env("CSRF_PROTECT"))
 
     @property
     def SESSION_COOKIE_DOMAIN(self) -> Optional[str]:
@@ -191,16 +197,37 @@ class Config:
         SameSite policy for session cookie.
         - "Lax": Default, works for same-site navigation
         - "None": Required for cross-site requests (requires Secure=True)
-
-        We use "None" in production for cross-subdomain requests
-        (timrx.live -> 3d.timrx.live) to ensure cookies are sent.
         """
-        # Use "None" in production for cross-origin subdomain requests
-        # SameSite=None requires Secure=True (HTTPS)
-        if self.IS_PROD:
-            return "None"
-        # In dev, use "Lax" since we're on localhost (no HTTPS)
+        raw = (self._SESSION_COOKIE_SAMESITE_RAW or "").strip().lower()
+        if raw in ("strict", "lax", "none"):
+            return raw.title()
+        # Subdomains of the same registrable domain are same-site, so Lax is
+        # sufficient for timrx.live <-> 3d.timrx.live and is safer than None.
         return "Lax"
+
+    @property
+    def CSRF_SECRET(self) -> str:
+        """
+        Secret used to derive stateless CSRF tokens.
+
+        In production, set CSRF_SECRET explicitly in Render. We fall back to a
+        hash of DATABASE_URL only so existing deployments can boot safely.
+        """
+        if self._CSRF_SECRET_RAW:
+            return self._CSRF_SECRET_RAW
+        if self._DATABASE_URL_RAW:
+            seed = f"{self._DATABASE_URL_RAW}|{self.SESSION_COOKIE_NAME}|csrf-v1"
+            return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+        return "dev-csrf-secret"
+
+    @property
+    def CSRF_PROTECT(self) -> bool:
+        raw = (self._CSRF_PROTECT_RAW or "").strip().lower()
+        if raw in ("true", "1", "yes", "on"):
+            return True
+        if raw in ("false", "0", "no", "off"):
+            return False
+        return self.IS_PROD
 
     # Single TTL for both DB session expiry AND cookie max-age (must match!)
     SESSION_TTL_DAYS: int = field(default_factory=lambda: _get_env_int("SESSION_TTL_DAYS", 30))
@@ -781,6 +808,10 @@ class Config:
                 warnings.append("ALLOWED_ORIGINS not set - CORS will block requests")
             if self.ALLOW_ALL_ORIGINS:
                 warnings.append("ALLOWED_ORIGINS=* - allowing all origins (not recommended for production)")
+            if not self._CSRF_SECRET_RAW:
+                warnings.append("CSRF_SECRET not set - falling back to DATABASE_URL-derived secret")
+            if not self.CSRF_PROTECT:
+                warnings.append("CSRF_PROTECT=false in production - state-changing browser requests are not CSRF-protected")
 
         return warnings
 
@@ -836,6 +867,10 @@ SESSION_COOKIE_SECURE = config.SESSION_COOKIE_SECURE
 SESSION_COOKIE_SAMESITE = config.SESSION_COOKIE_SAMESITE
 SESSION_COOKIE_HTTPONLY = config.SESSION_COOKIE_HTTPONLY
 SESSION_COOKIE_PATH = config.SESSION_COOKIE_PATH
+CSRF_COOKIE_NAME = config.CSRF_COOKIE_NAME
+CSRF_HEADER_NAME = config.CSRF_HEADER_NAME
+CSRF_SECRET = config.CSRF_SECRET
+CSRF_PROTECT = config.CSRF_PROTECT
 SESSION_TTL_DAYS = config.SESSION_TTL_DAYS
 SESSION_TTL_SECONDS = config.SESSION_TTL_SECONDS
 SESSION_MAX_AGE_DAYS = config.SESSION_MAX_AGE_DAYS  # Deprecated alias

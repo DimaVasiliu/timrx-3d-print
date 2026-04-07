@@ -7,7 +7,6 @@ changing the monolith yet. Routes can migrate gradually.
 
 from __future__ import annotations
 
-import base64
 import os
 import uuid
 from typing import Any
@@ -23,8 +22,10 @@ from backend.utils import (
     get_content_type_for_extension,
     get_content_type_from_url,
     get_extension_for_content_type,
+    parse_data_url,
     sanitize_filename,
     unpack_upload_result,
+    validate_and_normalize_upload_bytes,
     wrap_upload_result,
 )
 
@@ -79,12 +80,11 @@ def build_hash_s3_key(prefix: str, provider: str | None, content_hash: str, cont
 
     safe_provider = safe_provider or "unknown"
 
-    if prefix == "models":
+    ext = get_extension_for_content_type(content_type)
+    if not ext and prefix in ("images", "thumbnails", "textures", "source_images"):
+        ext = ".png"
+    if not ext and prefix == "models":
         ext = ".glb"
-    else:
-        ext = get_extension_for_content_type(content_type)
-        if not ext and prefix in ("images", "thumbnails", "textures", "source_images"):
-            ext = ".png"
     return f"{prefix}/{safe_provider}/{content_hash}{ext}"
 
 
@@ -213,6 +213,8 @@ def upload_bytes_to_s3(
     if not config.AWS_BUCKET_MODELS:
         raise RuntimeError("AWS_BUCKET_MODELS not configured")
 
+    content_type = validate_and_normalize_upload_bytes(data_bytes, content_type, prefix)
+
     if not key:
         if not user_id:
             raise ValueError("user_id required for S3 upload")
@@ -320,10 +322,7 @@ def safe_upload_to_s3(
     resolved_type = content_type or "application/octet-stream"
     try:
         if url.startswith("data:"):
-            header, b64data = url.split(",", 1)
-            if ":" in header and ";" in header:
-                resolved_type = header.split(":")[1].split(";")[0] or resolved_type
-            data_bytes = base64.b64decode(b64data)
+            resolved_type, data_bytes = parse_data_url(url)
         else:
             resp = requests.get(url, timeout=120)
             resp.raise_for_status()
@@ -336,6 +335,7 @@ def safe_upload_to_s3(
         print(f"[S3] ERROR: Failed to fetch bytes for {prefix}: {e}")
         raise
 
+    resolved_type = validate_and_normalize_upload_bytes(data_bytes, resolved_type, prefix)
     content_hash = compute_sha256(data_bytes)
     s3_key = build_hash_s3_key(prefix, provider, content_hash, resolved_type)
     if s3_key_exists(s3_key):
@@ -529,11 +529,7 @@ def upload_base64_to_s3(
     key_base: str | None = None,
     return_hash: bool = False,
 ):
-    header, b64data = data_url.split(",", 1)
-    mime = "image/png"
-    if ":" in header and ";" in header:
-        mime = header.split(":")[1].split(";")[0]
-    image_bytes = base64.b64decode(b64data)
+    mime, image_bytes = parse_data_url(data_url)
     if key_base and not key:
         key = ensure_s3_key_ext(key_base, mime)
     return upload_bytes_to_s3(image_bytes, mime, prefix, name, user_id, key=key, return_hash=return_hash)

@@ -18,6 +18,7 @@ from functools import wraps
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import with_session, with_optional_session, require_session, require_admin, no_cache
+from backend.services.auth_rate_limit_service import AuthRateLimitService
 from backend.services.magic_code_service import MagicCodeService
 from backend.services.identity_service import IdentityService
 from backend.services.wallet_service import WalletService
@@ -35,6 +36,10 @@ ATTACH_IP_WINDOW_SECS = 60
 ATTACH_IP_MAX_REQUESTS = 10
 _ip_attach_log = {}  # { ip: [timestamp, ...] }
 _ip_attach_last_cleanup = 0
+AUTH_ATTACH_WINDOW_SECS = 15 * 60
+AUTH_ATTACH_MAX_REQUESTS = 5
+AUTH_RESTORE_WINDOW_SECS = 15 * 60
+AUTH_RESTORE_MAX_REQUESTS = 5
 
 
 def _check_ip_attach_rate(ip: str) -> bool:
@@ -135,6 +140,19 @@ def _get_client_ip() -> str:
     return request.remote_addr or ""
 
 
+def _shared_auth_limit(scope: str, ip_address: str, email: str, *, limit: int, window_seconds: int) -> dict | None:
+    try:
+        return AuthRateLimitService.hit(
+            scope,
+            key_parts=(f"ip:{ip_address or 'none'}", f"email:{email}"),
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+    except Exception as exc:
+        print(f"[AUTH_RATE_LIMIT] shared limiter unavailable for {scope}: {type(exc).__name__}: {exc}")
+        return None
+
+
 # ─────────────────────────────────────────────────────────────
 # IDENT-3: Anti-enumeration timing equalization
 # ─────────────────────────────────────────────────────────────
@@ -216,6 +234,21 @@ def request_restore():
 
     ip_address = _get_client_ip()
     print(f"[RESTORE][REQUEST] email={email} ip={ip_address or 'none'}")
+
+    shared_limit = _shared_auth_limit(
+        "auth_restore_request",
+        ip_address,
+        email,
+        limit=AUTH_RESTORE_MAX_REQUESTS,
+        window_seconds=AUTH_RESTORE_WINDOW_SECS,
+    )
+    if shared_limit and not shared_limit["ok"]:
+        return jsonify({
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many code requests for this email and IP. Please try again later.",
+            }
+        }), 429, {"Retry-After": str(shared_limit["retry_after"])}
 
     result = MagicCodeService.request_restore(email, ip_address)
 
@@ -517,8 +550,23 @@ def attach_email():
 
     ip_address = _get_client_ip()
 
+    shared_limit = _shared_auth_limit(
+        "auth_email_attach",
+        ip_address,
+        email,
+        limit=AUTH_ATTACH_MAX_REQUESTS,
+        window_seconds=AUTH_ATTACH_WINDOW_SECS,
+    )
+    if shared_limit and not shared_limit["ok"]:
+        return jsonify({
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many verification attempts for this email and IP. Please try again later.",
+            }
+        }), 429, {"Retry-After": str(shared_limit["retry_after"])}
+
     # Per-IP rate limit (defense against enumeration across many emails)
-    if not _check_ip_attach_rate(ip_address):
+    if shared_limit is None and not _check_ip_attach_rate(ip_address):
         print(f"[AUTH] IP rate limited on email/attach: ip={ip_address}")
         return jsonify({
             "error": {
@@ -780,114 +828,129 @@ def verify_email():
 
     # Verify the code against magic_codes table
     code_hash = MagicCodeService.hash_code(code)
-    from backend.db import query_one, transaction, Tables
+    from backend.db import fetch_one, query_one, transaction, Tables
     from backend.config import config
 
-    # Find matching active code for this email
-    code_record = query_one(
-        f"""
-        SELECT id, attempts
-        FROM {Tables.MAGIC_CODES}
-        WHERE email = %s
-          AND code_hash = %s
-          AND consumed = FALSE
-          AND expires_at > NOW()
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (email, code_hash),
-    )
-
-    if not code_record:
-        # Code not found or doesn't match - increment attempts counter
-        MagicCodeService._increment_attempts(email)
-        print(f"[AUTH] verify_email failed: invalid code for email={_mask_email(email)}")
-        return _get_redeem_error_response("Invalid or expired code")
-
-    # Check max attempts
     max_attempts = config.MAGIC_CODE_MAX_ATTEMPTS
-    if code_record["attempts"] >= max_attempts:
-        print(f"[AUTH] verify_email failed: too many attempts for email={_mask_email(email)}")
-        return _get_redeem_error_response("Too many failed attempts. Please request a new code")
-
-    code_id = str(code_record["id"])
 
     # ── Determine verification target ──
     current_email = None
     if identity and identity.get("email"):
         current_email = identity["email"].lower() if isinstance(identity["email"], str) else None
 
-    # ── Cross-identity check (no merge) ──
-    # If this email belongs to another identity, switch session to that
-    # exact identity. Do NOT follow merge chains or resolve canonical.
-    # Use a direct query instead of IdentityService.get_identity_by_email
-    # because that helper auto-resolves merged_into_id.
-    if current_email != email:
-        existing_owner = query_one(
-            f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
-            (email,),
-        )
-        if existing_owner and str(existing_owner["id"]) != identity_id:
-            owner_id = str(existing_owner["id"])
-            print(
-                f"[VERIFY] Email belongs to another account; "
-                f"switching session (merge disabled): "
-                f"source={identity_id[:8]}..., target={owner_id[:8]}..., "
-                f"email={_mask_email(email)}"
-            )
-            return _handle_verify_cross_identity(
-                code_id=code_id,
-                email=email,
-                source_id=identity_id,
-                target_id=owner_id,
-                session_id=g.session_id,
-            )
-
-    # ── Same-identity case: attach email idempotently ──
     email_attached = False
+    switched_account = False
+    target_identity_id = identity_id
+    invalid_code = False
+    too_many_attempts = False
 
-    if current_email == email:
-        # Email already on this identity - just verify it
-        pass
-    elif current_email is None:
-        # Identity has no email, and email is free → attach it
-        email_attached = True
-    else:
-        # Identity has a DIFFERENT email, and new email is free → change it
-        email_attached = True
-        print(f"[AUTH] Email change requested: identity {identity_id} from {_mask_email(current_email)} to {_mask_email(email)}")
-
-    # ── Commit: mark code consumed & attach/verify email ──
-    with transaction() as cur:
-        # Mark code as consumed
-        cur.execute(
-            f"""
-            UPDATE {Tables.MAGIC_CODES}
-            SET consumed = TRUE, consumed_at = NOW()
-            WHERE id = %s
-            """,
-            (code_id,),
-        )
-
-        # Attach email (if needed) and mark verified
-        if email_attached:
-            cur.execute(
-                f"""
-                UPDATE {Tables.IDENTITIES}
-                SET email = %s, email_verified = TRUE, last_seen_at = NOW()
-                WHERE id = %s
-                """,
-                (email, identity_id),
-            )
+    # ── Commit: lock matching code, consume it once, and update identity/session ──
+    with transaction("verify_email") as cur:
+        code_record = MagicCodeService._lock_matching_code(cur, email, code_hash)
+        if not code_record:
+            invalid_code = True
+        elif code_record["attempts"] >= max_attempts:
+            too_many_attempts = True
         else:
-            cur.execute(
-                f"""
-                UPDATE {Tables.IDENTITIES}
-                SET email_verified = TRUE, last_seen_at = NOW()
-                WHERE id = %s
-                """,
-                (identity_id,),
-            )
+            code_id = str(code_record["id"])
+
+            # If this email belongs to another identity, switch the session
+            # to that exact identity instead of merging accounts.
+            owner_id = None
+            if current_email != email:
+                cur.execute(
+                    f"SELECT id FROM {Tables.IDENTITIES} WHERE email = %s",
+                    (email,),
+                )
+                existing_owner = fetch_one(cur)
+                if existing_owner and str(existing_owner["id"]) != identity_id:
+                    owner_id = str(existing_owner["id"])
+
+            MagicCodeService._consume_code(cur, code_id)
+
+            if owner_id:
+                switched_account = True
+                email_attached = True
+                target_identity_id = owner_id
+                print(
+                    f"[VERIFY] Email belongs to another account; "
+                    f"switching session (merge disabled): "
+                    f"source={identity_id[:8]}..., target={owner_id[:8]}..., "
+                    f"email={_mask_email(email)}"
+                )
+                try:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.SESSIONS}
+                        SET identity_id = %s, updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING id
+                        """,
+                        (owner_id, g.session_id),
+                    )
+                except Exception as e:
+                    if "updated_at" in str(e):
+                        cur.execute(
+                            f"""
+                            UPDATE {Tables.SESSIONS}
+                            SET identity_id = %s
+                            WHERE id = %s
+                            RETURNING id
+                            """,
+                            (owner_id, g.session_id),
+                        )
+                    else:
+                        raise
+                updated_session = fetch_one(cur)
+                if not updated_session:
+                    raise ValueError(f"Session {g.session_id} not found")
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.IDENTITIES}
+                    SET email_verified = TRUE, last_seen_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (owner_id,),
+                )
+            else:
+                if current_email == email:
+                    pass
+                elif current_email is None:
+                    email_attached = True
+                else:
+                    email_attached = True
+                    print(
+                        f"[AUTH] Email change requested: identity {identity_id} "
+                        f"from {_mask_email(current_email)} to {_mask_email(email)}"
+                    )
+
+                if email_attached:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.IDENTITIES}
+                        SET email = %s, email_verified = TRUE, last_seen_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (email, identity_id),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        UPDATE {Tables.IDENTITIES}
+                        SET email_verified = TRUE, last_seen_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (identity_id,),
+                    )
+
+    if invalid_code:
+        MagicCodeService._increment_attempts(email)
+        print(f"[AUTH] verify_email failed: invalid code for email={_mask_email(email)}")
+        return _get_redeem_error_response("Invalid or expired code")
+
+    if too_many_attempts:
+        print(f"[AUTH] verify_email failed: too many attempts for email={_mask_email(email)}")
+        return _get_redeem_error_response("Too many failed attempts. Please request a new code")
 
     # Invalidate other pending codes for this email
     MagicCodeService.invalidate_codes_for_email(email)
@@ -906,14 +969,31 @@ def verify_email():
                   AND pause_reason = 'email_unverified'
                 RETURNING id
                 """,
-                (identity_id,),
+                (target_identity_id,),
             )
             resumed = cur.fetchall() or []
             subscriptions_resumed = len(resumed)
             for row in resumed:
                 print(f"[AUTH] Resumed subscription {row['id']} after email verification")
     except Exception as e:
-        print(f"[AUTH] Error resuming subscriptions for {identity_id}: {e}")
+        print(f"[AUTH] Error resuming subscriptions for {target_identity_id}: {e}")
+
+    if switched_account:
+        print(
+            f"[VERIFY] Switched session to identity {target_identity_id[:8]}... "
+            f"(email={_mask_email(email)}, source was {identity_id[:8]}...)"
+        )
+        return jsonify({
+            "ok": True,
+            "message": "Email verified successfully",
+            "email_verified": True,
+            "email_attached": True,
+            "identity_changed": True,
+            "switched_account": True,
+            "merge_performed": False,
+            "identity_id": target_identity_id,
+            "subscriptions_resumed": subscriptions_resumed,
+        })
 
     print(f"[AUTH] Email verified for identity {identity_id}: {_mask_email(email)} (attached={email_attached}, subs_resumed={subscriptions_resumed})")
 

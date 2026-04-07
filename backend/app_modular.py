@@ -146,9 +146,57 @@ def create_app() -> Flask:
             print(f"[SECURITY] Origin rejected: origin={origin} path={request.path} method={request.method}")
             return jsonify({"ok": False, "error": "origin_not_allowed"}), 403
 
+    @app.before_request
+    def _check_csrf():
+        from backend.services.csrf_service import CSRFService
+
+        is_valid, error = CSRFService.validate_request()
+        if is_valid:
+            return None
+
+        print(f"[SECURITY] CSRF rejected: path={request.path} method={request.method} reason={error}")
+        return jsonify({
+            "ok": False,
+            "error": {
+                "code": "CSRF_INVALID",
+                "message": "Missing or invalid CSRF token",
+            },
+        }), 403
+
     from backend.routes import register_blueprints
 
     register_blueprints(app)
+
+    @app.after_request
+    def _apply_security_headers(response):
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
+        existing_csp = response.headers.get("Content-Security-Policy", "").strip()
+        frame_ancestors_policy = "frame-ancestors 'none'"
+        if not existing_csp:
+            response.headers["Content-Security-Policy"] = frame_ancestors_policy
+        elif "frame-ancestors" not in existing_csp:
+            response.headers["Content-Security-Policy"] = f"{existing_csp}; {frame_ancestors_policy}"
+
+        if config.IS_PROD:
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains; preload",
+            )
+
+        try:
+            from backend.services.csrf_service import CSRFService
+
+            session_id = getattr(g, "session_id", None)
+            if session_id:
+                CSRFService.set_csrf_cookie(response, session_id)
+        except Exception as exc:
+            print(f"[SECURITY] Warning: failed to set CSRF cookie: {exc}")
+
+        return response
 
     # ─────────────────────────────────────────────────────────────
     # Legacy compat: /api/wallet (same as /api/credits/wallet)

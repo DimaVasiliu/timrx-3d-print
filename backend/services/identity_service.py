@@ -359,7 +359,7 @@ class IdentityService:
         Cookie settings (production):
         - Domain: .timrx.live (allows timrx.live + 3d.timrx.live + www.timrx.live)
         - Secure: True (HTTPS only)
-        - SameSite: None (required for cross-subdomain with credentials)
+        - SameSite: Configurable (Lax by default in production)
         - HttpOnly: True (not accessible via JavaScript)
         - Path: /
 
@@ -374,12 +374,12 @@ class IdentityService:
         if is_prod:
             # Always use .timrx.live domain in production, regardless of config
             canonical_domain = config.SESSION_COOKIE_DOMAIN or ".timrx.live"
-            canonical_samesite = "None"
+            canonical_samesite = config.SESSION_COOKIE_SAMESITE
             canonical_secure = True
         else:
             # Development: no domain (host-only), Lax samesite
             canonical_domain = None
-            canonical_samesite = "Lax"
+            canonical_samesite = config.SESSION_COOKIE_SAMESITE
             canonical_secure = False
 
         # ─────────────────────────────────────────────────────────────
@@ -468,6 +468,12 @@ class IdentityService:
             response.delete_cookie(cookie_name, path="/", domain=canonical_domain)
         else:
             response.delete_cookie(cookie_name, path="/")
+
+        try:
+            from backend.services.csrf_service import CSRFService
+            CSRFService.clear_csrf_cookie(response)
+        except Exception:
+            pass
 
         if SESSION_DEBUG:
             print(f"[SESSION] Cookies cleared: host-only + domain={canonical_domain!r}")
@@ -1158,7 +1164,7 @@ class IdentityService:
             max_age=60 * 60 * 24 * 365,  # 1 year
             httponly=True,
             secure=is_prod,
-            samesite="None" if is_prod else "Lax",
+            samesite=config.SESSION_COOKIE_SAMESITE,
             path="/",
             domain=config.SESSION_COOKIE_DOMAIN if is_prod else None,
         )
@@ -1456,4 +1462,3 @@ def require_identity() -> tuple[str | None, Response | None]:
         }),
         401,
     )
-
