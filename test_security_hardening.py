@@ -25,6 +25,18 @@ ONE_BY_ONE_PNG = (
 
 
 class SecurityHardeningTests(unittest.TestCase):
+    def test_flux_upload_validation_maps_to_source_image_field(self):
+        try:
+            from backend.routes.image_gen import _upload_validation_field
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"Image route dependencies unavailable: {exc}")
+
+        field = _upload_validation_field(
+            "flux_pro",
+            {"source_image": "data:image/png;base64,ZmFrZQ=="},
+        )
+        self.assertEqual(field, "source_image")
+
     def test_health_endpoint_sets_frame_protection_headers(self):
         try:
             from app_modular import app

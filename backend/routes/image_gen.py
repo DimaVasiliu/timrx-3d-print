@@ -82,8 +82,24 @@ from backend.services.job_service import create_internal_job_row, load_store, sa
 from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
 from backend.services.prompt_safety_service import check_prompt_safety
 from backend.utils.helpers import now_s, log_event
+from backend.utils.upload_validation import UploadValidationError
 
 bp = Blueprint("image_gen", __name__)
+
+
+def _upload_validation_field(provider: str, body: dict) -> str:
+    if provider == "flux_pro":
+        if any(body.get(key) for key in ("source_image", "sourceImage", "input_image")):
+            return "source_image"
+        if any(body.get(key) for key in ("reference_images", "referenceImages", "input_images")):
+            return "reference_images"
+    if any(body.get(key) for key in ("image_data", "imageData")):
+        return "image_data"
+    if any(body.get(key) for key in ("image_url", "imageUrl")):
+        return "image_url"
+    if any(body.get(key) for key in ("mask_image", "maskImage")):
+        return "mask_image"
+    return "asset"
 
 
 def _get_image_action_key(image_size: str = "1K", provider: str = "openai") -> str:
@@ -315,6 +331,14 @@ def image_generate_unified():
                 "message": f"Unknown image provider: {provider}",
                 "allowed": get_allowed_image_providers(),
             }), 400
+    except UploadValidationError as e:
+        print(f"[IMAGE_API] Upload validation failed provider={provider}: {e}")
+        return jsonify({
+            "error": "invalid_params",
+            "message": str(e) or "Invalid uploaded file content",
+            "field": _upload_validation_field(provider, body),
+            "details": {"provider": provider, "reason": "upload_validation"},
+        }), 400
     except Exception as e:
         print(f"[IMAGE_API] Unhandled error provider={provider}: {e}")
         print(traceback.format_exc())
