@@ -1155,6 +1155,27 @@ def _ensure_schema_direct() -> None:
                     ON {_APP_SCHEMA}.videos (upstream_id)
                     WHERE upstream_id IS NOT NULL
                 """)
+                # Inspire opt-in column on models/images/videos
+                for tbl in ('models', 'images', 'videos'):
+                    cur.execute(f"""
+                        ALTER TABLE {_APP_SCHEMA}.{tbl}
+                        ADD COLUMN IF NOT EXISTS share_to_inspire BOOLEAN DEFAULT FALSE
+                    """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_models_inspire
+                    ON {_APP_SCHEMA}.models (share_to_inspire, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_images_inspire
+                    ON {_APP_SCHEMA}.images (share_to_inspire, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_videos_inspire
+                    ON {_APP_SCHEMA}.videos (share_to_inspire, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
             conn.commit()
             print("[DB] Schema indexes ensured")
         finally:

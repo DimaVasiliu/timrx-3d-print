@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional
 from flask import Blueprint, jsonify, request, Response
 
 from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, is_transient_db_error
+from backend.services.identity_service import require_identity
 
 # Debug: confirm module loads
 print("[INSPIRE] Module loaded successfully")
@@ -217,7 +218,8 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
                 upstream_job_id,
                 created_at
             FROM timrx_app.models
-            WHERE thumbnail_url IS NOT NULL
+            WHERE share_to_inspire = TRUE
+              AND thumbnail_url IS NOT NULL
               AND thumbnail_url != ''
               AND glb_url IS NOT NULL
               AND glb_url != ''
@@ -310,8 +312,9 @@ def _fetch_images(cursor, limit: Optional[int] = None, debug: bool = False) -> L
             height,
             created_at
         FROM timrx_app.images
-        WHERE (thumbnail_url IS NOT NULL AND thumbnail_url != '')
-           OR (image_url IS NOT NULL AND image_url != '')
+        WHERE share_to_inspire = TRUE
+          AND ((thumbnail_url IS NOT NULL AND thumbnail_url != '')
+            OR (image_url IS NOT NULL AND image_url != ''))
         {order}
         {limit_clause}
     """)
@@ -341,7 +344,8 @@ def _fetch_videos(cursor, limit: Optional[int] = None, debug: bool = False) -> L
             duration_seconds,
             created_at
         FROM timrx_app.videos
-        WHERE thumbnail_url IS NOT NULL
+        WHERE share_to_inspire = TRUE
+          AND thumbnail_url IS NOT NULL
           AND thumbnail_url != ''
           AND video_url IS NOT NULL
         {order}
@@ -693,3 +697,54 @@ def inspire_shuffle() -> Response:
     from flask import redirect, url_for
     seed = str(random.randint(1, 1000000))
     return redirect(url_for('.inspire_feed', shuffle='true', seed=seed, **request.args))
+
+
+@bp.route("/inspire/share", methods=["POST", "OPTIONS"])
+def inspire_share() -> Response:
+    """
+    Toggle share_to_inspire for a specific asset.
+    Body: { "id": "<asset-id>", "type": "model"|"image"|"video", "share": true|false }
+    """
+    if request.method == "OPTIONS":
+        return Response("", status=204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": "Database not configured"}), 503
+
+    body = request.get_json(silent=True) or {}
+    asset_id = body.get("id", "").strip()
+    asset_type = body.get("type", "").strip().lower()
+    share = bool(body.get("share", True))
+
+    if not asset_id:
+        return jsonify({"ok": False, "error": "Missing id"}), 400
+
+    table_map = {"model": "models", "image": "images", "video": "videos"}
+    table = table_map.get(asset_type)
+    if not table:
+        return jsonify({"ok": False, "error": f"Invalid type: {asset_type}. Use model, image, or video."}), 400
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE timrx_app.{table}
+                    SET share_to_inspire = %s
+                    WHERE id = %s AND identity_id = %s
+                    RETURNING id
+                    """,
+                    (share, asset_id, identity_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "Asset not found or not owned by you"}), 404
+            conn.commit()
+        return jsonify({"ok": True, "shared": share})
+    except Exception as e:
+        print(f"[INSPIRE] share toggle failed: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
