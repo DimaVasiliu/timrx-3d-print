@@ -39,6 +39,15 @@ _s3 = boto3.client(
 )
 
 
+def _effective_validation_prefix(prefix: str | None, key: str | None) -> str:
+    raw_prefix = (prefix or "").strip().lower()
+    if key:
+        key_prefix = key.lstrip("/").split("/", 1)[0].strip().lower()
+        if key_prefix:
+            return key_prefix
+    return raw_prefix or "models"
+
+
 def build_hash_s3_key(prefix: str, provider: str | None, content_hash: str, content_type: str) -> str:
     """
     Build S3 key with content hash for deduplication.
@@ -213,7 +222,8 @@ def upload_bytes_to_s3(
     if not config.AWS_BUCKET_MODELS:
         raise RuntimeError("AWS_BUCKET_MODELS not configured")
 
-    content_type = validate_and_normalize_upload_bytes(data_bytes, content_type, prefix)
+    validation_prefix = _effective_validation_prefix(prefix, key)
+    content_type = validate_and_normalize_upload_bytes(data_bytes, content_type, validation_prefix)
 
     if not key:
         if not user_id:

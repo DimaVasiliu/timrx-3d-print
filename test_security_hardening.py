@@ -25,6 +25,21 @@ ONE_BY_ONE_PNG = (
 
 
 class SecurityHardeningTests(unittest.TestCase):
+    def test_s3_validation_prefix_comes_from_key(self):
+        try:
+            from backend.services.s3_service import _effective_validation_prefix
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"S3 service dependencies unavailable: {exc}")
+
+        self.assertEqual(
+            _effective_validation_prefix("models", "images/provider/hash.png"),
+            "images",
+        )
+        self.assertEqual(
+            _effective_validation_prefix("models", "thumbnails/provider/hash.jpg"),
+            "thumbnails",
+        )
+
     def test_flux_upload_validation_maps_to_source_image_field(self):
         try:
             from backend.routes.image_gen import _upload_validation_field

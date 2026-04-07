@@ -526,6 +526,8 @@ def save_image_to_normalized_db(
                 uploaded_url_cache: dict[str, str] = {}
                 image_bytes = None  # kept in memory for thumbnail generation
                 resolved_ct = extra_meta.get("mime_type") or "image/png"
+                canonical_storage_status = "s3"
+                canonical_storage_error = None
 
                 if image_url:
                     # ── Fetch image bytes once, use for both upload and thumbnail ──
@@ -565,17 +567,25 @@ def save_image_to_normalized_db(
                         # Upload full image to S3 with content-hash dedup
                         image_content_hash = compute_sha256(image_bytes)
                         s3_key = build_hash_s3_key("images", provider, image_content_hash, resolved_ct)
-                        upload_result = upload_bytes_to_s3(
-                            image_bytes,
-                            content_type=resolved_ct,
-                            key=s3_key,
-                            return_hash=True,
-                        )
-                        image_url, _, image_s3_key_from_upload, image_reused = unpack_upload_result(upload_result)
-                        if image_reused is False and image_s3_key_from_upload:
-                            _newly_created_s3_keys.append(image_s3_key_from_upload)
+                        try:
+                            upload_result = upload_bytes_to_s3(
+                                image_bytes,
+                                content_type=resolved_ct,
+                                key=s3_key,
+                                return_hash=True,
+                            )
+                            image_url, _, image_s3_key_from_upload, image_reused = unpack_upload_result(upload_result)
+                            if image_reused is False and image_s3_key_from_upload:
+                                _newly_created_s3_keys.append(image_s3_key_from_upload)
+                        except Exception as e:
+                            canonical_storage_status = "original_url_fallback"
+                            canonical_storage_error = str(e)
+                            image_url = original_image_url
+                            image_s3_key_from_upload = None
+                            image_reused = None
+                            print(f"[IMAGE] Canonical S3 upload failed for image {image_id}; preserving original URL in history: {e}")
 
-                    if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
+                    if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url) and canonical_storage_status == "s3":
                         print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
                         image_url = None
                     if original_image_url:
@@ -598,15 +608,21 @@ def save_image_to_normalized_db(
                         if url in uploaded_url_cache:
                             normalized_urls.append(uploaded_url_cache[url])
                             continue
-                        s3_url = safe_upload_to_s3(
-                            url,
-                            "image/png",
-                            "images",
-                            f"{image_id}_{i}",
-                            user_id=user_id,
-                            key_base=f"{image_key_base}_{i}",
-                            provider=provider,
-                        )
+                        try:
+                            s3_url = safe_upload_to_s3(
+                                url,
+                                "image/png",
+                                "images",
+                                f"{image_id}_{i}",
+                                user_id=user_id,
+                                key_base=f"{image_key_base}_{i}",
+                                provider=provider,
+                            )
+                        except Exception as e:
+                            canonical_storage_status = "original_url_fallback"
+                            canonical_storage_error = canonical_storage_error or str(e)
+                            print(f"[IMAGE] Canonical S3 upload failed for image list asset {image_id}[{i}]; preserving original URL: {e}")
+                            s3_url = url
                         uploaded_url_cache[url] = s3_url
                         normalized_urls.append(s3_url)
                     image_urls = normalized_urls
@@ -685,6 +701,8 @@ def save_image_to_normalized_db(
                     "output_mode": extra_meta.get("output_mode"),
                     "upstream_request_id": extra_meta.get("upstream_request_id"),
                     "upstream_cost": extra_meta.get("upstream_cost"),
+                    "canonical_storage_status": canonical_storage_status,
+                    "canonical_storage_error": canonical_storage_error,
                 }
 
                 image_meta_dict = {
@@ -699,6 +717,8 @@ def save_image_to_normalized_db(
                     "upstream_request_id": extra_meta.get("upstream_request_id"),
                     "upstream_cost": extra_meta.get("upstream_cost"),
                     "mime_type": resolved_ct,
+                    "canonical_storage_status": canonical_storage_status,
+                    "canonical_storage_error": canonical_storage_error,
                 }
                 image_meta_dict.update({k: v for k, v in extra_meta.items() if v is not None})
                 image_meta = json.dumps(image_meta_dict)
@@ -2533,19 +2553,24 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     if thumbnail_url and (thumbnail_url == original_image_url or thumbnail_url == image_url):
                         thumbnail_url = image_url
                     elif thumbnail_url and not is_s3_url(thumbnail_url):
-                        thumbnail_url = safe_upload_to_s3(
-                            thumbnail_url,
-                            "image/png",
-                            "thumbnails",
-                            image_slug,
-                            user_id=user_id,
-                            key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
-                            provider=provider,
-                        )
-                    if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url):
+                        try:
+                            thumbnail_url = safe_upload_to_s3(
+                                thumbnail_url,
+                                "image/png",
+                                "thumbnails",
+                                image_slug,
+                                user_id=user_id,
+                                key_base=f"thumbnails/{image_user}/{image_job_key}/{image_slug}",
+                                provider=provider,
+                            )
+                        except Exception as e:
+                            canonical_storage_status = "original_url_fallback"
+                            canonical_storage_error = canonical_storage_error or str(e)
+                            print(f"[IMAGE] Thumbnail S3 upload failed for image {image_id}; preserving original thumbnail URL: {e}")
+                    if AWS_BUCKET_MODELS and image_url and not is_s3_url(image_url) and canonical_storage_status == "s3":
                         print(f"[WARN] canonical url is not S3: image_url={image_url[:80]}")
                         image_url = None
-                    if AWS_BUCKET_MODELS and thumbnail_url and not is_s3_url(thumbnail_url):
+                    if AWS_BUCKET_MODELS and thumbnail_url and not is_s3_url(thumbnail_url) and canonical_storage_status == "s3":
                         print(f"[WARN] canonical url is not S3: thumbnail_url={thumbnail_url[:80]}")
                         thumbnail_url = None
                     image_s3_key = image_s3_key_from_upload or get_s3_key_from_url(image_url)

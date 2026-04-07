@@ -227,6 +227,11 @@ def _complete_image_job(
         provider=provider,
         extra_meta=extra_meta,
     )
+    if not isinstance(persisted_result, dict):
+        print(
+            f"[IMAGE] WARNING: canonical persistence returned no normalized record "
+            f"job_id={internal_job_id} provider={provider}"
+        )
     final_image_url, final_image_urls, discord_image_url = _resolve_persisted_image_result(
         persisted_result,
         image_url,
