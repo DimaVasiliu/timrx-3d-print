@@ -60,7 +60,14 @@ def create_app() -> Flask:
         app,
         resources={r"/api/*": {"origins": origins}},
         supports_credentials=True,
-        allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "X-Requested-With", "X-Admin-Token"],
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "Idempotency-Key",
+            "X-Requested-With",
+            "X-Admin-Token",
+            "X-CSRF-Token",
+        ],
         expose_headers=["Content-Type"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
@@ -169,10 +176,29 @@ def create_app() -> Flask:
 
     @app.after_request
     def _apply_security_headers(response):
+        requested_headers = request.headers.get("Access-Control-Request-Headers", "")
+        allowed_headers = {
+            "Content-Type",
+            "Authorization",
+            "Idempotency-Key",
+            "X-Requested-With",
+            "X-Admin-Token",
+            "X-CSRF-Token",
+        }
+        if requested_headers:
+            for raw_header in requested_headers.split(","):
+                header = raw_header.strip()
+                if header:
+                    allowed_headers.add(header)
+
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault(
+            "Access-Control-Allow-Headers",
+            ", ".join(sorted(allowed_headers, key=str.lower)),
+        )
 
         existing_csp = response.headers.get("Content-Security-Policy", "").strip()
         frame_ancestors_policy = "frame-ancestors 'none'"
