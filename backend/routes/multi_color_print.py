@@ -469,42 +469,54 @@ def multi_color_status(job_id: str):
                     user_id=user_id,
                 )
 
-                # After S3 save, store metadata so the history card works:
-                # - glb_url stays as the 3MF S3 URL (viewer has 3MFLoader)
-                # - payload stores parent_glb_url (fallback) and model_urls.3mf
+                # After S3 save, fix the history card:
+                # - glb_url -> parent GLB (viewer can render GLB, not 3MF)
+                # - payload stores three_mf_url for download
                 if s3_result and s3_result.get("success"):
-                    three_mf_s3 = s3_result.get("glb_url") or ""  # This is the 3MF S3 URL
+                    three_mf_s3 = s3_result.get("glb_url") or ""  # S3 URL of the 3MF
                     if three_mf_s3:
                         try:
                             from backend.db import execute as _ex2, Tables as _Th
                             _identity = meta.get("identity_id") or identity_id
-                            _ex2(
-                                f"""UPDATE {_Th.HISTORY_ITEMS}
-                                    SET payload = COALESCE(payload, '{{}}'::jsonb)
-                                            || jsonb_build_object(
-                                                'three_mf_url', %s::text,
-                                                'parent_glb_url', %s::text,
-                                                'model_urls', jsonb_build_object('3mf', %s::text)
-                                            )
-                                    WHERE id::text = %s AND identity_id = %s""",
-                                (three_mf_s3, parent_glb or '', three_mf_s3,
-                                 job_id, _identity),
-                            )
+                            # Swap glb_url to parent GLB so viewer works
+                            if parent_glb:
+                                _ex2(
+                                    f"""UPDATE {_Th.HISTORY_ITEMS}
+                                        SET glb_url = %s,
+                                            payload = COALESCE(payload, '{{}}'::jsonb)
+                                                    || jsonb_build_object(
+                                                        'three_mf_url', %s::text,
+                                                        'model_urls', jsonb_build_object('3mf', %s::text)
+                                                    )
+                                        WHERE id::text = %s AND identity_id = %s""",
+                                    (parent_glb, three_mf_s3, three_mf_s3,
+                                     job_id, _identity),
+                                )
+                            else:
+                                _ex2(
+                                    f"""UPDATE {_Th.HISTORY_ITEMS}
+                                        SET payload = COALESCE(payload, '{{}}'::jsonb)
+                                                || jsonb_build_object(
+                                                    'three_mf_url', %s::text,
+                                                    'model_urls', jsonb_build_object('3mf', %s::text)
+                                                )
+                                        WHERE id::text = %s AND identity_id = %s""",
+                                    (three_mf_s3, three_mf_s3,
+                                     job_id, _identity),
+                                )
                             # Also update models row
                             _ex2(
                                 f"""UPDATE {_Th.MODELS}
                                     SET meta = COALESCE(meta, '{{}}'::jsonb)
                                             || jsonb_build_object(
                                                 'three_mf_url', %s::text,
-                                                'parent_glb_url', %s::text,
                                                 'model_urls', jsonb_build_object('3mf', %s::text)
                                             )
                                     WHERE upstream_id = %s AND identity_id = %s""",
-                                (three_mf_s3, parent_glb or '', three_mf_s3,
+                                (three_mf_s3, three_mf_s3,
                                  job_id, _identity),
                             )
-                            print(f"[MULTI_COLOR] Updated payload: 3MF={three_mf_s3[:60]}... parent_glb={'yes' if parent_glb else 'no'}")
-                            # Update the response to reflect the URLs
+                            print(f"[MULTI_COLOR] Updated: glb_url->{'parent' if parent_glb else '3mf'} 3mf={three_mf_s3[:60]}...")
                             out["three_mf_url"] = three_mf_s3
                             out["model_urls"] = {"3mf": three_mf_s3}
                         except Exception as fix_err:
@@ -573,7 +585,7 @@ def multi_color_status(job_id: str):
                         int_job,
                         upstream_job_id=job_id,
                         model_id=s3_result.get("model_id") if s3_result else None,
-                        glb_url=out.get("three_mf_url"),
+                        glb_url=parent_glb or out.get("three_mf_url"),
                     )
             except Exception as e:
                 print(f"[MULTI_COLOR] job status->ready failed: {e}")
