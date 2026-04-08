@@ -354,22 +354,53 @@ def multi_color_status(job_id: str):
         except Exception as e:
             print(f"[MULTI_COLOR] credit finalize failed: {e}")
 
-        # 2. Use the standard save pipeline: download 3MF from Meshy → S3,
-        #    create models row + history_items row with S3 URLs.
-        #    We pass the 3MF URL as glb_url (the field the pipeline downloads)
-        #    and set content_type_override so S3 stores it as model/3mf with
-        #    the correct .3mf extension instead of .glb.
+        # 2. Upload the 3MF to S3 and create history/model rows.
+        #
+        #    Key design: the 3MF is a print file (not viewable in Three.js),
+        #    so we store the PARENT model's GLB as the viewable glb_url and
+        #    put the 3MF S3 URL in model_urls["3mf"].  We also inherit the
+        #    parent's thumbnail when Meshy returns none (which is always for
+        #    multi-color-print).
         s3_result = None
         three_mf = out.get("three_mf_url")
         if three_mf:
             try:
+                # ── Look up parent model for thumbnail + viewable GLB ───
+                parent_thumbnail = ""
+                parent_glb = ""
+                source_task = meta.get("source_task_id")
+                if source_task and USE_DB:
+                    try:
+                        from backend.db import query_one, Tables as _Tp
+                        _parent = query_one(
+                            f"""SELECT glb_url, thumbnail_url
+                                FROM {_Tp.HISTORY_ITEMS}
+                                WHERE (upstream_id = %s OR id::text = %s)
+                                  AND identity_id = %s
+                                ORDER BY created_at DESC LIMIT 1""",
+                            (source_task, source_task,
+                             meta.get("identity_id") or identity_id),
+                        )
+                        if _parent:
+                            parent_thumbnail = _parent.get("thumbnail_url") or ""
+                            parent_glb = _parent.get("glb_url") or ""
+                    except Exception as pe:
+                        print(f"[MULTI_COLOR] Parent lookup failed: {pe}")
+
+                # Use Meshy's thumbnail if available, else inherit parent's
+                effective_thumbnail = out.get("thumbnail_url") or parent_thumbnail
+
+                # Upload the 3MF file to S3 via the standard pipeline.
+                # We pass it as glb_url so safe_upload_to_s3 downloads it,
+                # but with content_type_override="model/3mf" so it gets the
+                # correct extension and MIME type.
                 normalized_status = {
                     "id": job_id,
                     "status": "done",
                     "pct": 100,
                     "stage": "multi_color_print",
                     "glb_url": three_mf,  # Pipeline downloads this URL → S3
-                    "thumbnail_url": out.get("thumbnail_url") or "",
+                    "thumbnail_url": effective_thumbnail,
                     "model_urls": out.get("model_urls") or {"3mf": three_mf},
                     "created_at": out.get("created_at"),
                     # Tell the save pipeline to use 3MF content type, not GLB
@@ -385,14 +416,50 @@ def multi_color_status(job_id: str):
                     user_id=user_id,
                 )
 
+                # After S3 save, fix the URLs so the history card works:
+                # - glb_url → parent's viewable GLB (Three.js can render)
+                # - model_urls.3mf → the S3-hosted 3MF (for download)
                 if s3_result and s3_result.get("success"):
-                    # Replace Meshy URLs with durable S3 URLs in response
-                    if s3_result.get("glb_url"):
-                        out["three_mf_url"] = s3_result["glb_url"]
+                    three_mf_s3 = s3_result.get("glb_url") or ""  # This is actually the 3MF S3 URL
+                    if three_mf_s3 and parent_glb:
+                        try:
+                            from backend.db import execute as _ex2, Tables as _Th
+                            _ex2(
+                                f"""UPDATE {_Th.HISTORY_ITEMS}
+                                    SET glb_url = %s,
+                                        payload = COALESCE(payload, '{{}}'::jsonb)
+                                            || jsonb_build_object(
+                                                'three_mf_url', %s,
+                                                'model_urls', jsonb_build_object('3mf', %s)
+                                            )
+                                    WHERE upstream_id = %s AND identity_id = %s""",
+                                (parent_glb, three_mf_s3, three_mf_s3,
+                                 job_id, meta.get("identity_id") or identity_id),
+                            )
+                            # Also update models row
+                            _ex2(
+                                f"""UPDATE {_Th.MODELS}
+                                    SET glb_url = %s,
+                                        meta = COALESCE(meta, '{{}}'::jsonb)
+                                            || jsonb_build_object(
+                                                'three_mf_url', %s,
+                                                'model_urls', jsonb_build_object('3mf', %s)
+                                            )
+                                    WHERE upstream_id = %s AND user_id = %s""",
+                                (parent_glb, three_mf_s3, three_mf_s3,
+                                 job_id, meta.get("identity_id") or identity_id),
+                            )
+                            print(f"[MULTI_COLOR] Fixed history: glb_url→parent GLB, 3MF in payload")
+                            # Update the response to reflect the corrected URLs
+                            out["three_mf_url"] = three_mf_s3
+                            out["model_urls"] = {"3mf": three_mf_s3}
+                        except Exception as fix_err:
+                            print(f"[MULTI_COLOR] DB fix for glb_url failed: {fix_err}")
+
+                if s3_result and s3_result.get("success"):
+                    # Thumbnail: use S3-persisted thumbnail in response
                     if s3_result.get("thumbnail_url"):
                         out["thumbnail_url"] = s3_result["thumbnail_url"]
-                    if s3_result.get("model_urls"):
-                        out["model_urls"] = s3_result["model_urls"]
                     if s3_result.get("db_ok") is False:
                         out["db_ok"] = False
                         out["db_errors"] = s3_result.get("db_errors")
