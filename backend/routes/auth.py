@@ -22,6 +22,7 @@ from backend.services.auth_rate_limit_service import AuthRateLimitService
 from backend.services.magic_code_service import MagicCodeService
 from backend.services.identity_service import IdentityService
 from backend.services.wallet_service import WalletService
+from backend.utils.redeem_verify_rate_limiter import check_redeem_verify_rate
 
 bp = Blueprint("auth", __name__)
 
@@ -329,6 +330,16 @@ def redeem_restore():
 
     Requires: Active session (from cookie)
     """
+    # Per-IP rate limit on redeem attempts
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not check_redeem_verify_rate(ip):
+        return jsonify({
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many attempts. Please try again later.",
+            }
+        }), 429
+
     data = request.get_json() or {}
     email = data.get("email", "").strip()
     code = data.get("code", "").strip()
@@ -768,6 +779,16 @@ def verify_email():
     - 400 TOO_MANY_ATTEMPTS: Max attempts exceeded
     - 401 NO_SESSION: No active session
     """
+    # Per-IP rate limit on verify attempts
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if not check_redeem_verify_rate(ip):
+        return jsonify({
+            "error": {
+                "code": "RATE_LIMITED",
+                "message": "Too many attempts. Please try again later.",
+            }
+        }), 429
+
     data = request.get_json() or {}
 
     # Normalize email (same as attach_email for consistency)
