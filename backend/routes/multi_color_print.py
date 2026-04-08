@@ -366,24 +366,50 @@ def multi_color_status(job_id: str):
         if three_mf:
             try:
                 # ── Look up parent model for thumbnail + viewable GLB ───
+                # The source_task_id is the Meshy task ID of the parent model.
+                # We search both history_items (by id) and models (by upstream_id)
+                # since the parent's history ID may differ from its Meshy task ID.
                 parent_thumbnail = ""
                 parent_glb = ""
                 source_task = meta.get("source_task_id")
                 if source_task and USE_DB:
                     try:
                         from backend.db import query_one, Tables as _Tp
+                        _uid = meta.get("identity_id") or identity_id
+                        # Try history_items first (id = source_task)
                         _parent = query_one(
                             f"""SELECT glb_url, thumbnail_url
                                 FROM {_Tp.HISTORY_ITEMS}
-                                WHERE (upstream_id = %s OR id::text = %s)
-                                  AND identity_id = %s
-                                ORDER BY created_at DESC LIMIT 1""",
-                            (source_task, source_task,
-                             meta.get("identity_id") or identity_id),
+                                WHERE id::text = %s AND identity_id = %s
+                                LIMIT 1""",
+                            (source_task, _uid),
                         )
+                        # If not found, try models table (upstream_id = source_task)
+                        if not _parent:
+                            _parent = query_one(
+                                f"""SELECT m.glb_url, m.thumbnail_url
+                                    FROM {_Tp.MODELS} m
+                                    WHERE m.upstream_id = %s AND m.user_id = %s
+                                    ORDER BY m.created_at DESC LIMIT 1""",
+                                (source_task, _uid),
+                            )
+                        # Also try with the original input_task_id (frontend history ID)
+                        if not _parent:
+                            _orig_input = store.get(job_id, {}).get("source_task_id") or source_task
+                            if _orig_input != source_task:
+                                _parent = query_one(
+                                    f"""SELECT glb_url, thumbnail_url
+                                        FROM {_Tp.HISTORY_ITEMS}
+                                        WHERE id::text = %s AND identity_id = %s
+                                        LIMIT 1""",
+                                    (_orig_input, _uid),
+                                )
                         if _parent:
                             parent_thumbnail = _parent.get("thumbnail_url") or ""
                             parent_glb = _parent.get("glb_url") or ""
+                            print(f"[MULTI_COLOR] Parent found: thumb={'yes' if parent_thumbnail else 'no'} glb={'yes' if parent_glb else 'no'}")
+                        else:
+                            print(f"[MULTI_COLOR] Parent not found for source_task={source_task}")
                     except Exception as pe:
                         print(f"[MULTI_COLOR] Parent lookup failed: {pe}")
 
@@ -432,7 +458,7 @@ def multi_color_status(job_id: str):
                                                 'three_mf_url', %s,
                                                 'model_urls', jsonb_build_object('3mf', %s)
                                             )
-                                    WHERE upstream_id = %s AND identity_id = %s""",
+                                    WHERE id::text = %s AND identity_id = %s""",
                                 (parent_glb, three_mf_s3, three_mf_s3,
                                  job_id, meta.get("identity_id") or identity_id),
                             )
