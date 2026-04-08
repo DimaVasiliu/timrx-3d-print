@@ -552,5 +552,3 @@ def multi_color_status(job_id: str):
 
     cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
     return jsonify(out)
-
-
