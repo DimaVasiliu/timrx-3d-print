@@ -371,9 +371,11 @@ def proxy_glb_mod():
                 }
                 return Response("", status=200, headers=headers)
 
-            # For download requests, stream via presigned URL so the
-            # browser gets a same-origin response it can save as a file.
-            if force_download:
+            # Stream S3-backed models through the backend for GET requests.
+            # GLTFLoader uses credentialed XHR to reach this route; a 302 to S3
+            # breaks that flow because the redirected cross-origin request no
+            # longer matches the backend's credential/CORS contract.
+            if force_download or request.method == "GET":
                 try:
                     r = requests.get(presigned_url, stream=True, timeout=(5, 60))
                     content_type = r.headers.get("Content-Type", "application/octet-stream")
@@ -388,12 +390,13 @@ def proxy_glb_mod():
                     headers = {
                         **cors_headers,
                         "Content-Type": content_type,
-                        "Content-Disposition": _attachment_header(requested_filename),
                         "Cache-Control": "private, no-cache",
                     }
+                    if force_download:
+                        headers["Content-Disposition"] = _attachment_header(requested_filename)
                     return Response(s3_gen(), status=r.status_code, headers=headers)
                 except Exception as e:
-                    print(f"[proxy-glb][mod] S3 download stream failed: {e}")
+                    print(f"[proxy-glb][mod] S3 stream failed: {e}")
                     # Fall through to redirect
 
             # For GET requests, redirect to presigned URL
