@@ -389,7 +389,7 @@ def multi_color_status(job_id: str):
                             _parent = query_one(
                                 f"""SELECT m.glb_url, m.thumbnail_url
                                     FROM {_Tp.MODELS} m
-                                    WHERE m.upstream_id = %s AND m.user_id = %s
+                                    WHERE m.upstream_id = %s AND m.identity_id = %s
                                     ORDER BY m.created_at DESC LIMIT 1""",
                                 (source_task, _uid),
                             )
@@ -471,7 +471,7 @@ def multi_color_status(job_id: str):
                                                 'three_mf_url', %s,
                                                 'model_urls', jsonb_build_object('3mf', %s)
                                             )
-                                    WHERE upstream_id = %s AND user_id = %s""",
+                                    WHERE upstream_id = %s AND identity_id = %s""",
                                 (parent_glb, three_mf_s3, three_mf_s3,
                                  job_id, meta.get("identity_id") or identity_id),
                             )
