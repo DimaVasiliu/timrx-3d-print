@@ -716,6 +716,22 @@ def text_to_3d_status_mod(job_id: str):
                         "job_id": job_id,
                     })
 
+                # Jobs stuck in stalled/pending without an upstream_job_id
+                # for > 10 min will never complete — terminate them.
+                if internal_job["status"] in ("stalled", "pending") and not internal_job.get("upstream_job_id"):
+                    import datetime as _dt
+                    _created = job_meta.get("created_at") or internal_job.get("created_at")
+                    _age_ok = True
+                    if _created and isinstance(_created, _dt.datetime):
+                        _age_ok = (_dt.datetime.now(_dt.timezone.utc) - _created).total_seconds() > 600
+                    if _age_ok:
+                        terminalize_expired_meshy_job(job_id, identity_id)
+                        return jsonify({
+                            "status": "failed",
+                            "error": "Job stalled before dispatch completed",
+                            "job_id": job_id,
+                        })
+
                 if internal_job["upstream_job_id"]:
                     meshy_job_id = internal_job["upstream_job_id"]
                 else:

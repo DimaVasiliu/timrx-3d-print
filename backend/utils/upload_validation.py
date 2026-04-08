@@ -23,6 +23,7 @@ MODEL_MIME_TYPES = {
     "obj": "model/obj",
     "stl": "model/stl",
     "fbx": "application/x-fbx",
+    "3mf": "model/3mf",
 }
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_MODEL_BYTES = 200 * 1024 * 1024
@@ -131,6 +132,21 @@ def sniff_model_content_type(data_bytes: bytes) -> str:
         expected_size = 84 + (tri_count * 50)
         if expected_size == len(data_bytes):
             return MODEL_MIME_TYPES["stl"]
+
+    # 3MF is a ZIP archive (PK\x03\x04) containing 3D manufacturing data.
+    # Check ZIP magic bytes, then peek inside for 3MF markers.
+    if data_bytes[:4] == b"PK\x03\x04":
+        import zipfile, io
+        try:
+            with zipfile.ZipFile(io.BytesIO(data_bytes), "r") as zf:
+                names = zf.namelist()
+                # 3MF files contain [Content_Types].xml or 3D/*.model
+                if any("[Content_Types].xml" in n for n in names) or any(
+                    n.startswith("3D/") and n.endswith(".model") for n in names
+                ):
+                    return MODEL_MIME_TYPES["3mf"]
+        except Exception:
+            pass  # Not a valid ZIP or not 3MF — fall through
 
     raise UploadValidationError("Unsupported or invalid 3D model content")
 
