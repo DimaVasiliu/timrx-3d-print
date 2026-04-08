@@ -157,6 +157,9 @@ def multi_color_start():
 
     # ── Source resolution ────────────────────────────────────────────
     # Multi-color print requires input_task_id — a completed Meshy task.
+    # Preserve the original frontend history ID before resolution (may differ
+    # from the resolved Meshy task ID used for the API call).
+    original_input_task_id = (body.get("input_task_id") or "").strip()
     source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
     if err:
         return jsonify({"ok": False, "error": err}), 400
@@ -205,6 +208,7 @@ def multi_color_start():
         "title": title,
         "stage": "multi_color_print",
         "source_task_id": input_task_id,
+        "original_input_task_id": original_input_task_id,
         "max_colors": max_colors,
         "max_depth": max_depth,
     }
@@ -256,6 +260,7 @@ def multi_color_start():
     store[meshy_task_id] = {
         "stage": "multi_color_print",
         "source_task_id": input_task_id,
+        "original_input_task_id": original_input_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
         "root_prompt": root_prompt,
@@ -371,21 +376,34 @@ def multi_color_status(job_id: str):
                 # since the parent's history ID may differ from its Meshy task ID.
                 parent_thumbnail = ""
                 parent_glb = ""
-                source_task = meta.get("source_task_id")
-                if source_task and USE_DB:
+                source_task = meta.get("source_task_id")  # resolved Meshy ID
+                _orig_input = meta.get("original_input_task_id") or store.get(job_id, {}).get("original_input_task_id") or ""
+                if (source_task or _orig_input) and USE_DB:
                     try:
                         from backend.db import query_one, Tables as _Tp
                         _uid = meta.get("identity_id") or identity_id
-                        # Try history_items first (id = source_task)
-                        _parent = query_one(
-                            f"""SELECT glb_url, thumbnail_url
-                                FROM {_Tp.HISTORY_ITEMS}
-                                WHERE id::text = %s AND identity_id = %s
-                                LIMIT 1""",
-                            (source_task, _uid),
-                        )
-                        # If not found, try models table (upstream_id = source_task)
-                        if not _parent:
+                        # Try the original frontend history ID first (most likely match)
+                        if _orig_input and _orig_input != source_task:
+                            _parent = query_one(
+                                f"""SELECT glb_url, thumbnail_url
+                                    FROM {_Tp.HISTORY_ITEMS}
+                                    WHERE id::text = %s AND identity_id = %s
+                                    LIMIT 1""",
+                                (_orig_input, _uid),
+                            )
+                        else:
+                            _parent = None
+                        # Try history_items with resolved source_task
+                        if not _parent and source_task:
+                            _parent = query_one(
+                                f"""SELECT glb_url, thumbnail_url
+                                    FROM {_Tp.HISTORY_ITEMS}
+                                    WHERE id::text = %s AND identity_id = %s
+                                    LIMIT 1""",
+                                (source_task, _uid),
+                            )
+                        # Try models table (upstream_id = source_task or original)
+                        if not _parent and source_task:
                             _parent = query_one(
                                 f"""SELECT m.glb_url, m.thumbnail_url
                                     FROM {_Tp.MODELS} m
@@ -393,17 +411,6 @@ def multi_color_status(job_id: str):
                                     ORDER BY m.created_at DESC LIMIT 1""",
                                 (source_task, _uid),
                             )
-                        # Also try with the original input_task_id (frontend history ID)
-                        if not _parent:
-                            _orig_input = store.get(job_id, {}).get("source_task_id") or source_task
-                            if _orig_input != source_task:
-                                _parent = query_one(
-                                    f"""SELECT glb_url, thumbnail_url
-                                        FROM {_Tp.HISTORY_ITEMS}
-                                        WHERE id::text = %s AND identity_id = %s
-                                        LIMIT 1""",
-                                    (_orig_input, _uid),
-                                )
                         if _parent:
                             parent_thumbnail = _parent.get("thumbnail_url") or ""
                             parent_glb = _parent.get("glb_url") or ""
