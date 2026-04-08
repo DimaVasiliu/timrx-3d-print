@@ -56,6 +56,7 @@ def register_blueprints(app):
     from backend.routes.webhooks import bp as webhooks_bp
     from backend.routes.notifications import bp as notifications_bp
     from backend.routes.print_check import bp as print_check_bp
+    from backend.routes.multi_color_print import bp as multi_color_print_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -107,6 +108,7 @@ def register_blueprints(app):
         print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
     app.register_blueprint(notifications_bp, url_prefix="/api/_mod")
     app.register_blueprint(print_check_bp, url_prefix="/api/_mod")
+    app.register_blueprint(multi_color_print_bp, url_prefix="/api/_mod")
     app.register_blueprint(contact_bp, url_prefix="/api")
     app.register_blueprint(webhooks_bp, url_prefix="/api")
 
@@ -126,6 +128,7 @@ def register_blueprints(app):
     if inspire_bp:
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
     app.register_blueprint(notifications_bp, url_prefix="/api", name="notifications_compat")
+    app.register_blueprint(multi_color_print_bp, url_prefix="/api", name="multi_color_print_compat")
 
     # Temporarily enable route map to debug inspire registration
     # _print_route_map(app)

@@ -128,7 +128,7 @@ def text_to_3d_start_mod():
         payload["moderation"] = bool(body["moderation"])
 
     raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz"}
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
     target_formats = []
     if isinstance(raw_target_formats, str):
         raw_target_formats = [raw_target_formats]

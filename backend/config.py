@@ -678,6 +678,8 @@ class Config:
             "video_image_animate": "video_image_animate",
             "rigging": "rigging",
             "animation": "animation",
+            "multi-color-print": "multi_color_print",
+            "multi_color_print": "multi_color_print",
         }
     )
 

@@ -82,6 +82,7 @@ class CanonicalActions:
     VIDEO_IMAGE_ANIMATE = "video_image_animate"
     RIGGING = "rigging"
     ANIMATION = "animation"
+    MULTI_COLOR_PRINT = "multi_color_print"
     GEMINI_VIDEO = "gemini_video"  # Legacy alias for Vertex video — retained for DB compat
 
 
@@ -110,6 +111,7 @@ CANONICAL_TO_DB = {
     CanonicalActions.RETEXTURE: "MESHY_RETEXTURE",
     CanonicalActions.RIGGING: "MESHY_RIGGING",
     CanonicalActions.ANIMATION: "MESHY_ANIMATION",
+    CanonicalActions.MULTI_COLOR_PRINT: "MESHY_MULTI_COLOR_PRINT",
     # Video generation
     CanonicalActions.VIDEO_GENERATE: "VIDEO_GENERATE",
     CanonicalActions.VIDEO_TEXT_GENERATE: "VIDEO_TEXT_GENERATE",
@@ -151,6 +153,11 @@ ALIAS_TO_CANONICAL = {
     # Rigging / Animation aliases
     "rig": CanonicalActions.RIGGING,
     "animate": CanonicalActions.ANIMATION,
+
+    # Multi-color print aliases
+    "multi-color-print": CanonicalActions.MULTI_COLOR_PRINT,
+    "multi_color_print": CanonicalActions.MULTI_COLOR_PRINT,
+    "multicolor-print": CanonicalActions.MULTI_COLOR_PRINT,
 
     # Video aliases
     "video": CanonicalActions.VIDEO_GENERATE,
@@ -290,6 +297,7 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "MESHY_RETEXTURE", "cost_credits": 5, "provider": "meshy"},
     {"action_code": "MESHY_RIGGING", "cost_credits": 5, "provider": "meshy"},
     {"action_code": "MESHY_ANIMATION", "cost_credits": 3, "provider": "meshy"},
+    {"action_code": "MESHY_MULTI_COLOR_PRINT", "cost_credits": 10, "provider": "meshy"},
     # ── Image Generation — OpenAI (4c / 8c / 12c) ──
     {"action_code": "OPENAI_IMAGE", "cost_credits": 4, "provider": "openai"},        # Standard 1K
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 8, "provider": "openai"},     # 2K

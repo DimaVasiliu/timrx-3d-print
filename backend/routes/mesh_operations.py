@@ -81,7 +81,7 @@ def mesh_remesh_mod():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
     raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "fbx", "obj", "usdz", "blend", "stl"}
+    allowed_target_formats = {"glb", "fbx", "obj", "usdz", "blend", "stl", "3mf"}
     target_formats = []
     if isinstance(raw_target_formats, str):
         raw_target_formats = [raw_target_formats]
