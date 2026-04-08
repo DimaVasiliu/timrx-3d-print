@@ -57,7 +57,7 @@ def _migrate_mcp_glb_urls():
     if not USE_DB:
         return
     try:
-        from backend.db import query as _q, execute as _ex, Tables as _T
+        from backend.db import execute as _ex, Tables as _T
         # Single UPDATE joining jobs + parent history_items
         _ex(
             f"""UPDATE {_T.HISTORY_ITEMS} h
