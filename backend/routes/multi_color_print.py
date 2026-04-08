@@ -44,6 +44,7 @@ from backend.services.meshy_service import (
     MeshyTaskNotFoundError,
     terminalize_expired_meshy_job,
 )
+from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.status_cache import get_cached_status, cache_status
 from backend.utils.helpers import log_event, log_status_summary, now_s
 
@@ -314,12 +315,16 @@ def multi_color_status(job_id: str):
         except Exception as e:
             print(f"[MULTI_COLOR] auto-refund failed: {e}")
 
-    # ── Handle success → finalize credits + persist ──────────────────
+    # ── Handle success → finalize credits, S3 upload, DB persist ──────
     if out["status"] == "done" and not _already_finalized(job_id):
         store = load_store()
         meta = get_job_metadata(job_id, store) or {}
 
-        # Finalize credits
+        if identity_id and not meta.get("identity_id"):
+            meta["identity_id"] = identity_id
+            meta["user_id"] = identity_id
+
+        # 1. Finalize credits
         try:
             res_id = meta.get("reservation_id")
             int_job = meta.get("internal_job_id") or job_id
@@ -330,20 +335,53 @@ def multi_color_status(job_id: str):
         except Exception as e:
             print(f"[MULTI_COLOR] credit finalize failed: {e}")
 
-        # Persist 3MF result to history
-        if USE_DB and identity_id and out.get("three_mf_url"):
+        # 2. Use the standard save pipeline: download 3MF from Meshy → S3,
+        #    create models row + history_items row with S3 URLs.
+        #    Map three_mf_url → glb_url so the pipeline processes it.
+        s3_result = None
+        if out.get("three_mf_url"):
             try:
-                _save_multi_color_to_history(
-                    job_id=job_id,
-                    identity_id=meta.get("identity_id") or identity_id,
-                    meta=meta,
-                    three_mf_url=out["three_mf_url"],
-                    thumbnail_url=out.get("thumbnail_url"),
-                )
-            except Exception as e:
-                print(f"[MULTI_COLOR] history save failed: {e}")
+                # Build a normalized status dict that save_finished_job_to_normalized_db expects
+                normalized_status = {
+                    "id": job_id,
+                    "status": "done",
+                    "pct": 100,
+                    "stage": "multi_color_print",
+                    "glb_url": out["three_mf_url"],  # Pipeline downloads this URL → S3
+                    "thumbnail_url": out.get("thumbnail_url") or "",
+                    "model_urls": {"3mf": out["three_mf_url"]},
+                    "created_at": out.get("created_at"),
+                }
 
-        # Update internal job status
+                user_id = meta.get("identity_id") or meta.get("user_id") or identity_id
+                s3_result = save_finished_job_to_normalized_db(
+                    job_id,
+                    normalized_status,
+                    meta,
+                    job_type="multi_color_print",
+                    user_id=user_id,
+                )
+
+                if s3_result and s3_result.get("success"):
+                    # Replace Meshy URLs with durable S3 URLs in response
+                    if s3_result.get("glb_url"):
+                        out["three_mf_url"] = s3_result["glb_url"]
+                    if s3_result.get("thumbnail_url"):
+                        out["thumbnail_url"] = s3_result["thumbnail_url"]
+                    if s3_result.get("model_urls"):
+                        out["model_urls"] = s3_result["model_urls"]
+                    if s3_result.get("db_ok") is False:
+                        out["db_ok"] = False
+                        out["db_errors"] = s3_result.get("db_errors")
+                    print(f"[MULTI_COLOR] Saved to S3+DB: job_id={job_id}")
+                else:
+                    print(f"[MULTI_COLOR] save_finished_job_to_normalized_db returned: {s3_result}")
+            except Exception as e:
+                print(f"[MULTI_COLOR] S3/DB save failed (non-fatal): {e}")
+                import traceback
+                traceback.print_exc()
+
+        # 3. Update internal job status → "ready"
         try:
             int_job = meta.get("internal_job_id")
             if not int_job and USE_DB:
@@ -357,6 +395,7 @@ def multi_color_status(job_id: str):
                 _update_job_status_ready(
                     int_job,
                     upstream_job_id=job_id,
+                    model_id=s3_result.get("model_id") if s3_result else None,
                     glb_url=out.get("three_mf_url"),
                 )
         except Exception as e:
@@ -366,56 +405,3 @@ def multi_color_status(job_id: str):
     return jsonify(out)
 
 
-def _save_multi_color_to_history(
-    job_id: str,
-    identity_id: str,
-    meta: dict,
-    three_mf_url: str,
-    thumbnail_url: str | None,
-):
-    """
-    Persist the multi-color print result as a history item so it appears
-    in the user's generation history and can be downloaded later.
-    """
-    from backend.db import get_conn, Tables
-    import json
-
-    payload = {
-        "stage": "multi_color_print",
-        "source_task_id": meta.get("source_task_id"),
-        "three_mf_url": three_mf_url,
-        "max_colors": meta.get("max_colors", 4),
-        "max_depth": meta.get("max_depth", 4),
-        "prompt": meta.get("prompt"),
-        "title": meta.get("title"),
-    }
-
-    try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    INSERT INTO {Tables.HISTORY_ITEMS}
-                        (id, identity_id, item_type, stage, title, prompt, glb_url, thumbnail_url, payload)
-                    VALUES (%s, %s, 'model', 'multi_color_print', %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        glb_url = EXCLUDED.glb_url,
-                        thumbnail_url = EXCLUDED.thumbnail_url,
-                        payload = EXCLUDED.payload,
-                        updated_at = NOW()
-                    """,
-                    (
-                        job_id,
-                        identity_id,
-                        meta.get("title") or "Multi-Color Print",
-                        meta.get("prompt") or "",
-                        three_mf_url,
-                        thumbnail_url,
-                        json.dumps(payload),
-                    ),
-                )
-            conn.commit()
-        print(f"[MULTI_COLOR] Saved to history: job_id={job_id}")
-    except Exception as e:
-        print(f"[MULTI_COLOR] History save SQL failed: {e}")
-        raise
