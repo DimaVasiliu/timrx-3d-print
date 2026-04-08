@@ -1467,7 +1467,12 @@ def history_item_update_mod(item_id: str):
                         # Connection returned to pool here — not held during S3 I/O.
 
                         if not row:
-                            return jsonify({"error": "Item not found or access denied"}), 404
+                            # Return 200 no-op instead of 404 — the frontend
+                            # fires optimistic PATCHes for generating jobs whose
+                            # history_items row hasn't been created yet (it's
+                            # created on job completion). Returning 404 spams the
+                            # console with red errors on every poll cycle.
+                            return jsonify({"ok": True, "noop": True, "reason": "item_not_yet_created"}), 200
 
                         existing = row["payload"] if row["payload"] else {}
                         existing.update(updates)
