@@ -50,6 +50,42 @@ from backend.utils.helpers import log_event, log_status_summary, now_s
 
 bp = Blueprint("multi_color_print", __name__)
 
+
+# -- One-time migration: fix existing MCP records where glb_url is .3mf --
+def _migrate_mcp_glb_urls():
+    """Swap .3mf glb_url to parent GLB for existing MCP history items."""
+    if not USE_DB:
+        return
+    try:
+        from backend.db import query as _q, execute as _ex, Tables as _T
+        # Single UPDATE joining jobs + parent history_items
+        _ex(
+            f"""UPDATE {_T.HISTORY_ITEMS} h
+                SET glb_url = parent.glb_url,
+                    payload = COALESCE(h.payload, '{{}}'::jsonb)
+                            || jsonb_build_object(
+                                'three_mf_url', h.glb_url::text
+                            )
+                FROM {_T.JOBS} j,
+                     {_T.HISTORY_ITEMS} parent
+                WHERE h.stage = 'multi_color_print'
+                  AND h.glb_url LIKE '%%.3mf'
+                  AND j.upstream_job_id = h.id::text
+                  AND parent.id::text = j.meta->>'original_input_task_id'
+                  AND parent.glb_url IS NOT NULL
+                  AND parent.glb_url NOT LIKE '%%.3mf'""",
+            (),
+        )
+        print("[MULTI_COLOR] Migration: fixed MCP glb_url -> parent GLB")
+    except Exception as e:
+        print(f"[MULTI_COLOR] Migration (non-fatal): {e}")
+
+try:
+    _migrate_mcp_glb_urls()
+except Exception:
+    pass
+
+
 # -- Finalization dedup (same pattern as text_to_3d / remesh) --
 _finalized_jobs: dict = {}  # job_id -> monotonic timestamp
 _FINALIZED_TTL = 1800  # 30 min
