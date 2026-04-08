@@ -377,12 +377,34 @@ def multi_color_status(job_id: str):
                 parent_thumbnail = ""
                 parent_glb = ""
                 source_task = meta.get("source_task_id")  # resolved Meshy ID
-                _orig_input = meta.get("original_input_task_id") or store.get(job_id, {}).get("original_input_task_id") or ""
+                # The in-memory store is per-worker (gunicorn --workers 2),
+                # so we MUST also check the jobs table meta for the original ID.
+                _orig_input = (
+                    meta.get("original_input_task_id")
+                    or store.get(job_id, {}).get("original_input_task_id")
+                    or ""
+                )
                 if (source_task or _orig_input) and USE_DB:
                     try:
                         from backend.db import query_one, Tables as _Tp
                         _uid = meta.get("identity_id") or identity_id
+
+                        # If we don't have original_input_task_id from store,
+                        # fetch it from the jobs table meta (cross-worker safe)
+                        if not _orig_input:
+                            _job_meta_row = query_one(
+                                f"""SELECT meta->>'original_input_task_id' AS orig
+                                    FROM {_Tp.JOBS}
+                                    WHERE upstream_job_id = %s
+                                    LIMIT 1""",
+                                (job_id,),
+                            )
+                            if _job_meta_row:
+                                _orig_input = _job_meta_row.get("orig") or ""
+                            print(f"[MULTI_COLOR] DB meta lookup: orig={_orig_input or 'none'}")
+
                         # Try the original frontend history ID first (most likely match)
+                        _parent = None
                         if _orig_input and _orig_input != source_task:
                             _parent = query_one(
                                 f"""SELECT glb_url, thumbnail_url
@@ -391,8 +413,6 @@ def multi_color_status(job_id: str):
                                     LIMIT 1""",
                                 (_orig_input, _uid),
                             )
-                        else:
-                            _parent = None
                         # Try history_items with resolved source_task
                         if not _parent and source_task:
                             _parent = query_one(
@@ -416,7 +436,7 @@ def multi_color_status(job_id: str):
                             parent_glb = _parent.get("glb_url") or ""
                             print(f"[MULTI_COLOR] Parent found: thumb={'yes' if parent_thumbnail else 'no'} glb={'yes' if parent_glb else 'no'}")
                         else:
-                            print(f"[MULTI_COLOR] Parent not found for source_task={source_task}")
+                            print(f"[MULTI_COLOR] Parent not found for source_task={source_task} orig={_orig_input}")
                     except Exception as pe:
                         print(f"[MULTI_COLOR] Parent lookup failed: {pe}")
 
