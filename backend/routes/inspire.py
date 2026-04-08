@@ -31,6 +31,117 @@ MAX_LIMIT = 60
 DEFAULT_LIMIT = 24
 RECENT_DAYS = 30  # For "new" and "trending" tags
 
+CURATED_PROMPT_LIBRARY: List[Dict[str, str]] = [
+    {
+        "title": "Crystal Wyrm Reliquary",
+        "prompt": "single centered collectible crystal wyrm statue, translucent quartz scales with ember glow, obsidian horns, premium fantasy artifact, clean heroic silhouette",
+        "category": "model",
+        "provider_hint": "Best with Meshy text-to-3D",
+    },
+    {
+        "title": "Retro Dive Helmet",
+        "prompt": "single isolated retro-futurist deep sea dive helmet, brushed brass shell, circular glass viewport, weathered copper valves, clean industrial silhouette",
+        "category": "model",
+        "provider_hint": "Best with Meshy text-to-3D",
+    },
+    {
+        "title": "Alchemist Field Pack",
+        "prompt": "single centered fantasy alchemist field backpack, stitched leather satchel, potion vials, brass clamps, herb bundles, premium adventure prop",
+        "category": "model",
+        "provider_hint": "Best with Meshy text-to-3D",
+    },
+    {
+        "title": "Astronomical Orrery",
+        "prompt": "single isolated antique astronomical orrery, concentric brass rings, suspended enamel planets, engraved celestial markings, luxury observatory artifact",
+        "category": "model",
+        "provider_hint": "Best with Meshy text-to-3D",
+    },
+    {
+        "title": "Mascot Astronaut",
+        "prompt": "single centered plush-inspired mascot astronaut figure, oversized round helmet, stitched fabric suit panels, designer toy proportions, charming collectible silhouette",
+        "category": "model",
+        "provider_hint": "Best with Meshy text-to-3D",
+    },
+    {
+        "title": "Ceremonial Dagger",
+        "prompt": "single centered ceremonial obsidian dagger, faceted black blade, hammered gold guard, wrapped ivory grip, ancient royal artifact, clear premium profile",
+        "category": "model",
+        "provider_hint": "Best with Meshy text-to-3D",
+    },
+    {
+        "title": "Luxury Watch Macro",
+        "prompt": "macro product photograph of a luxury skeleton watch on dark volcanic stone, brushed titanium case, sapphire reflections, dramatic editorial lighting, ultra-sharp details",
+        "category": "image",
+        "provider_hint": "Best with OpenAI, Imagen, or FLUX.2 Pro",
+    },
+    {
+        "title": "Travel Poster Type",
+        "prompt": "\"VISIT LUCERNE\" vintage travel poster, alpine lake, classic paddle steamer, art deco framing, crisp typography, limited cobalt and cream palette",
+        "category": "image",
+        "provider_hint": "Best with Ideogram or Recraft",
+    },
+    {
+        "title": "Streetwear Portrait",
+        "prompt": "fashion portrait under a subway platform, oversized charcoal coat, silver jewelry, rain-slick pavement, moody side light, premium editorial energy",
+        "category": "image",
+        "provider_hint": "Best with OpenAI, Imagen, or FLUX.2 Pro",
+    },
+    {
+        "title": "Skincare Billboard",
+        "prompt": "\"RESET YOUR SKIN\" clean beauty billboard concept, frosted serum bottle splashing through water, pale stone backdrop, premium typography, luxury campaign style",
+        "category": "image",
+        "provider_hint": "Best with Ideogram or Recraft",
+    },
+    {
+        "title": "Icon System Sheet",
+        "prompt": "clean vector icon system for a sustainable home app, rounded geometric strokes, solar panel, leaf, battery, water drop, polished design presentation",
+        "category": "image",
+        "provider_hint": "Best with Recraft Vector",
+    },
+    {
+        "title": "Fantasy Cover Art",
+        "prompt": "epic fantasy book cover art, lone mage on a cliff above a storm-lit city, electric blue runes, dramatic focal lighting, premium cover illustration",
+        "category": "image",
+        "provider_hint": "Best with OpenAI, Imagen, or FLUX.2 Pro",
+    },
+    {
+        "title": "Neon Alley Pursuit",
+        "prompt": "A courier sprints through a neon alley at night, weaving past steam vents and glowing signs. Camera: handheld tracking shot from behind, then a quick arc to profile. Visual style: cinematic cyberpunk, wet reflections, urgent momentum.",
+        "category": "video",
+        "provider_hint": "Best with Veo or Seedance",
+    },
+    {
+        "title": "Chef Fire Sequence",
+        "prompt": "Chef’s hands toss vegetables into a blazing wok in an open kitchen, flames bursting upward. Audio: metal pan hits, sizzling oil, energetic kitchen ambience. Visual style: fast culinary commercial, crisp highlights, rich food detail.",
+        "category": "video",
+        "provider_hint": "Best with Seedance or Veo with audio",
+    },
+    {
+        "title": "Arctic Sky Timelapse",
+        "prompt": "Wide shot of the northern lights rippling over a frozen arctic lake, stars sharp above the horizon, drifting snow in the foreground. Camera: locked-off tripod timelapse. Visual style: photoreal, serene epic atmosphere.",
+        "category": "video",
+        "provider_hint": "Best with Veo",
+    },
+    {
+        "title": "Library Shock Beat",
+        "prompt": "Quiet library reading room, sudden heavy book slam on a table, everyone looks up, tension breaks into nervous laughter. Audio: paper rustle, sharp book impact, hushed reactions. Visual style: grounded cinematic comedy.",
+        "category": "video",
+        "provider_hint": "Best with Seedance",
+    },
+    {
+        "title": "Robot Piano Recital",
+        "prompt": "A polished service robot performs a piano recital in a dark hall, articulated fingers moving precisely over ivory keys. Audio: resonant piano chords, pedal clicks, quiet room reverb. Camera: slow lateral dolly.",
+        "category": "video",
+        "provider_hint": "Best with Seedance or Veo with audio",
+    },
+    {
+        "title": "Waterfall Trek Reveal",
+        "prompt": "A hiker emerges from dense jungle foliage onto a ledge facing a colossal waterfall. Camera: over-the-shoulder push forward, then crane up to reveal the full falls. Visual style: lush adventure cinema, awe-filled scale.",
+        "category": "video",
+        "provider_hint": "Best with Veo or Seedance",
+    },
+]
+
 # ── Inspire feed response cache ──
 # The feed content changes slowly (admin publishes models/images/videos).
 # Seeded requests produce deterministic results, so cache by full param set.
@@ -141,54 +252,20 @@ def _get_prompt_of_the_day(cursor) -> Dict[str, Any]:
     Get a featured prompt of the day.
     Uses date-based seed for daily consistency.
     """
-    try:
-        # Use today's date as seed for consistent daily selection
-        today_seed = datetime.now().strftime("%Y-%m-%d")
+    del cursor  # POTD is curated and no longer depends on recent DB content.
 
-        cursor.execute("""
-            SELECT prompt, 'model' as category, thumbnail_url
-            FROM timrx_app.models
-            WHERE prompt IS NOT NULL AND prompt != ''
-              AND thumbnail_url IS NOT NULL AND thumbnail_url != ''
-              AND created_at > NOW() - INTERVAL '60 days'
-            UNION ALL
-            SELECT prompt, 'image' as category, COALESCE(thumbnail_url, image_url) as thumbnail_url
-            FROM timrx_app.images
-            WHERE prompt IS NOT NULL AND prompt != ''
-              AND (thumbnail_url IS NOT NULL OR image_url IS NOT NULL)
-              AND created_at > NOW() - INTERVAL '60 days'
-            UNION ALL
-            SELECT prompt, 'video' as category, thumbnail_url
-            FROM timrx_app.videos
-            WHERE prompt IS NOT NULL AND prompt != ''
-              AND thumbnail_url IS NOT NULL AND thumbnail_url != ''
-              AND created_at > NOW() - INTERVAL '60 days'
-        """)
-        rows = cursor.fetchall()
-
-        if rows:
-            # Use seeded shuffle for daily consistency
-            shuffled = _seeded_shuffle(rows, today_seed)
-            row = shuffled[0]
-            return {
-                "prompt": row["prompt"],
-                "category": row["category"],
-                "thumbnail_url": row.get("thumbnail_url")
-            }
-
-    except Exception as e:
-        print(f"[INSPIRE] Error getting POTD: {e}")
-
-    # Fallback prompts
-    fallbacks = [
-        ("A mystical forest guardian made of twisted ancient vines and glowing mushrooms, ethereal atmosphere", "fantasy"),
-        ("Cyberpunk street food vendor stall with holographic menu, neon signs, steam rising", "sci-fi"),
-        ("Crystal dragon with iridescent scales perched on a volcanic rock formation", "fantasy"),
-        ("Robot samurai in meditation pose, cherry blossoms, zen garden background", "sci-fi"),
-    ]
-    # Pick based on day of year for variety
-    idx = datetime.now().timetuple().tm_yday % len(fallbacks)
-    return {"prompt": fallbacks[idx][0], "category": fallbacks[idx][1]}
+    today_seed = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    hash_seed = int(hashlib.md5(today_seed.encode()).hexdigest(), 16)
+    idx = hash_seed % len(CURATED_PROMPT_LIBRARY)
+    item = CURATED_PROMPT_LIBRARY[idx]
+    return {
+        "prompt": item["prompt"],
+        "title": item["title"],
+        "category": item["category"],
+        "type": item["category"],
+        "provider_hint": item["provider_hint"],
+        "source": "curated",
+    }
 
 
 def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
