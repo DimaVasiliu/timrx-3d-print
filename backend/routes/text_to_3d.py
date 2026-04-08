@@ -766,6 +766,34 @@ def text_to_3d_status_mod(job_id: str):
         print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
 
+    # ── Detect MCP jobs mis-routed through text-to-3d status ──────
+    # The frontend recovery system may route multi-color-print jobs here.
+    # Meshy returns type="print-multi-color" for those.  Redirect to the
+    # correct MCP status endpoint instead of processing them here (which
+    # would attempt S3 save with the wrong normalizer and cause infinite
+    # re-polling).
+    _meshy_type = (ms.get("type") or "").lower().replace("_", "-")
+    if "print-multi-color" in _meshy_type or "multi-color" in _meshy_type:
+        print(f"[text-to-3d/status] MCP job detected, redirecting job_id={job_id}")
+        try:
+            from backend.routes.multi_color_print import _normalize_multi_color_task
+            out = _normalize_multi_color_task(ms)
+            # If the MCP job succeeded but was stuck, terminate it cleanly
+            if out.get("status") == "done":
+                terminalize_expired_meshy_job(job_id, identity_id)
+                return jsonify({
+                    "status": "failed",
+                    "error": "MCP_WRONG_ENDPOINT",
+                    "message": "Multi-color print job completed but assets expired. Please retry.",
+                    "job_id": job_id,
+                }), 200
+            # For still-running MCP jobs, return the normalized status
+            return jsonify(out)
+        except Exception as redir_err:
+            print(f"[text-to-3d/status] MCP redirect error: {redir_err}")
+            terminalize_expired_meshy_job(job_id, identity_id)
+            return jsonify({"status": "failed", "error": "MCP_WRONG_ENDPOINT", "message": "Job routed to wrong endpoint."}), 200
+
     out = normalize_status(ms)
     log_status_summary("text-to-3d[mod]", job_id, out)
 

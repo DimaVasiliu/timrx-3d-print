@@ -400,29 +400,62 @@ def multi_color_status(job_id: str):
                 else:
                     print(f"[MULTI_COLOR] save_finished_job_to_normalized_db returned: {s3_result}")
             except Exception as e:
-                print(f"[MULTI_COLOR] S3/DB save failed (non-fatal): {e}")
+                print(f"[MULTI_COLOR] S3/DB save failed: {e}")
                 import traceback
                 traceback.print_exc()
+                # Mark the internal job as failed so it doesn't stay stuck
+                # in "processing" forever (e.g. when Meshy URLs expire → 403).
+                try:
+                    _int_job = meta.get("internal_job_id")
+                    if not _int_job and USE_DB:
+                        from backend.db import query_one, Tables as _T2
+                        _r = query_one(
+                            f"SELECT id::text AS jid FROM {_T2.JOBS} WHERE upstream_job_id = %s LIMIT 1",
+                            (job_id,),
+                        )
+                        _int_job = _r["jid"] if _r else None
+                    if _int_job:
+                        from backend.db import execute as _exec, Tables as _T3
+                        _exec(
+                            f"""UPDATE {_T3.JOBS}
+                                SET status = 'failed',
+                                    error_message = %s,
+                                    finished_at = NOW(),
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                  AND status NOT IN ('ready', 'succeeded', 'failed', 'refunded')""",
+                            (f"S3 save failed: {e}"[:500], _int_job),
+                        )
+                        print(f"[MULTI_COLOR] Marked job {_int_job} as failed after S3 error")
+                        # Refund credits since we couldn't save the result
+                        try:
+                            from backend.services.credits_helper import refund_failed_job
+                            refund_failed_job(_int_job)
+                        except Exception as re:
+                            print(f"[MULTI_COLOR] Refund after S3 failure failed: {re}")
+                except Exception as mark_err:
+                    print(f"[MULTI_COLOR] Could not mark job as failed: {mark_err}")
 
-        # 3. Update internal job status → "ready"
-        try:
-            int_job = meta.get("internal_job_id")
-            if not int_job and USE_DB:
-                from backend.db import query_one, Tables as _T
-                _row = query_one(
-                    f"SELECT id::text AS jid FROM {_T.JOBS} WHERE upstream_job_id = %s LIMIT 1",
-                    (job_id,),
-                )
-                int_job = _row["jid"] if _row else None
-            if int_job:
-                _update_job_status_ready(
-                    int_job,
-                    upstream_job_id=job_id,
-                    model_id=s3_result.get("model_id") if s3_result else None,
-                    glb_url=out.get("three_mf_url"),
-                )
-        except Exception as e:
-            print(f"[MULTI_COLOR] job status→ready failed: {e}")
+        # 3. Update internal job status → "ready" (only if S3 save succeeded)
+        if s3_result and s3_result.get("success"):
+            try:
+                int_job = meta.get("internal_job_id")
+                if not int_job and USE_DB:
+                    from backend.db import query_one, Tables as _T
+                    _row = query_one(
+                        f"SELECT id::text AS jid FROM {_T.JOBS} WHERE upstream_job_id = %s LIMIT 1",
+                        (job_id,),
+                    )
+                    int_job = _row["jid"] if _row else None
+                if int_job:
+                    _update_job_status_ready(
+                        int_job,
+                        upstream_job_id=job_id,
+                        model_id=s3_result.get("model_id") if s3_result else None,
+                        glb_url=out.get("three_mf_url"),
+                    )
+            except Exception as e:
+                print(f"[MULTI_COLOR] job status→ready failed: {e}")
 
     cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
     return jsonify(out)

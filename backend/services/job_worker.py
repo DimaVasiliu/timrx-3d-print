@@ -2448,6 +2448,61 @@ def log_pool_metrics():
         pass  # Pool metrics are non-critical
 
 
+def terminate_stuck_non_video_jobs():
+    """
+    Auto-terminate Meshy jobs stuck in processing/queued for > 30 min
+    whose stage is NOT 'video' (e.g. multi_color_print, preview, refine).
+
+    The durable worker only polls video jobs. Non-video jobs rely on
+    frontend polling → backend status endpoint → Meshy API.  If the
+    S3 save fails (e.g. 403 expired URL) the job stays in 'processing'
+    forever.  This sweep catches them and marks them failed + refunds.
+    """
+    if not USE_DB:
+        return
+    try:
+        from backend.db import query_all, execute, Tables
+        STUCK_THRESHOLD_MIN = 30
+        rows = query_all(
+            f"""SELECT id::text AS jid, upstream_job_id, stage, status, identity_id
+                FROM {Tables.JOBS}
+                WHERE provider = 'meshy'
+                  AND stage NOT IN ('video')
+                  AND status IN ('queued', 'dispatched', 'pending', 'processing',
+                                 'provider_pending', 'provider_processing')
+                  AND created_at < NOW() - INTERVAL '{STUCK_THRESHOLD_MIN} minutes'
+                LIMIT 50""",
+            source="ops_stuck_nonvideo",
+        )
+        if not rows:
+            return
+        for r in rows:
+            jid = r["jid"]
+            try:
+                execute(
+                    f"""UPDATE {Tables.JOBS}
+                        SET status = 'failed',
+                            error_message = 'Auto-terminated: stuck in ' || status || ' for >{STUCK_THRESHOLD_MIN}min',
+                            finished_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND status NOT IN ('ready', 'succeeded', 'failed', 'refunded',
+                                             'abandoned_legacy', 'recovery_blocked')""",
+                    (jid,),
+                )
+                print(f"[OPS][STUCK] Terminated job={jid} stage={r['stage']} status={r['status']}")
+                # Refund credits
+                try:
+                    from backend.services.credits_helper import refund_failed_job
+                    refund_failed_job(jid)
+                except Exception as re:
+                    print(f"[OPS][STUCK] Refund failed for {jid}: {re}")
+            except Exception as ue:
+                print(f"[OPS][STUCK] Failed to terminate {jid}: {ue}")
+    except Exception as e:
+        print(f"[OPS] stuck non-video sweep error: {e}")
+
+
 def log_active_job_counts():
     """Log active job counts by provider and stage."""
     if not USE_DB:
@@ -2502,7 +2557,7 @@ def recover_stale_jobs():
                     'finalizing'
                 )
                 AND provider IN ({provider_list})
-                AND stage = 'video'
+                AND stage IN ('video', 'multi_color_print')
                 AND created_at > NOW() - INTERVAL '{MAX_RECOVERY_AGE_HOURS} hours'
                 RETURNING id, status, provider
                 """,
@@ -2701,6 +2756,13 @@ def start_operations_loop():
                         print(f"[OPS][pid={pid}][TRANSIENT] rescue pass: {type(e).__name__}: {e}")
                     else:
                         print(f"[OPS][pid={pid}] rescue pass error: {e}")
+
+            # -- Stuck non-video job termination (leader only, every 5th cycle) --
+            if not _worker_stop.is_set() and cycle % 5 == 0 and (_am_leader or not leader_only):
+                try:
+                    terminate_stuck_non_video_jobs()
+                except Exception as e:
+                    print(f"[OPS][pid={pid}] stuck job termination error: {e}")
 
             # -- Monitoring (leader only, every 5th cycle) --
             if not _worker_stop.is_set() and cycle % 5 == 0 and (_am_leader or not leader_only):

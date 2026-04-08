@@ -1243,7 +1243,9 @@ class JobService:
         provider_job_id = upstream or None
 
         # Determine resume_strategy from stage first (most reliable), then action_code
-        if stage == "texture" or "retexture" in action:
+        if stage == "multi_color_print" or "multi_color" in action or "multi-color" in action:
+            resume_strategy = "skip"  # MCP jobs are self-managed by the modal
+        elif stage == "texture" or "retexture" in action:
             resume_strategy = "meshy_retexture"
         elif stage == "remesh" or ("remesh" in action) or ("upscale" in action):
             resume_strategy = "meshy_remesh"
