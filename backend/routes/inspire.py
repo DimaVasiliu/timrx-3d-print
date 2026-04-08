@@ -268,7 +268,12 @@ def _get_prompt_of_the_day(cursor) -> Dict[str, Any]:
     }
 
 
-def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
+def _fetch_models(
+    cursor,
+    limit: Optional[int] = None,
+    debug: bool = False,
+    shared_only: bool = True,
+) -> List[Dict]:
     """
     Fetch models with valid thumbnails. Accepts various success status values.
     Includes ALL stages: preview, texture, remesh, refine, etc.
@@ -282,6 +287,7 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
     # For preview models: look for textured/refined versions as thumb_refined
     # For texture/remesh/refine models: look for preview version as thumb_refined (shows before/after)
     # Status filter: accept 'ready', 'succeeded', 'success', 'completed', 'done', 'finished' (case-insensitive)
+    share_clause = "share_to_inspire = TRUE AND" if shared_only else ""
     cursor.execute(f"""
         WITH base_models AS (
             SELECT
@@ -295,8 +301,8 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
                 upstream_job_id,
                 created_at
             FROM timrx_app.models
-            WHERE share_to_inspire = TRUE
-              AND thumbnail_url IS NOT NULL
+            WHERE {share_clause}
+              thumbnail_url IS NOT NULL
               AND thumbnail_url != ''
               AND glb_url IS NOT NULL
               AND glb_url != ''
@@ -346,7 +352,8 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
 
     # Debug logging
     if debug:
-        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} models after filtering")
+        scope = "shared" if shared_only else "fallback_all"
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} models after filtering ({scope})")
         if len(rows) == 0:
             # Show what statuses/stages exist in DB to help diagnose
             cursor.execute("""
@@ -363,7 +370,12 @@ def _fetch_models(cursor, limit: Optional[int] = None, debug: bool = False) -> L
     return [dict(r) for r in rows]
 
 
-def _fetch_images(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
+def _fetch_images(
+    cursor,
+    limit: Optional[int] = None,
+    debug: bool = False,
+    shared_only: bool = True,
+) -> List[Dict]:
     """
     Fetch images with valid thumbnails or image URLs.
     Returns thumb_preview (thumbnail or image_url) and thumb_refined (full image_url if different).
@@ -371,6 +383,8 @@ def _fetch_images(cursor, limit: Optional[int] = None, debug: bool = False) -> L
     """
     order = "ORDER BY created_at DESC"
     limit_clause = f"LIMIT {limit}" if limit else ""
+
+    share_clause = "share_to_inspire = TRUE AND" if shared_only else ""
 
     cursor.execute(f"""
         SELECT
@@ -389,18 +403,26 @@ def _fetch_images(cursor, limit: Optional[int] = None, debug: bool = False) -> L
             height,
             created_at
         FROM timrx_app.images
-        WHERE share_to_inspire = TRUE
-          AND ((thumbnail_url IS NOT NULL AND thumbnail_url != '')
+        WHERE {share_clause}
+          ((thumbnail_url IS NOT NULL AND thumbnail_url != '')
             OR (image_url IS NOT NULL AND image_url != ''))
         {order}
         {limit_clause}
     """)
 
     rows = cursor.fetchall()
+    if debug:
+        scope = "shared" if shared_only else "fallback_all"
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} images after filtering ({scope})")
     return [dict(r) for r in rows]
 
 
-def _fetch_videos(cursor, limit: Optional[int] = None, debug: bool = False) -> List[Dict]:
+def _fetch_videos(
+    cursor,
+    limit: Optional[int] = None,
+    debug: bool = False,
+    shared_only: bool = True,
+) -> List[Dict]:
     """
     Fetch videos with valid thumbnails.
     Videos don't have refined thumbnails, so thumb_refined is always null.
@@ -408,6 +430,8 @@ def _fetch_videos(cursor, limit: Optional[int] = None, debug: bool = False) -> L
     """
     order = "ORDER BY created_at DESC"
     limit_clause = f"LIMIT {limit}" if limit else ""
+
+    share_clause = "share_to_inspire = TRUE AND" if shared_only else ""
 
     cursor.execute(f"""
         SELECT
@@ -421,8 +445,8 @@ def _fetch_videos(cursor, limit: Optional[int] = None, debug: bool = False) -> L
             duration_seconds,
             created_at
         FROM timrx_app.videos
-        WHERE share_to_inspire = TRUE
-          AND thumbnail_url IS NOT NULL
+        WHERE {share_clause}
+          thumbnail_url IS NOT NULL
           AND thumbnail_url != ''
           AND video_url IS NOT NULL
         {order}
@@ -430,6 +454,9 @@ def _fetch_videos(cursor, limit: Optional[int] = None, debug: bool = False) -> L
     """)
 
     rows = cursor.fetchall()
+    if debug:
+        scope = "shared" if shared_only else "fallback_all"
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} videos after filtering ({scope})")
     return [dict(r) for r in rows]
 
 
@@ -624,18 +651,37 @@ def inspire_feed() -> Response:
                 _t_start = _itime.monotonic()
                 cursor = conn.cursor(row_factory=dict_row)
                 potd = _get_prompt_of_the_day(cursor)
+                used_shared_fallback = False
                 if filter_type == "all":
                     models = _fetch_models(cursor, limit=_fetch_cap, debug=True)
                     images = _fetch_images(cursor, limit=_fetch_cap, debug=True)
                     videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True)
+                    if not (models or images or videos):
+                        used_shared_fallback = True
+                        print("[INSPIRE] Shared feed empty, falling back to recent ready assets")
+                        models = _fetch_models(cursor, limit=_fetch_cap, debug=True, shared_only=False)
+                        images = _fetch_images(cursor, limit=_fetch_cap, debug=True, shared_only=False)
+                        videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                 elif filter_type in ("model", "models"):
                     models = _fetch_models(cursor, limit=_fetch_cap, debug=True)
+                    if not models:
+                        used_shared_fallback = True
+                        print("[INSPIRE] Shared models feed empty, falling back to recent ready models")
+                        models = _fetch_models(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                     images, videos = [], []
                 elif filter_type in ("image", "images"):
                     images = _fetch_images(cursor, limit=_fetch_cap, debug=True)
+                    if not images:
+                        used_shared_fallback = True
+                        print("[INSPIRE] Shared images feed empty, falling back to recent images")
+                        images = _fetch_images(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                     models, videos = [], []
                 elif filter_type in ("video", "videos"):
                     videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True)
+                    if not videos:
+                        used_shared_fallback = True
+                        print("[INSPIRE] Shared videos feed empty, falling back to recent videos")
+                        videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                     models, images = [], []
                 else:
                     models, images, videos = [], [], []
@@ -644,7 +690,8 @@ def inspire_feed() -> Response:
                 _ms_conn = int((_t_start - _t_conn) * 1000)
                 _ms_query = int((_t_done - _t_start) * 1000)
                 print(f"[INSPIRE] DB: conn={_ms_conn}ms query={_ms_query}ms "
-                      f"models={len(models)} images={len(images)} videos={len(videos)}")
+                      f"models={len(models)} images={len(images)} videos={len(videos)} "
+                      f"fallback={'yes' if used_shared_fallback else 'no'}")
                 return potd, models, images, videos
 
         try:
