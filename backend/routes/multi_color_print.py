@@ -482,8 +482,8 @@ def multi_color_status(job_id: str):
                                     SET glb_url = %s,
                                         payload = COALESCE(payload, '{{}}'::jsonb)
                                             || jsonb_build_object(
-                                                'three_mf_url', %s,
-                                                'model_urls', jsonb_build_object('3mf', %s)
+                                                'three_mf_url', %s::text,
+                                                'model_urls', jsonb_build_object('3mf', %s::text)
                                             )
                                     WHERE id::text = %s AND identity_id = %s""",
                                 (parent_glb, three_mf_s3, three_mf_s3,
@@ -495,8 +495,8 @@ def multi_color_status(job_id: str):
                                     SET glb_url = %s,
                                         meta = COALESCE(meta, '{{}}'::jsonb)
                                             || jsonb_build_object(
-                                                'three_mf_url', %s,
-                                                'model_urls', jsonb_build_object('3mf', %s)
+                                                'three_mf_url', %s::text,
+                                                'model_urls', jsonb_build_object('3mf', %s::text)
                                             )
                                     WHERE upstream_id = %s AND identity_id = %s""",
                                 (parent_glb, three_mf_s3, three_mf_s3,
