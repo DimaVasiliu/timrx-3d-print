@@ -1,541 +1,582 @@
-/**
- * multi-color-print.js
- * ────────────────────
- * Full-color 3D Print modal — converts textured models into
- * slicer-ready 3MF files with configurable color palettes.
- *
- * Usage:
- *   import { openMultiColorModal } from './multi-color-print.js';
- *   openMultiColorModal({ taskId, title, thumbnailUrl });
- */
+"""
+Multi-Color 3D Print Route
 
-import { BACKEND, apiFetch } from './config.js';
+Converts textured 3D models into slicer-ready 3MF files with
+configurable color palettes (1-16 colors).
 
-// ─── State ──────────────────────────────────────────────────────────────
-let _overlay = null;
-let _activeJobId = null;
-let _pollTimer = null;
-const POLL_INTERVAL = 3000;
-const CREDIT_COST = 10;
+POST /api/_mod/print/multi-color      - Start a multi-color print job
+GET  /api/_mod/print/multi-color/<id> - Poll job status
 
-// ─── Public API ─────────────────────────────────────────────────────────
+Uses Meshy API:  POST /openapi/v1/print/multi-color
+                 GET  /openapi/v1/print/multi-color/<id>
+"""
 
-/**
- * Open the multi-color print modal for a given task.
- * @param {object} opts
- * @param {string} opts.taskId   — Meshy task ID (from prior generation)
- * @param {string} opts.title    — Display title of the source model
- * @param {string} opts.thumbnailUrl — Preview thumbnail URL
- */
-export function openMultiColorModal({ taskId, title, thumbnailUrl }) {
-  console.log('[MultiColorPrint] Opening modal for task:', taskId);
-  if (!taskId) return;
-  _cleanup();
-  _injectStylesOnce();
-  _overlay = _createOverlay(taskId, title || 'Untitled Model', thumbnailUrl || '');
-  // Append inside the workspace container so the modal respects the same
-  // stacking context as other workspace modals (upload, refine, etc.).
-  // The body > * { z-index: 2 } rule in variables.css would otherwise trap
-  // a body-level overlay behind the workspace.
-  const wsRoot = document.querySelector('.timrx-3dprint') || document.body;
-  wsRoot.appendChild(_overlay);
-  requestAnimationFrame(() => {
-    _overlay.classList.add('open');
-    _overlay.inert = false;
-    console.log('[MultiColorPrint] Modal opened, overlay in DOM:', wsRoot.contains(_overlay));
-  });
-  document.body.classList.add('has-modal');
-  document.addEventListener('keydown', _onEscape);
-}
+from __future__ import annotations
 
-/**
- * Close and destroy the modal.
- */
-export function closeMultiColorModal() {
-  _cleanup();
-}
+import time as _time
+import uuid
 
-// ─── Internal ───────────────────────────────────────────────────────────
+from flask import Blueprint, jsonify, request, g
 
-// Inject critical styles inline so the modal works even if the CSS file
-// hasn't loaded yet (cache, 404, slow CDN). Only injected once.
-let _stylesInjected = false;
-function _injectStylesOnce() {
-  if (_stylesInjected) return;
-  _stylesInjected = true;
-  const style = document.createElement('style');
-  style.id = 'mcp-critical-styles';
-  style.textContent = `
-    .mcp-overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(3,5,8,.58);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);z-index:99999;opacity:0;transition:opacity .25s ease;padding:20px}
-    .mcp-overlay.open{opacity:1}
-    .mcp-modal{width:min(520px,100%);max-height:calc(100vh - 80px);display:flex;flex-direction:column;background:linear-gradient(135deg,rgba(15,15,15,.96),rgba(18,18,20,.97));backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.07);border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.5);overflow:hidden;transform:translateY(12px) scale(.97);transition:transform .3s cubic-bezier(.4,0,.2,1)}
-    .mcp-overlay.open .mcp-modal{transform:translateY(0) scale(1)}
-    .mcp-modal__header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 12px;border-bottom:1px solid rgba(255,255,255,.06)}
-    .mcp-modal__eyebrow{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:rgba(255,255,255,.38);margin-bottom:2px}
-    .mcp-modal__title{font-size:15px;font-weight:700;color:#f0f2f5;margin:0}
-    .mcp-modal__close{width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);color:rgba(255,255,255,.55);cursor:pointer}
-    .mcp-modal__body{display:grid;gap:14px;padding:14px 16px;overflow-y:auto}
-    .mcp-modal__body--hidden{display:none!important}
-    .mcp-modal__footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px 14px;border-top:1px solid rgba(255,255,255,.06)}
-    .mcp-modal__footer--hidden{display:none!important}
-    .mcp-source{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.05)}
-    .mcp-source__thumb{width:48px;height:48px;border-radius:8px;object-fit:cover;background:rgba(255,255,255,.04);flex-shrink:0}
-    .mcp-source__info{display:flex;flex-direction:column;gap:2px;min-width:0}
-    .mcp-source__title{font-size:13px;font-weight:600;color:rgba(255,255,255,.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .mcp-source__subtitle{font-size:11px;color:rgba(255,255,255,.4)}
-    .mcp-field{display:flex;flex-direction:column;gap:6px}
-    .mcp-field__label{font-size:12px;font-weight:600;color:rgba(255,255,255,.85)}
-    .mcp-field__hint{font-size:11px;color:rgba(255,255,255,.4);line-height:1.4}
-    .mcp-color-presets{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-    .mcp-preset{display:flex;flex-direction:column;align-items:center;gap:8px;padding:10px 6px;border-radius:10px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.06);cursor:pointer;transition:all .18s ease}
-    .mcp-preset.is-active{background:rgba(14,165,233,.1);border-color:rgba(14,165,233,.35)}
-    .mcp-preset__swatches{display:flex;flex-wrap:wrap;justify-content:center;gap:3px;max-width:56px}
-    .mcp-preset__swatches span{width:12px;height:12px;border-radius:50%;border:1px solid rgba(0,0,0,.2)}
-    .mcp-preset__swatches--dense span{width:9px;height:9px}
-    .mcp-preset__label{font-size:10px;font-weight:600;color:rgba(255,255,255,.55);text-align:center}
-    .mcp-preset.is-active .mcp-preset__label{color:rgba(14,165,233,.9)}
-    .mcp-btn{display:inline-flex;align-items:center;gap:6px;padding:10px 18px;border-radius:10px;font-size:13px;font-weight:600;border:none;cursor:pointer;transition:all .18s ease}
-    .mcp-btn--ghost{background:transparent;color:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.1)}
-    .mcp-btn--primary{background:linear-gradient(135deg,#0ea5e9,#8b5cf6);color:#fff;box-shadow:0 4px 16px rgba(14,165,233,.25)}
-    .mcp-btn__badge{display:inline-flex;padding:2px 7px;background:rgba(255,255,255,.18);border-radius:999px;font-size:10px;font-weight:600}
-    .mcp-footer__meta{display:flex;align-items:center;gap:8px;font-size:11px;color:rgba(255,255,255,.4)}
-    .mcp-footer__credits{display:flex;align-items:center;gap:4px;color:rgba(234,179,8,.8)}
-    .mcp-footer__actions{display:flex;gap:8px}
-    .mcp-info-card{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border-radius:8px;background:rgba(14,165,233,.06);border:1px solid rgba(14,165,233,.12)}
-    .mcp-info-card svg{flex-shrink:0;color:rgba(14,165,233,.7);margin-top:1px}
-    .mcp-info-card div{display:flex;flex-direction:column;gap:2px}
-    .mcp-info-card strong{font-size:12px;font-weight:600;color:rgba(255,255,255,.85)}
-    .mcp-info-card span{font-size:11px;color:rgba(255,255,255,.5);line-height:1.4}
-    .mcp-detail-row{display:flex;flex-direction:column;gap:6px}
-    .mcp-detail-slider{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:2px;background:rgba(255,255,255,.1);outline:none}
-    .mcp-detail-slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:linear-gradient(135deg,#0ea5e9,#8b5cf6);cursor:pointer;border:2px solid rgba(15,15,15,.9)}
-    .mcp-detail-labels{display:flex;justify-content:space-between}
-    .mcp-detail-label{font-size:10px;color:rgba(255,255,255,.35);font-weight:500}
-    .mcp-detail-label.is-active{color:rgba(14,165,233,.85);font-weight:600}
-    .mcp-processing{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;padding:24px 16px}
-    .mcp-processing__spinner{width:40px;height:40px;border-radius:50%;border:3px solid rgba(255,255,255,.08);border-top-color:#0ea5e9;animation:mcp-spin .8s linear infinite}
-    @keyframes mcp-spin{to{transform:rotate(360deg)}}
-    .mcp-processing__title{font-size:14px;font-weight:600;color:rgba(255,255,255,.9);margin:0}
-    .mcp-processing__desc{font-size:12px;color:rgba(255,255,255,.45);margin:0}
-    .mcp-processing__progress{width:100%;max-width:280px;display:flex;flex-direction:column;align-items:center;gap:6px}
-    .mcp-processing__bar{width:100%;height:4px;border-radius:2px;background:rgba(255,255,255,.08);overflow:hidden}
-    .mcp-processing__fill{height:100%;width:0%;border-radius:2px;background:linear-gradient(90deg,#0ea5e9,#8b5cf6);transition:width .5s ease}
-    .mcp-processing__pct{font-size:11px;font-weight:600;color:rgba(14,165,233,.8);font-variant-numeric:tabular-nums}
-    .mcp-done{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:20px 16px}
-    .mcp-done__icon{width:56px;height:56px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(34,197,94,.1);color:#22c55e}
-    .mcp-done__title{font-size:15px;font-weight:700;color:rgba(255,255,255,.92);margin:0}
-    .mcp-done__desc{font-size:12px;color:rgba(255,255,255,.45);margin:0}
-    .mcp-done__download{display:inline-flex;align-items:center;gap:8px;padding:12px 24px;background:linear-gradient(135deg,#0ea5e9,#8b5cf6);color:#fff;font-size:14px;font-weight:600;border-radius:10px;text-decoration:none;transition:all .2s ease;box-shadow:0 4px 16px rgba(14,165,233,.3);margin-top:4px}
-    .mcp-done__slicer-hint{font-size:11px;color:rgba(255,255,255,.35);margin-top:2px}
-    .mcp-done__slicer-hint strong{color:rgba(255,255,255,.55)}
-    .mcp-error{display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:20px 16px}
-    .mcp-error__icon{width:56px;height:56px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(239,68,68,.1);color:#ef4444}
-    .mcp-error__title{font-size:15px;font-weight:700;color:rgba(255,255,255,.92);margin:0}
-    .mcp-error__desc{font-size:12px;color:rgba(255,255,255,.5);margin:0;max-width:320px}
-    .mcp-error__retry{padding:10px 20px;border-radius:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);color:rgba(255,255,255,.8);font-size:13px;font-weight:600;cursor:pointer;margin-top:4px}
-  `;
-  document.head.appendChild(style);
-}
+from backend.config import ACTION_KEYS, MESHY_API_KEY
+from backend.db import USE_DB
+from backend.middleware import with_session, with_session_readonly
+from backend.services.async_dispatch import update_job_with_upstream_id
+from backend.services.credits_helper import (
+    finalize_job_credits,
+    get_current_balance,
+    release_job_credits,
+    start_paid_job,
+)
+from backend.services.identity_service import require_identity
+from backend.services.job_service import (
+    create_internal_job_row,
+    get_job_metadata,
+    load_store,
+    save_store,
+    verify_job_ownership_detailed,
+    _update_job_status_ready,
+)
+from backend.services.meshy_service import (
+    build_source_payload,
+    mesh_get,
+    mesh_post,
+    MeshyTaskNotFoundError,
+    terminalize_expired_meshy_job,
+)
+from backend.services.s3_service import save_finished_job_to_normalized_db
+from backend.services.status_cache import get_cached_status, cache_status
+from backend.utils.helpers import log_event, log_status_summary, now_s
 
-function _cleanup() {
-  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
-  _activeJobId = null;
-  if (_overlay) {
-    _overlay.classList.remove('open');
-    document.body.classList.remove('has-modal');
-    setTimeout(() => { _overlay?.remove(); _overlay = null; }, 250);
-  }
-  document.removeEventListener('keydown', _onEscape);
-}
+bp = Blueprint("multi_color_print", __name__)
 
-function _onEscape(e) {
-  if (e.key === 'Escape') _cleanup();
-}
+# -- Finalization dedup (same pattern as text_to_3d / remesh) --
+_finalized_jobs: dict = {}  # job_id -> monotonic timestamp
+_FINALIZED_TTL = 1800  # 30 min
 
-function _createOverlay(taskId, title, thumbUrl) {
-  const el = document.createElement('div');
-  el.className = 'mcp-overlay';
-  el.inert = true;
-  el.innerHTML = `
-    <div class="mcp-modal" role="dialog" aria-labelledby="mcpTitle">
-      <!-- Header -->
-      <div class="mcp-modal__header">
-        <div>
-          <span class="mcp-modal__eyebrow">Full-Color 3D Print</span>
-          <h3 class="mcp-modal__title" id="mcpTitle">Prepare for Printing</h3>
-        </div>
-        <button class="mcp-modal__close" type="button" aria-label="Close" data-mcp-close>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
-            <path d="M18 6L6 18M6 6l12 12"/>
-          </svg>
-        </button>
-      </div>
 
-      <!-- Body — Config state -->
-      <div class="mcp-modal__body" data-mcp-state="config">
-        <!-- Source preview -->
-        <div class="mcp-source">
-          ${thumbUrl ? `<img class="mcp-source__thumb" src="${thumbUrl}" alt="" />` : `
-            <div class="mcp-source__thumb mcp-source__thumb--empty">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="28" height="28">
-                <path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/>
-                <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
-                <line x1="12" y1="22.08" x2="12" y2="12"/>
-              </svg>
-            </div>
-          `}
-          <div class="mcp-source__info">
-            <span class="mcp-source__title">${_esc(title)}</span>
-            <span class="mcp-source__subtitle">Source model</span>
-          </div>
-        </div>
+def _already_finalized(job_id: str) -> bool:
+    ts = _finalized_jobs.get(job_id)
+    if ts and (_time.monotonic() - ts) < _FINALIZED_TTL:
+        return True
+    return False
 
-        <!-- Color palette -->
-        <div class="mcp-field">
-          <label class="mcp-field__label">Color Palette</label>
-          <span class="mcp-field__hint">How many filament colors your printer can use (1–16)</span>
-          <div class="mcp-color-presets" data-mcp-presets>
-            <button class="mcp-preset" type="button" data-colors="2">
-              <span class="mcp-preset__swatches">
-                <span style="background:#2563eb"></span><span style="background:#f97316"></span>
-              </span>
-              <span class="mcp-preset__label">2 Colors</span>
-            </button>
-            <button class="mcp-preset is-active" type="button" data-colors="4">
-              <span class="mcp-preset__swatches">
-                <span style="background:#ef4444"></span><span style="background:#22c55e"></span>
-                <span style="background:#3b82f6"></span><span style="background:#eab308"></span>
-              </span>
-              <span class="mcp-preset__label">4 Colors</span>
-            </button>
-            <button class="mcp-preset" type="button" data-colors="8">
-              <span class="mcp-preset__swatches">
-                <span style="background:#ef4444"></span><span style="background:#f97316"></span>
-                <span style="background:#eab308"></span><span style="background:#22c55e"></span>
-                <span style="background:#3b82f6"></span><span style="background:#8b5cf6"></span>
-                <span style="background:#ec4899"></span><span style="background:#f5f5f5"></span>
-              </span>
-              <span class="mcp-preset__label">8 Colors</span>
-            </button>
-            <button class="mcp-preset" type="button" data-colors="16">
-              <span class="mcp-preset__swatches mcp-preset__swatches--dense">
-                <span style="background:#ef4444"></span><span style="background:#f97316"></span>
-                <span style="background:#eab308"></span><span style="background:#84cc16"></span>
-                <span style="background:#22c55e"></span><span style="background:#14b8a6"></span>
-                <span style="background:#06b6d4"></span><span style="background:#3b82f6"></span>
-                <span style="background:#6366f1"></span><span style="background:#8b5cf6"></span>
-                <span style="background:#a855f7"></span><span style="background:#d946ef"></span>
-                <span style="background:#ec4899"></span><span style="background:#f43f5e"></span>
-                <span style="background:#fafafa"></span><span style="background:#171717"></span>
-              </span>
-              <span class="mcp-preset__label">16 Colors</span>
-            </button>
-          </div>
-        </div>
 
-        <!-- Detail level -->
-        <div class="mcp-field">
-          <label class="mcp-field__label">Color Detail</label>
-          <span class="mcp-field__hint">Higher values capture finer color transitions but increase file size</span>
-          <div class="mcp-detail-row">
-            <input type="range" class="mcp-detail-slider" min="3" max="6" value="4" step="1" data-mcp-depth />
-            <div class="mcp-detail-labels">
-              <span class="mcp-detail-label" data-depth="3">Fast</span>
-              <span class="mcp-detail-label is-active" data-depth="4">Balanced</span>
-              <span class="mcp-detail-label" data-depth="5">Fine</span>
-              <span class="mcp-detail-label" data-depth="6">Ultra</span>
-            </div>
-          </div>
-        </div>
+def _mark_finalized(job_id: str):
+    _finalized_jobs[job_id] = _time.monotonic()
+    # Lazy cleanup of expired entries
+    if len(_finalized_jobs) > 200:
+        cutoff = _time.monotonic() - _FINALIZED_TTL
+        expired = [k for k, v in _finalized_jobs.items() if v < cutoff]
+        for k in expired:
+            del _finalized_jobs[k]
 
-        <!-- Output format info -->
-        <div class="mcp-info-card">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="16" height="16">
-            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
-            <polyline points="14 2 14 8 20 8"/>
-          </svg>
-          <div>
-            <strong>Output: 3MF</strong>
-            <span>Ready for Bambu Studio, OrcaSlicer, Cura, and other modern slicers.</span>
-          </div>
-        </div>
-      </div>
 
-      <!-- Body — Processing state -->
-      <div class="mcp-modal__body mcp-modal__body--hidden" data-mcp-state="processing">
-        <div class="mcp-processing">
-          <div class="mcp-processing__spinner"></div>
-          <h4 class="mcp-processing__title">Preparing your print file</h4>
-          <p class="mcp-processing__desc">Converting colors and optimizing mesh for printing...</p>
-          <div class="mcp-processing__progress">
-            <div class="mcp-processing__bar">
-              <div class="mcp-processing__fill" data-mcp-progress></div>
-            </div>
-            <span class="mcp-processing__pct" data-mcp-pct>0%</span>
-          </div>
-        </div>
-      </div>
+def _normalize_multi_color_task(ms: dict) -> dict:
+    """
+    Normalize Meshy multi-color print response to standard frontend shape.
 
-      <!-- Body — Done state -->
-      <div class="mcp-modal__body mcp-modal__body--hidden" data-mcp-state="done">
-        <div class="mcp-done">
-          <div class="mcp-done__icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32">
-              <path d="M22 11.08V12a10 10 0 11-5.93-9.14"/>
-              <polyline points="22 4 12 14.01 9 11.01"/>
-            </svg>
-          </div>
-          <h4 class="mcp-done__title">Print file ready</h4>
-          <p class="mcp-done__desc">Your full-color 3MF is ready for slicing.</p>
-          <a class="mcp-done__download" href="#" data-mcp-download target="_blank" rel="noopener">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
-              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-            Download 3MF
-          </a>
-          <div class="mcp-done__slicer-hint">
-            Open in <strong>Bambu Studio</strong>, <strong>OrcaSlicer</strong>, or your slicer of choice
-          </div>
-        </div>
-      </div>
+    Meshy returns the 3MF URL inside ``model_urls.3mf`` (not ``three_mf_url``).
+    See: https://docs.meshy.ai/en/api/multi-color-print
+    """
+    status_raw = (ms.get("status") or "PENDING").upper()
+    status_map = {
+        "PENDING": "pending",
+        "IN_PROGRESS": "running",
+        "SUCCEEDED": "done",
+        "COMPLETED": "done",
+        "FINISHED": "done",
+        "FAILED": "failed",
+        "CANCELLED": "failed",
+        "TIMEOUT": "failed",
+    }
+    status = status_map.get(status_raw, "pending")
+    pct = ms.get("progress") or 0
+    if status == "done":
+        pct = 100
 
-      <!-- Body — Error state -->
-      <div class="mcp-modal__body mcp-modal__body--hidden" data-mcp-state="error">
-        <div class="mcp-error">
-          <div class="mcp-error__icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32">
-              <circle cx="12" cy="12" r="10"/>
-              <line x1="15" y1="9" x2="9" y2="15"/>
-              <line x1="9" y1="9" x2="15" y2="15"/>
-            </svg>
-          </div>
-          <h4 class="mcp-error__title">Something went wrong</h4>
-          <p class="mcp-error__desc" data-mcp-error-msg>Please try again later.</p>
-          <button class="mcp-error__retry" type="button" data-mcp-retry>Try Again</button>
-        </div>
-      </div>
+    # Meshy nests the result in different ways; try all known locations.
+    result = ms.get("result") if isinstance(ms.get("result"), dict) else ms
 
-      <!-- Footer -->
-      <div class="mcp-modal__footer" data-mcp-footer="config">
-        <div class="mcp-footer__meta">
-          <span class="mcp-footer__time">~1 min</span>
-          <span class="mcp-footer__divider">|</span>
-          <span class="mcp-footer__credits">
-            <svg viewBox="0 0 24 24" fill="currentColor" width="12" height="12"><circle cx="12" cy="12" r="10"/></svg>
-            ${CREDIT_COST}
-          </span>
-        </div>
-        <div class="mcp-footer__actions">
-          <button class="mcp-btn mcp-btn--ghost" type="button" data-mcp-close>Cancel</button>
-          <button class="mcp-btn mcp-btn--primary" type="button" data-mcp-start data-task-id="${taskId}">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-              <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
-              <polyline points="14 2 14 8 20 8"/>
-            </svg>
-            Generate 3MF
-            <span class="mcp-btn__badge">${CREDIT_COST} cr</span>
-          </button>
-        </div>
-      </div>
+    # -- Extract 3MF URL -----------------------------------------
+    # Primary: model_urls.3mf  (actual Meshy API response schema)
+    # Fallback: three_mf_url   (in case Meshy ever adds this alias)
+    model_urls = ms.get("model_urls") or result.get("model_urls") or {}
+    three_mf_url = (
+        model_urls.get("3mf")
+        or result.get("three_mf_url")
+        or ms.get("three_mf_url")
+    )
 
-      <!-- Footer — processing (minimal) -->
-      <div class="mcp-modal__footer mcp-modal__footer--hidden" data-mcp-footer="processing">
-        <div class="mcp-footer__meta">
-          <span class="mcp-footer__time">Processing...</span>
-        </div>
-        <button class="mcp-btn mcp-btn--ghost" type="button" data-mcp-close>Close</button>
-      </div>
-
-      <!-- Footer — done -->
-      <div class="mcp-modal__footer mcp-modal__footer--hidden" data-mcp-footer="done">
-        <div></div>
-        <button class="mcp-btn mcp-btn--ghost" type="button" data-mcp-close>Done</button>
-      </div>
-    </div>
-  `;
-
-  // Wire events
-  el.querySelectorAll('[data-mcp-close]').forEach(b => b.addEventListener('click', _cleanup));
-  el.addEventListener('click', e => { if (e.target === el) _cleanup(); });
-
-  // Preset buttons
-  el.querySelector('[data-mcp-presets]')?.addEventListener('click', e => {
-    const btn = e.target.closest('.mcp-preset');
-    if (!btn) return;
-    el.querySelectorAll('.mcp-preset').forEach(b => b.classList.remove('is-active'));
-    btn.classList.add('is-active');
-  });
-
-  // Depth slider
-  const slider = el.querySelector('[data-mcp-depth]');
-  slider?.addEventListener('input', () => {
-    el.querySelectorAll('.mcp-detail-label').forEach(l => {
-      l.classList.toggle('is-active', l.dataset.depth === slider.value);
-    });
-  });
-
-  // Start button
-  el.querySelector('[data-mcp-start]')?.addEventListener('click', () => {
-    const selectedPreset = el.querySelector('.mcp-preset.is-active');
-    const maxColors = parseInt(selectedPreset?.dataset.colors || '4', 10);
-    const maxDepth = parseInt(slider?.value || '4', 10);
-    _startJob(taskId, maxColors, maxDepth);
-  });
-
-  // Retry button
-  el.querySelector('[data-mcp-retry]')?.addEventListener('click', () => {
-    _switchState('config');
-  });
-
-  return el;
-}
-
-function _switchState(state) {
-  if (!_overlay) return;
-  // Toggle body panels
-  _overlay.querySelectorAll('[data-mcp-state]').forEach(panel => {
-    panel.classList.toggle('mcp-modal__body--hidden', panel.dataset.mcpState !== state);
-  });
-  // Toggle footer panels
-  _overlay.querySelectorAll('[data-mcp-footer]').forEach(footer => {
-    footer.classList.toggle('mcp-modal__footer--hidden', footer.dataset.mcpFooter !== state);
-  });
-}
-
-async function _startJob(taskId, maxColors, maxDepth) {
-  _switchState('processing');
-  _updateProgress(0);
-
-  try {
-    const res = await apiFetch(`${BACKEND}/api/_mod/print/multi-color`, {
-      method: 'POST',
-      body: JSON.stringify({
-        input_task_id: taskId,
-        max_colors: maxColors,
-        max_depth: maxDepth,
-      }),
-    });
-
-    if (!res.ok && !res.data?.ok) {
-      const msg = res.data?.message || res.data?.error || res.error || 'Failed to start job';
-      _showError(msg);
-      return;
+    out = {
+        "id": ms.get("id") or (result.get("id") if isinstance(result, dict) else None),
+        "status": status,
+        "pct": pct,
+        "stage": "multi_color_print",
+        "three_mf_url": three_mf_url,
+        "model_urls": model_urls if model_urls else {"3mf": three_mf_url} if three_mf_url else {},
+        "thumbnail_url": (
+            result.get("thumbnail_url")
+            or ms.get("thumbnail_url")
+            or ms.get("cover_image_url")
+        ),
+        "created_at": ms.get("created_at"),
+        "preceding_tasks": ms.get("preceding_tasks"),
     }
 
-    _activeJobId = res.data?.job_id;
-    if (!_activeJobId) {
-      _showError('No job ID returned');
-      return;
+    if status == "failed":
+        err = ms.get("task_error") or {}
+        out["message"] = err.get("message") or ms.get("message") or "Multi-color print failed"
+
+    return out
+
+
+@bp.route("/print/multi-color", methods=["POST", "OPTIONS"])
+@with_session
+def multi_color_start():
+    """
+    Start a multi-color 3D print job.
+
+    Body:
+        input_task_id: str  -- Task ID from a prior 3D generation
+                              (text-to-3d, image-to-3d, remesh, retexture)
+        max_colors: int     -- Color palette size, 1-16 (default 4)
+        max_depth: int      -- Quadtree depth for color precision, 3-6 (default 4)
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+    log_event("print/multi-color:incoming", body)
+
+    # -- Source resolution --------------------------------------------
+    # Multi-color print requires input_task_id -- a completed Meshy task.
+    # Preserve the original frontend history ID before resolution (may differ
+    # from the resolved Meshy task ID used for the API call).
+    original_input_task_id = (body.get("input_task_id") or "").strip()
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    input_task_id = source.get("input_task_id")
+    if not input_task_id:
+        return jsonify({
+            "ok": False,
+            "error": "input_task_id required -- select a completed 3D model first.",
+            "code": "SOURCE_TASK_REQUIRED",
+        }), 400
+
+    # -- Validate parameters ------------------------------------------
+    try:
+        max_colors = int(body.get("max_colors", 4))
+    except (TypeError, ValueError):
+        max_colors = 4
+    max_colors = max(1, min(16, max_colors))
+
+    try:
+        max_depth = int(body.get("max_depth", 4))
+    except (TypeError, ValueError):
+        max_depth = 4
+    max_depth = max(3, min(6, max_depth))
+
+    # -- Build Meshy payload ------------------------------------------
+    payload = {
+        "input_task_id": input_task_id,
+        "max_colors": max_colors,
+        "max_depth": max_depth,
     }
 
-    // Update wallet display if new_balance is present
-    if (res.data?.new_balance != null) {
-      _updateWalletDisplay(res.data.new_balance);
+    # -- Resolve source metadata for history lineage ------------------
+    store = load_store()
+    source_meta = get_job_metadata(input_task_id, store) or {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    title = source_meta.get("title") or original_prompt[:60] or "Multi-Color Print"
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = ACTION_KEYS.get("multi-color-print", "multi_color_print")
+
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": "multi_color_print",
+        "source_task_id": input_task_id,
+        "original_input_task_id": original_input_task_id,
+        "max_colors": max_colors,
+        "max_depth": max_depth,
     }
 
-    // Start polling
-    _pollTimer = setInterval(() => _pollStatus(), POLL_INTERVAL);
-    // Also poll immediately after a short delay
-    setTimeout(() => _pollStatus(), 1000);
+    # -- Reserve credits BEFORE calling upstream ----------------------
+    reservation_id, credit_error = start_paid_job(
+        identity_id, action_key, internal_job_id, job_meta
+    )
+    if credit_error:
+        return credit_error
 
-  } catch (err) {
-    console.error('[MultiColorPrint] start failed:', err);
-    _showError('Network error — please check your connection.');
-  }
-}
+    # -- Persist job row for ownership/status tracking ----------------
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=job_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
 
-async function _pollStatus() {
-  if (!_activeJobId || !_overlay) { _stopPolling(); return; }
+    # -- Dispatch to Meshy --------------------------------------------
+    try:
+        resp = mesh_post("/openapi/v1/print/multi-color", payload)
+        log_event("print/multi-color:meshy-resp", resp)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            print(f"[MULTI_COLOR] provider=meshy job_id={internal_job_id} error=no_task_id raw={resp}")
+            return jsonify({
+                "ok": False,
+                "error": "PRINT_JOB_FAILED",
+                "message": "Multi-color print job could not be started. Please try again.",
+            }), 502
+    except Exception as e:
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+        return jsonify(sanitize_provider_error(
+            provider="meshy", error=e, job_id=internal_job_id,
+            code=MODEL_GENERATION_FAILED,
+        )), 502
 
-  try {
-    const res = await apiFetch(`${BACKEND}/api/_mod/print/multi-color/${_activeJobId}`);
-    const data = res.data || res;
+    # -- Link internal job to upstream Meshy task ---------------------
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
-    if (data.status === 'done') {
-      _stopPolling();
-      _updateProgress(100);
-      // Meshy returns 3MF URL in model_urls.3mf; backend also mirrors it as three_mf_url
-      const threeMfUrl = data.three_mf_url
-        || (data.model_urls && data.model_urls['3mf'])
-        || data.glb_url;
-      if (threeMfUrl) {
-        const downloadLink = _overlay.querySelector('[data-mcp-download]');
-        if (downloadLink) downloadLink.href = threeMfUrl;
-      }
-      setTimeout(() => _switchState('done'), 400);
-
-      // Refresh workspace history so the new 3MF asset appears
-      try {
-        const stateModule = await import('./state.js');
-        const historyModule = await import('./history.js?v=20260408a');
-        if (stateModule.loadHistoryTab) {
-          await stateModule.loadHistoryTab('all');
-        }
-        if (historyModule.renderHistory) {
-          historyModule.renderHistory();
-        }
-      } catch (_e) {
-        console.warn('[MultiColorPrint] history refresh skipped:', _e);
-      }
-      return;
+    # -- Persist to in-memory store for metadata retrieval on poll -----
+    store[meshy_task_id] = {
+        "stage": "multi_color_print",
+        "source_task_id": input_task_id,
+        "original_input_task_id": original_input_task_id,
+        "created_at": now_s() * 1000,
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "max_colors": max_colors,
+        "max_depth": max_depth,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
     }
+    save_store(store)
 
-    if (data.status === 'failed') {
-      _stopPolling();
-      _showError(data.message || 'The print conversion failed. Please try again.');
-      return;
-    }
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": meshy_task_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "source": "modular",
+    })
 
-    // Still running — update progress
-    const pct = data.pct || 0;
-    _updateProgress(pct);
 
-    // Show queue position if available (Meshy returns preceding_tasks count)
-    if (data.preceding_tasks != null && data.preceding_tasks > 0 && pct === 0) {
-      const desc = _overlay?.querySelector('.mcp-processing__desc');
-      if (desc) desc.textContent = `Queued — ${data.preceding_tasks} task${data.preceding_tasks > 1 ? 's' : ''} ahead of you...`;
-    } else if (pct > 0) {
-      const desc = _overlay?.querySelector('.mcp-processing__desc');
-      if (desc) desc.textContent = 'Converting colors and optimizing mesh for printing...';
-    }
+@bp.route("/print/multi-color/<job_id>", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def multi_color_status(job_id: str):
+    """Poll status of a multi-color print job."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    log_event("print/multi-color/status:incoming", {"job_id": job_id})
 
-  } catch (err) {
-    console.error('[MultiColorPrint] poll error:', err);
-    // Don't stop polling on transient errors
-  }
-}
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-function _stopPolling() {
-  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
-}
+    # -- Short-circuit: cached response -------------------------------
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
-function _updateProgress(pct) {
-  if (!_overlay) return;
-  const fill = _overlay.querySelector('[data-mcp-progress]');
-  const label = _overlay.querySelector('[data-mcp-pct]');
-  if (fill) fill.style.width = `${pct}%`;
-  if (label) label.textContent = `${Math.round(pct)}%`;
-}
+    identity_id = g.identity_id
 
-function _showError(msg) {
-  if (!_overlay) return;
-  const el = _overlay.querySelector('[data-mcp-error-msg]');
-  if (el) el.textContent = msg;
-  _switchState('error');
-}
+    # -- Ownership check ----------------------------------------------
+    ownership = verify_job_ownership_detailed(job_id, identity_id)
+    if not ownership["found"]:
+        return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
+    if not ownership["authorized"]:
+        return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
 
-function _updateWalletDisplay(newBalance) {
-  // Update any visible wallet badge in the header
-  const badge = document.querySelector('.credits-balance, .wallet-balance, [data-wallet-balance]');
-  if (badge) {
-    badge.textContent = newBalance;
-  }
-}
+    # -- Poll Meshy ---------------------------------------------------
+    try:
+        ms = mesh_get(f"/openapi/v1/print/multi-color/{job_id}")
+        log_event("print/multi-color/status:meshy-resp", ms)
+    except MeshyTaskNotFoundError:
+        print(f"[MULTI_COLOR] Task expired: job_id={job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({
+            "status": "failed",
+            "error": "TASK_EXPIRED",
+            "message": "This job has expired on the provider.",
+        }), 200
+    except Exception as e:
+        print(f"[MULTI_COLOR] provider=meshy job_id={job_id} error={e}")
+        return jsonify({
+            "error": "PRINT_JOB_FAILED",
+            "message": "Failed to fetch job status. Please try again.",
+        }), 502
 
-function _esc(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
-}
+    out = _normalize_multi_color_task(ms)
+    log_status_summary("print/multi-color", job_id, out)
+
+    # -- Handle failure -> refund --------------------------------------
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(job_id)
+        except Exception as e:
+            print(f"[MULTI_COLOR] auto-refund failed: {e}")
+
+    # -- Handle success -> finalize credits, S3 upload, DB persist ------
+    if out["status"] == "done" and not _already_finalized(job_id):
+        store = load_store()
+        meta = get_job_metadata(job_id, store) or {}
+
+        if identity_id and not meta.get("identity_id"):
+            meta["identity_id"] = identity_id
+            meta["user_id"] = identity_id
+
+        # 1. Finalize credits
+        try:
+            res_id = meta.get("reservation_id")
+            int_job = meta.get("internal_job_id") or job_id
+            cred_identity = meta.get("identity_id") or identity_id
+            if res_id:
+                finalize_job_credits(res_id, int_job, cred_identity)
+                _mark_finalized(job_id)
+        except Exception as e:
+            print(f"[MULTI_COLOR] credit finalize failed: {e}")
+
+        # 2. Upload the 3MF to S3 and create history/model rows.
+        #
+        #    Key design: the 3MF is a print file (not viewable in Three.js),
+        #    so we store the PARENT model's GLB as the viewable glb_url and
+        #    put the 3MF S3 URL in model_urls["3mf"].  We also inherit the
+        #    parent's thumbnail when Meshy returns none (which is always for
+        #    multi-color-print).
+        s3_result = None
+        three_mf = out.get("three_mf_url")
+        if three_mf:
+            try:
+                # -- Look up parent model for thumbnail + viewable GLB ---
+                # The source_task_id is the Meshy task ID of the parent model.
+                # We search both history_items (by id) and models (by upstream_id)
+                # since the parent's history ID may differ from its Meshy task ID.
+                parent_thumbnail = ""
+                parent_glb = ""
+                source_task = meta.get("source_task_id")  # resolved Meshy ID
+                # The in-memory store is per-worker (gunicorn --workers 2),
+                # so we MUST also check the jobs table meta for the original ID.
+                _orig_input = (
+                    meta.get("original_input_task_id")
+                    or store.get(job_id, {}).get("original_input_task_id")
+                    or ""
+                )
+                if (source_task or _orig_input) and USE_DB:
+                    try:
+                        from backend.db import query_one, Tables as _Tp
+                        _uid = meta.get("identity_id") or identity_id
+
+                        # If we don't have original_input_task_id from store,
+                        # fetch it from the jobs table meta (cross-worker safe)
+                        if not _orig_input:
+                            _job_meta_row = query_one(
+                                f"""SELECT meta->>'original_input_task_id' AS orig
+                                    FROM {_Tp.JOBS}
+                                    WHERE upstream_job_id = %s
+                                    LIMIT 1""",
+                                (job_id,),
+                            )
+                            if _job_meta_row:
+                                _orig_input = _job_meta_row.get("orig") or ""
+                            print(f"[MULTI_COLOR] DB meta lookup: orig={_orig_input or 'none'}")
+
+                        # Try the original frontend history ID first (most likely match)
+                        _parent = None
+                        if _orig_input and _orig_input != source_task:
+                            _parent = query_one(
+                                f"""SELECT glb_url, thumbnail_url
+                                    FROM {_Tp.HISTORY_ITEMS}
+                                    WHERE id::text = %s AND identity_id = %s
+                                    LIMIT 1""",
+                                (_orig_input, _uid),
+                            )
+                        # Try history_items with resolved source_task
+                        if not _parent and source_task:
+                            _parent = query_one(
+                                f"""SELECT glb_url, thumbnail_url
+                                    FROM {_Tp.HISTORY_ITEMS}
+                                    WHERE id::text = %s AND identity_id = %s
+                                    LIMIT 1""",
+                                (source_task, _uid),
+                            )
+                        # Try models table (upstream_id = source_task or original)
+                        if not _parent and source_task:
+                            _parent = query_one(
+                                f"""SELECT m.glb_url, m.thumbnail_url
+                                    FROM {_Tp.MODELS} m
+                                    WHERE m.upstream_id = %s AND m.identity_id = %s
+                                    ORDER BY m.created_at DESC LIMIT 1""",
+                                (source_task, _uid),
+                            )
+                        if _parent:
+                            parent_thumbnail = _parent.get("thumbnail_url") or ""
+                            parent_glb = _parent.get("glb_url") or ""
+                            print(f"[MULTI_COLOR] Parent found: thumb={'yes' if parent_thumbnail else 'no'} glb={'yes' if parent_glb else 'no'}")
+                        else:
+                            print(f"[MULTI_COLOR] Parent not found for source_task={source_task} orig={_orig_input}")
+                    except Exception as pe:
+                        print(f"[MULTI_COLOR] Parent lookup failed: {pe}")
+
+                # Use Meshy's thumbnail if available, else inherit parent's
+                effective_thumbnail = out.get("thumbnail_url") or parent_thumbnail
+
+                # Upload the 3MF file to S3 via the standard pipeline.
+                # We pass it as glb_url so safe_upload_to_s3 downloads it,
+                # but with content_type_override="model/3mf" so it gets the
+                # correct extension and MIME type.
+                normalized_status = {
+                    "id": job_id,
+                    "status": "done",
+                    "pct": 100,
+                    "stage": "multi_color_print",
+                    "glb_url": three_mf,  # Pipeline downloads this URL -> S3
+                    "thumbnail_url": effective_thumbnail,
+                    "model_urls": out.get("model_urls") or {"3mf": three_mf},
+                    "created_at": out.get("created_at"),
+                    # Tell the save pipeline to use 3MF content type, not GLB
+                    "content_type_override": "model/3mf",
+                }
+
+                user_id = meta.get("identity_id") or meta.get("user_id") or identity_id
+                s3_result = save_finished_job_to_normalized_db(
+                    job_id,
+                    normalized_status,
+                    meta,
+                    job_type="multi_color_print",
+                    user_id=user_id,
+                )
+
+                # After S3 save, store metadata so the history card works:
+                # - glb_url stays as the 3MF S3 URL (viewer has 3MFLoader)
+                # - payload stores parent_glb_url (fallback) and model_urls.3mf
+                if s3_result and s3_result.get("success"):
+                    three_mf_s3 = s3_result.get("glb_url") or ""  # This is the 3MF S3 URL
+                    if three_mf_s3:
+                        try:
+                            from backend.db import execute as _ex2, Tables as _Th
+                            _identity = meta.get("identity_id") or identity_id
+                            _ex2(
+                                f"""UPDATE {_Th.HISTORY_ITEMS}
+                                    SET payload = COALESCE(payload, '{{}}'::jsonb)
+                                            || jsonb_build_object(
+                                                'three_mf_url', %s::text,
+                                                'parent_glb_url', %s::text,
+                                                'model_urls', jsonb_build_object('3mf', %s::text)
+                                            )
+                                    WHERE id::text = %s AND identity_id = %s""",
+                                (three_mf_s3, parent_glb or '', three_mf_s3,
+                                 job_id, _identity),
+                            )
+                            # Also update models row
+                            _ex2(
+                                f"""UPDATE {_Th.MODELS}
+                                    SET meta = COALESCE(meta, '{{}}'::jsonb)
+                                            || jsonb_build_object(
+                                                'three_mf_url', %s::text,
+                                                'parent_glb_url', %s::text,
+                                                'model_urls', jsonb_build_object('3mf', %s::text)
+                                            )
+                                    WHERE upstream_id = %s AND identity_id = %s""",
+                                (three_mf_s3, parent_glb or '', three_mf_s3,
+                                 job_id, _identity),
+                            )
+                            print(f"[MULTI_COLOR] Updated payload: 3MF={three_mf_s3[:60]}... parent_glb={'yes' if parent_glb else 'no'}")
+                            # Update the response to reflect the URLs
+                            out["three_mf_url"] = three_mf_s3
+                            out["model_urls"] = {"3mf": three_mf_s3}
+                        except Exception as fix_err:
+                            print(f"[MULTI_COLOR] DB payload update failed: {fix_err}")
+
+                if s3_result and s3_result.get("success"):
+                    # Thumbnail: use S3-persisted thumbnail in response
+                    if s3_result.get("thumbnail_url"):
+                        out["thumbnail_url"] = s3_result["thumbnail_url"]
+                    if s3_result.get("db_ok") is False:
+                        out["db_ok"] = False
+                        out["db_errors"] = s3_result.get("db_errors")
+                    print(f"[MULTI_COLOR] Saved to S3+DB: job_id={job_id}")
+                else:
+                    print(f"[MULTI_COLOR] save_finished_job_to_normalized_db returned: {s3_result}")
+            except Exception as e:
+                print(f"[MULTI_COLOR] S3/DB save failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Mark the internal job as failed so it doesn't stay stuck
+                # in "processing" forever (e.g. when Meshy URLs expire -> 403).
+                try:
+                    _int_job = meta.get("internal_job_id")
+                    if not _int_job and USE_DB:
+                        from backend.db import query_one, Tables as _T2
+                        _r = query_one(
+                            f"SELECT id::text AS jid FROM {_T2.JOBS} WHERE upstream_job_id = %s LIMIT 1",
+                            (job_id,),
+                        )
+                        _int_job = _r["jid"] if _r else None
+                    if _int_job:
+                        from backend.db import execute as _exec, Tables as _T3
+                        _exec(
+                            f"""UPDATE {_T3.JOBS}
+                                SET status = 'failed',
+                                    error_message = %s,
+                                    finished_at = NOW(),
+                                    updated_at = NOW()
+                                WHERE id = %s
+                                  AND status NOT IN ('ready', 'succeeded', 'failed', 'refunded')""",
+                            (f"S3 save failed: {e}"[:500], _int_job),
+                        )
+                        print(f"[MULTI_COLOR] Marked job {_int_job} as failed after S3 error")
+                        # Refund credits since we couldn't save the result
+                        try:
+                            from backend.services.credits_helper import refund_failed_job
+                            refund_failed_job(_int_job)
+                        except Exception as re:
+                            print(f"[MULTI_COLOR] Refund after S3 failure failed: {re}")
+                except Exception as mark_err:
+                    print(f"[MULTI_COLOR] Could not mark job as failed: {mark_err}")
+
+        # 3. Update internal job status -> "ready" (only if S3 save succeeded)
+        if s3_result and s3_result.get("success"):
+            try:
+                int_job = meta.get("internal_job_id")
+                if not int_job and USE_DB:
+                    from backend.db import query_one, Tables as _T
+                    _row = query_one(
+                        f"SELECT id::text AS jid FROM {_T.JOBS} WHERE upstream_job_id = %s LIMIT 1",
+                        (job_id,),
+                    )
+                    int_job = _row["jid"] if _row else None
+                if int_job:
+                    _update_job_status_ready(
+                        int_job,
+                        upstream_job_id=job_id,
+                        model_id=s3_result.get("model_id") if s3_result else None,
+                        glb_url=out.get("three_mf_url"),
+                    )
+            except Exception as e:
+                print(f"[MULTI_COLOR] job status->ready failed: {e}")
+
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
+    return jsonify(out)
