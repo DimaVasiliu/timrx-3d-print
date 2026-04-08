@@ -297,6 +297,8 @@ def _map_action_code(job_type: str) -> str:
         "texture": "MESHY_RETEXTURE",
         "retexture": "MESHY_RETEXTURE",
         "remesh": "MESHY_REFINE",
+        "multi_color_print": "MESHY_MULTI_COLOR_PRINT",
+        "multi-color-print": "MESHY_MULTI_COLOR_PRINT",
         "image": "OPENAI_IMAGE",
         "openai_image": "OPENAI_IMAGE",
     }
@@ -1976,7 +1978,15 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             obj_candidate = textured_model_urls.get("obj") or model_urls.get("obj") or status_data.get("obj_url")
             primary_model_source = glb_candidate or obj_candidate or rigged_glb_url
             primary_content_type = "model/gltf-binary"
-            if primary_model_source:
+
+            # Allow callers (e.g. multi_color_print) to override the content
+            # type when the URL extension doesn't reflect the real format
+            # (Meshy 3MF URLs are opaque and don't end in .3mf).
+            content_type_override = status_data.get("content_type_override")
+
+            if content_type_override:
+                primary_content_type = content_type_override
+            elif primary_model_source:
                 from backend.utils import get_content_type_from_url
 
                 primary_content_type = get_content_type_from_url(primary_model_source)

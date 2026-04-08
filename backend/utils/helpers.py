@@ -191,6 +191,8 @@ def get_extension_for_content_type(content_type: str) -> str:
         "model/vnd.usdz+zip": ".usdz",
         "model/obj": ".obj",
         "model/stl": ".stl",
+        "model/3mf": ".3mf",
+        "application/vnd.ms-package.3dmanufacturing-3dmodel+xml": ".3mf",
     }
     return ext_map.get(content_type, "")
 
@@ -204,6 +206,7 @@ def get_content_type_for_extension(ext: str) -> str:
         ".obj": "model/obj",
         ".stl": "model/stl",
         ".usdz": "model/vnd.usdz+zip",
+        ".3mf": "model/3mf",
         ".png": "image/png",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",

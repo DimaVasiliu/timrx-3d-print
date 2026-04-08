@@ -75,7 +75,9 @@ def _mark_finalized(job_id: str):
 def _normalize_multi_color_task(ms: dict) -> dict:
     """
     Normalize Meshy multi-color print response to standard frontend shape.
-    The multi-color endpoint returns a different structure than model tasks.
+
+    Meshy returns the 3MF URL inside ``model_urls.3mf`` (not ``three_mf_url``).
+    See: https://docs.meshy.ai/en/api/multi-color-print
     """
     status_raw = (ms.get("status") or "PENDING").upper()
     status_map = {
@@ -93,16 +95,33 @@ def _normalize_multi_color_task(ms: dict) -> dict:
     if status == "done":
         pct = 100
 
-    result = ms.get("result") or ms
+    # Meshy nests the result in different ways; try all known locations.
+    result = ms.get("result") if isinstance(ms.get("result"), dict) else ms
+
+    # ── Extract 3MF URL ─────────────────────────────────────────
+    # Primary: model_urls.3mf  (actual Meshy API response schema)
+    # Fallback: three_mf_url   (in case Meshy ever adds this alias)
+    model_urls = ms.get("model_urls") or result.get("model_urls") or {}
+    three_mf_url = (
+        model_urls.get("3mf")
+        or result.get("three_mf_url")
+        or ms.get("three_mf_url")
+    )
 
     out = {
-        "id": ms.get("id") or result.get("id"),
+        "id": ms.get("id") or (result.get("id") if isinstance(result, dict) else None),
         "status": status,
         "pct": pct,
         "stage": "multi_color_print",
-        "three_mf_url": result.get("three_mf_url") or ms.get("three_mf_url"),
-        "thumbnail_url": result.get("thumbnail_url") or ms.get("thumbnail_url"),
+        "three_mf_url": three_mf_url,
+        "model_urls": model_urls if model_urls else {"3mf": three_mf_url} if three_mf_url else {},
+        "thumbnail_url": (
+            result.get("thumbnail_url")
+            or ms.get("thumbnail_url")
+            or ms.get("cover_image_url")
+        ),
         "created_at": ms.get("created_at"),
+        "preceding_tasks": ms.get("preceding_tasks"),
     }
 
     if status == "failed":
@@ -337,20 +356,24 @@ def multi_color_status(job_id: str):
 
         # 2. Use the standard save pipeline: download 3MF from Meshy → S3,
         #    create models row + history_items row with S3 URLs.
-        #    Map three_mf_url → glb_url so the pipeline processes it.
+        #    We pass the 3MF URL as glb_url (the field the pipeline downloads)
+        #    and set content_type_override so S3 stores it as model/3mf with
+        #    the correct .3mf extension instead of .glb.
         s3_result = None
-        if out.get("three_mf_url"):
+        three_mf = out.get("three_mf_url")
+        if three_mf:
             try:
-                # Build a normalized status dict that save_finished_job_to_normalized_db expects
                 normalized_status = {
                     "id": job_id,
                     "status": "done",
                     "pct": 100,
                     "stage": "multi_color_print",
-                    "glb_url": out["three_mf_url"],  # Pipeline downloads this URL → S3
+                    "glb_url": three_mf,  # Pipeline downloads this URL → S3
                     "thumbnail_url": out.get("thumbnail_url") or "",
-                    "model_urls": {"3mf": out["three_mf_url"]},
+                    "model_urls": out.get("model_urls") or {"3mf": three_mf},
                     "created_at": out.get("created_at"),
+                    # Tell the save pipeline to use 3MF content type, not GLB
+                    "content_type_override": "model/3mf",
                 }
 
                 user_id = meta.get("identity_id") or meta.get("user_id") or identity_id
