@@ -59,7 +59,10 @@ def mesh_post(path: str, payload: dict) -> dict:
     url = f"{MESHY_API_BASE.rstrip('/')}{path}"
     r = requests.post(url, headers=_auth_headers(), json=payload, timeout=60)
     if not r.ok:
-        raise RuntimeError(f"POST {path} -> {r.status_code}: {r.text[:500]}")
+        detail = f"POST {path} -> {r.status_code}: {r.text[:500]}"
+        if r.status_code == 404:
+            raise MeshyTaskNotFoundError(detail)
+        raise RuntimeError(detail)
     return r.json()
 
 

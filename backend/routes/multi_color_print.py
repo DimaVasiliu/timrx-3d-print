@@ -13,6 +13,7 @@ Uses Meshy API:  POST /openapi/v1/print/multi-color
 
 from __future__ import annotations
 
+import json
 import time as _time
 import uuid
 
@@ -317,7 +318,32 @@ def multi_color_start():
 
     # -- Dispatch to Meshy --------------------------------------------
     try:
-        resp = mesh_post("/openapi/v1/print/multi-color", payload)
+        try:
+            resp = mesh_post("/openapi/v1/print/multi-color", payload)
+        except MeshyTaskNotFoundError as first_err:
+            # Some older TimrX rows resolve to a task ID that Meshy no longer
+            # accepts, while the saved GLB URL is still valid. Retry with
+            # model_url before failing/refunding.
+            fallback_url = original_model_url or model_url or ""
+            if not payload.get("input_task_id") or not fallback_url:
+                raise
+            fallback_source, fallback_err = build_source_payload(
+                {**body, "input_task_id": "", "model_url": fallback_url},
+                identity_id=identity_id,
+                prefer="model_url",
+            )
+            if fallback_err or not fallback_source or not fallback_source.get("model_url"):
+                print(f"[MULTI_COLOR] input_task_id rejected and model_url fallback unavailable: {fallback_err or first_err}")
+                raise first_err
+            payload = _build_multi_color_payload(fallback_source, max_colors, max_depth)
+            job_meta["source_task_id"] = ""
+            job_meta["source_model_url"] = fallback_url
+            job_meta["source_kind"] = "model_url"
+            log_event("print/multi-color:fallback-model-url", {
+                "original_input_task_id": original_input_task_id,
+                "reason": str(first_err)[:240],
+            })
+            resp = mesh_post("/openapi/v1/print/multi-color", payload)
         log_event("print/multi-color:meshy-resp", resp)
         meshy_task_id = resp.get("result") or resp.get("id")
         if not meshy_task_id:
@@ -338,12 +364,25 @@ def multi_color_start():
 
     # -- Link internal job to upstream Meshy task ---------------------
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
+    if job_meta.get("source_kind") == "model_url" and USE_DB:
+        try:
+            from backend.db import execute as _exec, Tables as _T
+            _exec(
+                f"UPDATE {_T.JOBS} SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb WHERE id = %s",
+                (json.dumps({
+                    "source_task_id": "",
+                    "source_model_url": job_meta.get("source_model_url") or "",
+                    "source_kind": "model_url",
+                }), internal_job_id),
+            )
+        except Exception as meta_err:
+            print(f"[MULTI_COLOR] failed to persist model_url fallback meta: {meta_err}")
 
     # -- Persist to in-memory store for metadata retrieval on poll -----
     store[meshy_task_id] = {
         "stage": "multi_color_print",
-        "source_task_id": input_task_id or "",
-        "source_model_url": original_model_url or model_url or "",
+        "source_task_id": job_meta.get("source_task_id") or "",
+        "source_model_url": job_meta.get("source_model_url") or "",
         "original_input_task_id": original_input_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
