@@ -565,7 +565,7 @@ def _find_and_claim_3d_job(upstream_id: str, new_status: str) -> Optional[Dict[s
     """
     Atomically find a 3D job by upstream_job_id and transition it.
 
-    Same as _find_and_claim_job but matches stage='3d' instead of 'video'.
+    Same as _find_and_claim_job but matches Meshy 3D stages instead of video.
     Returns the job row dict if the transition succeeded, or None if:
       - no job found for this upstream_id
       - job is already in a terminal or finalizing state (idempotent no-op)
@@ -588,7 +588,11 @@ def _find_and_claim_3d_job(upstream_id: str, new_status: str) -> Optional[Dict[s
                         meta = COALESCE(meta, '{{}}'::jsonb)
                                || %s::jsonb
                     WHERE upstream_job_id = %s
-                      AND stage = '3d'
+                      AND COALESCE(stage, '3d') IN (
+                          '3d', 'preview', 'image3d', 'refine', 'remesh',
+                          'texture', 'rig', 'animate', 'animation',
+                          'multi_color_print'
+                      )
                       AND status NOT IN ({excluded})
                     RETURNING id, identity_id, provider, reservation_id,
                               upstream_job_id, prompt, meta, action_code,
@@ -638,19 +642,25 @@ def _meshy_webhook_finalize_success(
         from backend.services.expense_guard import ExpenseGuard
 
         # Extract model URLs from the Meshy payload
-        model_urls = extract_model_urls(task_data)
+        glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, _ = extract_model_urls(task_data)
+        stage = (meta.get("stage") or "").lower()
+        is_multi_color = stage == "multi_color_print" or (task_data.get("type") or "").lower().replace("_", "-") == "print-multi-color"
+        three_mf_url = (model_urls or {}).get("3mf")
 
         # Build the status_out dict for the normalized DB saver
         status_out = {
             "status": "done",
-            "model_urls": model_urls.get("model_urls", {}),
-            "textured_model_urls": model_urls.get("textured_model_urls", {}),
-            "glb_url": model_urls.get("glb_url", ""),
-            "thumbnail_url": model_urls.get("thumbnail_url", ""),
+            "model_urls": model_urls or {},
+            "textured_model_urls": textured_model_urls or {},
+            "glb_url": three_mf_url if is_multi_color and three_mf_url else (glb_url or textured_glb_url or rigged_glb or ""),
+            "thumbnail_url": task_data.get("thumbnail_url") or task_data.get("cover_image_url") or "",
         }
+        if is_multi_color:
+            status_out["stage"] = "multi_color_print"
+            status_out["content_type_override"] = "model/3mf"
 
         # Determine the job type from meta
-        job_type = meta.get("task", "text-to-3d") or "text-to-3d"
+        job_type = "multi_color_print" if is_multi_color else (meta.get("task", "text-to-3d") or "text-to-3d")
 
         # Save to normalized DB tables (history/items/models/images)
         save_finished_job_to_normalized_db(

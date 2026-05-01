@@ -108,6 +108,38 @@ def _mark_finalized(job_id: str):
             del _finalized_jobs[k]
 
 
+def _fail_internal_job_after_delivery_error(job_id: str, meta: dict, reason: str, identity_id: str | None):
+    """Fail local job and release held credits when provider output cannot be kept."""
+    try:
+        reservation_id = meta.get("reservation_id")
+        internal_job_id = meta.get("internal_job_id")
+        if not internal_job_id and USE_DB:
+            from backend.db import query_one, Tables as _T
+            row = query_one(
+                f"SELECT id::text AS jid FROM {_T.JOBS} WHERE upstream_job_id = %s LIMIT 1",
+                (job_id,),
+            )
+            internal_job_id = row["jid"] if row else None
+
+        if reservation_id:
+            release_job_credits(reservation_id, reason, internal_job_id or job_id)
+
+        if internal_job_id and USE_DB:
+            from backend.db import execute as _exec, Tables as _T
+            _exec(
+                f"""UPDATE {_T.JOBS}
+                    SET status = 'failed',
+                        error_message = %s,
+                        finished_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND status NOT IN ('ready', 'succeeded', 'failed', 'refunded')""",
+                (reason[:500], internal_job_id),
+            )
+    except Exception as err:
+        print(f"[MULTI_COLOR] fail/release after delivery error failed job={job_id}: {err}")
+
+
 def _normalize_multi_color_task(ms: dict) -> dict:
     """
     Normalize Meshy multi-color print response to standard frontend shape.
@@ -167,6 +199,18 @@ def _normalize_multi_color_task(ms: dict) -> dict:
     return out
 
 
+def _build_multi_color_payload(source: dict, max_colors: int, max_depth: int) -> dict:
+    payload = {
+        "max_colors": max_colors,
+        "max_depth": max_depth,
+    }
+    if source.get("input_task_id"):
+        payload["input_task_id"] = source["input_task_id"]
+    elif source.get("model_url"):
+        payload["model_url"] = source["model_url"]
+    return payload
+
+
 @bp.route("/print/multi-color", methods=["POST", "OPTIONS"])
 @with_session
 def multi_color_start():
@@ -176,6 +220,8 @@ def multi_color_start():
     Body:
         input_task_id: str  -- Task ID from a prior 3D generation
                               (text-to-3d, image-to-3d, remesh, retexture)
+        model_url: str      -- Public model URL fallback when no usable Meshy
+                              task ID is available
         max_colors: int     -- Color palette size, 1-16 (default 4)
         max_depth: int      -- Quadtree depth for color precision, 3-6 (default 4)
     """
@@ -192,20 +238,23 @@ def multi_color_start():
     log_event("print/multi-color:incoming", body)
 
     # -- Source resolution --------------------------------------------
-    # Multi-color print requires input_task_id -- a completed Meshy task.
+    # Multi-color print accepts either input_task_id or model_url. Prefer a
+    # Meshy task ID when available so provider-side lineage is preserved.
     # Preserve the original frontend history ID before resolution (may differ
     # from the resolved Meshy task ID used for the API call).
     original_input_task_id = (body.get("input_task_id") or "").strip()
+    original_model_url = (body.get("model_url") or "").strip()
     source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
     input_task_id = source.get("input_task_id")
-    if not input_task_id:
+    model_url = source.get("model_url")
+    if not input_task_id and not model_url:
         return jsonify({
             "ok": False,
-            "error": "input_task_id required -- select a completed 3D model first.",
-            "code": "SOURCE_TASK_REQUIRED",
+            "error": "input_task_id or model_url required -- select a completed 3D model first.",
+            "code": "SOURCE_REQUIRED",
         }), 400
 
     # -- Validate parameters ------------------------------------------
@@ -222,15 +271,12 @@ def multi_color_start():
     max_depth = max(3, min(6, max_depth))
 
     # -- Build Meshy payload ------------------------------------------
-    payload = {
-        "input_task_id": input_task_id,
-        "max_colors": max_colors,
-        "max_depth": max_depth,
-    }
+    payload = _build_multi_color_payload(source, max_colors, max_depth)
 
     # -- Resolve source metadata for history lineage ------------------
     store = load_store()
-    source_meta = get_job_metadata(input_task_id, store) or {}
+    source_meta = get_job_metadata(input_task_id, store) if input_task_id else {}
+    source_meta = source_meta or {}
     original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = source_meta.get("root_prompt") or original_prompt
     title = source_meta.get("title") or original_prompt[:60] or "Multi-Color Print"
@@ -243,7 +289,8 @@ def multi_color_start():
         "root_prompt": root_prompt,
         "title": title,
         "stage": "multi_color_print",
-        "source_task_id": input_task_id,
+        "source_task_id": input_task_id or "",
+        "source_model_url": original_model_url or model_url or "",
         "original_input_task_id": original_input_task_id,
         "max_colors": max_colors,
         "max_depth": max_depth,
@@ -295,7 +342,8 @@ def multi_color_start():
     # -- Persist to in-memory store for metadata retrieval on poll -----
     store[meshy_task_id] = {
         "stage": "multi_color_print",
-        "source_task_id": input_task_id,
+        "source_task_id": input_task_id or "",
+        "source_model_url": original_model_url or model_url or "",
         "original_input_task_id": original_input_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
@@ -384,18 +432,7 @@ def multi_color_status(job_id: str):
             meta["identity_id"] = identity_id
             meta["user_id"] = identity_id
 
-        # 1. Finalize credits
-        try:
-            res_id = meta.get("reservation_id")
-            int_job = meta.get("internal_job_id") or job_id
-            cred_identity = meta.get("identity_id") or identity_id
-            if res_id:
-                finalize_job_credits(res_id, int_job, cred_identity)
-                _mark_finalized(job_id)
-        except Exception as e:
-            print(f"[MULTI_COLOR] credit finalize failed: {e}")
-
-        # 2. Upload the 3MF to S3 and create history/model rows.
+        # 1. Upload the 3MF to S3 and create history/model rows.
         #
         #    Key design: the 3MF is a print file (not viewable in Three.js),
         #    so we store the PARENT model's GLB as the viewable glb_url and
@@ -413,6 +450,7 @@ def multi_color_status(job_id: str):
                 parent_thumbnail = ""
                 parent_glb = ""
                 source_task = meta.get("source_task_id")  # resolved Meshy ID
+                source_model_url = meta.get("source_model_url") or ""
                 # The in-memory store is per-worker (gunicorn --workers 2),
                 # so we MUST also check the jobs table meta for the original ID.
                 _orig_input = (
@@ -420,7 +458,7 @@ def multi_color_status(job_id: str):
                     or store.get(job_id, {}).get("original_input_task_id")
                     or ""
                 )
-                if (source_task or _orig_input) and USE_DB:
+                if (source_task or _orig_input or source_model_url) and USE_DB:
                     try:
                         from backend.db import query_one, Tables as _Tp
                         _uid = meta.get("identity_id") or identity_id
@@ -473,6 +511,30 @@ def multi_color_status(job_id: str):
                             print(f"[MULTI_COLOR] Parent found: thumb={'yes' if parent_thumbnail else 'no'} glb={'yes' if parent_glb else 'no'}")
                         else:
                             print(f"[MULTI_COLOR] Parent not found for source_task={source_task} orig={_orig_input}")
+                        if not _parent and source_model_url:
+                            _parent = query_one(
+                                f"""SELECT glb_url, thumbnail_url
+                                    FROM {_Tp.HISTORY_ITEMS}
+                                    WHERE identity_id = %s
+                                      AND (glb_url = %s OR payload->>'glb_url' = %s OR payload->>'model_url' = %s)
+                                    ORDER BY created_at DESC
+                                    LIMIT 1""",
+                                (_uid, source_model_url, source_model_url, source_model_url),
+                            )
+                            if not _parent:
+                                _parent = query_one(
+                                    f"""SELECT glb_url, thumbnail_url
+                                        FROM {_Tp.MODELS}
+                                        WHERE identity_id = %s
+                                          AND (glb_url = %s OR meta->>'glb_url' = %s OR meta->>'model_url' = %s)
+                                        ORDER BY created_at DESC
+                                        LIMIT 1""",
+                                    (_uid, source_model_url, source_model_url, source_model_url),
+                                )
+                            if _parent:
+                                parent_thumbnail = _parent.get("thumbnail_url") or ""
+                                parent_glb = _parent.get("glb_url") or ""
+                                print(f"[MULTI_COLOR] Parent found by model_url: thumb={'yes' if parent_thumbnail else 'no'} glb={'yes' if parent_glb else 'no'}")
                     except Exception as pe:
                         print(f"[MULTI_COLOR] Parent lookup failed: {pe}")
 
@@ -568,6 +630,12 @@ def multi_color_status(job_id: str):
                     print(f"[MULTI_COLOR] Saved to S3+DB: job_id={job_id}")
                 else:
                     print(f"[MULTI_COLOR] save_finished_job_to_normalized_db returned: {s3_result}")
+                    _fail_internal_job_after_delivery_error(
+                        job_id, meta, "Multi-color print S3 save failed", identity_id
+                    )
+                    out["status"] = "failed"
+                    out["error"] = "SAVE_FAILED"
+                    out["message"] = "Multi-color print finished, but saving the 3MF failed. Credits were not captured."
             except Exception as e:
                 print(f"[MULTI_COLOR] S3/DB save failed: {e}")
                 import traceback
@@ -604,9 +672,31 @@ def multi_color_status(job_id: str):
                             print(f"[MULTI_COLOR] Refund after S3 failure failed: {re}")
                 except Exception as mark_err:
                     print(f"[MULTI_COLOR] Could not mark job as failed: {mark_err}")
+                out["status"] = "failed"
+                out["error"] = "SAVE_FAILED"
+                out["message"] = "Multi-color print finished, but saving the 3MF failed. Credits were not captured."
+        else:
+            _fail_internal_job_after_delivery_error(
+                job_id, meta, "Meshy multi-color print completed without a 3MF URL", identity_id
+            )
+            out["status"] = "failed"
+            out["error"] = "NO_3MF_URL"
+            out["message"] = "Meshy completed without returning a 3MF file."
 
-        # 3. Update internal job status -> "ready" (only if S3 save succeeded)
+        # 2. Finalize credits and update internal job status only after S3 save
+        # succeeds. This avoids charging for provider outputs we failed to keep.
         if s3_result and s3_result.get("success"):
+            try:
+                res_id = meta.get("reservation_id")
+                int_job = meta.get("internal_job_id") or job_id
+                cred_identity = meta.get("identity_id") or identity_id
+                if res_id:
+                    credit_result = finalize_job_credits(res_id, int_job, cred_identity)
+                    if isinstance(credit_result, dict) and credit_result.get("new_balance") is not None:
+                        out["new_balance"] = credit_result.get("new_balance")
+                _mark_finalized(job_id)
+            except Exception as e:
+                print(f"[MULTI_COLOR] credit finalize failed after S3 save: {e}")
             try:
                 int_job = meta.get("internal_job_id")
                 if not int_job and USE_DB:

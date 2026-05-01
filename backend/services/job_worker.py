@@ -771,15 +771,21 @@ def _finalize_meshy_success(
     from backend.services.status_cache import invalidate_status
 
     try:
-        model_urls = extract_model_urls(task_data)
+        glb_url, model_urls, textured_model_urls, textured_glb_url, rigged_glb, _ = extract_model_urls(task_data)
+        stage = (meta.get("stage") or "").lower()
+        is_multi_color = stage == "multi_color_print" or (task_data.get("type") or "").lower().replace("_", "-") == "print-multi-color"
+        three_mf_url = (model_urls or {}).get("3mf")
         status_out = {
             "status": "done",
-            "model_urls": model_urls.get("model_urls", {}),
-            "textured_model_urls": model_urls.get("textured_model_urls", {}),
-            "glb_url": model_urls.get("glb_url", ""),
-            "thumbnail_url": model_urls.get("thumbnail_url", ""),
+            "model_urls": model_urls or {},
+            "textured_model_urls": textured_model_urls or {},
+            "glb_url": three_mf_url if is_multi_color and three_mf_url else (glb_url or textured_glb_url or rigged_glb or ""),
+            "thumbnail_url": task_data.get("thumbnail_url") or task_data.get("cover_image_url") or "",
         }
-        job_type = meta.get("task", "text-to-3d")
+        if is_multi_color:
+            status_out["stage"] = "multi_color_print"
+            status_out["content_type_override"] = "model/3mf"
+        job_type = "multi_color_print" if is_multi_color else meta.get("task", "text-to-3d")
 
         save_finished_job_to_normalized_db(
             job_id=job_id, status_out=status_out,
@@ -793,11 +799,11 @@ def _finalize_meshy_success(
             except Exception as e:
                 print(f"[JOB] meshy credit finalize error job={job_id}: {e}")
 
-        glb_url = model_urls.get("glb_url", "")
-        thumb_url = model_urls.get("thumbnail_url", "")
+        result_url = status_out.get("glb_url", "")
+        thumb_url = status_out.get("thumbnail_url", "")
 
         _transition_job(job_id, "ready", {
-            "result_url": glb_url,
+            "result_url": result_url,
             "thumbnail_url": thumb_url,
             "claimed_by": None,
             "claimed_at": None,

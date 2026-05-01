@@ -1731,6 +1731,13 @@ def save_failed_video_to_history(
         traceback.print_exc()
         return None
 
+def _primary_model_url_key(primary_content_type: str) -> str:
+    if primary_content_type == "model/obj":
+        return "obj"
+    if primary_content_type in ("model/3mf", "application/vnd.ms-package.3dmanufacturing-3dmodel+xml"):
+        return "3mf"
+    return "glb"
+
 
 def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta: dict, job_type: str = "model", user_id: str | None = None):
     """
@@ -2067,7 +2074,7 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             model_urls_uploaded = {}
             textured_model_urls_uploaded = {}
             if final_glb_url:
-                primary_ext = "obj" if primary_content_type == "model/obj" else "glb"
+                primary_ext = _primary_model_url_key(primary_content_type)
                 model_urls_uploaded[primary_ext] = final_glb_url
                 if textured_glb_url and primary_ext == "glb":
                     textured_model_urls_uploaded["glb"] = final_glb_url
