@@ -62,6 +62,7 @@ def print_check(job_id: str):
 
     body = request.get_json(silent=True) or {}
     printer_type = body.get("printer_type", "fdm")  # "fdm" or "resin"
+    fallback_model_url = (body.get("model_url") or "").strip()
 
     if not USE_DB:
         return jsonify({"error": "Database not configured"}), 503
@@ -136,6 +137,13 @@ def print_check(job_id: str):
                         model_url = row[0] if isinstance(row, tuple) else row.get("model_url")
     except Exception as e:
         return jsonify({"error": f"Database lookup failed: {e}"}), 500
+
+    if not model_url and fallback_model_url:
+        # Manual paint/remesh history cards can already have a valid S3/Meshy
+        # GLB URL even when the DB lookup by display id misses. The analysis
+        # service still enforces the model-domain allowlist and private-IP
+        # protection before downloading, so this remains SSRF-safe.
+        model_url = fallback_model_url
 
     if not model_url:
         return jsonify({"error": "Model not found or no printable model URL available"}), 404
