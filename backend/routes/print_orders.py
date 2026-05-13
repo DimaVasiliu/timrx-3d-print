@@ -16,12 +16,13 @@ import json
 import re
 from typing import Any, Dict
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, g, jsonify, redirect, request
 
 from backend.config import config
-from backend.middleware import require_session
-from backend.services import print_order_service
+from backend.middleware import require_admin, require_session
+from backend.services import print_order_service, s3_service
 from backend.services.paypal_service import PayPalService
+from backend.services.print_order_archive import get_admin_download_target
 from backend.services.print_order_pricing import compute as compute_price, PriceError, pick_currency
 
 bp = Blueprint("print_orders", __name__)
@@ -168,7 +169,11 @@ def create():
     except print_order_service.PrintOrderError as e:
         return _err("ORDER_FAILED", str(e), 400)
     except Exception as e:
-        print(f"[PRINT-ORDER] create unexpected error: {e}")
+        import traceback
+        print(
+            f"[PRINT-ORDER] create unexpected error: {type(e).__name__}: {e!r}\n"
+            f"{traceback.format_exc()}"
+        )
         return _err("ORDER_FAILED", "Could not create order", 500)
 
     return jsonify({
@@ -231,6 +236,38 @@ def webhook_mollie():
         return jsonify({"ok": True, "swallowed": True}), 200
 
     return jsonify(result), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# GET /api/print-orders/admin/<id>/download?type=glb|stl|thumb
+# Admin-only download — 302 to a 1-hour presigned S3 URL.
+# ─────────────────────────────────────────────────────────────
+@bp.route("/admin/<order_ref>/download", methods=["GET"])
+@require_admin
+def admin_download(order_ref: str):
+    kind = (request.args.get("type") or "glb").lower()
+    if kind not in ("glb", "stl", "thumb"):
+        return _err("BAD_TYPE", "type must be glb|stl|thumb", 400)
+
+    target = get_admin_download_target(order_ref, kind)
+    if not target:
+        return _err("NOT_FOUND", f"No archived {kind} for this order", 404)
+
+    s3_key, _content_type, filename = target
+    # Presign with response-content-disposition so the browser saves it
+    # with our chosen filename.
+    try:
+        url = s3_service.presign_s3_key(s3_key, expires_in=3600)
+    except Exception as e:
+        print(f"[PRINT-ORDER] presign failed for {s3_key}: {e}")
+        return _err("PRESIGN_FAILED", "Could not generate download URL", 500)
+    if not url:
+        return _err("PRESIGN_FAILED", "S3 not configured", 500)
+
+    # Append disposition hint to the presigned URL (S3 honors this param)
+    sep = "&" if "?" in url else "?"
+    url = f"{url}{sep}response-content-disposition=attachment%3B%20filename%3D{filename}"
+    return redirect(url, code=302)
 
 
 # ─────────────────────────────────────────────────────────────

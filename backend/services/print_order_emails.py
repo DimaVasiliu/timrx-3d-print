@@ -8,7 +8,35 @@ Two emails fire on successful payment (via webhook):
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+from backend.config import config
+
+try:
+    from backend.services import s3_service
+except Exception:
+    s3_service = None  # type: ignore
+
+
+def _admin_download_url(order: Dict[str, Any], kind: str) -> Optional[str]:
+    """Build the admin-auth download URL for an archived order file."""
+    if not order.get(f"archived_{kind}_key"):
+        return None
+    base = (config.PUBLIC_BASE_URL or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/api/print-orders/admin/{order.get('order_number')}/download?type={kind}"
+
+
+def _presigned_thumb_url(order: Dict[str, Any]) -> Optional[str]:
+    """Return a 7-day presigned URL to the thumbnail for inline <img> in email."""
+    key = order.get("archived_thumb_key")
+    if not key or not s3_service:
+        return None
+    try:
+        return s3_service.presign_s3_key(key, expires_in=7 * 24 * 3600)
+    except Exception:
+        return None
 
 
 def _esc(s: Any) -> str:
@@ -153,7 +181,8 @@ def admin_email(order: Dict[str, Any]) -> Dict[str, str]:
         f"Order <strong>{_esc(order_number)}</strong> · "
         f"Paid <strong>{_esc(total)}</strong>"
         f"</p>"
-        + _section("Model", _model_rows(order))
+        + _model_card(order)
+        + _downloads_block(order)
         + _section("Print specification", _spec_rows(order))
         + _section("Shipping", _shipping_rows(order))
         + _section("Payment", _payment_rows(order))
@@ -172,16 +201,100 @@ def admin_email(order: Dict[str, Any]) -> Dict[str, str]:
     return {"subject": subject, "html": html, "text": text}
 
 
-def _model_rows(order: Dict[str, Any]) -> str:
-    return (
-        _row("Name", _esc(order.get("model_name") or "Untitled model"))
-        + _row(
-            "GLB",
-            f"<a href='{_esc(order.get('model_glb_url') or '#')}' "
-            f"style='color:#0ea5e9;text-decoration:none;'>Open file ↗</a>"
-            if order.get("model_glb_url") else "—",
+def _model_card(order: Dict[str, Any]) -> str:
+    """Model summary card with embedded thumbnail (if archived)."""
+    name = _esc(order.get("model_name") or "Untitled model")
+    model_id = _esc(order.get("model_id") or "—")
+    thumb_url = _presigned_thumb_url(order)
+
+    thumb_html = ""
+    if thumb_url:
+        thumb_html = (
+            f"<td style='padding:0 14px 0 0;vertical-align:top;width:120px;'>"
+            f"<img src='{_esc(thumb_url)}' alt='Model preview' width='120' height='120' "
+            f"style='display:block;width:120px;height:120px;object-fit:cover;border-radius:10px;"
+            f"border:1px solid #e5e7eb;background:#0a0a0a;'/>"
+            f"</td>"
         )
-        + _row("Model ID", _esc(order.get("model_id") or "—"))
+
+    meta_rows = (
+        _row("Name", name)
+        + _row("Model ID", model_id)
+    )
+
+    return (
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+        f"style='border:1px solid #e5e7eb;border-radius:10px;margin:10px 0;'>"
+        f"<tr><td style='padding:12px 16px;background:#f9fafb;border-bottom:1px solid #e5e7eb;"
+        f"font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#0ea5e9;font-weight:700;'>"
+        f"Model</td></tr>"
+        f"<tr><td style='padding:14px 16px;'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'>"
+        f"<tr>{thumb_html}"
+        f"<td style='vertical-align:top;'>"
+        f"<table role='presentation' width='100%' cellpadding='0' cellspacing='0'>{meta_rows}</table>"
+        f"</td></tr></table>"
+        f"</td></tr>"
+        f"</table>"
+    )
+
+
+def _downloads_block(order: Dict[str, Any]) -> str:
+    """Big GLB + STL download buttons that hit the admin-auth endpoint."""
+    glb_url = _admin_download_url(order, "glb")
+    stl_url = _admin_download_url(order, "stl")
+    err = order.get("archived_glb_key") is None  # archive failed entirely
+
+    if not glb_url and not stl_url:
+        # No archived files — fall back to the (possibly expiring) source URL.
+        src = order.get("model_glb_url")
+        if not src:
+            return ""
+        return (
+            "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+            "style='border:1px solid #fcd34d;border-radius:10px;margin:10px 0;background:#fffbeb;'>"
+            "<tr><td style='padding:12px 16px;font-size:12px;color:#92400e;line-height:1.55;'>"
+            "<strong>⚠️ Model archive failed.</strong> Use this temporary link "
+            f"(may expire): <a href='{_esc(src)}' style='color:#0ea5e9;'>{_esc(src[:80])}</a>"
+            "</td></tr></table>"
+        )
+
+    btn_style = (
+        "display:inline-block;padding:12px 22px;border-radius:10px;text-decoration:none;"
+        "font-weight:700;font-size:13px;letter-spacing:0.01em;"
+    )
+    glb_btn = (
+        f"<a href='{_esc(glb_url)}' style='{btn_style}"
+        f"background:#0ea5e9;color:#fff;margin-right:10px;'>⬇ Download GLB</a>"
+        if glb_url else ""
+    )
+    stl_btn = (
+        f"<a href='{_esc(stl_url)}' style='{btn_style}"
+        f"background:#0f172a;color:#fff;border:1px solid #334155;'>⬇ Download STL (ready for slicer)</a>"
+        if stl_url else ""
+    )
+
+    warn = ""
+    if not stl_url and not err:
+        warn = (
+            "<p style='margin:10px 0 0;font-size:11px;color:#92400e;'>"
+            "Note: STL conversion failed — convert from GLB manually in Blender or your slicer."
+            "</p>"
+        )
+
+    return (
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+        "style='border:1px solid #e5e7eb;border-radius:10px;margin:10px 0;background:#f8fafc;'>"
+        "<tr><td style='padding:14px 16px;'>"
+        "<p style='margin:0 0 10px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;"
+        "color:#0ea5e9;font-weight:700;'>Model files</p>"
+        f"{glb_btn}{stl_btn}"
+        "<p style='margin:10px 0 0;font-size:11px;color:#64748b;line-height:1.5;'>"
+        "Files are archived in TimrX S3 and downloadable indefinitely. "
+        "Links require your admin session (open in the same browser you use for the dashboard)."
+        "</p>"
+        f"{warn}"
+        "</td></tr></table>"
     )
 
 

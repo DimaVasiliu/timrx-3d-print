@@ -37,8 +37,10 @@ MOLLIE_API_BASE = "https://api.mollie.com/v2"
 # Helpers
 # ─────────────────────────────────────────────────────────────
 def _next_order_number(cur) -> str:
-    cur.execute("SELECT nextval('timrx_billing.print_order_number_seq')")
-    n = cur.fetchone()[0]
+    cur.execute("SELECT nextval('timrx_billing.print_order_number_seq') AS n")
+    row = cur.fetchone()
+    # Cursor uses dict_row by default; fall back to positional if not.
+    n = row["n"] if isinstance(row, dict) else row[0]
     return f"TX-PR-{int(n):06d}"
 
 
@@ -303,15 +305,10 @@ def mark_paid_and_notify(
         # Already paid (idempotent webhook redelivery) or order not found.
         return None
 
-    cols = [
-        "id", "identity_id", "customer_email", "order_number", "status",
-        "model_id", "model_name", "model_glb_url", "model_thumb_url",
-        "spec", "shipping", "currency",
-        "subtotal_cents", "shipping_cents", "total_cents", "estimate",
-        "payment_provider", "provider_payment_id", "paid_at",
-    ]
-    order = dict(zip(cols, row))
-    # JSONB columns come back as dicts already (psycopg) — but be defensive.
+    # Cursor uses dict_row by default — row is a Mapping.
+    order: Dict[str, Any] = dict(row) if not isinstance(row, dict) else dict(row)
+
+    # JSONB columns come back as dicts already (psycopg) — be defensive against str.
     for k in ("spec", "shipping", "estimate"):
         if isinstance(order.get(k), (bytes, str)):
             try:
@@ -319,28 +316,26 @@ def mark_paid_and_notify(
             except Exception:
                 order[k] = {}
 
-    # Decorate for templates
+    # Decorate for templates.  'shipping' is the address dict; the cost lives
+    # in shipping_cents — surface both, keyed distinctly.
     est = order.get("estimate") or {}
-    order["subtotal"]      = float(order["subtotal_cents"]) / 100.0
-    order["shipping"]      = est.get("shipping", float(order["shipping_cents"]) / 100.0)
-    order["total"]         = float(order["total_cents"]) / 100.0
-    order["material_label"] = est.get("material_label")
-    order["color_label"]    = est.get("color_label")
+    order["subtotal"]        = float(order["subtotal_cents"]) / 100.0
+    order["shipping_amount"] = float(order["shipping_cents"]) / 100.0
+    order["total"]           = float(order["total_cents"]) / 100.0
+    order["material_label"]  = est.get("material_label")
+    order["color_label"]     = est.get("color_label")
 
-    # Restore the shipping address dict (we overwrote above for total)
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"SELECT shipping FROM {Tables.PRINT_ORDERS} WHERE id = %s",
-                (order_id,),
-            )
-            shp = cur.fetchone()
-    order["shipping"] = (shp[0] if shp else {}) or {}
-    # We need a dedicated key for the shipping cost amount, separate from address
-    order["shipping_amount"] = est.get("shipping", float(order["shipping_cents"]) / 100.0)
-    # Compatibility: template helpers read order.get('shipping') as address dict
-    # and order.get('shipping', 0) as cost — fix by aliasing for totals helper.
-    order["__shipping_cost"] = order["shipping_amount"]
+    # Archive the model file + thumb to S3 BEFORE emails so the admin links
+    # are permanent (Meshy URLs can expire). Best-effort: emails still go out
+    # even if archiving fails — admin will see archive_error in the row.
+    try:
+        from backend.services.print_order_archive import archive_for_order
+        arch = archive_for_order(order_id)
+        order["archived_glb_key"]   = arch.get("glb_key")
+        order["archived_stl_key"]   = arch.get("stl_key")
+        order["archived_thumb_key"] = arch.get("thumb_key")
+    except Exception as e:
+        print(f"[PRINT-ORDER] archive failed for {order_id}: {e}")
 
     # Send emails (best-effort, never raise)
     _send_admin_email(order)
@@ -466,7 +461,7 @@ def handle_paypal_webhook(event: Dict[str, Any]) -> Dict[str, Any]:
             row = cur.fetchone()
     if not row:
         return {"ok": True, "ignored": True, "reason": "unknown order_number"}
-    order_id = str(row[0])
+    order_id = str(row["id"] if isinstance(row, dict) else row[0])
 
     if event_type in ("CHECKOUT.ORDER.APPROVED", "PAYMENT.CAPTURE.COMPLETED"):
         result = mark_paid_and_notify(order_id, "paypal", paypal_order_id or invoice_id)
@@ -500,16 +495,17 @@ def get_order_public(order_id_or_number: str, identity_id: str) -> Optional[Dict
             row = cur.fetchone()
     if not row:
         return None
+    r = dict(row)
     return {
-        "id":           str(row[0]),
-        "order_number": row[1],
-        "status":       row[2],
-        "total":        float(row[3]) / 100.0,
-        "currency":     row[4],
-        "provider":     row[5],
-        "checkout_url": row[6],
-        "paid_at":      row[7].isoformat() if row[7] else None,
-        "created_at":   row[8].isoformat() if row[8] else None,
+        "id":           str(r["id"]),
+        "order_number": r["order_number"],
+        "status":       r["status"],
+        "total":        float(r["total_cents"]) / 100.0,
+        "currency":     r["currency"],
+        "provider":     r["payment_provider"],
+        "checkout_url": r["checkout_url"],
+        "paid_at":      r["paid_at"].isoformat() if r.get("paid_at") else None,
+        "created_at":   r["created_at"].isoformat() if r.get("created_at") else None,
     }
 
 
@@ -529,15 +525,16 @@ def list_my_orders(identity_id: str, limit: int = 20) -> List[Dict[str, Any]]:
             )
             rows = cur.fetchall()
     out = []
-    for r in rows:
+    for raw in rows:
+        r = dict(raw)
         out.append({
-            "id":           str(r[0]),
-            "order_number": r[1],
-            "status":       r[2],
-            "total":        float(r[3]) / 100.0,
-            "currency":     r[4],
-            "provider":     r[5],
-            "created_at":   r[6].isoformat() if r[6] else None,
-            "paid_at":      r[7].isoformat() if r[7] else None,
+            "id":           str(r["id"]),
+            "order_number": r["order_number"],
+            "status":       r["status"],
+            "total":        float(r["total_cents"]) / 100.0,
+            "currency":     r["currency"],
+            "provider":     r["payment_provider"],
+            "created_at":   r["created_at"].isoformat() if r.get("created_at") else None,
+            "paid_at":      r["paid_at"].isoformat() if r.get("paid_at") else None,
         })
     return out

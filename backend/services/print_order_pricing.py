@@ -45,11 +45,12 @@ SPEED_FEE_USD = {"standard": 0, "express": 18, "priority": 42}
 SHIP_BASE_USD = {"US": 9, "CA": 14, "GB": 14, "EU": 16, "AU": 22, "JP": 22, "OTHER": 28}
 BASE_FEE_USD = 6.50
 
-# Currency mapping: USD for US/CA/AU, EUR for everyone else.
+# Currency mapping by shipping country.
 USD_COUNTRIES = {"US", "CA", "AU"}
+GBP_COUNTRIES = {"GB"}
 
 # Naive FX from USD baseline.  Adjust quarterly or wire to an FX API.
-FX_FROM_USD = {"USD": 1.0, "EUR": 0.92}
+FX_FROM_USD = {"USD": 1.0, "EUR": 0.92, "GBP": 0.79}
 
 
 class PriceError(ValueError):
@@ -80,8 +81,11 @@ class PriceBreakdown:
 
 def pick_currency(country: Optional[str]) -> str:
     """Auto-detect currency from shipping country."""
-    if country and country.upper() in USD_COUNTRIES:
+    c = (country or "").upper()
+    if c in USD_COUNTRIES:
         return "USD"
+    if c in GBP_COUNTRIES:
+        return "GBP"
     return "EUR"
 
 
