@@ -81,6 +81,20 @@ def image_to_3d_start_mod():
         "enable_pbr": True,
     }
 
+    if body.get("should_texture") is not None:
+        payload["should_texture"] = bool(body.get("should_texture"))
+    if body.get("enable_pbr") is not None:
+        payload["enable_pbr"] = bool(body.get("enable_pbr"))
+    if body.get("hd_texture") is not None and ai_model != "meshy-5":
+        payload["hd_texture"] = bool(body.get("hd_texture"))
+
+    texture_prompt = (body.get("texture_prompt") or "").strip()
+    texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip()
+    if texture_prompt:
+        payload["texture_prompt"] = texture_prompt
+    elif texture_image_url:
+        payload["texture_image_url"] = texture_image_url
+
     # ── Meshy 6+ parameters for print-quality control ──────────────
     # should_remesh defaults to false in Meshy 6 / "latest", which
     # preserves the highest-precision triangular mesh.  We intentionally
@@ -94,8 +108,14 @@ def image_to_3d_start_mod():
         topo = (body.get("topology") or "").strip().lower()
         if topo in ("triangle", "quad"):
             payload["topology"] = topo
+        try:
+            decimation_mode = int(body.get("decimation_mode"))
+            if decimation_mode in {1, 2, 3, 4}:
+                payload["decimation_mode"] = decimation_mode
+        except (TypeError, ValueError):
+            pass
         tpc = body.get("target_polycount")
-        if tpc is not None:
+        if tpc is not None and "decimation_mode" not in payload:
             try:
                 tpc = int(tpc)
                 if 100 <= tpc <= 300000:
@@ -103,11 +123,51 @@ def image_to_3d_start_mod():
             except (ValueError, TypeError):
                 pass
 
+    model_type = (body.get("model_type") or "").strip().lower()
+    if model_type in {"standard", "lowpoly"}:
+        payload["model_type"] = model_type
+
     # image_enhancement — let Meshy optimize the input image or keep
     # the original.  Default is unset (Meshy decides).
     img_enhance = body.get("image_enhancement")
     if img_enhance is not None:
         payload["image_enhancement"] = bool(img_enhance)
+
+    remove_lighting = body.get("remove_lighting")
+    if remove_lighting is not None and ai_model != "meshy-5":
+        payload["remove_lighting"] = bool(remove_lighting)
+
+    moderation = body.get("moderation")
+    if moderation is not None:
+        payload["moderation"] = bool(moderation)
+
+    raw_target_formats = body.get("target_formats")
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
+    target_formats = []
+    if isinstance(raw_target_formats, str):
+        raw_target_formats = [raw_target_formats]
+    if isinstance(raw_target_formats, list):
+        seen_formats = set()
+        for item in raw_target_formats:
+            value = str(item or "").strip().lower()
+            if not value or value not in allowed_target_formats or value in seen_formats:
+                continue
+            seen_formats.add(value)
+            target_formats.append(value)
+    if target_formats:
+        if "glb" not in target_formats:
+            target_formats.insert(0, "glb")
+        payload["target_formats"] = target_formats
+
+    auto_size = None
+    if body.get("auto_size") is not None:
+        auto_size = bool(body.get("auto_size"))
+        payload["auto_size"] = auto_size
+    origin_at = (body.get("origin_at") or "").strip().lower()
+    if auto_size and origin_at in {"bottom", "center"}:
+        payload["origin_at"] = origin_at
+    if auto_size and body.get("multi_view_thumbnails") is not None:
+        payload["multi_view_thumbnails"] = bool(body.get("multi_view_thumbnails"))
 
     store_meta = {
         "stage": "image3d",
@@ -124,6 +184,16 @@ def image_to_3d_start_mod():
         "source_task_id": source_image_history_id,
         "should_remesh": bool(payload.get("should_remesh", False)),
         "image_enhancement": payload.get("image_enhancement"),
+        "model_type": payload.get("model_type"),
+        "decimation_mode": payload.get("decimation_mode"),
+        "target_formats": payload.get("target_formats") or [],
+        "auto_size": bool(payload.get("auto_size")),
+        "origin_at": payload.get("origin_at"),
+        "multi_view_thumbnails": bool(payload.get("multi_view_thumbnails")),
+        "hd_texture": bool(payload.get("hd_texture")),
+        "remove_lighting": payload.get("remove_lighting"),
+        "texture_prompt": payload.get("texture_prompt"),
+        "texture_style_mode": "text" if texture_prompt else ("image" if texture_image_url else None),
     }
 
     # Persist immediately so status polling can return queued while dispatch runs

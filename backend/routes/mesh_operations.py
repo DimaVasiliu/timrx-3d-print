@@ -104,16 +104,34 @@ def mesh_remesh_mod():
     if topology in {"triangle", "quad"}:
         payload["topology"] = topology
     try:
+        decimation_mode = int(body.get("decimation_mode"))
+        if decimation_mode in {1, 2, 3, 4}:
+            payload["decimation_mode"] = decimation_mode
+    except Exception:
+        pass
+    try:
         tp = int(body.get("target_polycount"))
-        if tp > 0:
+        if tp > 0 and "decimation_mode" not in payload:
             payload["target_polycount"] = tp
     except Exception:
         pass
 
+    auto_size = False
+    if body.get("auto_size") is not None:
+        auto_size = bool(body.get("auto_size"))
+        payload["auto_size"] = auto_size
+
     try:
         rh = float(body.get("resize_height"))
-        if rh > 0:
+        if rh > 0 and not auto_size:
             payload["resize_height"] = rh
+    except Exception:
+        pass
+
+    try:
+        rls = float(body.get("resize_longest_side"))
+        if rls > 0 and not auto_size and "resize_height" not in payload:
+            payload["resize_longest_side"] = rls
     except Exception:
         pass
 
@@ -178,8 +196,11 @@ def mesh_remesh_mod():
         "source_task_id": source_task_id,  # Use resolved ID
         "topology": payload.get("topology"),
         "target_polycount": payload.get("target_polycount"),
+        "decimation_mode": payload.get("decimation_mode"),
         "target_formats": target_formats,
         "resize_height": payload.get("resize_height"),
+        "resize_longest_side": payload.get("resize_longest_side"),
+        "auto_size": bool(payload.get("auto_size")),
         "origin_at": payload.get("origin_at"),
         "convert_format_only": convert_format_only,
         "print_height_mm": print_height_mm,
@@ -232,8 +253,11 @@ def mesh_remesh_mod():
         "title": title,
         "topology": payload.get("topology"),
         "target_polycount": payload.get("target_polycount"),
+        "decimation_mode": payload.get("decimation_mode"),
         "target_formats": target_formats,
         "resize_height": payload.get("resize_height"),
+        "resize_longest_side": payload.get("resize_longest_side"),
+        "auto_size": bool(payload.get("auto_size")),
         "origin_at": payload.get("origin_at"),
         "convert_format_only": convert_format_only,
         "print_height_mm": print_height_mm,
@@ -507,9 +531,10 @@ def mesh_retexture_mod():
     enable_pbr = bool(body.get("enable_pbr", False))
     remove_lighting = bool(body.get("remove_lighting", True))
     ai_model = (body.get("ai_model") or "").strip() or "latest"
+    hd_texture = bool(body.get("hd_texture", False)) if ai_model != "meshy-5" else False
 
     raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz"}
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
     target_formats = []
     if isinstance(raw_target_formats, str):
         raw_target_formats = [raw_target_formats]
@@ -551,6 +576,7 @@ def mesh_retexture_mod():
         "enable_pbr": enable_pbr,
         "enable_original_uv": enable_original_uv,
         "remove_lighting": remove_lighting,
+        "hd_texture": hd_texture,
         "target_formats": target_formats,
         "ai_model": ai_model,
     }
@@ -577,6 +603,8 @@ def mesh_retexture_mod():
         "enable_pbr": enable_pbr,
         "remove_lighting": remove_lighting,
     }
+    if hd_texture:
+        payload["hd_texture"] = hd_texture
     if prompt:
         payload["text_style_prompt"] = prompt
     if style_img:

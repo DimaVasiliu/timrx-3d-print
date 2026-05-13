@@ -354,9 +354,13 @@ def text_to_3d_refine_mod():
                         )
                         hi_row = cur.fetchone()
                         if hi_row and hi_row.get("resolved_id"):
-                            preview_task_id = hi_row["resolved_id"]
-                            resolved = True
-                            print(f"[REFINE_RESOLVE] fallback history_items lookup: {preview_task_id_input} -> {preview_task_id}")
+                            history_candidate = hi_row["resolved_id"]
+                            preview_task_id = resolve_meshy_job_id(history_candidate)
+                            resolved = preview_task_id != preview_task_id_input
+                            print(
+                                f"[REFINE_RESOLVE] fallback history_items lookup: "
+                                f"{preview_task_id_input} -> {history_candidate} -> {preview_task_id}"
+                            )
 
                     if not resolved:
                         # Input might be a Meshy task ID that's valid on the provider side
@@ -393,12 +397,25 @@ def text_to_3d_refine_mod():
         try:
             upstream = mesh_get(f"/openapi/v2/text-to-3d/{preview_task_id}")
             upstream_status = (upstream.get("status") or "").upper()
-            print(f"[REFINE:PREFLIGHT] task_id={preview_task_id} status={upstream_status}")
+            upstream_type = (upstream.get("type") or "").lower()
+            print(f"[REFINE:PREFLIGHT] task_id={preview_task_id} status={upstream_status} type={upstream_type}")
             if upstream_status == "FAILED":
                 return jsonify({
                     "ok": False,
                     "error": "Preview task not found — the preview generation failed. Please generate a new preview first.",
                     "code": "PREVIEW_FAILED_UPSTREAM",
+                }), 400
+            if upstream_status != "SUCCEEDED":
+                return jsonify({
+                    "ok": False,
+                    "error": "Preview task is not ready yet. Please wait for preview generation to finish before refining.",
+                    "code": "PREVIEW_NOT_READY",
+                }), 400
+            if upstream_type and upstream_type != "text-to-3d-preview":
+                return jsonify({
+                    "ok": False,
+                    "error": "Only Text to 3D preview tasks can be refined. Select the original preview result first.",
+                    "code": "NOT_TEXT_TO_3D_PREVIEW",
                 }), 400
         except MeshyTaskNotFoundError:
             print(f"[REFINE:PREFLIGHT] task_id={preview_task_id} EXPIRED (404 from provider)")
@@ -424,7 +441,25 @@ def text_to_3d_refine_mod():
     remove_lighting = None
     if body.get("remove_lighting") is not None:
         remove_lighting = bool(body.get("remove_lighting"))
-    texture_style_mode = "image" if texture_image_url else "text"
+    hd_texture = None
+    if body.get("hd_texture") is not None and ai_model != "meshy-5":
+        hd_texture = bool(body.get("hd_texture"))
+    raw_target_formats = body.get("target_formats")
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
+    target_formats = []
+    if isinstance(raw_target_formats, str):
+        raw_target_formats = [raw_target_formats]
+    if isinstance(raw_target_formats, list):
+        seen_formats = set()
+        for item in raw_target_formats:
+            value = str(item or "").strip().lower()
+            if not value or value not in allowed_target_formats or value in seen_formats:
+                continue
+            seen_formats.add(value)
+            target_formats.append(value)
+    if target_formats and "glb" not in target_formats:
+        target_formats.insert(0, "glb")
+    texture_style_mode = "text" if texture_prompt else ("image" if texture_image_url else "text")
     # Derive title from prompt/root_prompt - derive_display_title handles generic titles automatically
     explicit_title = body.get("title") or preview_meta.get("title")
     title = derive_display_title(original_prompt, explicit_title, root_prompt=root_prompt)
@@ -446,6 +481,10 @@ def text_to_3d_refine_mod():
         job_meta["texture_prompt"] = texture_prompt
     if remove_lighting is not None:
         job_meta["remove_lighting"] = remove_lighting
+    if hd_texture is not None:
+        job_meta["hd_texture"] = hd_texture
+    if target_formats:
+        job_meta["target_formats"] = target_formats
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
@@ -459,10 +498,14 @@ def text_to_3d_refine_mod():
     }
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
-    if texture_image_url:
+    elif texture_image_url:
         payload["texture_image_url"] = texture_image_url
     if remove_lighting is not None:
         payload["remove_lighting"] = remove_lighting
+    if hd_texture is not None:
+        payload["hd_texture"] = hd_texture
+    if target_formats:
+        payload["target_formats"] = target_formats
 
     store_meta = {
         "stage": "refine",
@@ -476,6 +519,8 @@ def text_to_3d_refine_mod():
         "ai_model": ai_model,
         "texture_style_mode": texture_style_mode,
         "uses_image_style": texture_style_mode == "image",
+        "hd_texture": bool(hd_texture),
+        "target_formats": target_formats,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
