@@ -417,6 +417,41 @@ class Config:
         return "test"
 
     # ─────────────────────────────────────────────────────────────
+    # PayPal (used for print-on-demand orders)
+    # ─────────────────────────────────────────────────────────────
+    PAYPAL_CLIENT_ID: str = field(default_factory=lambda: _get_env("PAYPAL_CLIENT_ID"))
+    PAYPAL_CLIENT_SECRET: str = field(default_factory=lambda: _get_env("PAYPAL_CLIENT_SECRET"))
+    PAYPAL_WEBHOOK_ID: str = field(default_factory=lambda: _get_env("PAYPAL_WEBHOOK_ID"))
+    PAYPAL_ENV: str = field(default_factory=lambda: _get_env("PAYPAL_ENV", "sandbox").lower())
+
+    @property
+    def PAYPAL_CONFIGURED(self) -> bool:
+        """True if PayPal is configured."""
+        return bool(self.PAYPAL_CLIENT_ID and self.PAYPAL_CLIENT_SECRET)
+
+    @property
+    def PAYPAL_API_BASE(self) -> str:
+        """PayPal REST API base URL (live or sandbox)."""
+        if self.PAYPAL_ENV == "live":
+            return "https://api-m.paypal.com"
+        return "https://api-m.sandbox.paypal.com"
+
+    # ─────────────────────────────────────────────────────────────
+    # Print-on-demand orders
+    # ─────────────────────────────────────────────────────────────
+    # Address that receives the new-order admin notification email.
+    PRINT_ORDER_ADMIN_EMAIL: str = field(
+        default_factory=lambda: _get_env("PRINT_ORDER_ADMIN_EMAIL", "admin@timrx.live")
+    )
+    # From-address used for customer receipts (must be SES/SMTP authorized).
+    PRINT_ORDER_FROM_EMAIL: str = field(
+        default_factory=lambda: _get_env("PRINT_ORDER_FROM_EMAIL", "no-reply@timrx.live")
+    )
+    PRINT_ORDER_FROM_NAME: str = field(
+        default_factory=lambda: _get_env("PRINT_ORDER_FROM_NAME", "TimrX Print")
+    )
+
+    # ─────────────────────────────────────────────────────────────
     # Credits System
     # ─────────────────────────────────────────────────────────────
     RESERVATION_EXPIRY_MINUTES: int = field(default_factory=lambda: _get_env_int("RESERVATION_EXPIRY_MINUTES", 20))

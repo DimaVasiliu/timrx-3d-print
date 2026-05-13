@@ -870,6 +870,7 @@ class Tables:
     CHECKOUT_IDEMPOTENCY = f"{_BILLING_SCHEMA}.checkout_idempotency"
     AUTH_RATE_LIMITS = f"{_BILLING_SCHEMA}.auth_rate_limits"
     PROCESSED_WEBHOOK_PAYMENTS = f"{_BILLING_SCHEMA}.processed_webhook_payments"
+    PRINT_ORDERS = f"{_BILLING_SCHEMA}.print_orders"
     CRON_LOCKS = f"{_BILLING_SCHEMA}.cron_locks"
     VIDEO_DAILY_USAGE = f"{_BILLING_SCHEMA}.video_daily_usage"
 
