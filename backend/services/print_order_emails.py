@@ -17,15 +17,29 @@ try:
 except Exception:
     s3_service = None  # type: ignore
 
+from backend.services import download_link_signer
+
 
 def _admin_download_url(order: Dict[str, Any], kind: str) -> Optional[str]:
-    """Build the admin-auth download URL for an archived order file."""
+    """Build the admin-auth download URL for an archived order file.
+
+    The URL carries an HMAC signature so it works when clicked from an
+    email on a device where the admin isn't signed in. The route still
+    accepts a normal admin session as a fallback.
+    """
     if not order.get(f"archived_{kind}_key"):
         return None
     base = (config.PUBLIC_BASE_URL or "").rstrip("/")
     if not base:
         return None
-    return f"{base}/api/print-orders/admin/{order.get('order_number')}/download?type={kind}"
+    order_number = order.get("order_number")
+    if not order_number:
+        return None
+    url = f"{base}/api/print-orders/admin/{order_number}/download?type={kind}"
+    signed = download_link_signer.sign(order_number, kind)
+    if signed:
+        url += f"&exp={signed['exp']}&sig={signed['sig']}"
+    return url
 
 
 def _presigned_thumb_url(order: Dict[str, Any]) -> Optional[str]:
@@ -298,8 +312,8 @@ def _downloads_block(order: Dict[str, Any]) -> str:
         "color:#0ea5e9;font-weight:700;'>Model files</p>"
         f"{glb_btn}{stl_btn}"
         "<p style='margin:10px 0 0;font-size:11px;color:#64748b;line-height:1.5;'>"
-        "Files are archived in TimrX S3 and downloadable indefinitely. "
-        "Links require your admin session (open in the same browser you use for the dashboard)."
+        "Files are archived in TimrX S3 and stay downloadable for 30 days from these links. "
+        "After that, open the admin dashboard and re-download from the order page."
         "</p>"
         f"{warn}"
         "</td></tr></table>"

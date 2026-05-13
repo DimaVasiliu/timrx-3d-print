@@ -24,6 +24,7 @@ from backend.services import print_order_service, s3_service
 from backend.services.paypal_service import PayPalService
 from backend.services.print_order_archive import get_admin_download_target
 from backend.services.print_order_pricing import compute as compute_price, PriceError, pick_currency
+from backend.services import download_link_signer
 
 bp = Blueprint("print_orders", __name__)
 
@@ -240,11 +241,19 @@ def webhook_mollie():
 
 # ─────────────────────────────────────────────────────────────
 # GET /api/print-orders/admin/<id>/download?type=glb|stl|thumb
-# Admin-only download — 302 to a 1-hour presigned S3 URL.
+# Admin download — 302 to a 1-hour presigned S3 URL.
+#
+# Auth: accepts either
+#   (a) an authenticated admin session / X-Admin-Token (via require_admin),
+#   (b) a valid HMAC signature in the query string (`exp`, `sig`).
+#
+# The HMAC path lets the admin click the download buttons in the order
+# confirmation email from any device — including a phone they aren't
+# signed in on. The signature binds the order number + file kind, so a
+# leaked link only works for that single file until its embedded
+# expiry passes.
 # ─────────────────────────────────────────────────────────────
-@bp.route("/admin/<order_ref>/download", methods=["GET"])
-@require_admin
-def admin_download(order_ref: str):
+def _admin_download_handler(order_ref: str):
     kind = (request.args.get("type") or "glb").lower()
     if kind not in ("glb", "stl", "thumb"):
         return _err("BAD_TYPE", "type must be glb|stl|thumb", 400)
@@ -268,6 +277,21 @@ def admin_download(order_ref: str):
     sep = "&" if "?" in url else "?"
     url = f"{url}{sep}response-content-disposition=attachment%3B%20filename%3D{filename}"
     return redirect(url, code=302)
+
+
+@bp.route("/admin/<order_ref>/download", methods=["GET"])
+def admin_download(order_ref: str):
+    # Path A: valid HMAC signature in the URL — bypass admin gate. This is
+    # what makes email buttons clickable from any device.
+    exp = request.args.get("exp")
+    sig = request.args.get("sig")
+    kind_for_sig = (request.args.get("type") or "glb").lower()
+    if exp and sig and download_link_signer.verify(order_ref, kind_for_sig, exp, sig):
+        return _admin_download_handler(order_ref)
+
+    # Path B: fall back to admin auth (existing behavior — preserves the
+    # dashboard download path and X-Admin-Token clients).
+    return require_admin(_admin_download_handler)(order_ref)
 
 
 # ─────────────────────────────────────────────────────────────
