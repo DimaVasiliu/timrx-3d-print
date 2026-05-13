@@ -84,9 +84,16 @@ def _section(title: str, rows_html: str) -> str:
 def _spec_rows(order: Dict[str, Any]) -> str:
     spec = order.get("spec") or {}
     dims = spec.get("scaled_dimensions_mm") or []
+    # 'scaled_dimensions_mm' is the model's bounding box AFTER scaling to the
+    # customer's target height — i.e. how big it'll be once printed:
+    #   index 0 = width  (X)
+    #   index 1 = height (Y, vertical) — matches the customer's chosen target
+    #   index 2 = depth  (D, Z)
     size_str = (
         f"{dims[0]:.0f} × {dims[1]:.0f} × {dims[2]:.0f} mm" if len(dims) == 3 else "—"
     )
+    target_h = spec.get("target_height_mm")
+    target_str = f"{int(round(float(target_h)))} mm" if target_h else "—"
     process = "FDM (filament)" if (spec.get("process") == "fdm") else "Resin (SLA)"
     infill = "100% (resin)" if spec.get("process") == "resin" else f"{spec.get('infill_pct', 20)}%"
     quality_labels = {
@@ -106,7 +113,8 @@ def _spec_rows(order: Dict[str, Any]) -> str:
         + _row("Quality",  _esc(quality_labels.get(quality_key, quality_key or "—")))
         + _row("Infill",   _esc(infill))
         + _row("Finish",   _esc(finish_labels.get(finish_key, finish_key or "—")))
-        + _row("Size",     _esc(size_str))
+        + _row("Target height (customer-chosen)", _esc(target_str))
+        + _row("Printed size (W × H × D)", _esc(size_str))
         + _row("Quantity", _esc(spec.get("quantity") or 1))
     )
 

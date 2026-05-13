@@ -94,6 +94,87 @@ def _create_mollie_payment(
     }
 
 
+def _resolve_model_from_history(
+    model_id: Optional[str],
+    identity_id: str,
+) -> Dict[str, Any]:
+    """
+    Server-side authoritative model lookup.
+
+    If model_id is provided, find the GLB URL, title and thumbnail in
+    history_items / models — DO NOT trust the URLs the frontend posted
+    (they may be empty or expired).
+
+    Returns {id, name, glb_url, thumb_url}.  Falls back to empty dict if
+    nothing is found (the caller is responsible for refusing the order).
+    """
+    out: Dict[str, Any] = {"id": None, "name": None, "glb_url": None, "thumb_url": None}
+    if not model_id:
+        return out
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                # 1) history_items (canonical, has title + thumbnail)
+                cur.execute(
+                    f"""
+                    SELECT
+                        id,
+                        title,
+                        thumbnail_url,
+                        COALESCE(
+                            glb_url,
+                            payload->>'glb_url',
+                            payload->>'textured_glb_url',
+                            payload->'model_urls'->>'glb',
+                            payload->'textured_model_urls'->>'glb'
+                        ) AS resolved_glb_url,
+                        payload->>'prompt' AS prompt_text
+                    FROM {Tables.HISTORY_ITEMS}
+                    WHERE (id = %s OR payload->>'original_job_id' = %s)
+                      AND identity_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (model_id, model_id, identity_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    r = dict(row)
+                    out["id"]        = str(r["id"]) if r.get("id") else model_id
+                    out["name"]      = r.get("title") or r.get("prompt_text")
+                    out["thumb_url"] = r.get("thumbnail_url")
+                    out["glb_url"]   = r.get("resolved_glb_url")
+
+                # 2) models table fallback for GLB if still missing
+                if not out["glb_url"]:
+                    cur.execute(
+                        f"""
+                        SELECT COALESCE(
+                            glb_url,
+                            meta->>'glb_url',
+                            meta->>'textured_glb_url',
+                            meta->'model_urls'->>'glb',
+                            meta->'textured_model_urls'->>'glb'
+                        ) AS resolved_glb_url
+                        FROM {Tables.MODELS}
+                        WHERE (id = %s OR upstream_job_id = %s)
+                          AND identity_id = %s
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (model_id, model_id, identity_id),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        r = dict(row)
+                        out["glb_url"] = r.get("resolved_glb_url")
+    except Exception as e:
+        print(f"[PRINT-ORDER] history lookup failed for id={model_id!r}: {e}")
+
+    return out
+
+
 def _fetch_mollie_payment(payment_id: str) -> Dict[str, Any]:
     resp = requests.get(
         f"{MOLLIE_API_BASE}/payments/{payment_id}",
@@ -149,6 +230,27 @@ def create_order(
     except PriceError as e:
         raise PrintOrderError(f"Invalid order: {e}")
 
+    # ── Resolve the model authoritatively from history_items / models.
+    # The frontend may have an empty or stale URL — never trust it for the
+    # value we'll archive and send to the operator.  Fall back to the
+    # frontend payload only when DB lookup misses (e.g. third-party links).
+    resolved = _resolve_model_from_history(model.get("id"), identity_id)
+    final_model = {
+        "id":        resolved["id"]        or model.get("id"),
+        "name":      resolved["name"]      or model.get("name") or "Untitled model",
+        "glb_url":   resolved["glb_url"]   or model.get("glb_url"),
+        "thumb_url": resolved["thumb_url"] or model.get("thumb_url"),
+    }
+
+    if not final_model["glb_url"]:
+        # No printable model — fail loudly so the user can fix it instead of
+        # paying for an order we can't fulfill.
+        raise PrintOrderError(
+            "We couldn't find a printable model for this order. Open a "
+            "completed model from your history (or generate one) before "
+            "placing the order."
+        )
+
     # ── Insert order row ─────────────────────────────────────────────
     order_id = str(uuid.uuid4())
     with get_conn() as conn:
@@ -173,7 +275,8 @@ def create_order(
                 """,
                 (
                     order_id, identity_id, customer_email, order_number,
-                    model.get("id"), model.get("name"), model.get("glb_url"), model.get("thumb_url"),
+                    final_model["id"], final_model["name"],
+                    final_model["glb_url"], final_model["thumb_url"],
                     json.dumps(spec), json.dumps(shipping),
                     price.currency, price.subtotal_cents, price.shipping_cents, price.total_cents,
                     json.dumps(price.to_dict()),
@@ -188,7 +291,7 @@ def create_order(
     return_url = f"{frontend}/3dprint?print_order={order_number}"
     cancel_url = f"{frontend}/3dprint?print_order={order_number}&cancelled=1"
 
-    description = f"TimrX print order {order_number} — {model.get('name') or 'model'}"[:255]
+    description = f"TimrX print order {order_number} — {final_model['name']}"[:255]
 
     # ── Create provider checkout ─────────────────────────────────────
     if provider == "mollie":
