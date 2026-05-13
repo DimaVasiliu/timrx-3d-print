@@ -24,7 +24,7 @@ from backend.services import print_order_service, s3_service
 from backend.services.paypal_service import PayPalService
 from backend.services.print_order_archive import get_admin_download_target
 from backend.services.print_order_pricing import compute as compute_price, PriceError, pick_currency
-from backend.services import download_link_signer
+from backend.services.download_link_signer import verify as _verify_download_link
 
 bp = Blueprint("print_orders", __name__)
 
@@ -286,7 +286,7 @@ def admin_download(order_ref: str):
     exp = request.args.get("exp")
     sig = request.args.get("sig")
     kind_for_sig = (request.args.get("type") or "glb").lower()
-    if exp and sig and download_link_signer.verify(order_ref, kind_for_sig, exp, sig):
+    if exp and sig and _verify_download_link(order_ref, kind_for_sig, exp, sig):
         return _admin_download_handler(order_ref)
 
     # Path B: fall back to admin auth (existing behavior — preserves the

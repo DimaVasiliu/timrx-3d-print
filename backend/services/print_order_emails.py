@@ -17,7 +17,7 @@ try:
 except Exception:
     s3_service = None  # type: ignore
 
-from backend.services import download_link_signer
+from backend.services.download_link_signer import sign as _sign_download_link
 
 
 def _admin_download_url(order: Dict[str, Any], kind: str) -> Optional[str]:
@@ -36,7 +36,7 @@ def _admin_download_url(order: Dict[str, Any], kind: str) -> Optional[str]:
     if not order_number:
         return None
     url = f"{base}/api/print-orders/admin/{order_number}/download?type={kind}"
-    signed = download_link_signer.sign(order_number, kind)
+    signed = _sign_download_link(order_number, kind)
     if signed:
         url += f"&exp={signed['exp']}&sig={signed['sig']}"
     return url
