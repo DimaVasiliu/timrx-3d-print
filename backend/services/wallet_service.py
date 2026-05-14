@@ -132,21 +132,67 @@ VIDEO_ACTION_CODES = {
     "video_image_transition_8s_720p",   # 96 credits
     "video_image_transition_8s_1080p",  # 120 credits
     "video_image_transition_8s_4k",     # 156 credits
-    # Seedance 2.0 Fast — STANDARD tier (10 c/s)
-    "seedance_fast_text_generate_5s",       # 50 credits
-    "seedance_fast_text_generate_10s",      # 100 credits
-    "seedance_fast_text_generate_15s",      # 150 credits
-    # Seedance 2.0 Preview — PREMIUM tier (16 c/s)
-    "seedance_preview_text_generate_5s",    # 80 credits
-    "seedance_preview_text_generate_10s",   # 160 credits
-    "seedance_preview_text_generate_15s",   # 240 credits
-    # Seedance 2.0 — Image-to-Video (equalized per tier)
-    "seedance_fast_image_animate_5s",       # 50 credits
-    "seedance_fast_image_animate_10s",      # 100 credits
-    "seedance_fast_image_animate_15s",      # 150 credits
-    "seedance_preview_image_animate_5s",    # 80 credits
-    "seedance_preview_image_animate_10s",   # 160 credits
-    "seedance_preview_image_animate_15s",   # 240 credits
+    # ── Seedance 2.0 GA — resolution-aware (Fast + Quality, all modes) ──
+    # FAST 480p (80/160/240) and 720p (120/240/360)
+    "seedance_fast_text_generate_5s_480p",
+    "seedance_fast_text_generate_10s_480p",
+    "seedance_fast_text_generate_15s_480p",
+    "seedance_fast_text_generate_5s_720p",
+    "seedance_fast_text_generate_10s_720p",
+    "seedance_fast_text_generate_15s_720p",
+    "seedance_fast_image_animate_5s_480p",
+    "seedance_fast_image_animate_10s_480p",
+    "seedance_fast_image_animate_15s_480p",
+    "seedance_fast_image_animate_5s_720p",
+    "seedance_fast_image_animate_10s_720p",
+    "seedance_fast_image_animate_15s_720p",
+    "seedance_fast_image_transition_5s_480p",
+    "seedance_fast_image_transition_10s_480p",
+    "seedance_fast_image_transition_15s_480p",
+    "seedance_fast_image_transition_5s_720p",
+    "seedance_fast_image_transition_10s_720p",
+    "seedance_fast_image_transition_15s_720p",
+    # QUALITY 480p (100/200/300), 720p (160/320/480), 1080p (250/500/750)
+    "seedance_quality_text_generate_5s_480p",
+    "seedance_quality_text_generate_10s_480p",
+    "seedance_quality_text_generate_15s_480p",
+    "seedance_quality_text_generate_5s_720p",
+    "seedance_quality_text_generate_10s_720p",
+    "seedance_quality_text_generate_15s_720p",
+    "seedance_quality_text_generate_5s_1080p",
+    "seedance_quality_text_generate_10s_1080p",
+    "seedance_quality_text_generate_15s_1080p",
+    "seedance_quality_image_animate_5s_480p",
+    "seedance_quality_image_animate_10s_480p",
+    "seedance_quality_image_animate_15s_480p",
+    "seedance_quality_image_animate_5s_720p",
+    "seedance_quality_image_animate_10s_720p",
+    "seedance_quality_image_animate_15s_720p",
+    "seedance_quality_image_animate_5s_1080p",
+    "seedance_quality_image_animate_10s_1080p",
+    "seedance_quality_image_animate_15s_1080p",
+    "seedance_quality_image_transition_5s_480p",
+    "seedance_quality_image_transition_10s_480p",
+    "seedance_quality_image_transition_15s_480p",
+    "seedance_quality_image_transition_5s_720p",
+    "seedance_quality_image_transition_10s_720p",
+    "seedance_quality_image_transition_15s_720p",
+    "seedance_quality_image_transition_5s_1080p",
+    "seedance_quality_image_transition_10s_1080p",
+    "seedance_quality_image_transition_15s_1080p",
+    # ── Legacy preview-era codes (no resolution suffix) — kept so in-flight jobs charge correctly ──
+    "seedance_fast_text_generate_5s",
+    "seedance_fast_text_generate_10s",
+    "seedance_fast_text_generate_15s",
+    "seedance_preview_text_generate_5s",
+    "seedance_preview_text_generate_10s",
+    "seedance_preview_text_generate_15s",
+    "seedance_fast_image_animate_5s",
+    "seedance_fast_image_animate_10s",
+    "seedance_fast_image_animate_15s",
+    "seedance_preview_image_animate_5s",
+    "seedance_preview_image_animate_10s",
+    "seedance_preview_image_animate_15s",
     # fal Seedance 1.5 Pro — BUDGET tier (8–9 c/s)
     "fal_seedance_text_generate_5s",        # 45 credits
     "fal_seedance_text_generate_10s",       # 80 credits

@@ -2,10 +2,13 @@
 Video Daily Quota Service — per-user, per-provider daily generation limits.
 
 Provider buckets:
-  veo             — Vertex Veo 3.1 (all resolutions/durations)
-  seedance_fast   — Seedance 2.0 Fast tier
-  seedance_preview — Seedance 2.0 Preview tier
-  fal_seedance    — fal Seedance 1.5 Pro
+  veo               — Vertex Veo 3.1 (all resolutions/durations)
+  seedance_fast     — Seedance 2.0 Fast tier
+  seedance_quality  — Seedance 2.0 Quality tier  (was "seedance_preview" pre-GA)
+  fal_seedance      — fal Seedance 1.5 Pro
+
+The legacy "seedance_preview" bucket key is preserved as an alias on read/write
+so any in-flight rows in `video_daily_usage` keep counting under the same bucket.
 
 Quota enforcement:
   1. check_quota()    — returns (allowed, usage, limit, resets_at)
@@ -26,19 +29,26 @@ from backend.db import get_conn, Tables
 
 # ── Configurable daily limits ───────────────────────────────────────────────
 # Override via environment variables. Defaults are conservative starting points.
+# `seedance_preview` env var (legacy) is honoured as a fallback for `seedance_quality`.
 
 DAILY_LIMITS: Dict[str, int] = {
     "veo":              int(os.getenv("VIDEO_QUOTA_VEO", "6")),
     "seedance_fast":    int(os.getenv("VIDEO_QUOTA_SEEDANCE_FAST", "20")),
-    "seedance_preview": int(os.getenv("VIDEO_QUOTA_SEEDANCE_PREVIEW", "10")),
+    "seedance_quality": int(os.getenv(
+        "VIDEO_QUOTA_SEEDANCE_QUALITY",
+        os.getenv("VIDEO_QUOTA_SEEDANCE_PREVIEW", "10"),
+    )),
     "fal_seedance":     int(os.getenv("VIDEO_QUOTA_FAL_SEEDANCE", "20")),
 }
+# Back-compat: legacy code paths reading DAILY_LIMITS["seedance_preview"] continue to work.
+DAILY_LIMITS["seedance_preview"] = DAILY_LIMITS["seedance_quality"]
 
 # Human-readable provider names for user-facing messages
 PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
     "veo":              "Veo 3.1",
     "seedance_fast":    "Seedance 2.0 Fast",
-    "seedance_preview": "Seedance 2.0 Preview",
+    "seedance_quality": "Seedance 2.0 Quality",
+    "seedance_preview": "Seedance 2.0 Quality",  # legacy bucket key, same display
     "fal_seedance":     "Seedance 1.5",
 }
 
@@ -51,10 +61,10 @@ def resolve_quota_key(provider: str, seedance_tier: Optional[str] = None) -> str
 
     Args:
         provider: normalized provider name ('vertex', 'seedance', 'fal_seedance')
-        seedance_tier: 'fast' or 'preview' (only for seedance provider)
+        seedance_tier: 'fast' or 'quality' (legacy 'preview' is accepted and mapped to 'quality')
 
     Returns:
-        Quota bucket key: 'veo', 'seedance_fast', 'seedance_preview', 'fal_seedance'
+        Quota bucket key: 'veo', 'seedance_fast', 'seedance_quality', 'fal_seedance'
     """
     p = (provider or "").lower().strip()
 
@@ -64,7 +74,9 @@ def resolve_quota_key(provider: str, seedance_tier: Optional[str] = None) -> str
         return "fal_seedance"
     elif p == "seedance":
         tier = (seedance_tier or "fast").lower()
-        return "seedance_preview" if tier == "preview" else "seedance_fast"
+        if tier in ("quality", "preview"):
+            return "seedance_quality"
+        return "seedance_fast"
 
     # Fallback — treat unknown as veo (most restrictive)
     return "veo"
@@ -75,17 +87,18 @@ def resolve_quota_key_from_action_code(action_code: str) -> str:
     Derive quota bucket from an action_code string.
 
     Examples:
-        video_text_generate_8s_720p  → veo
-        seedance_fast_text_generate_5s → seedance_fast
-        seedance_preview_image_animate_10s → seedance_preview
-        fal_seedance_text_generate_5s → fal_seedance
+        video_text_generate_8s_720p              → veo
+        seedance_fast_text_generate_5s_480p      → seedance_fast
+        seedance_quality_image_animate_10s_720p  → seedance_quality
+        seedance_preview_image_animate_10s       → seedance_quality  (legacy alias)
+        fal_seedance_text_generate_5s            → fal_seedance
     """
     ac = (action_code or "").lower()
 
     if ac.startswith("fal_seedance"):
         return "fal_seedance"
-    elif ac.startswith("seedance_preview"):
-        return "seedance_preview"
+    elif ac.startswith("seedance_quality") or ac.startswith("seedance_preview"):
+        return "seedance_quality"
     elif ac.startswith("seedance_fast") or ac.startswith("seedance_"):
         return "seedance_fast"
     else:

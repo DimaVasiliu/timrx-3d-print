@@ -234,18 +234,43 @@ def _is_seedance_variant_code(action_key: str) -> bool:
     """
     Check if an action key is a Seedance variant code.
 
-    Pattern: seedance_{fast|preview}_{text_generate|image_animate}_{duration}s
+    Two patterns are recognised:
+
+      Legacy preview-only (no resolution suffix, locked to 480p output on PiAPI):
+        seedance_{fast|preview}_{text_generate|image_animate}_{duration}s
+
+      GA resolution-aware:
+        seedance_{fast|quality}_{text_generate|image_animate|image_transition}_{duration}s_{480p|720p|1080p}
     """
     if not action_key.startswith("seedance_"):
         return False
 
-    valid_prefixes = (
+    # GA resolution-aware codes — try first (the more specific pattern).
+    ga_prefixes = (
+        "seedance_fast_text_generate_",
+        "seedance_fast_image_animate_",
+        "seedance_fast_image_transition_",
+        "seedance_quality_text_generate_",
+        "seedance_quality_image_animate_",
+        "seedance_quality_image_transition_",
+    )
+    for prefix in ga_prefixes:
+        if action_key.startswith(prefix):
+            suffix = action_key[len(prefix):]
+            # e.g. "5s_480p", "10s_720p", "15s_1080p"
+            parts = suffix.split("_")
+            if len(parts) == 2 and parts[0] in {"5s", "10s", "15s"} and parts[1] in {"480p", "720p", "1080p"}:
+                return True
+            # Fall through to legacy check (e.g. seedance_fast_text_generate_5s with no res)
+
+    # Legacy preview-era codes (kept so in-flight jobs still cost-resolve).
+    legacy_prefixes = (
         "seedance_fast_text_generate_",
         "seedance_fast_image_animate_",
         "seedance_preview_text_generate_",
         "seedance_preview_image_animate_",
     )
-    for prefix in valid_prefixes:
+    for prefix in legacy_prefixes:
         if action_key.startswith(prefix):
             suffix = action_key[len(prefix):]
             return suffix in {"5s", "10s", "15s"}
@@ -336,21 +361,67 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_image_transition_8s_720p", "cost_credits": 96, "provider": "vertex"},
     {"action_code": "video_image_transition_8s_1080p", "cost_credits": 120, "provider": "vertex"},
     {"action_code": "video_image_transition_8s_4k", "cost_credits": 156, "provider": "vertex"},
-    # ── Seedance 2.0 Fast — STANDARD tier (10 credits/sec) ──
-    {"action_code": "seedance_fast_text_generate_5s", "cost_credits": 50, "provider": "seedance"},
-    {"action_code": "seedance_fast_text_generate_10s", "cost_credits": 100, "provider": "seedance"},
-    {"action_code": "seedance_fast_text_generate_15s", "cost_credits": 150, "provider": "seedance"},
-    # ── Seedance 2.0 Preview — PREMIUM tier (16 credits/sec) ──
-    {"action_code": "seedance_preview_text_generate_5s", "cost_credits": 80, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_10s", "cost_credits": 160, "provider": "seedance"},
-    {"action_code": "seedance_preview_text_generate_15s", "cost_credits": 240, "provider": "seedance"},
-    # ── Seedance 2.0 — Image-to-Video (equalized with text-to-video per tier) ──
-    {"action_code": "seedance_fast_image_animate_5s", "cost_credits": 50, "provider": "seedance"},
-    {"action_code": "seedance_fast_image_animate_10s", "cost_credits": 100, "provider": "seedance"},
-    {"action_code": "seedance_fast_image_animate_15s", "cost_credits": 150, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_5s", "cost_credits": 80, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_10s", "cost_credits": 160, "provider": "seedance"},
-    {"action_code": "seedance_preview_image_animate_15s", "cost_credits": 240, "provider": "seedance"},
+    # ── Seedance 2.0 GA — resolution-aware (mirror of migration 068) ──
+    # FAST tier: 80c (480p 5s) / 120c (720p 5s) / +scaling by duration
+    {"action_code": "seedance_fast_text_generate_5s_480p",      "cost_credits": 80,  "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_10s_480p",     "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_15s_480p",     "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_5s_720p",      "cost_credits": 120, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_10s_720p",     "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_15s_720p",     "cost_credits": 360, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_5s_480p",      "cost_credits": 80,  "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_10s_480p",     "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_15s_480p",     "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_5s_720p",      "cost_credits": 120, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_10s_720p",     "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_15s_720p",     "cost_credits": 360, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_transition_5s_480p",   "cost_credits": 80,  "provider": "seedance"},
+    {"action_code": "seedance_fast_image_transition_10s_480p",  "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_transition_15s_480p",  "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_transition_5s_720p",   "cost_credits": 120, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_transition_10s_720p",  "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_transition_15s_720p",  "cost_credits": 360, "provider": "seedance"},
+    # QUALITY tier: 480p / 720p / 1080p (1080p is premium cinematic)
+    {"action_code": "seedance_quality_text_generate_5s_480p",      "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_10s_480p",     "cost_credits": 200, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_15s_480p",     "cost_credits": 300, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_5s_720p",      "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_10s_720p",     "cost_credits": 320, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_15s_720p",     "cost_credits": 480, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_5s_1080p",     "cost_credits": 250, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_10s_1080p",    "cost_credits": 500, "provider": "seedance"},
+    {"action_code": "seedance_quality_text_generate_15s_1080p",    "cost_credits": 750, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_5s_480p",      "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_10s_480p",     "cost_credits": 200, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_15s_480p",     "cost_credits": 300, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_5s_720p",      "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_10s_720p",     "cost_credits": 320, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_15s_720p",     "cost_credits": 480, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_5s_1080p",     "cost_credits": 250, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_10s_1080p",    "cost_credits": 500, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_animate_15s_1080p",    "cost_credits": 750, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_5s_480p",   "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_10s_480p",  "cost_credits": 200, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_15s_480p",  "cost_credits": 300, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_5s_720p",   "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_10s_720p",  "cost_credits": 320, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_15s_720p",  "cost_credits": 480, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_5s_1080p",  "cost_credits": 250, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_10s_1080p", "cost_credits": 500, "provider": "seedance"},
+    {"action_code": "seedance_quality_image_transition_15s_1080p", "cost_credits": 750, "provider": "seedance"},
+    # ── Legacy preview-era codes (no resolution; kept so in-flight jobs cost-resolve) ──
+    {"action_code": "seedance_fast_text_generate_5s",       "cost_credits": 80,  "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_10s",      "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_fast_text_generate_15s",      "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_5s",    "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_10s",   "cost_credits": 200, "provider": "seedance"},
+    {"action_code": "seedance_preview_text_generate_15s",   "cost_credits": 300, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_5s",       "cost_credits": 80,  "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_10s",      "cost_credits": 160, "provider": "seedance"},
+    {"action_code": "seedance_fast_image_animate_15s",      "cost_credits": 240, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_5s",    "cost_credits": 100, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_10s",   "cost_credits": 200, "provider": "seedance"},
+    {"action_code": "seedance_preview_image_animate_15s",   "cost_credits": 300, "provider": "seedance"},
     # ── fal Seedance 1.5 Pro — BUDGET tier (8–9 credits/sec) ──
     {"action_code": "fal_seedance_text_generate_5s", "cost_credits": 45, "provider": "fal_seedance"},
     {"action_code": "fal_seedance_text_generate_10s", "cost_credits": 80, "provider": "fal_seedance"},
@@ -396,18 +467,62 @@ VIDEO_IMAGE_CREDIT_COSTS = {
     "4k": {8: 156},
 }
 
-# Seedance 2.0 credit costs by tier and duration (explicit lookup, DB is authoritative)
-# Fast = STANDARD tier (10 credits/sec), Preview = PREMIUM tier (16 credits/sec)
-SEEDANCE_CREDIT_COSTS = {
-    "fast": {5: 50, 10: 100, 15: 150},
-    "preview": {5: 80, 10: 160, 15: 240},
+# ── Seedance 2.0 credit costs ───────────────────────────────────────────────
+# DB is authoritative — these tables are explicit lookups + fallbacks.
+#
+# Two layouts coexist (matching the action_code patterns):
+#
+#   Legacy (preview-only via PiAPI, 480p output, no resolution suffix in code):
+#     SEEDANCE_LEGACY_CREDIT_COSTS[tier][duration]
+#       tier ∈ {"fast", "preview"}
+#
+#   GA Seedance 2 (resolution-aware):
+#     SEEDANCE_CREDIT_COSTS[tier][resolution][duration]
+#       tier       ∈ {"fast", "quality"}
+#       resolution ∈ {"480p", "720p", "1080p"}   (fast has no 1080p)
+#
+# Pricing strategy: creator-friendly, encourages experimentation,
+# psychologically competitive with Kling/Runway/Luma/Pika, 1080p = premium cinematic.
+
+SEEDANCE_CREDIT_COSTS: Dict[str, Dict[str, Dict[int, int]]] = {
+    "fast": {
+        "480p":  {5: 80,  10: 160, 15: 240},
+        "720p":  {5: 120, 10: 240, 15: 360},
+        # No 1080p for fast (PiAPI seedance-2-fast does not offer 1080p)
+    },
+    "quality": {
+        "480p":  {5: 100, 10: 200, 15: 300},
+        "720p":  {5: 160, 10: 320, 15: 480},
+        "1080p": {5: 250, 10: 500, 15: 750},
+    },
 }
+
+# Legacy preview-era credit table (no resolution, preserved for in-flight jobs).
+# Maps to the same prices as the new 480p tier so refunds/cost reads stay consistent.
+SEEDANCE_LEGACY_CREDIT_COSTS: Dict[str, Dict[int, int]] = {
+    "fast":    {5: 80,  10: 160, 15: 240},
+    # `preview` is the user-facing alias that became "quality" in GA.
+    "preview": {5: 100, 10: 200, 15: 300},
+}
+
 # Approximate CPS for fallback only (DB values are authoritative)
 SEEDANCE_CREDITS_PER_SEC = {
-    "fast": 10,
-    "preview": 16,
+    "fast":    16,   # 80c / 5s (480p baseline)
+    "quality": 20,   # 100c / 5s (480p baseline)
+    # Legacy
+    "preview": 20,
 }
+
 SEEDANCE_VALID_DURATIONS = [5, 10, 15]
+SEEDANCE_VALID_RESOLUTIONS = ("480p", "720p", "1080p")
+
+# Tier alias map — user-facing & legacy names → canonical internal tier.
+# Kept here so the backend remains a single source of truth.
+SEEDANCE_TIER_ALIASES = {
+    "fast":    "fast",
+    "quality": "quality",
+    "preview": "quality",   # legacy alias from the preview-era frontend
+}
 
 # fal Seedance 1.5 Pro credit costs by duration (explicit lookup, DB is authoritative)
 # BUDGET tier: 8–9 credits/sec
@@ -424,6 +539,12 @@ VIDEO_VALID_DURATIONS = {
 }
 
 
+def normalize_seedance_tier(tier: str | None) -> str:
+    """Canonicalise tier name. `preview` (legacy) → `quality`. Unknown → `fast`."""
+    t = (tier or "").strip().lower()
+    return SEEDANCE_TIER_ALIASES.get(t, "fast")
+
+
 def get_video_action_code(
     task: str,
     duration_seconds: int,
@@ -437,12 +558,16 @@ def get_video_action_code(
     Args:
         task: "text2video", "image2video", or "image_transition"
         duration_seconds: Duration in seconds
-        resolution: "720p" or "1080p"
-        provider: "vertex" or "seedance"
-        seedance_tier: "fast" or "preview" (only for seedance)
+        resolution: "480p" / "720p" / "1080p" (Vertex also accepts "4k")
+        provider: "vertex", "seedance", or "fal_seedance"
+        seedance_tier: "fast" or "quality" (legacy "preview" → quality)
 
     Returns:
-        Action code like "video_text_generate_4s_720p" or "seedance_fast_text_generate_5s"
+        Action code, e.g.
+          video_text_generate_4s_720p                (Vertex)
+          seedance_fast_text_generate_5s_480p        (Seedance 2 GA)
+          seedance_quality_image_transition_10s_1080p
+          fal_seedance_text_generate_5s              (fal Seedance)
     """
     if task.lower() in ("text2video", "text_to_video", "text"):
         task_part = "text_generate"
@@ -455,8 +580,11 @@ def get_video_action_code(
         return f"fal_seedance_{task_part}_{duration_seconds}s"
 
     if provider == "seedance":
-        tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
-        return f"seedance_{tier}_{task_part}_{duration_seconds}s"
+        tier = normalize_seedance_tier(seedance_tier)
+        res_part = (resolution or "480p").lower()
+        if res_part not in SEEDANCE_VALID_RESOLUTIONS:
+            res_part = "480p"
+        return f"seedance_{tier}_{task_part}_{duration_seconds}s_{res_part}"
 
     duration_part = f"{duration_seconds}s"
     resolution_part = resolution.lower()
@@ -475,9 +603,9 @@ def get_video_credit_cost(
 
     Args:
         duration_seconds: Duration in seconds
-        resolution: "720p" or "1080p"
-        provider: "vertex" or "seedance"
-        seedance_tier: "fast" or "preview" (only for seedance)
+        resolution: "480p" / "720p" / "1080p" (Vertex also accepts "4k")
+        provider: "vertex", "seedance", or "fal_seedance"
+        seedance_tier: "fast" or "quality" (legacy "preview" mapped to "quality")
         task: "text2video", "image2video", or "image_transition"
 
     Returns:
@@ -491,13 +619,24 @@ def get_video_credit_cost(
         return FAL_SEEDANCE_CREDITS_PER_SEC * duration
 
     if provider == "seedance":
-        tier = seedance_tier if seedance_tier in ("fast", "preview") else "fast"
+        tier = normalize_seedance_tier(seedance_tier)
         duration = int(duration_seconds)
-        # Prefer explicit lookup; fall back to CPS approximation
+        res = (resolution or "480p").lower()
+        # GA resolution-aware lookup
         tier_costs = SEEDANCE_CREDIT_COSTS.get(tier, {})
-        if duration in tier_costs:
-            return tier_costs[duration]
-        cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 16)
+        res_costs = tier_costs.get(res, {})
+        if duration in res_costs:
+            return res_costs[duration]
+        # Fast tier has no 1080p — fall back to 720p price so credit estimator never zeros out.
+        if res == "1080p" and "720p" in tier_costs and duration in tier_costs["720p"]:
+            return tier_costs["720p"][duration]
+        # Legacy preview-style fallback (no resolution stored)
+        legacy_tier = "preview" if tier == "quality" else tier
+        legacy_costs = SEEDANCE_LEGACY_CREDIT_COSTS.get(legacy_tier, {})
+        if duration in legacy_costs:
+            return legacy_costs[duration]
+        # Last-resort CPS approximation
+        cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 20)
         return cps * duration
 
     resolution = resolution.lower()
@@ -889,22 +1028,60 @@ class PricingService:
             print(f"[PRICING] fal Seedance fallback cost: {canonical} -> {computed} credits")
             return computed
 
-        # Seedance variant fallback: use explicit lookup, then CPS approximation
-        # Pattern: seedance_{fast|preview}_{text_generate|image_animate}_{duration}s
+        # Seedance variant fallback: use explicit lookup, then CPS approximation.
+        # Patterns:
+        #   Legacy preview-era (no resolution):
+        #     seedance_{fast|preview}_{text_generate|image_animate}_{N}s
+        #   GA resolution-aware:
+        #     seedance_{fast|quality}_{text_generate|image_animate|image_transition}_{N}s_{480p|720p|1080p}
         if _is_seedance_variant_code(canonical):
-            tier = "preview" if canonical.startswith("seedance_preview_") else "fast"
-            suffix = canonical.rsplit("_", 1)[-1]  # e.g. "15s"
+            # Detect tier from the prefix.
+            if canonical.startswith("seedance_quality_"):
+                tier = "quality"
+            elif canonical.startswith("seedance_preview_"):
+                tier = "quality"  # legacy alias
+            else:
+                tier = "fast"
+
+            # Detect resolution suffix.
+            resolution = None
+            for res in SEEDANCE_VALID_RESOLUTIONS:
+                if canonical.endswith(f"_{res}"):
+                    resolution = res
+                    break
+
+            # Detect duration.
+            if resolution:
+                # Last two tokens are {dur}s and {res} — duration is second-to-last
+                parts = canonical.rsplit("_", 2)
+                dur_tok = parts[1] if len(parts) >= 2 else "5s"
+            else:
+                dur_tok = canonical.rsplit("_", 1)[-1]
             try:
-                duration = int(suffix.rstrip("s"))
+                duration = int(dur_tok.rstrip("s"))
             except ValueError:
                 duration = 5
-            tier_costs = SEEDANCE_CREDIT_COSTS.get(tier, {})
-            if duration in tier_costs:
-                computed = tier_costs[duration]
+
+            if resolution:
+                tier_costs = SEEDANCE_CREDIT_COSTS.get(tier, {})
+                res_costs = tier_costs.get(resolution, {})
+                if duration in res_costs:
+                    computed = res_costs[duration]
+                elif resolution == "1080p" and duration in tier_costs.get("720p", {}):
+                    computed = tier_costs["720p"][duration]
+                else:
+                    cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 20)
+                    computed = cps * duration
             else:
-                cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 16)
-                computed = cps * duration
-            print(f"[PRICING] Seedance fallback cost: {canonical} -> {computed} credits")
+                # No resolution → legacy preview-era code, use legacy table (preview tier = quality)
+                legacy_tier = "preview" if tier == "quality" else "fast"
+                legacy_costs = SEEDANCE_LEGACY_CREDIT_COSTS.get(legacy_tier, {})
+                if duration in legacy_costs:
+                    computed = legacy_costs[duration]
+                else:
+                    cps = SEEDANCE_CREDITS_PER_SEC.get(tier, 20)
+                    computed = cps * duration
+            print(f"[PRICING] Seedance fallback cost: {canonical} -> {computed} credits (tier={tier} res={resolution} dur={duration})")
             return computed
 
         print(f"[PRICING] Warning: Unknown action key '{action_key}', returning 0 cost")

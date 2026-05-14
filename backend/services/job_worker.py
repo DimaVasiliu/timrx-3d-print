@@ -1272,8 +1272,10 @@ def _poll_provider_once(
     # Once processing has started, skip the pending timeout entirely — use
     # the processing timeout instead (checked below).
     if last_status in ("pending", "queued", "staged") and not processing_started_at and pending_elapsed >= pend_hard:
-        # Seedance-specific: attempt preview -> fast fallback
-        if provider_name == "seedance" and task_type == "seedance-2-preview":
+        # Seedance-specific: attempt quality -> fast fallback. Triggered for both
+        # the GA `seedance-2` task type and the legacy `*-preview` aliases.
+        quality_task_types = {"seedance-2", "seedance-2-preview", "seedance-2-preview-vip"}
+        if provider_name == "seedance" and task_type in quality_task_types:
             from backend.services.video_router import resolve_video_provider
             provider_obj = resolve_video_provider(provider_name)
             fallback = _attempt_seedance_fallback(job_id, meta, provider_obj)
@@ -1587,6 +1589,9 @@ def _finalize_success(
 
     from backend.services.async_dispatch import _finalize_video_success
 
+    _rehydrated_tier = meta.get("seedance_tier", "fast")
+    if _rehydrated_tier == "preview":
+        _rehydrated_tier = "quality"  # canonicalise legacy stored tier on read
     store_meta = {
         "status": "processing",
         "provider": provider_name,
@@ -1598,9 +1603,13 @@ def _finalize_success(
         "duration_seconds": meta.get("duration_seconds"),
         "aspect_ratio": meta.get("aspect_ratio"),
         "resolution": meta.get("resolution"),
-        "task_type": meta.get("task_type") or meta.get("seedance_variant") or "seedance-2-fast-preview",
-        "seedance_variant": meta.get("seedance_variant") or meta.get("task_type") or "seedance-2-fast-preview",
-        "seedance_tier": meta.get("seedance_tier", "fast"),
+        "task_type": meta.get("task_type") or meta.get("seedance_variant") or "seedance-2-fast",
+        "seedance_variant": meta.get("seedance_variant") or meta.get("task_type") or "seedance-2-fast",
+        "seedance_tier": _rehydrated_tier,
+        "seedance_tier_label": (
+            meta.get("seedance_tier_label")
+            or ("Quality" if _rehydrated_tier == "quality" else "Fast")
+        ),
         "stage": "video",
         "task": meta.get("task", "text2video"),
         "internal_job_id": job_id,
@@ -1953,29 +1962,44 @@ def _handle_job_error(job: Dict[str, Any], error_msg: str):
 
 def _attempt_seedance_fallback(job_id: str, meta: Dict[str, Any], provider) -> Optional[str]:
     """
-    Attempt to retry a Seedance preview job with fast tier.
+    Attempt to retry a stuck Seedance quality-tier job with fast tier.
+
+    Handles both GA `seedance-2` and legacy `*-preview` task types as the
+    "quality" source. The retry always lands on GA `seedance-2-fast`.
+
     Returns new upstream_id on success, None on failure.
     """
     try:
-        print(f"[JOB] attempting fallback job={job_id} from=seedance-2-preview to=seedance-2-fast-preview")
+        original_task_type = meta.get("task_type", "seedance-2")
+        print(f"[JOB] attempting fallback job={job_id} from={original_task_type} to=seedance-2-fast")
 
         from backend.services.seedance_service import create_seedance_task
 
         prompt = meta.get("prompt", "")
         duration = meta.get("duration_seconds", 5)
         aspect = meta.get("aspect_ratio", "16:9")
+        resolution = meta.get("resolution")
+        task = meta.get("task") or ""
         image_urls = None
-        if meta.get("task") == "image2video":
+        # Carry over images for both single-image animate and two-image transition.
+        if task == "image2video":
             img = meta.get("image_data") or ""
             if img:
                 image_urls = [img]
+        elif task in ("image_transition", "experimental_morph"):
+            start_img = meta.get("start_image") or ""
+            end_img = meta.get("end_image") or ""
+            if start_img and end_img:
+                image_urls = [start_img, end_img]
 
         resp = create_seedance_task(
             prompt=prompt,
             duration=int(duration) if duration else 5,
             aspect_ratio=aspect,
             image_urls=image_urls,
-            task_type="seedance-2-fast-preview",
+            task_type="seedance-2-fast",
+            mode=("first_last_frames" if image_urls else "text_to_video"),
+            resolution=resolution,
         )
 
         new_upstream = resp.get("task_id")
@@ -1998,8 +2022,8 @@ def _attempt_seedance_fallback(job_id: str, meta: Dict[str, Any], provider) -> O
                         new_upstream,
                         json.dumps({
                             "upstream_id": new_upstream,
-                            "task_type": "seedance-2-fast-preview",
-                            "fallback_from": "seedance-2-preview",
+                            "task_type": "seedance-2-fast",
+                            "fallback_from": original_task_type,
                             "fallback_reason": "pending_timeout",
                             "dispatched_at": time.time(),
                             "fallback_dispatched_at": time.time(),

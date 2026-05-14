@@ -17,6 +17,7 @@ from requests.exceptions import Timeout, ConnectionError as RequestsConnectionEr
 from typing import Dict, Any, Optional, Tuple
 
 from backend.config import config
+from backend.services.video_errors import PIAPI_STATUS_MAP
 
 # Timeouts
 PIAPI_TIMEOUT = (15, 180)  # (connect_timeout, read_timeout) — increased for slow generations
@@ -276,16 +277,20 @@ def poll_nano_banana_task(task_id: str) -> Dict[str, Any]:
             print(f"[PiAPI NanoBanana] Poll error for {task_id}: {e}")
             continue
 
-        status = result["status"]
-        print(f"[PiAPI NanoBanana] Poll task_id={task_id} status={status} elapsed={elapsed:.0f}s")
+        raw_status = result["status"]
+        # PiAPI returns capitalised status strings ("Completed", "Failed", "Pending",
+        # "Processing", "Staged"). Map to canonical lowercase via the shared status map
+        # used by the Seedance pipeline. Treat unknown statuses as still-in-progress.
+        internal = PIAPI_STATUS_MAP.get(raw_status, "pending")
+        print(f"[PiAPI NanoBanana] Poll task_id={task_id} raw_status={raw_status!r} -> {internal} elapsed={elapsed:.0f}s")
 
-        if status == "completed":
+        if internal == "done":
             if not result["image_urls"]:
                 raise PiAPITaskError(f"Task {task_id} completed but no image URLs returned")
             return result
 
-        if status in ("failed", "error"):
+        if internal == "failed":
             error_msg = result.get("raw", {}).get("data", {}).get("error", {}).get("message", "Unknown error")
             raise PiAPITaskError(f"Task {task_id} failed: {error_msg}")
 
-        # Continue polling for pending/processing statuses
+        # Continue polling for pending/processing/staged statuses.

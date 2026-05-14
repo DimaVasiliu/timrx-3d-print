@@ -1723,16 +1723,16 @@ def _dispatch_to_fal_seedance(
             print(f"[ASYNC] fal_seedance not configured: {err}")
 
     # Dispatch-time fallback to PiAPI Seedance (if enabled).
-    # PiAPI does NOT support image_transition — only fall back for text2video/image2video.
+    # Seedance 2 GA supports image_transition natively via mode=first_last_frames —
+    # so all three modes (text2video / image2video / image_transition) can fall back.
     fallback_enabled = getattr(_cfg, "FAL_SEEDANCE_FALLBACK_TO_PIAPI", True)
-    if fallback_enabled and task != "image_transition":
+    if fallback_enabled:
         print(f"[ASYNC] Falling back to PiAPI Seedance for job {internal_job_id}")
         return _dispatch_to_seedance(
             internal_job_id, task, prompt, payload, route_params, store_meta,
         )
 
-    reason = "image_transition not supported by PiAPI fallback" if task == "image_transition" else "fallback disabled"
-    raise ProviderUnavailableError(f"fal Seedance not available and {reason}")
+    raise ProviderUnavailableError("fal Seedance not available and fallback disabled")
 
 
 def _dispatch_to_seedance(
@@ -1756,17 +1756,28 @@ def _dispatch_to_seedance(
     if not configured:
         raise ProviderUnavailableError(f"Seedance not configured: {err}")
 
-    # Pass task_type so provider sends correct model tier
+    # Pass task_type + tier so provider sends correct model tier/resolution.
+    # Default to GA `seedance-2-fast` (legacy aliases still accepted by service).
     seedance_variant = (
         payload.get("seedance_variant")
         or store_meta.get("seedance_variant")
-        or "seedance-2-fast-preview"
+        or "seedance-2-fast"
     )
     route_params["task_type"] = seedance_variant
+    # Tier is the authoritative selector — task_type is just the wire format.
+    # If both are provided, normalize_seedance_params reconciles them.
+    seedance_tier = (
+        payload.get("seedance_tier")
+        or store_meta.get("seedance_tier")
+        or "fast"
+    )
+    route_params["tier"] = seedance_tier
 
-    if task == "experimental_morph":
+    if task in ("image_transition", "experimental_morph"):
+        # Native first_last_frames (Seedance 2 GA). `experimental_morph` retained
+        # as a legacy task name from older clients — routes through the same path.
         prompt = payload.get("motion") or prompt
-        resp = seedance.start_experimental_morph(
+        resp = seedance.start_image_transition(
             start_image=payload.get("start_image", ""),
             end_image=payload.get("end_image", ""),
             prompt=prompt,
@@ -2352,13 +2363,18 @@ def _poll_video_completion(
 #
 # PiAPI observed timings (2026-03-10):
 #   fast:    7-8 min total (queue + render)
-#   preview: can sit Pending 20-100+ min, total up to 1h40m
+#   quality: can sit Pending 20-100+ min, total up to 1h40m
 #
-# Strategy: preview gets a generous pending window, but if it stalls we
+# Strategy: quality gets a generous pending window, but if it stalls we
 # fallback to fast tier (see _seedance_pending_fallback).
+# Both GA and legacy preview task types are registered so in-flight jobs keep working.
 _SEEDANCE_TIMEOUTS = {
-    "seedance-2-fast-preview": (5 * 60, 15 * 60, 10 * 60, 20 * 60),
-    "seedance-2-preview":      (15 * 60, 30 * 60, 15 * 60, 30 * 60),
+    # GA
+    "seedance-2-fast":          (5 * 60, 15 * 60, 10 * 60, 20 * 60),
+    "seedance-2":               (15 * 60, 30 * 60, 15 * 60, 30 * 60),
+    # Legacy preview-era (kept for in-flight jobs)
+    "seedance-2-fast-preview":  (5 * 60, 15 * 60, 10 * 60, 20 * 60),
+    "seedance-2-preview":       (15 * 60, 30 * 60, 15 * 60, 30 * 60),
 }
 _SEEDANCE_DEFAULT_TIMEOUTS = (5 * 60, 15 * 60, 10 * 60, 20 * 60)
 
@@ -2389,7 +2405,7 @@ def _poll_seedance_with_state_awareness(
     print(f"[SEEDANCE_OBS] event=legacy_poller_hit func=_poll_seedance_with_state_awareness job={internal_job_id}")
     return
 
-    task_type = store_meta.get("task_type", "seedance-2-fast-preview")
+    task_type = store_meta.get("task_type", "seedance-2-fast")
     pend_soft, pend_hard, proc_soft, proc_hard = _SEEDANCE_TIMEOUTS.get(
         task_type, _SEEDANCE_DEFAULT_TIMEOUTS,
     )
@@ -2417,8 +2433,10 @@ def _poll_seedance_with_state_awareness(
 
         # ── Hard timeout check ──
         if last_phase == "pending" and pending_elapsed >= pend_hard:
-            # FALLBACK: If this was a preview job, retry once with fast tier
-            if task_type == "seedance-2-preview" and not did_fallback:
+            # FALLBACK: If this was a quality job (GA `seedance-2` or legacy `*-preview`),
+            # retry once with fast tier.
+            quality_task_types = {"seedance-2", "seedance-2-preview", "seedance-2-preview-vip"}
+            if task_type in quality_task_types and not did_fallback:
                 fallback_result = _seedance_pending_fallback(
                     internal_job_id, identity_id, reservation_id,
                     provider, store_meta,
@@ -2426,7 +2444,7 @@ def _poll_seedance_with_state_awareness(
                 if fallback_result:
                     # Fallback created a new upstream task — reset poll state
                     upstream_id = fallback_result["upstream_id"]
-                    task_type = "seedance-2-fast-preview"
+                    task_type = "seedance-2-fast"
                     pend_soft, pend_hard, proc_soft, proc_hard = _SEEDANCE_TIMEOUTS.get(
                         task_type, _SEEDANCE_DEFAULT_TIMEOUTS,
                     )
@@ -2635,12 +2653,15 @@ def _seedance_pending_fallback(
                 image_urls = [img]
 
         from backend.services.seedance_service import create_seedance_task
+        original_task_type = store_meta.get("task_type", "seedance-2")
         resp = create_seedance_task(
             prompt=prompt,
             duration=duration,
             aspect_ratio=aspect,
             image_urls=image_urls,
-            task_type="seedance-2-fast-preview",
+            task_type="seedance-2-fast",
+            resolution=store_meta.get("resolution"),
+            mode=("first_last_frames" if image_urls else "text_to_video"),
         )
 
         new_upstream = resp.get("task_id")
@@ -2651,10 +2672,10 @@ def _seedance_pending_fallback(
         # Update store and DB with new upstream id + fallback metadata
         store_meta["upstream_id"] = new_upstream
         store_meta["operation_name"] = new_upstream
-        store_meta["task_type"] = "seedance-2-fast-preview"
-        store_meta["seedance_variant"] = "seedance-2-fast-preview"
+        store_meta["task_type"] = "seedance-2-fast"
+        store_meta["seedance_variant"] = "seedance-2-fast"
         store_meta["seedance_tier"] = "fast"
-        store_meta["fallback_from"] = "seedance-2-preview"
+        store_meta["fallback_from"] = original_task_type
         store_meta["status"] = "processing"
 
         store = load_store()
@@ -2663,8 +2684,8 @@ def _seedance_pending_fallback(
 
         _update_job_meta(internal_job_id, {
             "upstream_id": new_upstream,
-            "task_type": "seedance-2-fast-preview",
-            "fallback_from": "seedance-2-preview",
+            "task_type": "seedance-2-fast",
+            "fallback_from": original_task_type,
             "fallback_reason": "pending_timeout",
         })
         update_job_with_upstream_id(internal_job_id, new_upstream)

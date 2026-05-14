@@ -84,43 +84,123 @@ def _get_headers() -> Dict[str, str]:
     }
 
 
+# ── Task-type compatibility ─────────────────────────────────
+# GA task types accept a `mode` field and resolution; legacy preview-era types
+# do not. We keep both so:
+#   • new code targets GA (`seedance-2-fast` / `seedance-2`)
+#   • legacy in-flight jobs polling against this service keep working
+#   • frontends pinned to old `*-preview` task types still produce a job
+GA_TASK_TYPES = frozenset({"seedance-2", "seedance-2-fast"})
+LEGACY_TASK_TYPES = frozenset({
+    "seedance-2-preview",
+    "seedance-2-fast-preview",
+    "seedance-2-preview-vip",
+    "seedance-2-fast-preview-vip",
+})
+
+# When a caller passes a legacy alias from the frontend, transparently upgrade to GA.
+# (Doesn't affect in-flight upstream task ids — PiAPI also keeps the legacy task types live.)
+_LEGACY_TO_GA = {
+    "seedance-2-preview":          "seedance-2",
+    "seedance-2-fast-preview":     "seedance-2-fast",
+    "seedance-2-preview-vip":      "seedance-2",
+    "seedance-2-fast-preview-vip": "seedance-2-fast",
+}
+
+# Modes are required on GA task types only.
+VALID_MODES = frozenset({"text_to_video", "first_last_frames", "omni_reference"})
+
+
+def _resolve_task_type(task_type: str) -> str:
+    """Coerce any provided task_type to a canonical PiAPI string. Defaults to GA fast."""
+    t = (task_type or "").strip().lower()
+    if t in GA_TASK_TYPES or t in LEGACY_TASK_TYPES:
+        return t
+    return "seedance-2-fast"
+
+
 # ── Create task ──────────────────────────────────────────────
 def create_seedance_task(
     prompt: str,
     duration: int = 5,
     aspect_ratio: str = "16:9",
     image_urls: Optional[List[str]] = None,
-    task_type: str = "seedance-2-preview",
+    task_type: str = "seedance-2-fast",
+    mode: Optional[str] = None,
+    resolution: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a Seedance video generation task via PiAPI.
 
     Args:
-        prompt: Text prompt for video generation.
-        duration: Video duration in seconds (5, 10, or 15).
-        aspect_ratio: Output aspect ratio (16:9, 9:16, 4:3, 3:4).
-        image_urls: Optional list of image URLs for image-to-video.
-        task_type: PiAPI task type (seedance-2-preview or seedance-2-fast-preview).
+        prompt:       Text prompt for video generation.
+        duration:     Video duration in seconds (4–15 for GA; 5/10/15 for legacy preview).
+        aspect_ratio: Output aspect ratio (GA: 21:9 / 16:9 / 4:3 / 1:1 / 3:4 / 9:16 / auto;
+                                            legacy: 16:9 / 9:16 / 4:3 / 3:4).
+        image_urls:   Optional image URLs.
+                       • text_to_video mode MUST omit image_urls.
+                       • first_last_frames mode accepts 1 image (animate from single ref)
+                         or 2 images (transition from first → last frame).
+                       • omni_reference accepts up to 12.
+        task_type:    PiAPI task type. Defaults to GA `seedance-2-fast`. Legacy preview
+                      types are accepted (and silently upgraded to their GA equivalent).
+        mode:         "text_to_video" | "first_last_frames" | "omni_reference"
+                      Required for GA task types; ignored for legacy preview.
+        resolution:   "480p" | "720p" | "1080p" (GA only).
 
     Returns:
         {"task_id": "...", "status": "processing"}
 
     Raises:
         SeedanceConfigError: API key not set.
-        SeedanceAuthError: Authentication failed.
-        SeedanceQuotaError: Quota exhausted or rate limited.
-        RuntimeError: Other API errors.
+        SeedanceAuthError:   Authentication failed.
+        SeedanceQuotaError:  Quota exhausted or rate limited.
+        RuntimeError:        Other API errors.
     """
     headers = _get_headers()
 
+    # Resolve task type (may upgrade legacy → GA so we can use mode/resolution).
+    resolved_task_type = _resolve_task_type(task_type)
+    is_ga = resolved_task_type in GA_TASK_TYPES
+
+    # Some frontends still pass `seedance-2-fast-preview` etc. Upgrade them so we
+    # can send `mode` + `resolution` on the modern endpoint.
+    if resolved_task_type in _LEGACY_TO_GA:
+        upgraded = _LEGACY_TO_GA[resolved_task_type]
+        print(f"[Seedance] upgrading legacy task_type {resolved_task_type!r} → {upgraded!r} (GA)")
+        resolved_task_type = upgraded
+        is_ga = True
+
+    input_obj: Dict[str, Any] = {
+        "prompt": prompt,
+        "duration": int(duration),
+        "aspect_ratio": aspect_ratio,
+    }
+
+    if is_ga:
+        # mode is REQUIRED on GA. Default to text_to_video if caller didn't say.
+        # If images are present and no mode was given, prefer first_last_frames.
+        if mode and mode in VALID_MODES:
+            resolved_mode = mode
+        elif image_urls:
+            resolved_mode = "first_last_frames"
+        else:
+            resolved_mode = "text_to_video"
+
+        # GA contract: text_to_video does NOT accept image_urls. Strip them to avoid 400.
+        if resolved_mode == "text_to_video" and image_urls:
+            print("[Seedance] WARNING: text_to_video mode rejects image_urls — stripping per PiAPI spec")
+            image_urls = None
+
+        input_obj["mode"] = resolved_mode
+
+        if resolution:
+            input_obj["resolution"] = resolution.lower()
+
     body = {
         "model": "seedance",
-        "task_type": task_type,
-        "input": {
-            "prompt": prompt,
-            "duration": duration,
-            "aspect_ratio": aspect_ratio,
-        },
+        "task_type": resolved_task_type,
+        "input": input_obj,
     }
 
     if image_urls:
@@ -141,10 +221,16 @@ def create_seedance_task(
 
     # Log the exact request body (redact API key from headers, keep webhook visible)
     _prompt_preview = (body.get("input", {}).get("prompt") or "")[:60]
+    _input_view = body.get("input", {})
     _log_body_safe = {
         "model": body.get("model"),
         "task_type": body.get("task_type"),
-        "input_keys": sorted(body.get("input", {}).keys()),
+        "mode": _input_view.get("mode"),
+        "resolution": _input_view.get("resolution"),
+        "duration": _input_view.get("duration"),
+        "aspect_ratio": _input_view.get("aspect_ratio"),
+        "image_url_count": len(_input_view.get("image_urls") or []),
+        "input_keys": sorted(_input_view.keys()),
         "prompt_preview": _prompt_preview,
         "webhook_config": (body.get("config") or {}).get("webhook_config", "NOT_SET"),
     }

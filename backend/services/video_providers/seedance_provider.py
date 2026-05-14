@@ -9,11 +9,20 @@ PiAPI ignores/strips webhook_config for Seedance models (confirmed March 2025).
 Webhook config is still sent best-effort but all completion, failure, timeout,
 and credit logic works correctly without webhook delivery.
 
-Supported options:
-- durations:     5, 10, 15 seconds
-- aspect ratios: 16:9, 9:16, 1:1, 4:3, 3:4
-- tiers:         fast  (seedance-2-fast-preview)
-                 preview (seedance-2-preview)
+Supported options (Seedance 2 GA — task types `seedance-2-fast` / `seedance-2`):
+- durations:     5, 10, 15 seconds (PiAPI accepts 4–15; UI exposes 5/10/15 for now)
+- aspect ratios: 21:9, 16:9, 4:3, 1:1, 3:4, 9:16, auto
+- resolutions:   fast    → 480p, 720p
+                 quality → 480p, 720p, 1080p
+- tiers:         fast    (PiAPI task_type `seedance-2-fast`)
+                 quality (PiAPI task_type `seedance-2`)  — was "preview" pre-GA
+- modes:         text_to_video      (no image_urls)
+                 first_last_frames  (1 image = animate; 2 images = native transition)
+                 omni_reference     (multimodal — wired but UI not yet exposing it)
+
+Legacy preview aliases (`seedance-2-preview` / `seedance-2-fast-preview` /
+`-vip` variants) are still accepted by the underlying service and silently
+upgraded to GA, so in-flight jobs polling here keep working.
 """
 
 from __future__ import annotations
@@ -39,26 +48,67 @@ def _ensure_public_image_url(image_data: str) -> str:
     return ensure_public_image_url(image_data, provider_name="seedance")
 
 
-# ── Seedance constraints ────────────────────────────────────────
-SUPPORTED_DURATIONS = frozenset({5, 10, 15})
-SUPPORTED_ASPECTS = frozenset({"16:9", "9:16", "4:3", "3:4"})
+# ── Seedance constraints (GA) ───────────────────────────────────
+# Backend is permissive: GA PiAPI accepts 4–15s. We don't reject 4/6/7/8/9/11/12/13/14
+# even though the UI currently only exposes 5/10/15 — keeps the door open for future UX.
+SUPPORTED_DURATIONS = frozenset({4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})
+SUPPORTED_ASPECTS = frozenset({"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "auto"})
 
-# Maps user-facing tier name → PiAPI task_type string.
+# Tier ↔ PiAPI GA task_type.
 TIER_TO_TASK_TYPE = {
-    "fast": "seedance-2-fast-preview",
-    "preview": "seedance-2-preview",
+    "fast":    "seedance-2-fast",
+    "quality": "seedance-2",
+    # Legacy alias (user-facing copy was "Preview" pre-GA; the underlying PiAPI behaviour
+    # was the same quality model). Keep it so any caller still passing "preview" works.
+    "preview": "seedance-2",
 }
 
-# Maps the full seedance_variant string (from frontend) to (task_type, tier).
+# Maps any `seedance_variant` string we may receive (GA or legacy) to (task_type, tier).
+# Both GA and legacy preview names are accepted — legacy maps to the same canonical tier.
 VARIANT_MAP = {
-    "seedance-2-fast-preview": ("seedance-2-fast-preview", "fast"),
-    "seedance-2-preview": ("seedance-2-preview", "preview"),
+    # GA
+    "seedance-2-fast":           ("seedance-2-fast", "fast"),
+    "seedance-2":                ("seedance-2",      "quality"),
+    # Legacy preview-era (still works upstream; seedance_service upgrades to GA before sending)
+    "seedance-2-fast-preview":     ("seedance-2-fast", "fast"),
+    "seedance-2-preview":          ("seedance-2",      "quality"),
+    "seedance-2-fast-preview-vip": ("seedance-2-fast", "fast"),
+    "seedance-2-preview-vip":      ("seedance-2",      "quality"),
+}
+
+# Per-tier allowed resolutions (PiAPI caps Fast at 720p — no 1080p).
+TIER_TO_RESOLUTIONS = {
+    "fast":    frozenset({"480p", "720p"}),
+    "quality": frozenset({"480p", "720p", "1080p"}),
 }
 
 DEFAULT_DURATION = 5
 DEFAULT_ASPECT = "16:9"
+DEFAULT_RESOLUTION = "480p"
 DEFAULT_TIER = "fast"
 DEFAULT_TASK_TYPE = TIER_TO_TASK_TYPE[DEFAULT_TIER]
+
+
+def _normalize_tier(raw: str | None) -> str:
+    """Map any tier name (incl. legacy `preview`) to the canonical tier."""
+    t = (raw or "").strip().lower()
+    if t in ("quality", "preview"):
+        return "quality"
+    if t == "fast":
+        return "fast"
+    return DEFAULT_TIER
+
+
+def _normalize_resolution(raw: str | None, tier: str) -> str:
+    """Snap resolution to one supported by the chosen tier."""
+    r = (raw or "").strip().lower()
+    allowed = TIER_TO_RESOLUTIONS.get(tier, TIER_TO_RESOLUTIONS["fast"])
+    if r in allowed:
+        return r
+    # If user asked for 1080p with fast tier, snap down to 720p (router/route also enforces this).
+    if r == "1080p" and "720p" in allowed:
+        return "720p"
+    return DEFAULT_RESOLUTION
 
 
 def normalize_seedance_params(
@@ -66,16 +116,19 @@ def normalize_seedance_params(
     aspect_ratio: str = DEFAULT_ASPECT,
     tier: str | None = None,
     seedance_variant: str | None = None,
+    resolution: str | None = None,
 ) -> Dict[str, Any]:
     """
     Normalize and validate Seedance-specific parameters.
 
     Accepts raw values from the request and returns a clean dict with:
-      duration_seconds (int), aspect_ratio (str), task_type (str), tier (str)
+      duration_seconds (int), aspect_ratio (str), task_type (str), tier (str), resolution (str)
 
-    Falls back to safe defaults for invalid values.
+    Resolution snap behaviour: if `fast` tier is requested with 1080p, snaps down to 720p
+    (PiAPI's seedance-2-fast does not support 1080p). 720p quality stays 720p.
+    Unknown resolutions default to 480p.
     """
-    # Duration
+    # Duration — exposed durations are 5/10/15; backend tolerates 4–15.
     try:
         dur = int(str(duration_seconds).replace("s", "").replace("sec", "").strip())
     except (ValueError, TypeError):
@@ -92,38 +145,39 @@ def normalize_seedance_params(
     resolved_tier = DEFAULT_TIER
     resolved_task_type = DEFAULT_TASK_TYPE
 
-    if tier and tier in TIER_TO_TASK_TYPE:
-        resolved_tier = tier
-        resolved_task_type = TIER_TO_TASK_TYPE[tier]
+    if tier:
+        resolved_tier = _normalize_tier(tier)
+        resolved_task_type = TIER_TO_TASK_TYPE[resolved_tier]
     elif seedance_variant and seedance_variant in VARIANT_MAP:
         resolved_task_type, resolved_tier = VARIANT_MAP[seedance_variant]
     # else: defaults
+
+    # Resolution (tier-aware snap)
+    resolved_resolution = _normalize_resolution(resolution, resolved_tier)
 
     return {
         "duration_seconds": dur,
         "aspect_ratio": ar,
         "task_type": resolved_task_type,
         "tier": resolved_tier,
+        "resolution": resolved_resolution,
     }
 
 
 class SeedanceProvider:
     """
-    Seedance 2.0 video generation provider via PiAPI.
+    Seedance 2.0 GA video generation provider via PiAPI.
 
-    Supports text-to-video and image-to-video with durations 5/10/15s,
-    aspect ratios 16:9 / 9:16 / 1:1, and two quality tiers (fast / preview).
+    Supports:
+      • text-to-video                (mode: text_to_video)
+      • image-to-video, single image (mode: first_last_frames, image_urls=[ref])
+      • image transition, two images (mode: first_last_frames, image_urls=[start, end])
 
-    Image Transition (two-image interpolation) is NOT supported.
-    PiAPI's create_seedance_task() accepts image_urls: List[str] for a single
-    reference image only — there is no end_image, last_frame, or keyframe
-    interpolation field in the Seedance PiAPI schema. Do NOT expose transition
-    in the UI for this provider. See VIDEO_PROVIDER_CONFIG.seedance.capabilities.
+    Durations 4–15s, aspect ratios 21:9/16:9/4:3/1:1/3:4/9:16/auto.
+    Resolutions: fast tier → 480p/720p, quality tier → 480p/720p/1080p.
 
-    Experimental Morph (Beta): passes image_urls=[url1, url2] — two reference
-    images in the existing list field. PiAPI may only use the first image;
-    behavior is undocumented and results are unpredictable. This is NOT true
-    first-to-last-frame interpolation. Billed at image animate rates.
+    omni_reference (multimodal: images + video + audio references) is supported by
+    the underlying service but not yet exposed at the provider/UX level.
     """
 
     name = "seedance"
@@ -133,12 +187,13 @@ class SeedanceProvider:
         return check_seedance_configured()
 
     def start_text_to_video(self, prompt: str, **params) -> Dict[str, Any]:
-        """Start text-to-video generation via Seedance."""
+        """Start text-to-video generation via Seedance (PiAPI mode=text_to_video)."""
         clean = normalize_seedance_params(
             duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
             aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
             tier=params.get("tier"),
             seedance_variant=params.get("task_type") or params.get("seedance_variant"),
+            resolution=params.get("resolution"),
         )
         try:
             return create_seedance_task(
@@ -146,6 +201,8 @@ class SeedanceProvider:
                 duration=clean["duration_seconds"],
                 aspect_ratio=clean["aspect_ratio"],
                 task_type=clean["task_type"],
+                mode="text_to_video",
+                resolution=clean["resolution"],
             )
         except SeedanceQuotaError as e:
             from backend.services.video_router import QuotaExhaustedError
@@ -157,18 +214,24 @@ class SeedanceProvider:
             raise
 
     def start_image_to_video(self, image_data: str, prompt: str, **params) -> Dict[str, Any]:
-        """Start image-to-video generation via Seedance."""
+        """
+        Animate a single reference image (PiAPI mode=first_last_frames, image_urls=[ref]).
+
+        Per the PiAPI Seedance 2 docs, single-image animation is done by
+        first_last_frames with just one URL; text_to_video mode rejects image_urls.
+        """
         clean = normalize_seedance_params(
             duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
             aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
             tier=params.get("tier"),
             seedance_variant=params.get("task_type") or params.get("seedance_variant"),
+            resolution=params.get("resolution"),
         )
         # PiAPI requires image_urls to be publicly accessible URLs.
         # If the client sent a base64 data URI, upload to S3 first.
         public_url = _ensure_public_image_url(image_data) if image_data else None
 
-        # Ensure prompt references the image per PiAPI docs (@image1 syntax)
+        # PiAPI converts our @image1 marker to ByteDance's upstream 【@图片N】 form.
         i2v_prompt = prompt
         if public_url and "@image1" not in i2v_prompt:
             i2v_prompt = f"@image1 {prompt}"
@@ -180,6 +243,8 @@ class SeedanceProvider:
                 aspect_ratio=clean["aspect_ratio"],
                 image_urls=[public_url] if public_url else None,
                 task_type=clean["task_type"],
+                mode="first_last_frames",
+                resolution=clean["resolution"],
             )
         except SeedanceQuotaError as e:
             from backend.services.video_router import QuotaExhaustedError
@@ -190,52 +255,47 @@ class SeedanceProvider:
                 raise QuotaExhaustedError(self.name, str(e))
             raise
 
-    def start_experimental_morph(self, start_image: str, end_image: str, prompt: str, **params) -> Dict[str, Any]:
+    def start_image_transition(self, start_image: str, end_image: str, prompt: str, **params) -> Dict[str, Any]:
         """
-        Two-image morph/transition via Seedance.
+        Native first-to-last-frame interpolation via Seedance 2 GA.
 
-        Passes image_urls=[start_url, end_url] and ensures the prompt
-        references them using PiAPI's @image1 / @image2 syntax (which PiAPI
-        converts to the upstream ByteDance 【@图片N】 format).
-
-        PiAPI supports up to 9 reference images. For morph, we use exactly 2:
-          @image1 = start frame
-          @image2 = end frame
-
-        Billed at the same rate as image animate.
+        PiAPI mode=first_last_frames with image_urls=[start_url, end_url] —
+        this is the real keyframe interpolation that replaces the legacy
+        "experimental morph" hack we used pre-GA.
         """
         clean = normalize_seedance_params(
             duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
             aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
             tier=params.get("tier"),
             seedance_variant=params.get("task_type") or params.get("seedance_variant"),
+            resolution=params.get("resolution"),
         )
-        # Convert both images to public URLs (PiAPI requires http(s) URLs)
         start_url = _ensure_public_image_url(start_image) if start_image else None
         end_url = _ensure_public_image_url(end_image) if end_image else None
 
         if not start_url or not end_url:
-            raise RuntimeError("experimental_morph requires two valid images")
+            raise RuntimeError("image_transition requires two valid images")
 
-        # PiAPI requires @image1/@image2 references in the prompt for
-        # multi-image input. Without these markers the API rejects the request.
-        morph_prompt = prompt
-        if "@image1" not in morph_prompt and "@image2" not in morph_prompt:
-            morph_prompt = f"@image1 smoothly transitions into @image2. {prompt}"
+        # Prompt must reference both keyframes for multi-image input.
+        transition_prompt = prompt
+        if "@image1" not in transition_prompt and "@image2" not in transition_prompt:
+            transition_prompt = f"@image1 smoothly transitions into @image2. {prompt}"
 
         print(
-            f"[SEEDANCE] morph: image_urls=[start, end] "
-            f"tier={clean['tier']} duration={clean['duration_seconds']}s "
+            f"[SEEDANCE] first_last_frames: tier={clean['tier']} "
+            f"duration={clean['duration_seconds']}s resolution={clean['resolution']} "
             f"prompt_has_refs={'@image' in prompt}"
         )
 
         try:
             return create_seedance_task(
-                prompt=morph_prompt,
+                prompt=transition_prompt,
                 duration=clean["duration_seconds"],
                 aspect_ratio=clean["aspect_ratio"],
                 image_urls=[start_url, end_url],
                 task_type=clean["task_type"],
+                mode="first_last_frames",
+                resolution=clean["resolution"],
             )
         except SeedanceQuotaError as e:
             from backend.services.video_router import QuotaExhaustedError
@@ -245,6 +305,10 @@ class SeedanceProvider:
                 from backend.services.video_router import QuotaExhaustedError
                 raise QuotaExhaustedError(self.name, str(e))
             raise
+
+    # Back-compat alias — old callers that call `start_experimental_morph` keep working
+    # but now route through the proper first_last_frames path.
+    start_experimental_morph = start_image_transition
 
     def check_status(self, task_id: str) -> Dict[str, Any]:
         """Check status of a Seedance task."""

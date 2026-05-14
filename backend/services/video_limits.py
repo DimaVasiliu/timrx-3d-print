@@ -220,7 +220,12 @@ def get_last_video_job_started_at(identity_id: str) -> Optional[datetime]:
 # PROVIDER SPEND TRACKING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_video_provider_cost(provider: str, duration_seconds: int, seedance_tier: str = "fast") -> float:
+def estimate_video_provider_cost(
+    provider: str,
+    duration_seconds: int,
+    seedance_tier: str = "fast",
+    resolution: str | None = None,
+) -> float:
     """
     Estimate the real GBP cost of a video job to the provider.
 
@@ -228,7 +233,7 @@ def estimate_video_provider_cost(provider: str, duration_seconds: int, seedance_
     Delegates to the canonical implementation in provider_costs.py.
     """
     from backend.services.provider_costs import estimate_video_cost
-    return estimate_video_cost(provider, duration_seconds, seedance_tier)
+    return estimate_video_cost(provider, duration_seconds, seedance_tier, resolution)
 
 
 def get_daily_user_video_provider_spend(identity_id: str) -> float:
@@ -431,12 +436,13 @@ def validate_video_rate_limits(
 # Average generation time per provider+tier (seconds)
 # Observed PiAPI timings (2026-03-10):
 #   fast:    7-8 min total (queue + render)
-#   preview: 20-100+ min (highly variable queue)
+#   quality: 20-100+ min (highly variable queue)  — was "preview" pre-GA
 AVERAGE_GENERATION_TIME = {
     "vertex": 80,               # 45–120s
     "seedance": 480,            # ~8 min (fast tier typical)
     "seedance_fast": 480,       # ~8 min
-    "seedance_preview": 1200,   # ~20 min (highly variable)
+    "seedance_quality": 1200,   # ~20 min (highly variable)
+    "seedance_preview": 1200,   # legacy alias
     "fal_seedance": 120,        # ~2 min (estimated)
 }
 
@@ -445,7 +451,8 @@ RENDER_TIME_RANGE = {
     "vertex": (45, 120),
     "seedance": (300, 600),          # 5-10 min (fast tier default)
     "seedance_fast": (300, 600),     # 5-10 min
-    "seedance_preview": (600, 3600), # 10-60 min (variable queue)
+    "seedance_quality": (600, 3600), # 10-60 min (variable queue)
+    "seedance_preview": (600, 3600), # legacy alias
     "fal_seedance": (60, 300),       # 1-5 min (estimated)
 }
 
