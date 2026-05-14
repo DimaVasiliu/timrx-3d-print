@@ -58,11 +58,28 @@ MATERIALS: Dict[str, Dict[str, Dict[str, Any]]] = {
     },
 }
 
+ENABLED_PROCESSES = {"fdm"}
+
 COLOR_LABELS: Dict[str, str] = {
-    "black": "Black", "white": "White", "gray": "Gray", "red": "Red",
-    "orange": "Orange", "yellow": "Yellow", "green": "Green", "teal": "Teal",
-    "blue": "Blue", "navy": "Navy", "purple": "Purple", "pink": "Pink",
-    "gold": "Gold", "silver": "Silver",
+    "black": "Black",
+    "jade_white": "Jade White",
+    "white": "Jade White",
+    "gray": "Gray",
+    "dark_gray": "Dark Gray",
+    "red": "Red",
+    "orange": "Orange",
+    "yellow": "Yellow",
+    "bambu_green": "Bambu Green",
+    "green": "Bambu Green",
+    "blue": "Blue",
+    "lake_blue": "Lake Blue",
+    "cyan": "Cyan",
+    "magenta": "Magenta",
+    "lime_green": "Lime Green",
+    "forest_green": "Forest Green",
+    "cream": "Cream",
+    "silver": "Silver",
+    "peanut_brown": "Peanut Brown",
 }
 
 # Quality affects detail + print-time. Premium feel — Fine and Ultra are
@@ -280,6 +297,8 @@ def _validate_spec(spec: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Dict[str,
     process = (spec.get("process") or "fdm").lower()
     if process not in MATERIALS:
         raise PriceError(f"Unknown process '{process}'")
+    if process not in ENABLED_PROCESSES:
+        raise PriceError("Resin ordering is not available on the current Bambu Lab P1S fulfilment setup")
 
     material_id = (spec.get("material") or "").lower()
     catalog = MATERIALS[process]

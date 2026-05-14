@@ -73,3 +73,18 @@ def test_single_piece_must_fit_current_256mm_build_volume():
         assert "256" in str(exc)
     else:
         raise AssertionError("Expected oversized single-piece print to be rejected")
+
+
+def test_current_fulfilment_rejects_resin_until_resin_printer_exists():
+    try:
+        compute(_spec(process="resin", material="std", color="gray"), country="GB", speed="standard")
+    except PriceError as exc:
+        assert "Resin ordering is not available" in str(exc)
+    else:
+        raise AssertionError("Expected resin order to be rejected for P1S fulfilment")
+
+
+def test_bambu_lab_color_ids_are_accepted():
+    quote = compute(_spec(color="bambu_green"), country="GB", speed="standard")
+
+    assert quote.color_label == "Bambu Green"
