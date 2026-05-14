@@ -9,6 +9,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 compute = _MODULE.compute
+PriceError = _MODULE.PriceError
 
 
 def _spec(**overrides):
@@ -49,7 +50,7 @@ def test_small_premium_materials_change_the_quote_even_at_floor():
 def test_size_increases_production_value_and_can_change_parcel_tier():
     mini = compute(_spec(scaled_dimensions_mm=[60, 60, 60]), country="GB", speed="standard")
     display = compute(_spec(scaled_dimensions_mm=[150, 150, 150]), country="GB", speed="standard")
-    oversized = compute(_spec(scaled_dimensions_mm=[260, 260, 260]), country="GB", speed="standard")
+    oversized = compute(_spec(scaled_dimensions_mm=[256, 256, 256]), country="GB", speed="standard")
 
     assert display.subtotal > mini.subtotal
     assert oversized.subtotal > display.subtotal
@@ -63,3 +64,12 @@ def test_standard_delivery_becomes_included_over_threshold():
     assert quote.free_shipping_unlocked is True
     assert quote.shipping == 0
     assert quote.shipping_label == "Free secure packaging & tracked delivery"
+
+
+def test_single_piece_must_fit_current_256mm_build_volume():
+    try:
+        compute(_spec(scaled_dimensions_mm=[257, 80, 80]), country="GB", speed="standard")
+    except PriceError as exc:
+        assert "256" in str(exc)
+    else:
+        raise AssertionError("Expected oversized single-piece print to be rejected")

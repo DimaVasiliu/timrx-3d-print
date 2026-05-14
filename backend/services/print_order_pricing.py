@@ -109,6 +109,8 @@ SIZE_CLASS_LABELS = {
     "oversized": "Oversized production",
 }
 
+BUILD_VOLUME_MM = (256.0, 256.0, 256.0)
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 2.  PER-CURRENCY PRICING TABLES (native rates — NOT FX'd)
@@ -307,7 +309,12 @@ def _bbox_mm(spec: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
         try:
             d = tuple(float(x) for x in dims)
             if all(v > 0 for v in d):
+                over = [v for v, max_v in zip(d, BUILD_VOLUME_MM) if v > max_v]
+                if over:
+                    raise PriceError("Scaled dimensions exceed the current 256 × 256 × 256mm printer volume")
                 return d  # type: ignore[return-value]
+        except PriceError:
+            raise
         except (TypeError, ValueError):
             pass
     return None
