@@ -73,6 +73,42 @@ QUALITY_MULT = {"draft": 0.85, "standard": 1.0, "fine": 1.4, "ultra": 2.0}
 # noticeably more.  Raw stays as the baseline.
 FINISH_MULT  = {"raw": 1.0, "sanded": 1.15, "primed": 1.35, "painted": 2.2}
 
+# Small custom prints often hit the minimum-order floor.  Without a
+# material-aware floor, changing PLA -> PETG/Resin appears to do nothing in
+# the modal, which is both confusing and commercially wrong.
+MATERIAL_FLOOR_PREMIUMS: Dict[str, Dict[str, float]] = {
+    "fdm": {
+        "pla": 0.00,
+        "plaplus": 1.20,
+        "petg": 2.00,
+        "abs": 2.40,
+        "tpu": 3.80,
+        "silk": 2.50,
+    },
+    "resin": {
+        "std": 4.00,
+        "tough": 6.00,
+        "clear": 7.00,
+        "flex": 9.00,
+    },
+}
+
+SIZE_CLASS_MULT = {
+    "mini": 1.00,       # 50-74mm
+    "collectible": 1.12, # 75-124mm
+    "display": 1.32,   # 125-174mm
+    "showpiece": 1.58, # 175-224mm
+    "oversized": 1.95,
+}
+
+SIZE_CLASS_LABELS = {
+    "mini": "Mini collectible",
+    "collectible": "Collectible",
+    "display": "Display piece",
+    "showpiece": "Showpiece",
+    "oversized": "Oversized production",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 2.  PER-CURRENCY PRICING TABLES (native rates — NOT FX'd)
@@ -83,15 +119,18 @@ FINISH_MULT  = {"raw": 1.0, "sanded": 1.15, "primed": 1.35, "painted": 2.2}
 PRICING: Dict[str, Dict[str, Any]] = {
     # ── United Kingdom (Royal Mail Tracked) ───────────────────────────
     "GBP": {
-        "production_fee":           8.50,   # setup + cleaning + QC + std packaging + Mollie fee reserve + 5% failed-print reserve
-        "print_time_per_hour":      0.80,   # electricity + nozzle/build-plate wear
-        "min_order":                14.00,  # absolute floor per unit (post quality/finish)
+        "production_fee":           9.75,   # setup + slicing + cleaning + QC + standard packaging + fee/failure reserve
+        "print_time_per_hour":      1.10,   # electricity + nozzle/build-plate wear + operator supervision
+        "min_order":                14.95,  # absolute PLA mini floor per unit (material premiums apply on top)
         "packaging_premium":        3.99,   # optional gift box + crinkle + certificate
-        "free_shipping_threshold":  45.00,
+        "free_shipping_threshold":  49.00,
         "shipping": {
-            "standard":  4.49,   # Royal Mail Tracked 48
-            "express":   7.99,   # Royal Mail Tracked 24
-            "priority": 12.99,   # Special Delivery Guaranteed
+            # Customer-visible secure packaging + tracked delivery.  Rates
+            # include postage, box/padding/label, courier variance and damage reserve.
+            "small":     {"standard": 4.95,  "express": 7.95,  "priority": 12.95},
+            "parcel":    {"standard": 5.95,  "express": 8.95,  "priority": 14.95},
+            "medium":    {"standard": 7.95,  "express": 10.95, "priority": 18.95},
+            "oversized": {"standard": 14.95, "express": 19.95, "priority": 29.95},
         },
         "materials": {
             "fdm": {
@@ -113,15 +152,16 @@ PRICING: Dict[str, Dict[str, Any]] = {
 
     # ── Eurozone (DPD / Royal Mail International Tracked) ─────────────
     "EUR": {
-        "production_fee":           9.99,
-        "print_time_per_hour":      0.95,
-        "min_order":                16.00,
+        "production_fee":          11.50,
+        "print_time_per_hour":      1.25,
+        "min_order":                17.95,
         "packaging_premium":        4.99,
-        "free_shipping_threshold":  55.00,
+        "free_shipping_threshold":  65.00,
         "shipping": {
-            "standard":  7.49,
-            "express":  13.99,
-            "priority": 22.99,
+            "small":     {"standard": 8.95,  "express": 15.95, "priority": 24.95},
+            "parcel":    {"standard": 11.95, "express": 18.95, "priority": 28.95},
+            "medium":    {"standard": 16.95, "express": 24.95, "priority": 36.95},
+            "oversized": {"standard": 29.95, "express": 42.95, "priority": 64.95},
         },
         "materials": {
             "fdm": {
@@ -136,15 +176,16 @@ PRICING: Dict[str, Dict[str, Any]] = {
 
     # ── US / CA / AU (DHL Economy or USPS/Royal Mail Int'l Tracked) ──
     "USD": {
-        "production_fee":          11.99,
-        "print_time_per_hour":      1.10,
-        "min_order":                18.00,
+        "production_fee":          13.50,
+        "print_time_per_hour":      1.45,
+        "min_order":                19.95,
         "packaging_premium":        5.99,
-        "free_shipping_threshold":  65.00,
+        "free_shipping_threshold":  79.00,
         "shipping": {
-            "standard": 11.99,
-            "express":  24.99,
-            "priority": 42.99,
+            "small":     {"standard": 13.95, "express": 26.95, "priority": 44.95},
+            "parcel":    {"standard": 18.95, "express": 32.95, "priority": 54.95},
+            "medium":    {"standard": 28.95, "express": 44.95, "priority": 74.95},
+            "oversized": {"standard": 49.95, "express": 74.95, "priority": 119.95},
         },
         "materials": {
             "fdm": {
@@ -196,6 +237,8 @@ class PriceBreakdown:
     # Display helpers
     material_label: str
     color_label: str
+    size_class: str
+    shipping_tier: str
 
     # Cents for storage / Mollie / PayPal — integer-safe.
     subtotal_cents: int
@@ -254,6 +297,7 @@ def _validate_spec(spec: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Dict[str,
         "infill_pct":       int(spec.get("infill_pct") or 20),
         "quantity":         max(1, min(100, int(spec.get("quantity") or 1))),
         "premium_packaging": bool(spec.get("premium_packaging") or False),
+        "parts_count":       max(1, min(24, int(spec.get("parts_count") or spec.get("part_count") or 1))),
     }
 
 
@@ -306,6 +350,38 @@ def _estimate_weight_and_time(
     return weight_g, time_min
 
 
+def _size_class(bbox_mm: Tuple[float, float, float]) -> str:
+    max_dim = max(bbox_mm)
+    if max_dim < 75:
+        return "mini"
+    if max_dim < 125:
+        return "collectible"
+    if max_dim < 175:
+        return "display"
+    if max_dim < 225:
+        return "showpiece"
+    return "oversized"
+
+
+def _shipping_tier(
+    bbox_mm: Tuple[float, float, float],
+    total_weight_g: float,
+    quantity: int,
+    parts_count: int,
+) -> str:
+    """Map model + order bulk to a realistic parcel tier."""
+    max_dim = max(bbox_mm)
+    packed_weight_g = total_weight_g + 140 + (quantity - 1) * 35 + (parts_count - 1) * 25
+
+    if max_dim <= 160 and packed_weight_g <= 500:
+        return "small"
+    if max_dim <= 350 and packed_weight_g <= 2000:
+        return "parcel"
+    if max_dim <= 450 and packed_weight_g <= 5000:
+        return "medium"
+    return "oversized"
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 6.  MAIN COMPUTE
 # ─────────────────────────────────────────────────────────────────────
@@ -333,6 +409,8 @@ def compute(
     weight_g, time_min = _estimate_weight_and_time(
         bbox, process, sv["infill_pct"], float(mat["density"]), quality_mult,
     )
+    size_class = _size_class(bbox)
+    size_mult = SIZE_CLASS_MULT.get(size_class, 1.0)
 
     # ── Per-unit production cost (native currency) ──────────────────
     material_rate = float(P["materials"][process][sv["material_id"]])
@@ -340,11 +418,15 @@ def compute(
     print_time_cost = (time_min / 60.0) * float(P["print_time_per_hour"])
     production_fee = float(P["production_fee"])
 
-    per_unit_raw = production_fee + material_cost + print_time_cost
+    parts_overhead = max(0, sv["parts_count"] - 1) * float(P["production_fee"]) * 0.28
+    per_unit_raw = (production_fee + material_cost + print_time_cost + parts_overhead) * size_mult
 
     # Minimum order floor — protects margin on tiny items where production
-    # fee alone wouldn't cover overhead.
-    per_unit = max(per_unit_raw, float(P["min_order"]))
+    # fee alone wouldn't cover overhead. The floor is material-aware so
+    # premium materials still change the estimate on small models.
+    material_floor_premium = MATERIAL_FLOOR_PREMIUMS.get(process, {}).get(sv["material_id"], 0.0)
+    per_unit_floor = (float(P["min_order"]) + material_floor_premium) * size_mult
+    per_unit = max(per_unit_raw, per_unit_floor)
 
     # ── Quantity discount ───────────────────────────────────────────
     # Tighter than before: -2.5% per extra unit, capped at 15%, no
@@ -359,7 +441,8 @@ def compute(
 
     # ── Shipping (native rate, free over threshold for STANDARD only) ───
     speed_key = speed if speed in ("standard", "express", "priority") else "standard"
-    shipping_full = float(P["shipping"][speed_key])
+    tier = _shipping_tier(bbox, weight_g * qty, qty, sv["parts_count"])
+    shipping_full = float(P["shipping"][tier][speed_key])
 
     pre_shipping_total = subtotal + packaging
     free_shipping_threshold = float(P["free_shipping_threshold"])
@@ -370,7 +453,7 @@ def compute(
     shipping = 0.0 if free_shipping_unlocked else shipping_full
     free_shipping_remaining = max(0.0, free_shipping_threshold - pre_shipping_total)
 
-    shipping_label = _shipping_label(currency, speed_key, free_shipping_unlocked)
+    shipping_label = _shipping_label(currency, speed_key, free_shipping_unlocked, tier)
 
     # ── Total ───────────────────────────────────────────────────────
     total = subtotal + packaging + shipping
@@ -399,6 +482,8 @@ def compute(
         total=round(total, 2),
         material_label=str(mat["label"]),
         color_label=COLOR_LABELS.get(sv["color"], sv["color"] or "—"),
+        size_class=SIZE_CLASS_LABELS.get(size_class, size_class),
+        shipping_tier=tier,
         subtotal_cents=int(round(subtotal * 100)),
         packaging_cents=int(round(packaging * 100)),
         shipping_cents=int(round(shipping * 100)),
@@ -407,25 +492,26 @@ def compute(
     )
 
 
-def _shipping_label(currency: str, speed: str, free: bool) -> str:
+def _shipping_label(currency: str, speed: str, free: bool, tier: str = "small") -> str:
     """Human-readable shipping line for the receipt / email."""
     if free:
-        return "Free Tracked delivery"
+        return "Free secure packaging & tracked delivery"
+    tier_hint = "oversized " if tier == "oversized" else ""
     if currency == "GBP":
         return {
-            "standard": "Tracked delivery — Royal Mail Tracked 48",
-            "express":  "Express delivery — Royal Mail Tracked 24",
-            "priority": "Priority delivery — Special Delivery Guaranteed",
-        }.get(speed, "Tracked delivery")
+            "standard": f"Secure packaging & {tier_hint}tracked delivery",
+            "express":  f"Express secure packaging & {tier_hint}tracked delivery",
+            "priority": f"Priority secure packaging & {tier_hint}tracked delivery",
+        }.get(speed, "Secure packaging & tracked delivery")
     if currency == "USD":
         return {
-            "standard": "Tracked international delivery (7–14 days)",
-            "express":  "Express international delivery (3–5 days)",
-            "priority": "Priority international delivery (1–3 days)",
-        }.get(speed, "Tracked delivery")
+            "standard": f"Secure packaging & {tier_hint}tracked international delivery",
+            "express":  f"Express secure packaging & {tier_hint}tracked international delivery",
+            "priority": f"Priority secure packaging & {tier_hint}tracked international delivery",
+        }.get(speed, "Secure packaging & tracked delivery")
     # EUR
     return {
-        "standard": "Tracked delivery (5–8 days)",
-        "express":  "Express delivery (2–3 days)",
-        "priority": "Priority delivery (1–2 days)",
-    }.get(speed, "Tracked delivery")
+        "standard": f"Secure packaging & {tier_hint}tracked delivery",
+        "express":  f"Express secure packaging & {tier_hint}tracked delivery",
+        "priority": f"Priority secure packaging & {tier_hint}tracked delivery",
+    }.get(speed, "Secure packaging & tracked delivery")
