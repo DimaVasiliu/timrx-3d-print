@@ -233,7 +233,13 @@ def estimate_video_provider_cost(
     Delegates to the canonical implementation in provider_costs.py.
     """
     from backend.services.provider_costs import estimate_video_cost
-    return estimate_video_cost(provider, duration_seconds, seedance_tier, resolution)
+    # Defensive: if a stale build has the pre-GA 3-arg signature loaded in this
+    # process, fall back so the request still succeeds (just with a less-accurate
+    # cost estimate). Prevents 500s in rolling-deploy windows.
+    try:
+        return estimate_video_cost(provider, duration_seconds, seedance_tier, resolution)
+    except TypeError:
+        return estimate_video_cost(provider, duration_seconds, seedance_tier)
 
 
 def get_daily_user_video_provider_spend(identity_id: str) -> float:
