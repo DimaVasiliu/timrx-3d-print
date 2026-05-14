@@ -150,14 +150,49 @@ def _shipping_rows(order: Dict[str, Any]) -> str:
 
 def _totals_rows(order: Dict[str, Any]) -> str:
     cur = order.get("currency") or "USD"
-    # 'shipping_amount' is the cost; 'shipping' is the address dict.
+    packaging = float(order.get("packaging_amount", 0) or 0)
+    shipping_amount = float(order.get("shipping_amount", 0) or 0)
+    shipping_label = str(order.get("shipping_label") or "Tracked delivery")
+    free_unlocked = bool(order.get("free_shipping_unlocked"))
+
+    rows = [_row("Production", _esc(_fmt_money(float(order.get("subtotal", 0)), cur)))]
+
+    if packaging > 0:
+        rows.append(_row("Premium packaging", _esc(_fmt_money(packaging, cur))))
+
+    if free_unlocked or shipping_amount <= 0:
+        rows.append(_row(
+            shipping_label,
+            f"<span style='color:#16a34a'>{_esc(_fmt_money(0, cur))}</span>",
+        ))
+    else:
+        rows.append(_row(shipping_label, _esc(_fmt_money(shipping_amount, cur))))
+
+    rows.append(_row(
+        "<span style='color:#111827'>Order total</span>",
+        f"<span style='color:#0ea5e9;font-size:15px'>{_esc(_fmt_money(float(order.get('total', 0)), cur))}</span>",
+    ))
+    return "".join(rows)
+
+
+def _trust_strip() -> str:
+    """Small premium-feel trust strip rendered under the customer summary."""
     return (
-        _row("Subtotal", _esc(_fmt_money(float(order.get("subtotal", 0)), cur)))
-        + _row("Shipping", _esc(_fmt_money(float(order.get("shipping_amount", 0)), cur)))
-        + _row(
-            "<span style='color:#111827'>Total paid</span>",
-            f"<span style='color:#0ea5e9;font-size:15px'>{_esc(_fmt_money(float(order.get('total', 0)), cur))}</span>",
-        )
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' "
+        "style='border:1px solid #e5e7eb;border-radius:10px;margin:10px 0;background:#f8fafc;'>"
+        "<tr><td style='padding:14px 16px;'>"
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0'>"
+        "<tr>"
+        "<td align='center' style='padding:4px 6px;font-size:11px;color:#0f172a;font-weight:600;line-height:1.4'>"
+        "✓ Produced on demand</td>"
+        "<td align='center' style='padding:4px 6px;font-size:11px;color:#0f172a;font-weight:600;line-height:1.4'>"
+        "✓ Tracked delivery</td>"
+        "<td align='center' style='padding:4px 6px;font-size:11px;color:#0f172a;font-weight:600;line-height:1.4'>"
+        "✓ QC-checked</td>"
+        "<td align='center' style='padding:4px 6px;font-size:11px;color:#0f172a;font-weight:600;line-height:1.4'>"
+        "✓ Securely packaged</td>"
+        "</tr></table>"
+        "</td></tr></table>"
     )
 
 
@@ -208,7 +243,7 @@ def admin_email(order: Dict[str, Any]) -> Dict[str, str]:
         + _section("Print specification", _spec_rows(order))
         + _section("Shipping", _shipping_rows(order))
         + _section("Payment", _payment_rows(order))
-        + _section("Totals", _totals_rows(order))
+        + _section("Order summary", _totals_rows(order))
         + _next_steps_block()
     )
 
@@ -356,9 +391,10 @@ def customer_email(order: Dict[str, Any]) -> Dict[str, str]:
         f"<p style='margin:0 0 16px;font-size:13px;color:#6b7280'>"
         f"Order number: <strong style='color:#111827'>{_esc(order_number)}</strong>"
         f"</p>"
-        + _section("Order summary", _spec_rows(order))
+        + _section("Your custom collectible", _spec_rows(order))
         + _section("Shipping to", _shipping_rows(order))
-        + _section("Totals", _totals_rows(order))
+        + _section("Order summary", _totals_rows(order))
+        + _trust_strip()
         + "<p style='margin:18px 0 0;font-size:13px;color:#374151;line-height:1.6'>"
         "You'll receive a QC photo before your model ships, plus a tracking link once it's on the way. "
         "Replies to this email reach our support team."

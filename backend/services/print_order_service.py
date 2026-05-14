@@ -420,13 +420,17 @@ def mark_paid_and_notify(
                 order[k] = {}
 
     # Decorate for templates.  'shipping' is the address dict; the cost lives
-    # in shipping_cents — surface both, keyed distinctly.
+    # in shipping_cents — surface both, keyed distinctly.  Packaging,
+    # shipping_label and free-shipping flag live in the estimate JSONB.
     est = order.get("estimate") or {}
-    order["subtotal"]        = float(order["subtotal_cents"]) / 100.0
-    order["shipping_amount"] = float(order["shipping_cents"]) / 100.0
-    order["total"]           = float(order["total_cents"]) / 100.0
-    order["material_label"]  = est.get("material_label")
-    order["color_label"]     = est.get("color_label")
+    order["subtotal"]                = float(order["subtotal_cents"]) / 100.0
+    order["packaging_amount"]        = float(est.get("packaging", 0) or 0)
+    order["shipping_amount"]         = float(order["shipping_cents"]) / 100.0
+    order["shipping_label"]          = est.get("shipping_label") or "Tracked delivery"
+    order["free_shipping_unlocked"]  = bool(est.get("free_shipping_unlocked"))
+    order["total"]                   = float(order["total_cents"]) / 100.0
+    order["material_label"]          = est.get("material_label")
+    order["color_label"]             = est.get("color_label")
 
     # Archive the model file + thumb to S3 BEFORE emails so the admin links
     # are permanent (Meshy URLs can expire). Best-effort: emails still go out
