@@ -19,10 +19,11 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from backend.config import config
-from backend.db import get_conn, Tables
+from backend.db import get_conn, Tables, transaction
 from backend.services.email_service import EmailService
 from backend.services.paypal_service import PayPalService, PayPalError
 from backend.services.print_order_pricing import PriceBreakdown, PriceError, compute as compute_price
+from backend.services import print_offer_service
 from backend.services import print_order_emails
 
 
@@ -196,6 +197,7 @@ def create_order(
     spec: Dict[str, Any],
     shipping: Dict[str, Any],
     model: Dict[str, Any],
+    request_ip: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new print order, create the payment session, return checkout URL.
@@ -220,9 +222,9 @@ def create_order(
     if provider == "mollie" and not config.MOLLIE_CONFIGURED:
         raise PrintOrderError("Mollie is not configured")
 
-    # ── Authoritative price recomputation ────────────────────────────
+    # ── Authoritative base price recomputation ───────────────────────
     try:
-        price: PriceBreakdown = compute_price(
+        base_price: PriceBreakdown = compute_price(
             spec=spec,
             country=(shipping.get("country") or "").upper(),
             speed=(shipping.get("speed") or "standard"),
@@ -251,39 +253,67 @@ def create_order(
             "placing the order."
         )
 
-    # ── Insert order row ─────────────────────────────────────────────
+    # ── Insert order row + reserve automatic offers/credit ───────────
     order_id = str(uuid.uuid4())
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            order_number = _next_order_number(cur)
+    with transaction("print_order_create") as cur:
+        # Serializes first-time-offer checks and print-credit spends per identity.
+        cur.execute(f"SELECT id FROM {Tables.IDENTITIES} WHERE id = %s FOR UPDATE", (identity_id,))
 
-            cur.execute(
-                f"""
-                INSERT INTO {Tables.PRINT_ORDERS} (
-                    id, identity_id, customer_email, order_number, status,
-                    model_id, model_name, model_glb_url, model_thumb_url,
-                    spec, shipping,
-                    currency, subtotal_cents, shipping_cents, total_cents, estimate,
-                    payment_provider
-                ) VALUES (
-                    %s, %s, %s, %s, 'pending_payment',
-                    %s, %s, %s, %s,
-                    %s::jsonb, %s::jsonb,
-                    %s, %s, %s, %s, %s::jsonb,
-                    %s
-                )
-                """,
-                (
-                    order_id, identity_id, customer_email, order_number,
-                    final_model["id"], final_model["name"],
-                    final_model["glb_url"], final_model["thumb_url"],
-                    json.dumps(spec), json.dumps(shipping),
-                    price.currency, price.subtotal_cents, price.shipping_cents, price.total_cents,
-                    json.dumps(price.to_dict()),
-                    provider,
-                ),
+        order_number = _next_order_number(cur)
+        quote = print_offer_service.compute_offer_quote(
+            identity_id=identity_id,
+            base=base_price,
+            spec=spec,
+            shipping=shipping,
+            request_ip=request_ip,
+            cur=cur,
+        )
+        referral_attribution_id = print_offer_service.pending_referral_attribution_id(cur, identity_id)
+
+        cur.execute(
+            f"""
+            INSERT INTO {Tables.PRINT_ORDERS} (
+                id, identity_id, customer_email, order_number, status,
+                model_id, model_name, model_glb_url, model_thumb_url,
+                spec, shipping,
+                currency, subtotal_cents, packaging_cents, shipping_cents,
+                discount_cents, print_credit_cents, total_cents, estimate,
+                offer_code, offer_snapshot, payment_provider,
+                referral_attribution_id, order_ip_hash, shipping_address_hash
+            ) VALUES (
+                %s, %s, %s, %s, 'pending_payment',
+                %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s::jsonb,
+                %s, %s::jsonb, %s,
+                %s, %s, %s
             )
-        conn.commit()
+            """,
+            (
+                order_id, identity_id, customer_email, order_number,
+                final_model["id"], final_model["name"],
+                final_model["glb_url"], final_model["thumb_url"],
+                json.dumps(spec), json.dumps(shipping),
+                quote["currency"], quote["subtotal_cents"], quote.get("packaging_cents", 0),
+                quote["shipping_cents"], quote.get("discount_cents", 0),
+                quote.get("print_credit_cents", 0), quote["total_cents"],
+                json.dumps(quote),
+                quote.get("offer_code"), json.dumps(quote.get("offer_snapshot") or {}),
+                provider,
+                referral_attribution_id,
+                print_offer_service.ip_hash(request_ip),
+                print_offer_service.shipping_address_hash(shipping),
+            ),
+        )
+        print_offer_service.reserve_for_order(
+            cur=cur,
+            identity_id=identity_id,
+            order_id=order_id,
+            quote=quote,
+            request_ip=request_ip,
+            shipping=shipping,
+        )
 
     # ── Build return / webhook URLs ──────────────────────────────────
     frontend = (config.FRONTEND_BASE_URL or config.PUBLIC_BASE_URL or "").rstrip("/")
@@ -300,8 +330,8 @@ def create_order(
             res = _create_mollie_payment(
                 order_id=order_id,
                 order_number=order_number,
-                amount=price.total,
-                currency=price.currency,
+                amount=quote["total"],
+                currency=quote["currency"],
                 description=description,
                 customer_email=customer_email,
                 redirect_url=return_url,
@@ -316,8 +346,8 @@ def create_order(
         try:
             res = PayPalService.create_order(
                 order_number=order_number,
-                amount=price.total,
-                currency=price.currency,
+                amount=quote["total"],
+                currency=quote["currency"],
                 description=description,
                 return_url=return_url,
                 cancel_url=cancel_url,
@@ -347,8 +377,8 @@ def create_order(
         "order_id":     order_id,
         "order_number": order_number,
         "checkout_url": checkout_url,
-        "total":        price.total,
-        "currency":     price.currency,
+        "total":        quote["total"],
+        "currency":     quote["currency"],
         "provider":     provider,
     }
 
@@ -362,6 +392,7 @@ def _mark_order_failed(order_id: str, reason: str = "") -> None:
                     (order_id,),
                 )
             conn.commit()
+        print_offer_service.release_order_reservations(order_id)
         print(f"[PRINT-ORDER] order {order_id} marked failed: {reason or 'unspecified'}")
     except Exception as e:
         print(f"[PRINT-ORDER] mark_failed error: {e}")
@@ -383,26 +414,28 @@ def mark_paid_and_notify(
     """
     now = datetime.now(timezone.utc)
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE {Tables.PRINT_ORDERS}
-                SET status = 'paid', paid_at = %s
-                WHERE id = %s
-                  AND payment_provider = %s
-                  AND provider_payment_id = %s
-                  AND status = 'pending_payment'
-                RETURNING id, identity_id, customer_email, order_number, status,
-                          model_id, model_name, model_glb_url, model_thumb_url,
-                          spec, shipping, currency,
-                          subtotal_cents, shipping_cents, total_cents, estimate,
-                          payment_provider, provider_payment_id, paid_at
-                """,
-                (now, order_id, provider, provider_payment_id),
-            )
-            row = cur.fetchone()
-        conn.commit()
+    with transaction("print_order_paid") as cur:
+        cur.execute(
+            f"""
+            UPDATE {Tables.PRINT_ORDERS}
+            SET status = 'paid', paid_at = %s
+            WHERE id = %s
+              AND payment_provider = %s
+              AND provider_payment_id = %s
+              AND status = 'pending_payment'
+            RETURNING id, identity_id, customer_email, order_number, status,
+                      model_id, model_name, model_glb_url, model_thumb_url,
+                      spec, shipping, currency,
+                      subtotal_cents, packaging_cents, shipping_cents,
+                      discount_cents, print_credit_cents, total_cents,
+                      estimate, offer_code, offer_snapshot,
+                      payment_provider, provider_payment_id, paid_at
+            """,
+            (now, order_id, provider, provider_payment_id),
+        )
+        row = cur.fetchone()
+        if row:
+            print_offer_service.finalize_order_benefits(cur, dict(row))
 
     if not row:
         # Already paid (idempotent webhook redelivery) or order not found.
@@ -424,8 +457,10 @@ def mark_paid_and_notify(
     # shipping_label and free-shipping flag live in the estimate JSONB.
     est = order.get("estimate") or {}
     order["subtotal"]                = float(order["subtotal_cents"]) / 100.0
-    order["packaging_amount"]        = float(est.get("packaging", 0) or 0)
+    order["packaging_amount"]        = float(order.get("packaging_cents") or 0) / 100.0
     order["shipping_amount"]         = float(order["shipping_cents"]) / 100.0
+    order["discount_amount"]         = float(order.get("discount_cents") or 0) / 100.0
+    order["print_credit_amount"]     = float(order.get("print_credit_cents") or 0) / 100.0
     order["shipping_label"]          = est.get("shipping_label") or "Tracked delivery"
     order["free_shipping_unlocked"]  = bool(est.get("free_shipping_unlocked"))
     order["total"]                   = float(order["total_cents"]) / 100.0

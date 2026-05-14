@@ -20,7 +20,7 @@ from flask import Blueprint, g, jsonify, redirect, request
 
 from backend.config import config
 from backend.middleware import require_admin, require_session
-from backend.services import print_order_service, s3_service
+from backend.services import print_offer_service, print_order_service, s3_service
 from backend.services.paypal_service import PayPalService
 from backend.services.print_order_archive import get_admin_download_target
 from backend.services.print_order_pricing import compute as compute_price, PriceError, pick_currency
@@ -39,6 +39,13 @@ ALLOWED_PROVIDERS = {"mollie", "paypal"}
 
 def _err(code: str, msg: str, status: int = 400):
     return jsonify({"ok": False, "error": {"code": code, "message": msg}}), status
+
+
+def _get_client_ip() -> str:
+    forwarded_for = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr or ""
 
 
 def _validate_payload(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -117,7 +124,14 @@ def quote():
     speed   = (shipping.get("speed") or data.get("speed") or "standard").lower()
 
     try:
-        price = compute_price(spec=spec, country=country, speed=speed)
+        base_price = compute_price(spec=spec, country=country, speed=speed)
+        price = print_offer_service.compute_offer_quote(
+            identity_id=g.identity_id,
+            base=base_price,
+            spec=spec,
+            shipping=shipping,
+            request_ip=_get_client_ip(),
+        )
     except PriceError as e:
         return _err("BAD_SPEC", str(e), 400)
     except Exception as e:
@@ -133,7 +147,7 @@ def quote():
         "ok": True,
         "currency_detected": pick_currency(country),
         "providers_available": providers,
-        "quote": price.to_dict(),
+        "quote": price,
     })
 
 
@@ -166,6 +180,7 @@ def create():
             spec=payload["spec"],
             shipping=payload["shipping"],
             model=payload["model"],
+            request_ip=_get_client_ip(),
         )
     except print_order_service.PrintOrderError as e:
         return _err("ORDER_FAILED", str(e), 400)
@@ -186,6 +201,34 @@ def create():
         "currency":     result["currency"],
         "provider":     result["provider"],
     })
+
+
+# ─────────────────────────────────────────────────────────────
+# Referral helpers
+# ─────────────────────────────────────────────────────────────
+@bp.route("/referrals/me", methods=["GET"])
+@require_session
+def referrals_me():
+    base = (config.FRONTEND_BASE_URL or config.PUBLIC_BASE_URL or "").rstrip("/")
+    return jsonify({
+        "ok": True,
+        "referral": print_offer_service.referral_summary(g.identity_id, base_url=base),
+    })
+
+
+@bp.route("/referrals/claim", methods=["POST", "OPTIONS"])
+@require_session
+def referrals_claim():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or data.get("ref") or "").strip()
+    result = print_offer_service.claim_referral_token(
+        identity_id=g.identity_id,
+        token=token,
+        request_ip=_get_client_ip(),
+    )
+    return jsonify({"ok": True, "referral": result})
 
 
 # ─────────────────────────────────────────────────────────────

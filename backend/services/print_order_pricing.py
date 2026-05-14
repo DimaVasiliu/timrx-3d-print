@@ -152,7 +152,7 @@ PRICING: Dict[str, Dict[str, Any]] = {
         "print_time_per_hour":      1.10,   # electricity + nozzle/build-plate wear + operator supervision
         "min_order":                14.95,  # absolute PLA mini floor per unit (material premiums apply on top)
         "packaging_premium":        3.99,   # optional gift box + crinkle + certificate
-        "free_shipping_threshold":  49.00,
+        "free_shipping_threshold":  40.00,
         "shipping": {
             # Customer-visible secure packaging + tracked delivery.  Rates
             # include postage, box/padding/label, courier variance and damage reserve.

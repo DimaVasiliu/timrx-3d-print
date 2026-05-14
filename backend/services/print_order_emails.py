@@ -152,6 +152,8 @@ def _totals_rows(order: Dict[str, Any]) -> str:
     cur = order.get("currency") or "USD"
     packaging = float(order.get("packaging_amount", 0) or 0)
     shipping_amount = float(order.get("shipping_amount", 0) or 0)
+    discount_amount = float(order.get("discount_amount", 0) or 0)
+    print_credit_amount = float(order.get("print_credit_amount", 0) or 0)
     shipping_label = str(order.get("shipping_label") or "Tracked delivery")
     free_unlocked = bool(order.get("free_shipping_unlocked"))
 
@@ -159,6 +161,12 @@ def _totals_rows(order: Dict[str, Any]) -> str:
 
     if packaging > 0:
         rows.append(_row("Premium packaging", _esc(_fmt_money(packaging, cur))))
+
+    if discount_amount > 0:
+        rows.append(_row("Launch offer", f"<span style='color:#16a34a'>-{_esc(_fmt_money(discount_amount, cur))}</span>"))
+
+    if print_credit_amount > 0:
+        rows.append(_row("Print credit", f"<span style='color:#16a34a'>-{_esc(_fmt_money(print_credit_amount, cur))}</span>"))
 
     if free_unlocked or shipping_amount <= 0:
         rows.append(_row(
