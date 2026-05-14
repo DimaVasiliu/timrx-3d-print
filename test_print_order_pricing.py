@@ -88,3 +88,11 @@ def test_bambu_lab_color_ids_are_accepted():
     quote = compute(_spec(color="bambu_green"), country="GB", speed="standard")
 
     assert quote.color_label == "Bambu Green"
+
+
+def test_infill_changes_small_fdm_floor_price():
+    low = compute(_spec(infill_pct=20), country="GB", speed="standard")
+    high = compute(_spec(infill_pct=65), country="GB", speed="standard")
+
+    assert high.subtotal > low.subtotal
+    assert high.total > low.total

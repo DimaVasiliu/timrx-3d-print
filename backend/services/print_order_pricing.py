@@ -129,6 +129,16 @@ SIZE_CLASS_LABELS = {
 BUILD_VOLUME_MM = (256.0, 256.0, 256.0)
 
 
+def _infill_floor_multiplier(process: str, infill_pct: int) -> float:
+    """Make stronger FDM infill visibly affect even minimum-floor mini prints."""
+    if process == "resin":
+        return 1.0
+    infill = max(10, min(100, int(infill_pct or 20)))
+    if infill <= 20:
+        return 1.0
+    return 1.0 + min(0.35, (infill - 20) * 0.007)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 2.  PER-CURRENCY PRICING TABLES (native rates — NOT FX'd)
 # ─────────────────────────────────────────────────────────────────────
@@ -451,7 +461,8 @@ def compute(
     # fee alone wouldn't cover overhead. The floor is material-aware so
     # premium materials still change the estimate on small models.
     material_floor_premium = MATERIAL_FLOOR_PREMIUMS.get(process, {}).get(sv["material_id"], 0.0)
-    per_unit_floor = (float(P["min_order"]) + material_floor_premium) * size_mult
+    infill_floor_mult = _infill_floor_multiplier(process, sv["infill_pct"])
+    per_unit_floor = (float(P["min_order"]) + material_floor_premium) * size_mult * infill_floor_mult
     per_unit = max(per_unit_raw, per_unit_floor)
 
     # ── Quantity discount ───────────────────────────────────────────
