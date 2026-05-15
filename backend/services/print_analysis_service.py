@@ -6,6 +6,7 @@ Uses trimesh for geometry analysis.
 
 import gc
 import logging
+import os
 from urllib.parse import urlparse
 from typing import Dict, Any
 
@@ -21,18 +22,70 @@ class _SkipWallThickness(Exception):
     pass
 
 
+def _set_analysis_child_limits(memory_mb: int) -> None:
+    """Best-effort memory cap for the isolated mesh-analysis process."""
+    if memory_mb <= 0:
+        return
+    try:
+        import resource
+
+        limit = int(memory_mb) * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except Exception as exc:
+        logger.warning("[PRINT_ANALYSIS] Could not apply child memory limit: %s", exc)
+
+
+def _analysis_worker(conn, file_path: str, file_type: str | None, printer_type: str, memory_mb: int) -> None:
+    """Run trimesh analysis in a disposable child process."""
+    try:
+        # Keep native numerical libraries from multiplying memory usage.
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+        _set_analysis_child_limits(memory_mb)
+        result = PrintAnalysisService.analyze(file_path, file_type=file_type, printer_type=printer_type)
+        conn.send({"ok": True, "result": result})
+    except MemoryError:
+        conn.send({
+            "ok": False,
+            "error": "Model is too complex for the print-check memory budget.",
+            "suggestions": [
+                "Use Remesh with a lower polygon target, then run the print check again.",
+                "Export the model and verify it in a slicer if you need a full local analysis.",
+            ],
+        })
+    except BaseException as exc:
+        logger.exception("[PRINT_ANALYSIS] Child analysis failed")
+        conn.send({
+            "ok": False,
+            "error": f"Print analysis failed: {exc}",
+            "suggestions": ["Try Remesh to simplify and repair the mesh, then retry."],
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        gc.collect()
+
+
 class PrintAnalysisService:
     """Analyzes GLB/STL meshes for 3D printing readiness."""
 
-    MAX_FACE_COUNT = 300_000     # Very high-poly models are slow to slice
-    WALL_THICKNESS_FACE_LIMIT = 100_000  # Skip ray casting above this to avoid OOM
+    MAX_FACE_COUNT = int(os.getenv("PRINT_ANALYSIS_MAX_FACES", "200000"))
+    SCENE_CONCAT_FACE_LIMIT = int(os.getenv("PRINT_ANALYSIS_SCENE_CONCAT_FACE_LIMIT", "120000"))
+    WALL_THICKNESS_FACE_LIMIT = int(os.getenv("PRINT_ANALYSIS_WALL_FACE_LIMIT", "25000"))
+    WALL_THICKNESS_MAX_SAMPLES = int(os.getenv("PRINT_ANALYSIS_WALL_MAX_SAMPLES", "300"))
+    WALL_THICKNESS_MIN_SAMPLES = int(os.getenv("PRINT_ANALYSIS_WALL_MIN_SAMPLES", "80"))
     MIN_WALL_THICKNESS_MM = 0.8  # Minimum for FDM printing
 
     BASE_ALLOWED_MODEL_DOMAINS = {
         "assets.meshy.ai",
         "cdn.meshy.ai",
     }
-    MAX_DOWNLOAD_BYTES = 30 * 1024 * 1024  # 30 MB (was 100 MB — reduced to prevent OOM on constrained instances)
+    MAX_DOWNLOAD_BYTES = int(os.getenv("PRINT_ANALYSIS_MAX_DOWNLOAD_MB", "20")) * 1024 * 1024
 
     @staticmethod
     def _allowed_model_domains() -> set[str]:
@@ -99,13 +152,27 @@ class PrintAnalysisService:
                 continue
             if geometry.is_empty or len(geometry.vertices) == 0 or len(geometry.faces) == 0:
                 continue
-            meshes.append(geometry.copy())
+            meshes.append(geometry)
 
         if not meshes:
             raise ValueError("No valid mesh geometry found in file")
 
         if len(meshes) == 1:
             return meshes[0]
+
+        total_faces = sum(int(len(mesh.faces)) for mesh in meshes)
+        if total_faces > PrintAnalysisService.SCENE_CONCAT_FACE_LIMIT:
+            logger.warning(
+                "[PRINT_ANALYSIS] Scene has %d meshes / %d faces; using largest part to avoid OOM",
+                len(meshes),
+                total_faces,
+            )
+            largest = max(meshes, key=lambda mesh: int(len(mesh.faces)))
+            largest.metadata = dict(largest.metadata or {})
+            largest.metadata["timrx_analysis_limited_to_largest_part"] = True
+            largest.metadata["timrx_scene_part_count"] = len(meshes)
+            largest.metadata["timrx_scene_face_count"] = total_faces
+            return largest
 
         try:
             return trimesh.util.concatenate(meshes)
@@ -156,6 +223,16 @@ class PrintAnalysisService:
         score = 100
 
         try:
+            if mesh.metadata.get("timrx_analysis_limited_to_largest_part"):
+                checks["analysis_limited_to_largest_part"] = True
+                checks["scene_part_count"] = int(mesh.metadata.get("timrx_scene_part_count") or 0)
+                checks["scene_face_count"] = int(mesh.metadata.get("timrx_scene_face_count") or 0)
+                suggestions.append(
+                    "This file contains multiple high-poly mesh parts. To keep the server stable, "
+                    "the print check analyzed the largest part. Remesh or export as a single STL "
+                    "for complete whole-model diagnostics."
+                )
+
             # 1. Manifold check (watertight)
             checks["is_manifold"] = bool(mesh.is_watertight)
             if not mesh.is_watertight:
@@ -232,6 +309,20 @@ class PrintAnalysisService:
 
             # 7. Wall thickness analysis (ray-based sampling)
             try:
+                available_mb = PrintAnalysisService._get_available_memory_mb()
+                if available_mb is not None and available_mb < 700:
+                    logger.info(
+                        "[PRINT_ANALYSIS] Skipping wall thickness — low available memory: %.0fMB",
+                        available_mb,
+                    )
+                    checks["min_wall_thickness_mm"] = None
+                    checks["wall_thickness_ok"] = None
+                    suggestions.append(
+                        "Wall thickness analysis was skipped because the server is under "
+                        "memory pressure. Retry after remeshing or reducing polygon count."
+                    )
+                    raise _SkipWallThickness()
+
                 if len(mesh.faces) > PrintAnalysisService.WALL_THICKNESS_FACE_LIMIT:
                     logger.info(
                         "[PRINT_ANALYSIS] Skipping wall thickness — %d faces exceeds %d limit",
@@ -246,7 +337,10 @@ class PrintAnalysisService:
                     raise _SkipWallThickness()
 
                 # Sample surface points for thickness measurement
-                sample_count = min(2000, max(500, len(mesh.faces) // 10))
+                sample_count = min(
+                    PrintAnalysisService.WALL_THICKNESS_MAX_SAMPLES,
+                    max(PrintAnalysisService.WALL_THICKNESS_MIN_SAMPLES, len(mesh.faces) // 50),
+                )
                 points, face_indices = trimesh.sample.sample_surface(mesh, sample_count)
 
                 # Compute inward normals at sample points
@@ -520,7 +614,9 @@ class PrintAnalysisService:
 
         return None
 
-    ANALYSIS_TIMEOUT = 30  # seconds — if analysis takes longer, model is too complex
+    ANALYSIS_TIMEOUT = int(os.getenv("PRINT_ANALYSIS_TIMEOUT_SECONDS", "24"))
+    ANALYSIS_MEMORY_LIMIT_MB = int(os.getenv("PRINT_ANALYSIS_MEMORY_MB", "1800"))
+    USE_SUBPROCESS = os.getenv("PRINT_ANALYSIS_SUBPROCESS", "true").lower() not in ("0", "false", "no")
 
     @staticmethod
     def _get_available_memory_mb() -> float | None:
@@ -535,10 +631,83 @@ class PrintAnalysisService:
         return None
 
     @staticmethod
+    def _analyze_file_safely(file_path: str, file_type: str | None, printer_type: str) -> Dict[str, Any]:
+        """Run mesh analysis in a bounded child process so OOM does not kill Gunicorn."""
+        if not PrintAnalysisService.USE_SUBPROCESS:
+            return PrintAnalysisService.analyze(file_path, file_type=file_type, printer_type=printer_type)
+
+        import multiprocessing as mp
+        import time
+
+        start_method = os.getenv("PRINT_ANALYSIS_MP_START_METHOD", "spawn")
+        try:
+            ctx = mp.get_context(start_method)
+        except ValueError:
+            ctx = mp.get_context("spawn")
+
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_analysis_worker,
+            args=(child_conn, file_path, file_type, printer_type, PrintAnalysisService.ANALYSIS_MEMORY_LIMIT_MB),
+            daemon=True,
+        )
+
+        t0 = time.monotonic()
+        proc.start()
+        child_conn.close()
+
+        payload = None
+        try:
+            if parent_conn.poll(PrintAnalysisService.ANALYSIS_TIMEOUT):
+                payload = parent_conn.recv()
+            else:
+                logger.warning(
+                    "[PRINT_ANALYSIS] Timed out after %ss; terminating child pid=%s",
+                    PrintAnalysisService.ANALYSIS_TIMEOUT,
+                    proc.pid,
+                )
+                proc.terminate()
+        except EOFError:
+            payload = None
+        finally:
+            proc.join(timeout=3)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
+            parent_conn.close()
+
+        elapsed = time.monotonic() - t0
+        if not payload:
+            logger.warning(
+                "[PRINT_ANALYSIS] Child exited without result in %.1fs exitcode=%s",
+                elapsed,
+                proc.exitcode,
+            )
+            return PrintAnalysisService._failed_result(
+                "Print analysis exceeded the safe memory budget for this server.",
+                [
+                    "Use Remesh with a lower polygon target, then run the print check again.",
+                    "For very complex models, export the STL and verify it locally in a slicer.",
+                ],
+            )
+
+        if not payload.get("ok"):
+            logger.warning("[PRINT_ANALYSIS] Child returned failure in %.1fs: %s", elapsed, payload.get("error"))
+            return PrintAnalysisService._failed_result(
+                payload.get("error") or "Print analysis failed.",
+                payload.get("suggestions") or ["Try Remesh to simplify the model, then retry."],
+            )
+
+        result = payload["result"]
+        result["analysis_runtime_seconds"] = round(elapsed, 2)
+        result["analysis_mode"] = "isolated"
+        result["analysis_memory_limit_mb"] = PrintAnalysisService.ANALYSIS_MEMORY_LIMIT_MB
+        return result
+
+    @staticmethod
     def analyze_from_url(url: str, printer_type: str = "fdm") -> Dict[str, Any]:
-        """Download a GLB/STL from URL and analyze it in-process."""
+        """Download a GLB/STL from URL and analyze it with memory isolation."""
         import tempfile
-        import os
         import time
         import requests
 
@@ -598,12 +767,8 @@ class PrintAnalysisService:
                     head = f.read(16)
                 file_type = PrintAnalysisService._detect_file_type(url, resp.headers.get("content-type"), head)
 
-            # ── Run analysis in-process ──────────────────────────
-            # Runs inside the gunicorn worker — avoids the ~300 MB overhead
-            # of spawning a separate Python process.  gc.collect() afterwards
-            # frees trimesh/numpy allocations within this process.
             t0 = time.monotonic()
-            result = PrintAnalysisService.analyze(tmp_path, file_type=file_type, printer_type=printer_type)
+            result = PrintAnalysisService._analyze_file_safely(tmp_path, file_type=file_type, printer_type=printer_type)
             elapsed = time.monotonic() - t0
             logger.info("[PRINT_ANALYSIS] Completed in %.1fs", elapsed)
             return result

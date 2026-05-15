@@ -6,6 +6,9 @@ Free analysis (0 credits) to encourage the print workflow.
 """
 
 import logging
+import copy
+import hashlib
+import threading
 import time
 from collections import defaultdict
 
@@ -15,11 +18,15 @@ from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import with_session_readonly
 from backend.services.identity_service import require_identity
 
-# Simple per-identity rate limiter: max 10 print checks per minute
+# Simple per-identity rate limiter.
 _print_check_timestamps: dict[str, list[float]] = defaultdict(list)
-PRINT_CHECK_RATE_LIMIT = 10  # requests
+PRINT_CHECK_RATE_LIMIT = 4  # requests
 PRINT_CHECK_RATE_WINDOW = 60  # seconds
 _last_cleanup = time.time()
+_print_check_lock = threading.Lock()
+_print_check_cache: dict[str, tuple[float, dict]] = {}
+PRINT_CHECK_CACHE_TTL = 60 * 60
+PRINT_CHECK_CACHE_MAX = 128
 
 
 def _check_rate_limit(identity_id: str) -> bool:
@@ -41,6 +48,30 @@ def _check_rate_limit(identity_id: str) -> bool:
         return True
     _print_check_timestamps[identity_id].append(now)
     return False
+
+
+def _cache_key(identity_id: str, job_id: str, printer_type: str, model_url: str) -> str:
+    raw = f"{identity_id}|{job_id}|{printer_type}|{model_url}".encode("utf-8", "ignore")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _get_cached_result(key: str) -> dict | None:
+    cached = _print_check_cache.get(key)
+    if not cached:
+        return None
+    created_at, result = cached
+    if time.time() - created_at > PRINT_CHECK_CACHE_TTL:
+        _print_check_cache.pop(key, None)
+        return None
+    return copy.deepcopy(result)
+
+
+def _set_cached_result(key: str, result: dict) -> None:
+    if len(_print_check_cache) >= PRINT_CHECK_CACHE_MAX:
+        oldest_key = min(_print_check_cache, key=lambda item: _print_check_cache[item][0])
+        _print_check_cache.pop(oldest_key, None)
+    _print_check_cache[key] = (time.time(), copy.deepcopy(result))
+
 
 bp = Blueprint("print_check", __name__)
 logger = logging.getLogger(__name__)
@@ -148,6 +179,18 @@ def print_check(job_id: str):
     if not model_url:
         return jsonify({"error": "Model not found or no printable model URL available"}), 404
 
+    cache_key = _cache_key(identity_id, job_id, printer_type, model_url)
+    cached_result = _get_cached_result(cache_key)
+    if cached_result:
+        cached_result["cached"] = True
+        return jsonify(cached_result)
+
+    if not _print_check_lock.acquire(blocking=False):
+        return jsonify({
+            "error": "Another print check is already running. Please try again in a few seconds.",
+            "retry_after": 8,
+        }), 429
+
     # Run analysis
     try:
         from backend.services.print_analysis_service import PrintAnalysisService
@@ -217,9 +260,12 @@ def print_check(job_id: str):
         result["is_refined"] = is_refined
         result["source_action"] = source_action
 
+        _set_cached_result(cache_key, result)
         return jsonify(result)
     except ImportError:
         return jsonify({"error": "Print analysis not available (trimesh not installed)"}), 503
     except Exception as e:
         logger.exception("[PRINT_CHECK] Analysis failed for job_id=%s", job_id)
         return jsonify({"error": f"Analysis failed: {e}"}), 500
+    finally:
+        _print_check_lock.release()
