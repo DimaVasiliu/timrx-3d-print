@@ -2085,6 +2085,13 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
             canonical_raw = final_glb_url if asset_type == "model" else (image_url or final_thumbnail_url)
             canonical_url = build_canonical_url(canonical_raw)
 
+            # asset_saves has two unique constraints that can collide on the same INSERT:
+            #   uq_asset_saves_provider_upstream_stage   (provider, upstream_id, stage)
+            #   ux_asset_saves_url                       (provider, asset_type, canonical_url)
+            # A single ON CONFLICT clause can only target one. We try the upstream_id form
+            # first (the common case), and on a URL collision (the rarer case — different
+            # job produced byte-identical content → same hash-keyed S3 URL) we update the
+            # existing row by URL. Either way the upsert is idempotent and never crashes.
             try:
                 cur.execute("SAVEPOINT asset_saves_upsert")
                 cur.execute(
@@ -2109,13 +2116,43 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 )
                 cur.execute("RELEASE SAVEPOINT asset_saves_upsert")
             except Exception as e:
+                # Roll back the failed INSERT before we can run anything else on this txn.
                 try:
                     cur.execute("ROLLBACK TO SAVEPOINT asset_saves_upsert")
                     cur.execute("RELEASE SAVEPOINT asset_saves_upsert")
                 except Exception:
                     pass
-                log_db_continue("asset_saves_upsert", e)
-                db_errors.append({"op": "asset_saves_upsert", "error": str(e)})
+                # URL-collision branch: another job already saved this canonical_url.
+                # That's normal for hash-based S3 keys when two jobs converge on the same
+                # content. Update the existing URL row to point at the new upstream_id/stage.
+                if "ux_asset_saves_url" in str(e) and canonical_url:
+                    try:
+                        cur.execute("SAVEPOINT asset_saves_url_update")
+                        cur.execute(
+                            f"""
+                            UPDATE {APP_SCHEMA}.asset_saves
+                            SET upstream_id = %s,
+                                stage = %s,
+                                saved_at = NOW()
+                            WHERE provider = %s
+                              AND asset_type = %s
+                              AND canonical_url = %s
+                            """,
+                            (str(job_id), final_stage, provider, asset_type, canonical_url),
+                        )
+                        cur.execute("RELEASE SAVEPOINT asset_saves_url_update")
+                        print(f"[DB] asset_saves: URL already known (provider={provider} type={asset_type}); updated existing row")
+                    except Exception as url_update_err:
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT asset_saves_url_update")
+                            cur.execute("RELEASE SAVEPOINT asset_saves_url_update")
+                        except Exception:
+                            pass
+                        log_db_continue("asset_saves_url_update", url_update_err)
+                        db_errors.append({"op": "asset_saves_url_update", "error": str(url_update_err)})
+                else:
+                    log_db_continue("asset_saves_upsert", e)
+                    db_errors.append({"op": "asset_saves_upsert", "error": str(e)})
 
             item_type = "image" if is_image_output else "model"
 
@@ -2271,12 +2308,19 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                     cur.execute("SAVEPOINT model_upsert")
                     try:
                         if existing_by_hash_id:
-                            # Update existing model matched by content_hash
-                            # Protect existing good titles from being overwritten
+                            # Update existing model matched by content_hash.
+                            # Protect existing good titles from being overwritten.
+                            #
+                            # NOTE: every parameter is cast explicitly. The title CASE
+                            # expression references the parameter inside `%s IS NOT NULL`
+                            # before any column comparison, so PostgreSQL cannot infer
+                            # the type from context when the value is NULL and aborts
+                            # with `IndeterminateDatatype` — see the matching pattern in
+                            # the video UPDATE around line 1402.
                             cur.execute(
                                 f"""
                                 UPDATE {Tables.MODELS}
-                                SET identity_id = COALESCE(%s, identity_id),
+                                SET identity_id = COALESCE(%s::uuid, identity_id),
                                     title = CASE
                                         -- Keep existing good title
                                         WHEN title IS NOT NULL
@@ -2284,28 +2328,28 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                                          AND LOWER(BTRIM(title)) NOT IN ({_GENERIC_TITLES_SQL})
                                         THEN title
                                         -- Use incoming title if it's good
-                                        WHEN %s IS NOT NULL
-                                         AND BTRIM(%s) <> ''
-                                         AND LOWER(BTRIM(%s)) NOT IN ({_GENERIC_TITLES_SQL})
-                                        THEN %s
+                                        WHEN %s::text IS NOT NULL
+                                         AND BTRIM(%s::text) <> ''
+                                         AND LOWER(BTRIM(%s::text)) NOT IN ({_GENERIC_TITLES_SQL})
+                                        THEN %s::text
                                         -- Fallback to existing
-                                        ELSE COALESCE(title, %s)
+                                        ELSE COALESCE(title, %s::text)
                                     END,
-                                    prompt = COALESCE(%s, prompt),
-                                    root_prompt = COALESCE(%s, root_prompt),
-                                    upstream_job_id = COALESCE(upstream_job_id, %s),
-                                    upstream_id = COALESCE(upstream_id, %s),
+                                    prompt = COALESCE(%s::text, prompt),
+                                    root_prompt = COALESCE(%s::text, root_prompt),
+                                    upstream_job_id = COALESCE(upstream_job_id, %s::text),
+                                    upstream_id = COALESCE(upstream_id, %s::text),
                                     status = 'ready',
-                                    s3_bucket = COALESCE(%s, s3_bucket),
-                                    glb_url = %s,
-                                    thumbnail_url = %s,
-                                    glb_s3_key = COALESCE(%s, glb_s3_key),
-                                    thumbnail_s3_key = COALESCE(%s, thumbnail_s3_key),
-                                    content_hash = COALESCE(%s, content_hash),
-                                    stage = COALESCE(%s, stage),
-                                    meta = COALESCE(%s, meta),
+                                    s3_bucket = COALESCE(%s::text, s3_bucket),
+                                    glb_url = %s::text,
+                                    thumbnail_url = %s::text,
+                                    glb_s3_key = COALESCE(%s::text, glb_s3_key),
+                                    thumbnail_s3_key = COALESCE(%s::text, thumbnail_s3_key),
+                                    content_hash = COALESCE(%s::text, content_hash),
+                                    stage = COALESCE(%s::text, stage),
+                                    meta = COALESCE(%s::jsonb, meta),
                                     updated_at = NOW()
-                                WHERE id = %s
+                                WHERE id = %s::uuid
                                 RETURNING id
                                 """,
                                 (
@@ -2980,21 +3024,74 @@ def save_finished_job_to_normalized_db(job_id: str, status_data: dict, job_meta:
                 except Exception as rollback_err:
                     log_db_continue("normalized_save_rollback", rollback_err)
                 # ── Compensating S3 cleanup: delete newly-created objects on DB failure ──
-                cleanup_keys = []
+                #
+                # SAFETY: our S3 keys are content-addressed (SHA-256 of the file body),
+                # so a "newly-created" upload may produce the same key as a file referenced
+                # by other rows (different upstream_id, same bytes). Deleting it would
+                # break those rows. Before each delete, confirm no existing DB row points
+                # at the same key/URL — if anyone else references it, leave it alone.
+                candidate_keys: list[tuple[str, str | None]] = []
                 if model_reused is False and glb_s3_key:
-                    cleanup_keys.append(glb_s3_key)
+                    candidate_keys.append((glb_s3_key, final_glb_url))
                 if thumbnail_reused is False and thumbnail_s3_key:
-                    cleanup_keys.append(thumbnail_s3_key)
+                    candidate_keys.append((thumbnail_s3_key, final_thumbnail_url))
                 if image_reused is False and image_s3_key:
-                    cleanup_keys.append(image_s3_key)
-                cleanup_keys.extend(texture_newly_created_keys)
-                if cleanup_keys:
-                    print(f"[S3_CLEANUP] DB failed for job {job_id}, cleaning up {len(cleanup_keys)} newly-created S3 objects")
+                    candidate_keys.append((image_s3_key, image_url))
+                for tex_key in texture_newly_created_keys:
+                    candidate_keys.append((tex_key, None))
+
+                safe_to_delete: list[str] = []
+                for s3_key, s3_url in candidate_keys:
+                    referenced = False
                     try:
-                        result = delete_s3_objects_safe(cleanup_keys, source=f"model_db_failure:{job_id}")
+                        cur.execute("SAVEPOINT s3_cleanup_check")
+                        cur.execute(
+                            f"""
+                            SELECT 1 FROM {APP_SCHEMA}.asset_saves
+                            WHERE canonical_url = %s
+                            LIMIT 1
+                            """,
+                            (s3_url,),
+                        )
+                        if s3_url and cur.fetchone():
+                            referenced = True
+                        if not referenced:
+                            # Also check the models/images tables directly by s3_key
+                            cur.execute(
+                                f"""
+                                SELECT 1 FROM {Tables.MODELS}
+                                WHERE glb_s3_key = %s OR thumbnail_s3_key = %s
+                                LIMIT 1
+                                """,
+                                (s3_key, s3_key),
+                            )
+                            if cur.fetchone():
+                                referenced = True
+                        cur.execute("RELEASE SAVEPOINT s3_cleanup_check")
+                    except Exception as check_err:
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT s3_cleanup_check")
+                            cur.execute("RELEASE SAVEPOINT s3_cleanup_check")
+                        except Exception:
+                            pass
+                        # If the reference check itself failed, refuse to delete — fail safe.
+                        log_db_continue("s3_cleanup_reference_check", check_err)
+                        referenced = True
+
+                    if referenced:
+                        print(f"[S3_CLEANUP] SKIP key={s3_key} — referenced by an existing row, not orphaning it")
+                    else:
+                        safe_to_delete.append(s3_key)
+
+                if safe_to_delete:
+                    print(f"[S3_CLEANUP] DB failed for job {job_id}, deleting {len(safe_to_delete)}/{len(candidate_keys)} truly-orphaned S3 objects")
+                    try:
+                        result = delete_s3_objects_safe(safe_to_delete, source=f"model_db_failure:{job_id}")
                         print(f"[S3_CLEANUP] Deleted {result.get('deleted', 0)}, errors: {len(result.get('errors', []))}")
                     except Exception as cleanup_err:
                         print(f"[S3_CLEANUP] Cleanup itself failed (original DB error preserved): {cleanup_err}")
+                elif candidate_keys:
+                    print(f"[S3_CLEANUP] DB failed for job {job_id}, but all {len(candidate_keys)} candidate objects are still referenced — keeping them")
 
             cur.close()
             conn.commit()
