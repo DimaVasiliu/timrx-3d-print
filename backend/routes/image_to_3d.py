@@ -28,6 +28,7 @@ from backend.services.job_service import (
 )
 from backend.services.history_service import get_canonical_model_row
 from backend.services.meshy_service import mesh_get, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.status_cache import get_cached_status, cache_status
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -56,6 +57,8 @@ def image_to_3d_start_mod():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["image-to-3d"]
     prompt = (body.get("prompt") or "").strip()
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
+    provider_prompt = merge_negative_prompt(prompt, negative_prompt) if prompt else ""
     # For image-to-3d, use prompt if available, otherwise use a descriptive fallback
     title = derive_display_title(prompt, None) if prompt else "Image to 3D Model"
     # Link to source image history item for lineage grouping
@@ -66,6 +69,9 @@ def image_to_3d_start_mod():
         "title": title,
         "stage": "image3d",
     }
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
+        job_meta["provider_prompt"] = provider_prompt
     if source_image_history_id:
         job_meta["source_task_id"] = source_image_history_id
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
@@ -76,7 +82,7 @@ def image_to_3d_start_mod():
 
     payload = {
         "image_url": image_url,
-        "prompt": prompt,
+        "prompt": provider_prompt,
         "ai_model": ai_model,
         "enable_pbr": True,
     }
@@ -89,6 +95,9 @@ def image_to_3d_start_mod():
         payload["hd_texture"] = bool(body.get("hd_texture"))
 
     texture_prompt = (body.get("texture_prompt") or "").strip()
+    texture_negative_prompt = normalize_negative_prompt(body.get("texture_negative_prompt") or body.get("negative_prompt"))
+    if texture_prompt and texture_negative_prompt:
+        texture_prompt = merge_negative_prompt(texture_prompt, texture_negative_prompt)
     texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip()
     if texture_prompt:
         payload["texture_prompt"] = texture_prompt
@@ -195,6 +204,11 @@ def image_to_3d_start_mod():
         "texture_prompt": payload.get("texture_prompt"),
         "texture_style_mode": "text" if texture_prompt else ("image" if texture_image_url else None),
     }
+    if negative_prompt:
+        store_meta["negative_prompt"] = negative_prompt
+        store_meta["provider_prompt"] = provider_prompt
+    if texture_negative_prompt:
+        store_meta["texture_negative_prompt"] = texture_negative_prompt
 
     # Persist immediately so status polling can return queued while dispatch runs
     store = load_store()
@@ -476,6 +490,8 @@ def multi_image_to_3d_start_mod():
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["image-to-3d"]
     prompt = (body.get("prompt") or "").strip()
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
+    provider_prompt = merge_negative_prompt(prompt, negative_prompt) if prompt else ""
     title = derive_display_title(prompt, None) if prompt else "Multi-Image to 3D Model"
     job_meta = {
         "prompt": prompt,
@@ -483,6 +499,9 @@ def multi_image_to_3d_start_mod():
         "title": title,
         "stage": "image3d",
     }
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
+        job_meta["provider_prompt"] = provider_prompt
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
         return credit_error
@@ -492,6 +511,8 @@ def multi_image_to_3d_start_mod():
         "ai_model": body.get("model") or "latest",
         "enable_pbr": body.get("enable_pbr", True),
     }
+    if provider_prompt:
+        payload["prompt"] = provider_prompt
 
     store_meta = {
         "stage": "image3d",
@@ -506,6 +527,9 @@ def multi_image_to_3d_start_mod():
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
+    if negative_prompt:
+        store_meta["negative_prompt"] = negative_prompt
+        store_meta["provider_prompt"] = provider_prompt
 
     store = load_store()
     store[internal_job_id] = store_meta

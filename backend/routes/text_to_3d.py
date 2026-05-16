@@ -38,6 +38,7 @@ from backend.services.job_service import (
     verify_job_ownership,
 )
 from backend.services.meshy_service import mesh_get, mesh_post, normalize_status, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.history_service import get_canonical_model_row
 from backend.utils.helpers import clamp_int, log_event, log_status_summary, normalize_license, now_s
@@ -76,6 +77,8 @@ def text_to_3d_start_mod():
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"ok": False, "error": "prompt required"}), 400
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
+    provider_prompt = merge_negative_prompt(prompt, negative_prompt)
     if not MESHY_API_KEY:
         return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
 
@@ -89,7 +92,7 @@ def text_to_3d_start_mod():
 
     payload = {
         "mode": "preview",
-        "prompt": prompt,
+        "prompt": provider_prompt,
         "ai_model": ai_model,
     }
 
@@ -217,6 +220,9 @@ def text_to_3d_start_mod():
         "batch_group_id": batch_group_id,
         "generation_group_id": generation_group_id,
     }
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
+        job_meta["provider_prompt"] = provider_prompt
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
@@ -249,6 +255,9 @@ def text_to_3d_start_mod():
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
+    if negative_prompt:
+        store_meta["negative_prompt"] = negative_prompt
+        store_meta["provider_prompt"] = provider_prompt
 
     # Persist immediately so status polling can return queued while dispatch runs
     store = load_store()
@@ -435,6 +444,10 @@ def text_to_3d_refine_mod():
     original_prompt = preview_meta.get("prompt") or body.get("prompt") or ""
     root_prompt = preview_meta.get("root_prompt") or original_prompt
     texture_prompt = (body.get("texture_prompt") or "").strip() or None
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
+    texture_negative_prompt = normalize_negative_prompt(body.get("texture_negative_prompt") or body.get("negative_prompt"))
+    if texture_prompt and texture_negative_prompt:
+        texture_prompt = merge_negative_prompt(texture_prompt, texture_negative_prompt)
     texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip() or None
     enable_pbr = bool(body.get("enable_pbr", True))
     ai_model = (body.get("ai_model") or body.get("model") or "latest").strip() or "latest"
@@ -479,6 +492,10 @@ def text_to_3d_refine_mod():
     }
     if texture_prompt:
         job_meta["texture_prompt"] = texture_prompt
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
+    if texture_negative_prompt:
+        job_meta["texture_negative_prompt"] = texture_negative_prompt
     if remove_lighting is not None:
         job_meta["remove_lighting"] = remove_lighting
     if hd_texture is not None:
@@ -526,6 +543,10 @@ def text_to_3d_refine_mod():
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
+    if negative_prompt:
+        store_meta["negative_prompt"] = negative_prompt
+    if texture_negative_prompt:
+        store_meta["texture_negative_prompt"] = texture_negative_prompt
     if remove_lighting is not None:
         store_meta["remove_lighting"] = remove_lighting
 

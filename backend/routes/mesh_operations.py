@@ -20,6 +20,7 @@ from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
 from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed, _update_job_status_ready
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.status_cache import get_cached_status, cache_status
 from backend.utils.helpers import log_event, log_status_summary, now_s
@@ -493,14 +494,18 @@ def mesh_retexture_mod():
 
     # ── Prompt handling ──────────────────────────────────────────────────
     prompt = (body.get("text_style_prompt") or "").strip()
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt") or body.get("texture_negative_prompt"))
     style_img = (body.get("image_style_url") or "").strip()
     if not prompt and not style_img:
         return jsonify({"error": "text_style_prompt or image_style_url required"}), 400
 
     # Sanitize: ensure prompt describes texture style, not model geometry
     original_prompt_len = len(prompt)
-    prompt = _sanitize_texture_prompt(prompt)
-    prompt_mode = "sanitized" if len(prompt) != original_prompt_len else "raw"
+    sanitized_prompt = _sanitize_texture_prompt(prompt)
+    prompt_mode = "sanitized" if len(sanitized_prompt) != original_prompt_len else "raw"
+    prompt = sanitized_prompt
+    if prompt and negative_prompt:
+        prompt = merge_negative_prompt(prompt, negative_prompt, max_length=600)
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["retexture"]
@@ -580,6 +585,8 @@ def mesh_retexture_mod():
         "target_formats": target_formats,
         "ai_model": ai_model,
     }
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
@@ -708,6 +715,8 @@ def mesh_retexture_mod():
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
     }
+    if negative_prompt:
+        store[meshy_task_id]["negative_prompt"] = negative_prompt
     save_store(store)
 
     balance_info = get_current_balance(identity_id)

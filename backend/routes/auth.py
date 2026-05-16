@@ -1047,6 +1047,35 @@ def verify_email():
     except Exception as bonus_err:
         print(f"[AUTH] Welcome bonus check failed (non-fatal): {bonus_err}")
 
+    # ── Conversion tracking: sign_up + email_verified ──
+    # `email_attached` means this is the first time we've bound an email to this
+    # identity — that's our `sign_up` moment (anonymous-first model: account
+    # "creation" is when email is attached & verified). Without `email_attached`
+    # we only fire `email_verified` (e.g. a re-verification flow).
+    # Both events are idempotent via event_id so repeated verifications never
+    # double-fire conversions.
+    try:
+        from backend.services.analytics_events_service import (
+            enqueue as enqueue_analytics_event,
+            EVENT_SIGN_UP,
+            EVENT_EMAIL_VERIFIED,
+        )
+        if email_attached:
+            enqueue_analytics_event(
+                identity_id=identity_id,
+                event_name=EVENT_SIGN_UP,
+                event_id=f"sign_up:{identity_id}",
+                payload={"method": "magic_link"},
+            )
+        enqueue_analytics_event(
+            identity_id=identity_id,
+            event_name=EVENT_EMAIL_VERIFIED,
+            event_id=f"email_verified:{identity_id}",
+            payload={"method": "magic_link"},
+        )
+    except Exception as analytics_err:
+        print(f"[AUTH] analytics enqueue failed (non-fatal): {analytics_err}")
+
     # IDENT-3: Always include identity_changed and identity_id to normalize
     # response shape (same keys as cross-identity path).
     return jsonify({

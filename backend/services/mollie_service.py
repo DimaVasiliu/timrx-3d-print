@@ -976,6 +976,45 @@ class MollieService:
                 purchase_id = result["purchase"]["id"]
                 was_existing = result.get("was_existing", False)
 
+                # ── Conversion tracking enqueue ──
+                # Fires *only* for genuinely new purchases (not webhook replays).
+                # The browser polls /api/analytics/pending after wallet confirm and
+                # pushes a `purchase` event to dataLayer; GTM forwards to GA4 + Ads.
+                # Idempotency key: `purchase:<mollie_payment_id>` — unique per payment.
+                if not was_existing:
+                    try:
+                        from backend.services.analytics_events_service import (
+                            enqueue as enqueue_analytics_event,
+                            EVENT_PURCHASE,
+                        )
+                        credit_type = "video" if (plan_code or "").startswith("video_") else "general"
+                        enqueue_analytics_event(
+                            identity_id=identity_id,
+                            event_name=EVENT_PURCHASE,
+                            event_id=f"purchase:{payment_id}",
+                            payload={
+                                # GA4 standard ecommerce fields
+                                "transaction_id": payment_id,
+                                "value": float(amount_gbp),
+                                "currency": (amount_data.get("currency") or "GBP").upper(),
+                                "items": [{
+                                    "item_id":     plan_code,
+                                    "item_name":   plan_name,
+                                    "item_category": credit_type,
+                                    "price":       float(amount_gbp),
+                                    "quantity":    1,
+                                }],
+                                # TimrX-specific extras (available as variables in GTM)
+                                "plan_code":   plan_code,
+                                "credits":     credits,
+                                "credit_type": credit_type,
+                                "purchase_id": purchase_id,
+                            },
+                        )
+                    except Exception as analytics_err:
+                        # Never block credit grant on analytics failure.
+                        print(f"[MOLLIE] WARNING: analytics enqueue failed (non-fatal): {analytics_err}")
+
                 # Only send emails / invoices for NEW purchases (not duplicates)
                 # Emails are non-blocking - failures are logged as warnings only
                 if not was_existing and customer_email:

@@ -1,789 +1,1203 @@
 """
-Print-readiness analysis service.
-Analyzes 3D meshes for 3D printing compatibility.
-Uses trimesh for geometry analysis.
+Database utilities for TimrX Backend.
+Provides connection management and common query helpers.
+
+All functions raise meaningful exceptions on failure - no silent failures.
+
+Usage:
+    from backend.db import get_conn, transaction, fetch_one, fetch_all, now_utc
+
+    # Simple query
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+            user = fetch_one(cur)
+
+    # Transaction with automatic commit/rollback
+    with transaction() as cur:
+        cur.execute("INSERT INTO users (name) VALUES (%s) RETURNING *", ("John",))
+        user = fetch_one(cur)
+        cur.execute("INSERT INTO wallets (user_id) VALUES (%s)", (user["id"],))
 """
 
-import gc
-import logging
+import hashlib
 import os
-from urllib.parse import urlparse
-from typing import Dict, Any
+import re
+import threading
+import time as _time
+from contextlib import contextmanager
+from typing import Optional, Any, Dict, List, Union
+from datetime import datetime, timezone
 
-AWS_BUCKET_MODELS = None  # resolved lazily
-AWS_REGION = None          # resolved lazily
-_config_loaded = False
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    PSYCOPG_AVAILABLE = True
+except ImportError:
+    psycopg = None
+    dict_row = None
+    PSYCOPG_AVAILABLE = False
 
-logger = logging.getLogger(__name__)
+try:
+    from psycopg_pool import ConnectionPool as _ConnectionPool
+    _POOL_AVAILABLE = True
+except ImportError:
+    _ConnectionPool = None
+    _POOL_AVAILABLE = False
+
+# NOTE: Do NOT import config at module level - causes circular imports!
+# Use _get_config() for lazy access inside functions.
+
+def _get_config():
+    """Lazy import of config to avoid circular imports."""
+    from backend.config import config
+    return config
 
 
-class _SkipWallThickness(Exception):
-    """Sentinel to skip wall thickness analysis without failing the whole check."""
+# Module-level constants using os.getenv() directly to avoid circular imports
+_DATABASE_URL = os.getenv("DATABASE_URL", "")
+_HAS_DATABASE = bool(_DATABASE_URL)
+_DB_CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+_DB_POOL_ENABLED = os.getenv("DB_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
+_DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "4"))
+_DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+_DB_POOL_TIMEOUT = float(os.getenv("DB_POOL_TIMEOUT", "0.15"))  # 150ms — fail very fast to direct fallback; saves ~350ms vs 0.5s on each pool miss
+_DB_POOL_MAX_LIFETIME = float(os.getenv("DB_POOL_MAX_LIFETIME", "300"))   # 300s — longer lifetime reduces synchronized mass-recycling events that starve the pool
+_DB_POOL_MAX_IDLE = float(os.getenv("DB_POOL_MAX_IDLE", "60"))            # 60s — keep idle conns longer to avoid cold-start bursts
+_DB_POOL_CHECK = os.getenv("DB_POOL_CHECK", "true").lower() in ("true", "1", "yes")  # ON — detects dead SSL connections before handing to caller
+_APP_SCHEMA = os.getenv("APP_SCHEMA", "timrx_app")
+_BILLING_SCHEMA = os.getenv("BILLING_SCHEMA", "timrx_billing")
+
+# Fail-closed validation: reject malformed schema names at import time
+_SCHEMA_RE = re.compile(r'^[a-z][a-z0-9_]{0,62}$')
+if not _SCHEMA_RE.match(_APP_SCHEMA):
+    raise ValueError(f"Invalid APP_SCHEMA: {_APP_SCHEMA!r} — must match ^[a-z][a-z0-9_]{{0,62}}$")
+if not _SCHEMA_RE.match(_BILLING_SCHEMA):
+    raise ValueError(f"Invalid BILLING_SCHEMA: {_BILLING_SCHEMA!r} — must match ^[a-z][a-z0-9_]{{0,62}}$")
+
+
+# ─────────────────────────────────────────────────────────────
+# Connection Pool
+# ─────────────────────────────────────────────────────────────
+_pool = None
+_pool_init_attempted = False
+_pool_lock = threading.Lock()
+
+
+# ─── Transient connection error detection ─────────────────────
+_TRANSIENT_PATTERNS = (
+    "bad record mac",
+    "eof detected",
+    "consuming input failed",
+    "closed connection",
+    "connection not open",
+    "server closed the connection unexpectedly",
+    "ssl syscall error",
+    "ssl error",
+    "broken pipe",
+    "connection reset by peer",
+    "connection timed out",
+    "the connection is closed",
+    "can't send query",
+    "no connection to the server",
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Return True if exc is a transport/SSL/connection/pool error (not a SQL logic error).
+    These are safe to retry on a fresh direct connection."""
+    if not PSYCOPG_AVAILABLE:
+        return False
+    # PoolTimeout: pool couldn't serve a connection in time
+    if _POOL_AVAILABLE and isinstance(exc, _pool_timeout_class()):
+        return True
+    # psycopg.OperationalError covers most transport errors
+    if isinstance(exc, psycopg.OperationalError):
+        return True
+    # psycopg.InterfaceError covers "connection is closed" etc.
+    if isinstance(exc, psycopg.InterfaceError):
+        return True
+    # Check message text for SSL/transport patterns
+    msg = str(exc).lower()
+    return any(p in msg for p in _TRANSIENT_PATTERNS)
+
+
+def _pool_timeout_class():
+    """Return PoolTimeout class or a dummy that never matches."""
+    try:
+        from psycopg_pool import PoolTimeout
+        return PoolTimeout
+    except ImportError:
+        return type(None)  # never matches isinstance
+
+
+def _configure_pooled_conn(conn):
+    """Configure session settings for a new pooled connection.
+    Runs in autocommit so SETs are immediate and survive rollbacks.
+    Leaves the connection in autocommit mode so that read-only
+    get_conn() callers never open an implicit transaction (INTRANS).
+    transaction() temporarily switches to non-autocommit when it
+    needs real transactional semantics.
+
+    All SETs are batched into ONE round trip to minimize network cost
+    (~40ms instead of ~160ms for 4 separate execute() calls)."""
+    conn.autocommit = True
+    conn.execute(
+        f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public; "
+        "SET statement_timeout = '30000'; "
+        "SET idle_in_transaction_session_timeout = '60000'; "
+        "SET lock_timeout = '10000';"
+    )
+    # Stays autocommit=True — no implicit transactions on idle connections.
+
+
+def _get_pool():
+    """Get or create the connection pool. Returns None if pooling is disabled."""
+    global _pool, _pool_init_attempted
+    if not _DB_POOL_ENABLED:
+        return None
+
+    # Always check PID first — detect stale pool from pre-fork master.
+    # Must run BEFORE any fast-path return so the very first call from a
+    # job-worker thread (or any post-fork code) resets immediately instead
+    # of wasting a full pool timeout on dead sockets.
+    if _pool is not None and hasattr(_pool, '_opener_pid') and _pool._opener_pid != os.getpid():
+        print(f"[DB] Pool PID mismatch: created in pid={_pool._opener_pid}, "
+              f"current pid={os.getpid()} — resetting stale pool")
+        try:
+            _pool.close()
+        except Exception:
+            pass
+        _pool = None
+        _pool_init_attempted = False
+        # Fall through to create fresh pool
+
+    if _pool is not None:
+        return _pool
+    if _pool_init_attempted:
+        return None
+    if not _POOL_AVAILABLE or not _DATABASE_URL or not PSYCOPG_AVAILABLE:
+        return None
+
+    with _pool_lock:
+        if _pool is not None:
+            if hasattr(_pool, '_opener_pid') and _pool._opener_pid != os.getpid():
+                try:
+                    _pool.close()
+                except Exception:
+                    pass
+                _pool = None
+                _pool_init_attempted = False
+            else:
+                return _pool
+        if _pool_init_attempted:
+            return None
+        _pool_init_attempted = True
+        try:
+            _check_cb = _ConnectionPool.check_connection if _DB_POOL_CHECK else None
+
+            # open=False (default): pool background threads start on first
+            # .connection() or .open() call — NOT in the master process.
+            # We call pool.open() + pool.wait() inside init_db() which runs
+            # per-worker inside create_app(), so each Gunicorn worker gets
+            # its own live pool with min_size connections ready.
+            _pool = _ConnectionPool(
+                conninfo=_DATABASE_URL,
+                min_size=_DB_POOL_MIN_SIZE,
+                max_size=_DB_POOL_MAX_SIZE,
+                timeout=_DB_POOL_TIMEOUT,
+                max_lifetime=_DB_POOL_MAX_LIFETIME,
+                max_idle=_DB_POOL_MAX_IDLE,
+                kwargs={
+                    "connect_timeout": _DB_CONNECT_TIMEOUT,
+                    "row_factory": dict_row,
+                    "keepalives": 1,           # enable TCP keepalives
+                    "keepalives_idle": 30,      # first probe after 30s idle
+                    "keepalives_interval": 10,  # retry probe every 10s
+                    "keepalives_count": 3,      # give up after 3 failed probes
+                },
+                configure=_configure_pooled_conn,
+                check=_check_cb,
+            )
+            _pool._opener_pid = os.getpid()  # Tag for fork detection
+            # Explicitly open the pool and wait for min_size connections.
+            # Without this, the pool starts with 0 connections and creates
+            # them reactively on first getconn() — causing PoolTimeout on
+            # the first burst of requests.
+            _pool.open(wait=False)  # Start background threads immediately
+            try:
+                _pool.wait(timeout=10.0)  # Wait up to 10s for min_size connections
+            except Exception as e:
+                print(f"[DB] Pool warmup incomplete: {e} — continuing with partial pool")
+            print(
+                f"[DB] Connection pool ACTIVE: min={_DB_POOL_MIN_SIZE} "
+                f"max={_DB_POOL_MAX_SIZE} timeout={_DB_POOL_TIMEOUT}s "
+                f"max_lifetime={_DB_POOL_MAX_LIFETIME}s "
+                f"max_idle={_DB_POOL_MAX_IDLE}s "
+                f"check={'SELECT1' if _DB_POOL_CHECK else 'DISABLED'} "
+                f"pid={os.getpid()}"
+            )
+            return _pool
+        except Exception as e:
+            print(f"[DB] Pool init failed: {e} — using direct connections")
+            return None
+
+
+def pool_stats() -> dict:
+    """Return current pool statistics for diagnostics. Safe to call anytime."""
+    if _pool is None:
+        return {"pooling": False}
+    try:
+        raw = _pool.get_stats()
+        return {
+            "pooling": True,
+            "pool_min": _pool.min_size,
+            "pool_max": _pool.max_size,
+            "pool_size": raw.get("pool_size", -1),
+            "pool_available": raw.get("pool_available", -1),
+            "requests_waiting": raw.get("requests_waiting", -1),
+            "connections_lost": raw.get("connections_lost", 0),
+            "returns_bad": raw.get("returns_bad", 0),
+            "pid": os.getpid(),
+        }
+    except Exception:
+        return {"pooling": True, "error": "stats_unavailable"}
+
+
+def close_pool():
+    """Close the connection pool (for clean shutdown)."""
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.close()
+        except Exception:
+            pass
+        _pool = None
+
+
+# ─────────────────────────────────────────────────────────────
+# Custom Exceptions
+# ─────────────────────────────────────────────────────────────
+class DatabaseError(Exception):
+    """Base exception for database errors."""
     pass
 
 
-def _set_analysis_child_limits(memory_mb: int) -> None:
-    """Best-effort memory cap for the isolated mesh-analysis process."""
-    if memory_mb <= 0:
+class DatabaseNotConfiguredError(DatabaseError):
+    """Raised when database is not configured but an operation requires it."""
+    def __init__(self, message: str = "Database is not configured"):
+        super().__init__(message)
+
+
+class DatabaseConnectionError(DatabaseError):
+    """Raised when unable to connect to the database."""
+    def __init__(self, message: str, original_error: Exception = None):
+        super().__init__(message)
+        self.original_error = original_error
+
+
+class DatabaseQueryError(DatabaseError):
+    """Raised when a query fails."""
+    def __init__(self, message: str, query: str = None, original_error: Exception = None):
+        super().__init__(message)
+        self.query = query
+        self.original_error = original_error
+
+
+class DatabaseIntegrityError(DatabaseError):
+    """Raised on constraint violations (unique, foreign key, etc.)."""
+    def __init__(self, message: str, constraint: str = None, original_error: Exception = None):
+        super().__init__(message)
+        self.constraint = constraint
+        self.original_error = original_error
+
+
+# ─────────────────────────────────────────────────────────────
+# Connection State
+# ─────────────────────────────────────────────────────────────
+USE_DB = bool(_DATABASE_URL and PSYCOPG_AVAILABLE)
+
+_DB_STARTUP_CHECKED = False
+_DB_STARTUP_READY = False
+_DB_STARTUP_REASON = ""
+
+_DEGRADED_MODE_LIMITATIONS = [
+    {
+        "id": "durable_jobs_history",
+        "summary": (
+            "Jobs and history fall back to per-process local storage only where implemented; "
+            "persistence across restarts or multiple workers is disabled."
+        ),
+    },
+    {
+        "id": "background_recovery",
+        "summary": (
+            "Stale-job recovery, durable worker leadership, pricing seeding, and "
+            "operations/rescue loops do not run without a database."
+        ),
+    },
+    {
+        "id": "identity_wallet_billing",
+        "summary": (
+            "Session-backed identity, wallet, purchases, subscriptions, magic-code email "
+            "restore, and payment/webhook reconciliation require the database."
+        ),
+    },
+    {
+        "id": "community_assets_admin_diagnostics",
+        "summary": (
+            "Community routes, DB-backed asset ownership/proxy checks, and admin/auth "
+            "database diagnostics are unavailable."
+        ),
+    },
+]
+
+if PSYCOPG_AVAILABLE:
+    print(f"[DB] psycopg3 available, DATABASE_URL configured: {_HAS_DATABASE}, USE_DB: {USE_DB}")
+else:
+    print("[DB] psycopg3 not available - database features disabled")
+
+
+# ─────────────────────────────────────────────────────────────
+# Time Helpers
+# ─────────────────────────────────────────────────────────────
+def now_utc() -> datetime:
+    """Get current UTC datetime (timezone-aware)."""
+    return datetime.now(timezone.utc)
+
+
+def now_utc_iso() -> str:
+    """Get current UTC datetime as ISO string."""
+    return now_utc().isoformat()
+
+
+# ─────────────────────────────────────────────────────────────
+# Connection Management
+# ─────────────────────────────────────────────────────────────
+def _safe_rollback(conn):
+    """Attempt rollback; silently ignore if the connection is broken.
+    Prevents secondary exceptions when rolling back a dead SSL connection."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def _ensure_idle(conn):
+    """Roll back if the connection is still INTRANS/INERROR so it can be
+    returned to the pool in a clean state.  Without this, psycopg_pool logs
+    'rolling back returned connection' warnings and the connection costs an
+    extra round-trip inside putconn()."""
+    try:
+        # psycopg3: conn.info.transaction_status is a pq.TransactionStatus enum.
+        # IDLE (0) = clean, INTRANS (2) = open txn, INERROR (3) = failed txn.
+        status = conn.info.transaction_status
+        if status != 0:  # anything other than IDLE
+            conn.rollback()
+    except Exception:
+        pass  # broken connection — putconn will discard it
+
+
+def _create_connection():
+    """
+    Create a new database connection.
+    Internal function - raises exceptions on failure.
+    """
+    if not PSYCOPG_AVAILABLE:
+        raise DatabaseNotConfiguredError("psycopg3 is not installed")
+
+    if not _DATABASE_URL:
+        raise DatabaseNotConfiguredError("DATABASE_URL is not set")
+
+    try:
+        conn = psycopg.connect(
+            _DATABASE_URL,
+            connect_timeout=_DB_CONNECT_TIMEOUT,
+            row_factory=dict_row,  # Default to dict rows
+        )
+        # Set search path and session safety limits in ONE round trip.
+        # Previously 4 separate execute() calls = 4 network round trips
+        # (each ~40ms to external PostgreSQL = ~160ms total).
+        # Batching into one string cuts this to ~40ms.
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SET search_path TO {_APP_SCHEMA}, {_BILLING_SCHEMA}, public; "
+                "SET statement_timeout = '30000'; "
+                "SET idle_in_transaction_session_timeout = '60000'; "
+                "SET lock_timeout = '10000';"
+            )
+        return conn
+    except psycopg.OperationalError as e:
+        raise DatabaseConnectionError(f"Failed to connect to database: {e}", original_error=e)
+    except Exception as e:
+        raise DatabaseConnectionError(f"Unexpected error connecting to database: {e}", original_error=e)
+
+
+@contextmanager
+def get_conn(source: str = ""):
+    """
+    Pool-first, direct-fallback connection context manager.
+
+    Tries to borrow from the pool.  If the pool CHECKOUT fails with a
+    transient error (PoolTimeout, SSL on idle connection), opens a fresh
+    direct connection instead.  If the pool checkout succeeds, the caller
+    gets that pooled connection normally.
+
+    Pooled connections are in autocommit mode: each statement commits
+    immediately and the connection stays IDLE (no implicit transaction).
+    Callers that need atomicity across multiple statements should use
+    transaction() instead.
+
+    Direct-fallback connections use psycopg3's default (autocommit=False),
+    so callers doing writes on the fallback path should still commit.
+
+    This covers the main failure mode: pool full or dead SSL connections.
+    If a query fails mid-execution on a connection that was healthy at
+    checkout, that error propagates to the caller (and the pool discards
+    the broken connection automatically).
+    """
+    import time as _gc_time
+    pool = _get_pool()
+    conn = None
+    from_pool = False
+    _pool_failed = False
+    _t0 = _gc_time.monotonic()
+    _ms_pool_wait = 0
+
+    if pool is not None:
+        try:
+            conn = pool.getconn(timeout=_DB_POOL_TIMEOUT)
+            from_pool = True
+        except Exception as e:
+            if is_transient_db_error(e):
+                _ms_pool_wait = int((_gc_time.monotonic() - _t0) * 1000)
+                _pool_failed = True
+                conn = None
+            else:
+                raise
+
+    if conn is None:
+        # Direct connection (pool failed/timed out, or pool disabled)
+        _t_direct = _gc_time.monotonic()
+        conn = _create_connection()
+        _ms_direct = int((_gc_time.monotonic() - _t_direct) * 1000)
+        if _pool_failed:
+            print(f"[DB][FALLBACK] source={source} pool_wait={_ms_pool_wait}ms direct={_ms_direct}ms")
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
         return
+
+    # Pooled connection path
+    if from_pool:
+        try:
+            yield conn
+        finally:
+            # Clean up transaction state so the pool doesn't have to.
+            _ensure_idle(conn)
+            # Best-effort: restore autocommit mode for the next borrower.
+            try:
+                if not conn.autocommit:
+                    conn.autocommit = True
+            except Exception:
+                pass  # broken conn — putconn will discard it
+            # ALWAYS return via putconn so the pool can free the slot.
+            # putconn detects broken/closed connections and discards them
+            # instead of reusing them.  Skipping putconn leaks the slot
+            # permanently, eventually exhausting the pool.
+            try:
+                pool.putconn(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    else:
+        # Direct connection (pool failed or disabled)
+        conn = _create_connection()
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# get_conn_resilient is now an alias — get_conn has the same fallback
+# behaviour.  Kept so existing imports (history, inspire, billing,
+# subscription_service) continue to resolve without any code changes.
+get_conn_resilient = get_conn
+
+
+@contextmanager
+def get_conn_direct(source: str = ""):
+    """
+    Context manager that ALWAYS creates a fresh direct connection (never pooled).
+
+    Use for auth-critical paths (bootstrap, restore/redeem) that must not
+    depend on pool health. The connection is opened, used, and closed
+    within this block — no pool threads, no shared state.
+    """
+    conn = _create_connection()
     try:
-        import resource
-
-        limit = int(memory_mb) * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    except Exception as exc:
-        logger.warning("[PRINT_ANALYSIS] Could not apply child memory limit: %s", exc)
-
-
-def _analysis_worker(conn, file_path: str, file_type: str | None, printer_type: str, memory_mb: int) -> None:
-    """Run trimesh analysis in a disposable child process."""
-    try:
-        # Keep native numerical libraries from multiplying memory usage.
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
-        _set_analysis_child_limits(memory_mb)
-        result = PrintAnalysisService.analyze(file_path, file_type=file_type, printer_type=printer_type)
-        conn.send({"ok": True, "result": result})
-    except MemoryError:
-        conn.send({
-            "ok": False,
-            "error": "Model is too complex for the print-check memory budget.",
-            "suggestions": [
-                "Use Remesh with a lower polygon target, then run the print check again.",
-                "Export the model and verify it in a slicer if you need a full local analysis.",
-            ],
-        })
-    except BaseException as exc:
-        logger.exception("[PRINT_ANALYSIS] Child analysis failed")
-        conn.send({
-            "ok": False,
-            "error": f"Print analysis failed: {exc}",
-            "suggestions": ["Try Remesh to simplify and repair the mesh, then retry."],
-        })
+        yield conn
     finally:
         try:
             conn.close()
         except Exception:
             pass
-        gc.collect()
 
 
-class PrintAnalysisService:
-    """Analyzes GLB/STL meshes for 3D printing readiness."""
-
-    MAX_FACE_COUNT = int(os.getenv("PRINT_ANALYSIS_MAX_FACES", "200000"))
-    SCENE_CONCAT_FACE_LIMIT = int(os.getenv("PRINT_ANALYSIS_SCENE_CONCAT_FACE_LIMIT", "120000"))
-    WALL_THICKNESS_FACE_LIMIT = int(os.getenv("PRINT_ANALYSIS_WALL_FACE_LIMIT", "25000"))
-    WALL_THICKNESS_MAX_SAMPLES = int(os.getenv("PRINT_ANALYSIS_WALL_MAX_SAMPLES", "300"))
-    WALL_THICKNESS_MIN_SAMPLES = int(os.getenv("PRINT_ANALYSIS_WALL_MIN_SAMPLES", "80"))
-    MIN_WALL_THICKNESS_MM = 0.8  # Minimum for FDM printing
-
-    BASE_ALLOWED_MODEL_DOMAINS = {
-        "assets.meshy.ai",
-        "cdn.meshy.ai",
-    }
-    MAX_DOWNLOAD_BYTES = int(os.getenv("PRINT_ANALYSIS_MAX_DOWNLOAD_MB", "20")) * 1024 * 1024
-
-    @staticmethod
-    def _allowed_model_domains() -> set[str]:
-        global AWS_BUCKET_MODELS, AWS_REGION, _config_loaded
-        if not _config_loaded:
-            from backend.config import AWS_BUCKET_MODELS as _b, AWS_REGION as _r
-            AWS_BUCKET_MODELS = _b
-            AWS_REGION = _r
-            _config_loaded = True
-        domains = set(PrintAnalysisService.BASE_ALLOWED_MODEL_DOMAINS)
-        if AWS_BUCKET_MODELS:
-            domains.add(f"{AWS_BUCKET_MODELS}.s3.{AWS_REGION}.amazonaws.com")
-            domains.add(f"{AWS_BUCKET_MODELS}.s3.amazonaws.com")
-        return domains
-
-    @staticmethod
-    def _failed_result(issue: str, suggestions: list[str] | None = None) -> Dict[str, Any]:
-        return {
-            "score": 0,
-            "is_printable": False,
-            "checks": {},
-            "issues": [issue],
-            "suggestions": suggestions or [],
-        }
-
-    @staticmethod
-    def _detect_file_type(url: str, content_type: str | None, content: bytes) -> str | None:
-        path = (urlparse(url).path or "").lower()
-        content_type = (content_type or "").lower()
-        head = content[:16]
-        stripped = content.lstrip()[:16].lower()
-
-        if path.endswith(".stl") or "model/stl" in content_type or stripped.startswith(b"solid"):
-            return "stl"
-        if path.endswith(".glb") or "model/gltf-binary" in content_type or head.startswith(b"glTF"):
-            return "glb"
-        if path.endswith(".gltf") or "model/gltf+json" in content_type:
-            return "gltf"
-        if path.endswith(".obj") or "text/plain" in content_type:
-            return "obj"
-        return None
-
-    @staticmethod
-    def _load_mesh(file_path: str, file_type: str | None = None):
-        import trimesh
-
-        loaded = trimesh.load(
-            file_path,
-            file_type=file_type,
-            force="scene",
-            process=False,
-            skip_materials=True,
+@contextmanager
+def _run_transaction(conn):
+    """Internal: execute a transaction with error mapping.
+    Handles commit on success, safe rollback + exception wrapping on failure."""
+    try:
+        with conn.cursor() as cur:
+            yield cur
+        conn.commit()
+    except psycopg.errors.UniqueViolation as e:
+        _safe_rollback(conn)
+        constraint = getattr(e.diag, 'constraint_name', None)
+        raise DatabaseIntegrityError(
+            f"Unique constraint violation: {e}",
+            constraint=constraint,
+            original_error=e
         )
+    except psycopg.errors.ForeignKeyViolation as e:
+        _safe_rollback(conn)
+        constraint = getattr(e.diag, 'constraint_name', None)
+        raise DatabaseIntegrityError(
+            f"Foreign key violation: {e}",
+            constraint=constraint,
+            original_error=e
+        )
+    except psycopg.errors.CheckViolation as e:
+        _safe_rollback(conn)
+        constraint = getattr(e.diag, 'constraint_name', None)
+        raise DatabaseIntegrityError(
+            f"Check constraint violation: {e}",
+            constraint=constraint,
+            original_error=e
+        )
+    except psycopg.Error as e:
+        _safe_rollback(conn)
+        raise DatabaseQueryError(f"Database error: {e}", original_error=e)
+    except Exception:
+        _safe_rollback(conn)
+        raise
 
-        if isinstance(loaded, trimesh.Trimesh):
-            return loaded
 
-        if not isinstance(loaded, trimesh.Scene):
-            raise TypeError(f"Unsupported geometry type: {type(loaded).__name__}")
+@contextmanager
+def transaction(source: str = ""):
+    """
+    Context manager for database transactions.
+    Pool-first with direct-fallback on transient checkout errors.
+    Automatically commits on success, rolls back on exception.
+    Yields a cursor with dict_row factory.
+    """
+    import time as _tx_time
+    pool = _get_pool()
+    conn = None
+    from_pool = False
+    _t0 = _tx_time.monotonic()
 
-        meshes = []
-        for geometry in loaded.geometry.values():
-            if not isinstance(geometry, trimesh.Trimesh):
-                continue
-            if geometry.is_empty or len(geometry.vertices) == 0 or len(geometry.faces) == 0:
-                continue
-            meshes.append(geometry)
-
-        if not meshes:
-            raise ValueError("No valid mesh geometry found in file")
-
-        if len(meshes) == 1:
-            return meshes[0]
-
-        total_faces = sum(int(len(mesh.faces)) for mesh in meshes)
-        if total_faces > PrintAnalysisService.SCENE_CONCAT_FACE_LIMIT:
-            logger.warning(
-                "[PRINT_ANALYSIS] Scene has %d meshes / %d faces; using largest part to avoid OOM",
-                len(meshes),
-                total_faces,
-            )
-            largest = max(meshes, key=lambda mesh: int(len(mesh.faces)))
-            largest.metadata = dict(largest.metadata or {})
-            largest.metadata["timrx_analysis_limited_to_largest_part"] = True
-            largest.metadata["timrx_scene_part_count"] = len(meshes)
-            largest.metadata["timrx_scene_face_count"] = total_faces
-            return largest
-
+    if pool is not None:
         try:
-            return trimesh.util.concatenate(meshes)
-        except Exception as exc:
-            logger.warning("[PRINT_ANALYSIS] Mesh concatenate failed, using largest part: %s", exc)
-            return max(meshes, key=lambda mesh: int(len(mesh.faces)))
-
-    @staticmethod
-    def analyze(file_path: str, file_type: str | None = None, printer_type: str = "fdm") -> Dict[str, Any]:
-        """
-        Analyze a mesh file for 3D printing readiness.
-
-        Returns:
-            {
-                "score": 0-100,
-                "is_printable": bool,
-                "checks": { ... },
-                "issues": ["..."],
-                "suggestions": ["..."],
-            }
-        """
-        import numpy as np
-        import trimesh
-
-        try:
-            mesh = PrintAnalysisService._load_mesh(file_path, file_type=file_type)
-        except Exception as exc:
-            logger.warning("[PRINT_ANALYSIS] Failed to parse mesh %s: %s", file_path, exc)
-            return PrintAnalysisService._failed_result(
-                f"Could not parse model geometry: {exc}",
-                [
-                    "Try Remesh before running the print check again",
-                    "If available, export or download the model as STL for print analysis",
-                ],
-            )
-
-        # Set thresholds based on printer type
-        if printer_type == "resin":
-            min_wall = 0.4   # Resin can do thinner walls
-            overhang_threshold = 30.0  # Resin needs supports earlier
-        else:
-            min_wall = PrintAnalysisService.MIN_WALL_THICKNESS_MM  # 0.8mm for FDM
-            overhang_threshold = 45.0
-
-        checks = {}
-        issues = []
-        suggestions = []
-        score = 100
-
-        try:
-            if mesh.metadata.get("timrx_analysis_limited_to_largest_part"):
-                checks["analysis_limited_to_largest_part"] = True
-                checks["scene_part_count"] = int(mesh.metadata.get("timrx_scene_part_count") or 0)
-                checks["scene_face_count"] = int(mesh.metadata.get("timrx_scene_face_count") or 0)
-                suggestions.append(
-                    "This file contains multiple high-poly mesh parts. To keep the server stable, "
-                    "the print check analyzed the largest part. Remesh or export as a single STL "
-                    "for complete whole-model diagnostics."
-                )
-
-            # 1. Manifold check (watertight)
-            checks["is_manifold"] = bool(mesh.is_watertight)
-            if not mesh.is_watertight:
-                score -= 30
-                issues.append("Mesh is not watertight (has holes or open edges)")
-                suggestions.append(
-                    "Try Remesh with 'Print Ready' preset to close open edges. "
-                    "If already remeshed, the AI model may have geometry that Meshy's remesh "
-                    "cannot fully repair — use Blender (Mesh > Clean Up > Fill Holes) or "
-                    "Meshmixer (Analysis > Inspector > Auto Repair) for manual repair."
-                )
-
-            # 2. Face count
-            checks["face_count"] = int(len(mesh.faces))
-            checks["face_count_ok"] = len(mesh.faces) <= PrintAnalysisService.MAX_FACE_COUNT
-            if not checks["face_count_ok"]:
-                score -= 10
-                issues.append(f"High polygon count ({len(mesh.faces):,} faces) may slow slicing software")
-                suggestions.append("Use Remesh to reduce polygon count")
-
-            # 3. Degenerate faces
-            areas = mesh.area_faces
-            degenerate_count = int(np.sum(areas < 1e-10))
-            checks["has_degenerate_faces"] = degenerate_count > 0
-            checks["degenerate_face_count"] = degenerate_count
-            if degenerate_count > 0:
-                score -= 10
-                issues.append(f"{degenerate_count} degenerate (zero-area) faces found")
-
-            # 4. Volume check (positive = proper normals)
-            if mesh.is_watertight:
-                checks["is_volume_positive"] = bool(mesh.volume > 0)
-                if mesh.volume <= 0:
-                    score -= 20
-                    issues.append("Mesh normals may be inverted (negative volume)")
-                    suggestions.append("Flip normals before printing")
+            conn = pool.getconn(timeout=_DB_POOL_TIMEOUT)
+            from_pool = True
+        except Exception as e:
+            if is_transient_db_error(e):
+                _ms_pool = int((_tx_time.monotonic() - _t0) * 1000)
+                _t_dir = _tx_time.monotonic()
+                conn = _create_connection()
+                _ms_dir = int((_tx_time.monotonic() - _t_dir) * 1000)
+                print(f"[DB][TX_FALLBACK] source={source} pool_wait={_ms_pool}ms direct={_ms_dir}ms")
+                # fall through to direct path below
             else:
-                checks["is_volume_positive"] = None
+                raise
 
-            # 5. Bounding box + unit detection
-            extents = mesh.bounding_box.extents
-            raw_extents = [round(float(x), 4) for x in extents]
-            max_extent = max(raw_extents)
-
-            # Detect likely unit system
-            # glTF/GLB standard: meters. Meshy models: normalized -1 to 1 range.
-            detected_unit = "mm"
-            mm_multiplier = 1.0
-
-            if max_extent > 0 and max_extent < 10:
-                detected_unit = "meters"
-                mm_multiplier = 1000.0
-            elif max_extent >= 10 and max_extent < 100:
-                detected_unit = "mm_or_cm"
-                mm_multiplier = 1.0  # Assume mm unless user says otherwise
-
-            extents_mm = [round(float(x) * mm_multiplier, 2) for x in extents]
-            checks["bounding_box_raw"] = raw_extents
-            checks["bounding_box_mm"] = extents_mm
-            checks["detected_unit"] = detected_unit
-            checks["mm_multiplier"] = mm_multiplier
-
-            if detected_unit == "meters":
-                suggestions.append(
-                    f"Model appears to be in meters (max dimension: {max_extent:.2f}). "
-                    f"Converted to mm for display: {extents_mm[0]} × {extents_mm[1]} × {extents_mm[2]} mm"
-                )
-
-            # 6. Volume estimate
-            if mesh.is_watertight and mesh.volume > 0:
-                checks["estimated_volume_cm3"] = round(float(mesh.volume / 1000), 2)
-            else:
-                checks["estimated_volume_cm3"] = None
-
-            # 7. Wall thickness analysis (ray-based sampling)
+    if from_pool:
+        # Pooled connections live in autocommit mode.  Switch to
+        # transactional mode for the duration of this block so
+        # _run_transaction gets real BEGIN/COMMIT/ROLLBACK semantics.
+        conn.autocommit = False
+        try:
+            with _run_transaction(conn) as cur:
+                yield cur
+        finally:
+            _ensure_idle(conn)
             try:
-                available_mb = PrintAnalysisService._get_available_memory_mb()
-                if available_mb is not None and available_mb < 700:
-                    logger.info(
-                        "[PRINT_ANALYSIS] Skipping wall thickness — low available memory: %.0fMB",
-                        available_mb,
-                    )
-                    checks["min_wall_thickness_mm"] = None
-                    checks["wall_thickness_ok"] = None
-                    suggestions.append(
-                        "Wall thickness analysis was skipped because the server is under "
-                        "memory pressure. Retry after remeshing or reducing polygon count."
-                    )
-                    raise _SkipWallThickness()
-
-                if len(mesh.faces) > PrintAnalysisService.WALL_THICKNESS_FACE_LIMIT:
-                    logger.info(
-                        "[PRINT_ANALYSIS] Skipping wall thickness — %d faces exceeds %d limit",
-                        len(mesh.faces), PrintAnalysisService.WALL_THICKNESS_FACE_LIMIT,
-                    )
-                    checks["min_wall_thickness_mm"] = None
-                    checks["wall_thickness_ok"] = None
-                    suggestions.append(
-                        "Wall thickness analysis was skipped because the model has too many "
-                        "polygons. Use Remesh to reduce polygon count, then re-run the print check."
-                    )
-                    raise _SkipWallThickness()
-
-                # Sample surface points for thickness measurement
-                sample_count = min(
-                    PrintAnalysisService.WALL_THICKNESS_MAX_SAMPLES,
-                    max(PrintAnalysisService.WALL_THICKNESS_MIN_SAMPLES, len(mesh.faces) // 50),
-                )
-                points, face_indices = trimesh.sample.sample_surface(mesh, sample_count)
-
-                # Compute inward normals at sample points
-                face_normals = mesh.face_normals[face_indices]
-                inward_normals = -face_normals  # Point inward
-
-                # Cast rays inward from surface to find opposing wall
-                ray_origins = points + inward_normals * 0.001  # Offset slightly to avoid self-intersection
-
-                # Try the default ray engine (rtree-backed), fall back to
-                # the slower embree-less engine that ships with trimesh.
+                conn.autocommit = True
+            except Exception:
+                pass
+            try:
+                pool.putconn(conn)
+            except Exception:
                 try:
-                    locations, index_ray, index_tri = mesh.ray.intersects_location(
-                        ray_origins=ray_origins,
-                        ray_directions=inward_normals,
-                    )
-                except (ImportError, ModuleNotFoundError) as ray_dep_err:
-                    logger.info(
-                        "[PRINT_ANALYSIS] Default ray engine unavailable (%s), "
-                        "falling back to triangle-based intersection",
-                        ray_dep_err,
-                    )
-                    from trimesh.ray.ray_triangle import RayMeshIntersector
-                    ray_engine = RayMeshIntersector(mesh)
-                    locations, index_ray, index_tri = ray_engine.intersects_location(
-                        ray_origins=ray_origins,
-                        ray_directions=inward_normals,
-                    )
-
-                if len(locations) > 0:
-                    # Compute distances from origin points to hit points
-                    hit_distances = np.linalg.norm(
-                        locations - ray_origins[index_ray], axis=1
-                    )
-                    # Filter out very long rays (> 100mm = likely through-shots, not walls)
-                    valid_mask = hit_distances < 100.0
-                    if np.any(valid_mask):
-                        valid_distances = hit_distances[valid_mask]
-                        min_thickness = float(np.min(valid_distances))
-                        avg_thickness = float(np.mean(valid_distances))
-                        pct_below_min = float(np.sum(valid_distances < min_wall) / len(valid_distances) * 100)
-
-                        checks["min_wall_thickness_mm"] = round(min_thickness, 3)
-                        checks["avg_wall_thickness_mm"] = round(avg_thickness, 3)
-                        checks["pct_below_min_thickness"] = round(pct_below_min, 1)
-                        checks["wall_thickness_ok"] = pct_below_min < 5.0  # Less than 5% of surface below minimum
-
-                        if pct_below_min >= 20.0:
-                            score -= 15
-                            issues.append(
-                                f"Significant thin walls detected: {pct_below_min:.0f}% of surface "
-                                f"is below {min_wall}mm minimum "
-                                f"(thinnest: {min_thickness:.2f}mm)"
-                            )
-                            suggestions.append(
-                                "Thicken thin walls in a 3D editor before printing, "
-                                "or increase infill to 100% for very thin sections"
-                            )
-                        elif pct_below_min >= 5.0:
-                            score -= 5
-                            issues.append(
-                                f"Some thin walls detected: {pct_below_min:.0f}% of surface "
-                                f"below {min_wall}mm "
-                                f"(thinnest: {min_thickness:.2f}mm)"
-                            )
-                    else:
-                        checks["min_wall_thickness_mm"] = None
-                        checks["wall_thickness_ok"] = None
-                else:
-                    checks["min_wall_thickness_mm"] = None
-                    checks["wall_thickness_ok"] = None
-            except _SkipWallThickness:
-                pass  # Already handled above
-            except Exception as wall_exc:
-                logger.error("[PRINT_ANALYSIS] Wall thickness check failed: %s", wall_exc, exc_info=True)
-                checks["min_wall_thickness_mm"] = None
-                checks["wall_thickness_ok"] = None
-
-            # 8. Overhang detection (faces angled > threshold from vertical need support)
-            fdm_overhang_pct = 0.0
-            try:
-                face_normals_arr = mesh.face_normals  # (N, 3) array
-                # Build direction is +Y (up). Compute angle of each face from vertical.
-                up = np.array([0.0, 1.0, 0.0])
-                dots = np.dot(face_normals_arr, up)
-                # Only consider downward-facing faces (dot < 0 means face points downward)
-                downward_mask = dots < 0
-                if np.any(downward_mask):
-                    # Angle from vertical for downward faces
-                    overhang_angles_deg = np.degrees(np.arccos(np.clip(np.abs(dots[downward_mask]), 0, 1)))
-                    # Faces where angle from vertical > threshold are overhangs
-                    fdm_overhang_threshold = 45.0
-                    resin_overhang_threshold = 30.0
-
-                    fdm_overhang_count = int(np.sum(overhang_angles_deg > fdm_overhang_threshold))
-                    resin_overhang_count = int(np.sum(overhang_angles_deg > resin_overhang_threshold))
-
-                    fdm_overhang_pct = round(fdm_overhang_count / len(mesh.faces) * 100, 1) if len(mesh.faces) > 0 else 0
-                    resin_overhang_pct = round(resin_overhang_count / len(mesh.faces) * 100, 1) if len(mesh.faces) > 0 else 0
-
-                    checks["overhang_fdm_pct"] = fdm_overhang_pct
-                    checks["overhang_resin_pct"] = resin_overhang_pct
-                    checks["overhang_fdm_faces"] = fdm_overhang_count
-                    checks["overhang_resin_faces"] = resin_overhang_count
-
-                    if fdm_overhang_pct > 20:
-                        issues.append(
-                            f"{fdm_overhang_pct}% of faces are steep overhangs (>45°) — "
-                            f"FDM printing will require support material"
-                        )
-                        suggestions.append(
-                            "Consider rotating the model for fewer overhangs, "
-                            "or enable supports in your slicer (tree supports recommended)"
-                        )
-                    elif fdm_overhang_pct > 10:
-                        suggestions.append(
-                            f"{fdm_overhang_pct}% overhang faces detected — "
-                            f"enable supports in slicer for best results"
-                        )
-                else:
-                    checks["overhang_fdm_pct"] = 0.0
-                    checks["overhang_resin_pct"] = 0.0
-            except Exception as oh_exc:
-                logger.warning("[PRINT_ANALYSIS] Overhang check failed: %s", oh_exc)
-                checks["overhang_fdm_pct"] = None
-                checks["overhang_resin_pct"] = None
-
-            # 9. Printer-type-specific slicer guidance
-            if score >= 70:
-                max_dim_mm = max(extents_mm)
-                suggestions.append(
-                    f"FDM: Use 0.2mm layer height for standard quality, 0.12mm for fine detail. "
-                    f"Set wall count to 3+ for structural strength."
-                )
-                suggestions.append(
-                    f"Resin (SLA/DLP): Use 0.05mm layer height for maximum detail. "
-                    f"Ensure wall thickness is ≥0.5mm (min for supported walls)."
-                )
-                if checks.get("overhang_fdm_pct") and checks["overhang_fdm_pct"] > 5:
-                    suggestions.append(
-                        "FDM: Enable tree supports in your slicer to reduce material waste on overhangs."
-                    )
-                if max_dim_mm > 200:
-                    suggestions.append(
-                        f"Model is {max_dim_mm:.0f}mm on its longest side — "
-                        f"verify it fits your printer's build volume before slicing."
-                    )
-
-            # 10. Basic orientation suggestion
-            try:
-                best_orientation = "current"
-                best_overhang_pct = fdm_overhang_pct if fdm_overhang_pct is not None else 100.0
-
-                # Only run if overhangs are significant
-                if best_overhang_pct > 15:
-                    for axis_name, up_vec in [("rotate 90° around X (Z-up)", np.array([0, 0, 1.0])),
-                                               ("rotate 90° around Z (X-up)", np.array([1.0, 0, 0]))]:
-                        dots_alt = np.dot(face_normals_arr, up_vec)
-                        down_alt = dots_alt < 0
-                        if np.any(down_alt):
-                            angles_alt = np.degrees(np.arccos(np.clip(np.abs(dots_alt[down_alt]), 0, 1)))
-                            alt_pct = float(np.sum(angles_alt > 45.0) / len(mesh.faces) * 100)
-                            if alt_pct < best_overhang_pct:
-                                best_overhang_pct = alt_pct
-                                best_orientation = axis_name
-
-                    if best_orientation != "current":
-                        checks["suggested_orientation"] = best_orientation
-                        checks["suggested_orientation_overhang_pct"] = round(best_overhang_pct, 1)
-                        suggestions.append(
-                            f"Orientation tip: {best_orientation} would reduce overhangs "
-                            f"from {fdm_overhang_pct:.0f}% to {best_overhang_pct:.0f}% of faces"
-                        )
-            except Exception as orient_exc:
-                logger.warning("[PRINT_ANALYSIS] Orientation check failed: %s", orient_exc)
-
-        except Exception as exc:
-            logger.exception("[PRINT_ANALYSIS] Mesh analysis failed for %s", file_path)
-            return PrintAnalysisService._failed_result(
-                f"Could not analyze model geometry: {exc}",
-                [
-                    "Try Remesh to simplify and repair the mesh",
-                    "If the problem persists, export the model as STL and retry the print check",
-                ],
-            )
-
-        score = max(0, min(100, score))
-
-        # Add actionable suggestions for common issues
-        if not mesh.is_watertight:
-            suggestions.append(
-                "Non-watertight meshes cannot be accurately measured for wall thickness "
-                "or volume. If you haven't remeshed yet, try Remesh with 'Print Ready' preset. "
-                "If you already remeshed and the mesh is still not watertight, this is a known "
-                "limitation of AI-generated models — import the STL into Blender or Meshmixer "
-                "and use their automatic mesh repair tools before printing."
-            )
-
-        if score < 90 and checks.get("is_manifold") and checks.get("min_wall_thickness_mm") is None:
-            suggestions.append(
-                "Wall thickness analysis requires a closed mesh. Remesh the model first, "
-                "then re-run the print check for complete diagnostics."
-            )
-
-        # ── Additional production-print guidance ──────────────────
-        suggestions.append(
-            "Always verify the exported STL in a slicer (e.g. PrusaSlicer, Cura, Lychee) "
-            "before sending to a printer. Slicers detect issues that surface analysis cannot."
-        )
-        if not checks.get("is_manifold"):
-            suggestions.append(
-                "Non-watertight meshes often cause slicing failures. Most slicers "
-                "(PrusaSlicer, Cura) have built-in mesh repair that can fix minor gaps. "
-                "For serious issues, use Meshmixer's 'Inspector' tool for one-click repair."
-            )
-        if checks.get("min_wall_thickness_mm") is not None:
-            min_wt = checks["min_wall_thickness_mm"]
-            if printer_type == "fdm" and min_wt < 1.2:
-                suggestions.append(
-                    f"Minimum wall thickness is {min_wt:.1f} mm. For reliable FDM prints, "
-                    "aim for at least 1.2 mm walls (2-3 perimeters). Thin features may "
-                    "break during printing or post-processing."
-                )
-            elif printer_type == "resin" and min_wt < 0.6:
-                suggestions.append(
-                    f"Minimum wall thickness is {min_wt:.1f} mm. For resin prints, "
-                    "aim for at least 0.6 mm walls. Very thin features are fragile "
-                    "and may break during support removal."
-                )
-        suggestions.append(
-            "AI-generated models may contain hidden internal geometry or floating "
-            "fragments. Inspect the mesh in a 3D editor (Blender, Meshmixer) if you "
-            "plan to sell printed copies."
-        )
-
-        return {
-            "score": score,
-            "is_printable": score >= 60,
-            "checks": checks,
-            "issues": issues,
-            "suggestions": suggestions,
-        }
-
-    @staticmethod
-    def _validate_url(url: str) -> str | None:
-        """Return an error message if the URL is not safe to fetch, else None."""
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-
-        # Scheme check
-        if parsed.scheme not in ("https", "http"):
-            return f"Unsupported URL scheme: {parsed.scheme}"
-
-        # Domain allowlist — if configured, enforce it
-        allowed_domains = PrintAnalysisService._allowed_model_domains()
-        if allowed_domains:
-            domain = parsed.hostname or ""
-            if not any(domain == d or domain.endswith("." + d) for d in allowed_domains):
-                return f"Domain not in allowlist: {domain}"
-
-        # Block private/internal IPs
-        import socket
+                    conn.close()
+                except Exception:
+                    pass
+    else:
+        # Direct connection (fallback already created it, or pool disabled)
+        if conn is None:
+            conn = _create_connection()
         try:
-            ip = socket.gethostbyname(parsed.hostname)
-            import ipaddress
-            addr = ipaddress.ip_address(ip)
-            if addr.is_private or addr.is_loopback or addr.is_link_local:
-                return f"Resolved to private IP: {ip}"
-        except Exception:
-            pass  # DNS resolution failed — requests.get will handle it
+            with _run_transaction(conn) as cur:
+                yield cur
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-        return None
 
-    ANALYSIS_TIMEOUT = int(os.getenv("PRINT_ANALYSIS_TIMEOUT_SECONDS", "24"))
-    ANALYSIS_MEMORY_LIMIT_MB = int(os.getenv("PRINT_ANALYSIS_MEMORY_MB", "1800"))
-    USE_SUBPROCESS = os.getenv("PRINT_ANALYSIS_SUBPROCESS", "true").lower() not in ("0", "false", "no")
+@contextmanager
+def transaction_direct(source: str = ""):
+    """
+    Transaction that ALWAYS uses a fresh direct connection (never pooled).
 
-    @staticmethod
-    def _get_available_memory_mb() -> float | None:
-        """Return available system memory in MB, or None if unknown."""
+    Use for auth-critical paths (bootstrap, restore/redeem) that must work
+    even when the pool is full of dead SSL connections.
+    """
+    conn = _create_connection()
+    try:
+        with _run_transaction(conn) as cur:
+            yield cur
+    finally:
         try:
-            with open('/proc/meminfo', 'r') as f:
-                for line in f:
-                    if line.startswith('MemAvailable:'):
-                        return int(line.split()[1]) / 1024  # KB → MB
+            conn.close()
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Cursor Helpers (for use within transaction/get_conn blocks)
+# ─────────────────────────────────────────────────────────────
+def fetch_one(cur) -> Optional[Dict[str, Any]]:
+    """
+    Fetch one row from cursor as dict.
+    Returns None if no rows available.
+    """
+    row = cur.fetchone()
+    if row is None:
         return None
+    # psycopg3 with dict_row already returns dict
+    if isinstance(row, dict):
+        return row
+    # Fallback for tuple rows (shouldn't happen with our setup)
+    if cur.description:
+        columns = [desc[0] for desc in cur.description]
+        return dict(zip(columns, row))
+    return None
 
-    @staticmethod
-    def _analyze_file_safely(file_path: str, file_type: str | None, printer_type: str) -> Dict[str, Any]:
-        """Run mesh analysis in a bounded child process so OOM does not kill Gunicorn."""
-        if not PrintAnalysisService.USE_SUBPROCESS:
-            return PrintAnalysisService.analyze(file_path, file_type=file_type, printer_type=printer_type)
 
-        import multiprocessing as mp
-        import time
+def fetch_all(cur) -> List[Dict[str, Any]]:
+    """
+    Fetch all rows from cursor as list of dicts.
+    Returns empty list if no rows.
+    """
+    rows = cur.fetchall()
+    if not rows:
+        return []
+    # psycopg3 with dict_row already returns list of dicts
+    if rows and isinstance(rows[0], dict):
+        return list(rows)
+    # Fallback for tuple rows
+    if cur.description:
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in rows]
+    return []
 
-        start_method = os.getenv("PRINT_ANALYSIS_MP_START_METHOD", "spawn")
-        try:
-            ctx = mp.get_context(start_method)
-        except ValueError:
-            ctx = mp.get_context("spawn")
 
-        parent_conn, child_conn = ctx.Pipe(duplex=False)
-        proc = ctx.Process(
-            target=_analysis_worker,
-            args=(child_conn, file_path, file_type, printer_type, PrintAnalysisService.ANALYSIS_MEMORY_LIMIT_MB),
-            daemon=True,
+def fetch_scalar(cur) -> Any:
+    """
+    Fetch a single scalar value from cursor.
+    Returns None if no rows.
+    """
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        # Return first value from dict
+        return next(iter(row.values()), None)
+    # Tuple row
+    return row[0] if row else None
+
+
+# ─────────────────────────────────────────────────────────────
+# Standalone Query Helpers — pool-first, direct-fallback on transient errors
+#
+# Primary path uses the pool. On transient SSL/transport/pool errors,
+# the retry uses a DIRECT connection (bypasses the sick pool entirely).
+# This is the key resilience mechanism: user-facing reads survive pool storms.
+#
+# Non-connection errors (constraint violations, syntax errors, etc.)
+# are never retried.
+# ─────────────────────────────────────────────────────────────
+def query_one(sql: str, params: tuple = None, source: str = "") -> Optional[Dict[str, Any]]:
+    """Execute a query and return one row as dict. Falls back to direct connection on transient errors."""
+    try:
+        with transaction(source) as cur:
+            cur.execute(sql, params or ())
+            return fetch_one(cur)
+    except Exception as e:
+        if is_transient_db_error(e):
+            print(f"[DB][FALLBACK] query_one pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
+                cur.execute(sql, params or ())
+                return fetch_one(cur)
+        raise
+
+
+def query_all(sql: str, params: tuple = None, source: str = "") -> List[Dict[str, Any]]:
+    """Execute a query and return all rows. Falls back to direct connection on transient errors."""
+    try:
+        with transaction(source) as cur:
+            cur.execute(sql, params or ())
+            return fetch_all(cur)
+    except Exception as e:
+        if is_transient_db_error(e):
+            print(f"[DB][FALLBACK] query_all pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
+                cur.execute(sql, params or ())
+                return fetch_all(cur)
+        raise
+
+
+def execute(sql: str, params: tuple = None, source: str = "") -> int:
+    """Execute a statement and return affected row count. Falls back to direct on transient errors."""
+    try:
+        with transaction(source) as cur:
+            cur.execute(sql, params or ())
+            return cur.rowcount
+    except Exception as e:
+        if is_transient_db_error(e):
+            print(f"[DB][FALLBACK] execute pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
+                cur.execute(sql, params or ())
+                return cur.rowcount
+        raise
+
+
+def execute_returning(sql: str, params: tuple = None, source: str = "") -> Optional[Dict[str, Any]]:
+    """Execute an INSERT/UPDATE with RETURNING clause. Falls back to direct on transient errors."""
+    try:
+        with transaction(source) as cur:
+            cur.execute(sql, params or ())
+            return fetch_one(cur)
+    except Exception as e:
+        if is_transient_db_error(e):
+            print(f"[DB][FALLBACK] execute_returning pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
+                cur.execute(sql, params or ())
+                return fetch_one(cur)
+        raise
+
+
+def execute_returning_all(sql: str, params: tuple = None, source: str = "") -> List[Dict[str, Any]]:
+    """Execute an INSERT/UPDATE with RETURNING, return all rows. Falls back to direct on transient errors."""
+    try:
+        with transaction(source) as cur:
+            cur.execute(sql, params or ())
+            return fetch_all(cur)
+    except Exception as e:
+        if is_transient_db_error(e):
+            print(f"[DB][FALLBACK] execute_returning_all pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
+                cur.execute(sql, params or ())
+                return fetch_all(cur)
+        raise
+
+
+def execute_many(sql: str, params_list: List[tuple], source: str = "") -> int:
+    """Execute a batch of statements. Falls back to direct on transient errors."""
+    if not params_list:
+        return 0
+    try:
+        with transaction(source) as cur:
+            cur.executemany(sql, params_list)
+            return cur.rowcount
+    except Exception as e:
+        if is_transient_db_error(e):
+            print(f"[DB][FALLBACK] execute_many pool failed, using direct conn source={source or 'unknown'}: {type(e).__name__}: {e}")
+            with transaction_direct(source) as cur:
+                cur.executemany(sql, params_list)
+                return cur.rowcount
+        raise
+
+
+def is_available() -> bool:
+    """Check if database is configured and available."""
+    return USE_DB
+
+
+# ─────────────────────────────────────────────────────────────
+# Schema-aware Table References
+# ─────────────────────────────────────────────────────────────
+class Tables:
+    """Table name constants with schema prefixes."""
+    # Billing schema
+    IDENTITIES = f"{_BILLING_SCHEMA}.identities"
+    IDENTITY_MERGES = f"{_BILLING_SCHEMA}.identity_merges"
+    SESSIONS = f"{_BILLING_SCHEMA}.sessions"
+    MAGIC_CODES = f"{_BILLING_SCHEMA}.magic_codes"
+    WALLETS = f"{_BILLING_SCHEMA}.wallets"
+    LEDGER_ENTRIES = f"{_BILLING_SCHEMA}.ledger_entries"
+    ACTION_COSTS = f"{_BILLING_SCHEMA}.action_costs"
+    CREDIT_RESERVATIONS = f"{_BILLING_SCHEMA}.credit_reservations"
+    PURCHASES = f"{_BILLING_SCHEMA}.purchases"
+    PLANS = f"{_BILLING_SCHEMA}.plans"
+    JOBS = f"{_BILLING_SCHEMA}.jobs"
+    DAILY_LIMITS = f"{_BILLING_SCHEMA}.daily_limits"
+    SUBSCRIPTIONS = f"{_BILLING_SCHEMA}.subscriptions"
+    SUBSCRIPTION_CYCLES = f"{_BILLING_SCHEMA}.subscription_cycles"
+    SUBSCRIPTION_EVENTS = f"{_BILLING_SCHEMA}.subscription_events"
+    MOLLIE_CUSTOMERS = f"{_BILLING_SCHEMA}.mollie_customers"
+    INVOICES = f"{_BILLING_SCHEMA}.invoices"
+    INVOICE_ITEMS = f"{_BILLING_SCHEMA}.invoice_items"
+    RECEIPTS = f"{_BILLING_SCHEMA}.receipts"
+    REFUNDS = f"{_BILLING_SCHEMA}.refunds"
+    PAYMENT_DISPUTES = f"{_BILLING_SCHEMA}.payment_disputes"
+    EMAIL_OUTBOX = f"{_BILLING_SCHEMA}.email_outbox"
+    PROVIDER_LEDGER = f"{_BILLING_SCHEMA}.provider_ledger"
+    PROVIDER_ALERTS = f"{_BILLING_SCHEMA}.provider_alerts"
+    CHECKOUT_IDEMPOTENCY = f"{_BILLING_SCHEMA}.checkout_idempotency"
+    AUTH_RATE_LIMITS = f"{_BILLING_SCHEMA}.auth_rate_limits"
+    PROCESSED_WEBHOOK_PAYMENTS = f"{_BILLING_SCHEMA}.processed_webhook_payments"
+    PRINT_ORDERS = f"{_BILLING_SCHEMA}.print_orders"
+    PRINT_OFFER_REDEMPTIONS = f"{_BILLING_SCHEMA}.print_offer_redemptions"
+    PRINT_REFERRAL_CODES = f"{_BILLING_SCHEMA}.print_referral_codes"
+    PRINT_REFERRAL_ATTRIBUTIONS = f"{_BILLING_SCHEMA}.print_referral_attributions"
+    PRINT_CREDIT_LEDGER = f"{_BILLING_SCHEMA}.print_credit_ledger"
+    CRON_LOCKS = f"{_BILLING_SCHEMA}.cron_locks"
+    VIDEO_DAILY_USAGE = f"{_BILLING_SCHEMA}.video_daily_usage"
+
+    # Notification center (migration 054)
+    NOTIFICATIONS = f"{_BILLING_SCHEMA}.notifications"
+    NOTIFICATION_PREFERENCES = f"{_BILLING_SCHEMA}.notification_preferences"
+    NOTIFICATION_BROADCASTS = f"{_BILLING_SCHEMA}.notification_broadcasts"
+    NOTIFICATION_BROADCAST_DISMISSALS = f"{_BILLING_SCHEMA}.notification_broadcast_dismissals"
+
+    # App schema
+    ANALYTICS_EVENTS = f"{_APP_SCHEMA}.analytics_events"
+    MODELS = f"{_APP_SCHEMA}.models"
+    IMAGES = f"{_APP_SCHEMA}.images"
+    VIDEOS = f"{_APP_SCHEMA}.videos"
+    HISTORY_ITEMS = f"{_APP_SCHEMA}.history_items"
+    ACTIVE_JOBS = f"{_APP_SCHEMA}.active_jobs"
+    ACTIVITY_LOGS = f"{_APP_SCHEMA}.activity_logs"
+    PROVIDER_OPERATIONS = f"{_APP_SCHEMA}.provider_operations"
+
+
+# ─────────────────────────────────────────────────────────────
+# Utilities
+# ─────────────────────────────────────────────────────────────
+def hash_string(value: str) -> str:
+    """Hash a string using SHA256 (for IP addresses, user agents, etc.)."""
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def sql_in_clause(values: List[Any]) -> tuple:
+    """Build a SQL IN clause with proper placeholders."""
+    if not values:
+        return "NULL", ()
+    placeholders = ", ".join(["%s"] * len(values))
+    return placeholders, tuple(values)
+
+
+def verify_connection() -> bool:
+    """Test database connectivity. Returns True if connected."""
+    if not USE_DB:
+        return False
+    try:
+        result = query_one("SELECT 1 AS ok")
+        return result is not None and result.get("ok") == 1
+    except DatabaseError:
+        return False
+
+
+def require_db():
+    """Assert that database is available. Raises DatabaseNotConfiguredError if not."""
+    if not USE_DB:
+        raise DatabaseNotConfiguredError(
+            "This operation requires a database connection. "
+            "Please configure DATABASE_URL environment variable."
         )
 
-        t0 = time.monotonic()
-        proc.start()
-        child_conn.close()
 
-        payload = None
+def get_runtime_report() -> Dict[str, Any]:
+    """Return a stable, JSON-friendly view of DB runtime mode."""
+    if not _HAS_DATABASE:
+        reason = "DATABASE_URL is not set"
+    elif not PSYCOPG_AVAILABLE:
+        reason = "psycopg3 is not installed"
+    elif _DB_STARTUP_CHECKED and not _DB_STARTUP_READY:
+        reason = _DB_STARTUP_REASON or "Database startup check failed"
+    elif not _DB_STARTUP_CHECKED:
+        reason = "Database startup check has not run yet"
+    else:
+        reason = ""
+
+    degraded = not _DB_STARTUP_READY
+    return {
+        "configured": _HAS_DATABASE,
+        "driver_available": PSYCOPG_AVAILABLE,
+        "enabled": USE_DB,
+        "startup_checked": _DB_STARTUP_CHECKED,
+        "ready": _DB_STARTUP_READY,
+        "mode": "degraded" if degraded else "full",
+        "reason": reason or None,
+        "disabled_capabilities": list(_DEGRADED_MODE_LIMITATIONS) if degraded else [],
+        "notes": (
+            [
+                "Health means the HTTP service is up; DB-backed persistence is not available in degraded mode."
+            ]
+            if degraded
+            else []
+        ),
+    }
+
+
+def init_db() -> bool:
+    """Initialize database connection and verify connectivity at startup."""
+    global _DB_STARTUP_CHECKED, _DB_STARTUP_READY, _DB_STARTUP_REASON
+    _DB_STARTUP_CHECKED = True
+
+    if not _HAS_DATABASE:
+        print("[DB] DATABASE_URL not set - running without database")
+        _DB_STARTUP_READY = False
+        _DB_STARTUP_REASON = "DATABASE_URL is not set"
+        return False
+
+    if not PSYCOPG_AVAILABLE:
+        print("[DB] psycopg3 not installed - running without database")
+        _DB_STARTUP_READY = False
+        _DB_STARTUP_REASON = "psycopg3 is not installed"
+        return False
+
+    try:
+        # Verify connectivity with a DIRECT connection (not pooled).
+        # create_app() runs in the Gunicorn master process before fork.
+        # If we use the pool here, its background threads start in the
+        # master and die on fork, causing "couldn't stop thread" errors.
+        # The pool stays dormant until the first request hits the worker.
         try:
-            if parent_conn.poll(PrintAnalysisService.ANALYSIS_TIMEOUT):
-                payload = parent_conn.recv()
-            else:
-                logger.warning(
-                    "[PRINT_ANALYSIS] Timed out after %ss; terminating child pid=%s",
-                    PrintAnalysisService.ANALYSIS_TIMEOUT,
-                    proc.pid,
-                )
-                proc.terminate()
-        except EOFError:
-            payload = None
-        finally:
-            proc.join(timeout=3)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(timeout=2)
-            parent_conn.close()
-
-        elapsed = time.monotonic() - t0
-        if not payload:
-            logger.warning(
-                "[PRINT_ANALYSIS] Child exited without result in %.1fs exitcode=%s",
-                elapsed,
-                proc.exitcode,
-            )
-            return PrintAnalysisService._failed_result(
-                "Print analysis exceeded the safe memory budget for this server.",
-                [
-                    "Use Remesh with a lower polygon target, then run the print check again.",
-                    "For very complex models, export the STL and verify it locally in a slicer.",
-                ],
-            )
-
-        if not payload.get("ok"):
-            logger.warning("[PRINT_ANALYSIS] Child returned failure in %.1fs: %s", elapsed, payload.get("error"))
-            return PrintAnalysisService._failed_result(
-                payload.get("error") or "Print analysis failed.",
-                payload.get("suggestions") or ["Try Remesh to simplify the model, then retry."],
-            )
-
-        result = payload["result"]
-        result["analysis_runtime_seconds"] = round(elapsed, 2)
-        result["analysis_mode"] = "isolated"
-        result["analysis_memory_limit_mb"] = PrintAnalysisService.ANALYSIS_MEMORY_LIMIT_MB
-        return result
-
-    @staticmethod
-    def analyze_from_url(url: str, printer_type: str = "fdm") -> Dict[str, Any]:
-        """Download a GLB/STL from URL and analyze it with memory isolation."""
-        import tempfile
-        import time
-        import requests
-
-        # Validate URL safety
-        url_error = PrintAnalysisService._validate_url(url)
-        if url_error:
-            logger.warning("[PRINT_ANALYSIS] URL validation failed: %s — %s", url, url_error)
-            return PrintAnalysisService._failed_result(f"Invalid model URL: {url_error}")
-
-        tmp_path = None
-        try:
-            # ── Memory guard: check available system memory ──
-            avail = PrintAnalysisService._get_available_memory_mb()
-            if avail is not None and avail < 200:
-                logger.warning("[PRINT_ANALYSIS] Skipping — low available memory: %.0fMB", avail)
-                return PrintAnalysisService._failed_result(
-                    "Server is under memory pressure. Please try again in a moment.",
-                    ["Wait 30 seconds and retry — the server will free memory after other requests complete."],
-                )
-
-            # Stream download with size limit
-            resp = requests.get(url, timeout=30, stream=True)
-            resp.raise_for_status()
-
-            # Check Content-Length header if available
-            content_length = int(resp.headers.get("content-length", 0))
-            if content_length > PrintAnalysisService.MAX_DOWNLOAD_BYTES:
-                return PrintAnalysisService._failed_result(
-                    f"Model file too large ({content_length / 1024 / 1024:.0f} MB). "
-                    f"Maximum is {PrintAnalysisService.MAX_DOWNLOAD_BYTES / 1024 / 1024:.0f} MB."
-                )
-
-            file_type = PrintAnalysisService._detect_file_type(
-                url,
-                resp.headers.get("content-type"),
-                b"",  # We'll detect from content after download
-            )
-            suffix = f".{file_type}" if file_type else ".bin"
-
-            # Write to temp file with size limit enforcement
-            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            tmp_path = tmp.name
-            downloaded = 0
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                downloaded += len(chunk)
-                if downloaded > PrintAnalysisService.MAX_DOWNLOAD_BYTES:
-                    tmp.close()
-                    return PrintAnalysisService._failed_result(
-                        f"Model file exceeds {PrintAnalysisService.MAX_DOWNLOAD_BYTES / 1024 / 1024:.0f} MB limit."
-                    )
-                tmp.write(chunk)
-            tmp.close()
-
-            # Re-detect file type from first bytes if needed
-            if not file_type:
-                with open(tmp_path, "rb") as f:
-                    head = f.read(16)
-                file_type = PrintAnalysisService._detect_file_type(url, resp.headers.get("content-type"), head)
-
-            t0 = time.monotonic()
-            result = PrintAnalysisService._analyze_file_safely(tmp_path, file_type=file_type, printer_type=printer_type)
-            elapsed = time.monotonic() - t0
-            logger.info("[PRINT_ANALYSIS] Completed in %.1fs", elapsed)
-            return result
-
-        except requests.RequestException as e:
-            logger.error("[PRINT_ANALYSIS] Failed to download model: %s", e)
-            return PrintAnalysisService._failed_result(f"Could not download model: {e}")
+            conn = _create_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                row = cur.fetchone()
+            conn.close()
+            if not row or row.get("ok") != 1:
+                raise DatabaseConnectionError("Connection test query failed")
+        except DatabaseConnectionError:
+            raise
         except Exception as e:
-            logger.exception("[PRINT_ANALYSIS] Unexpected error in analyze_from_url")
-            return PrintAnalysisService._failed_result(f"Analysis failed: {e}")
+            raise DatabaseConnectionError(f"Startup connection test failed: {e}", original_error=e)
+
+        print("[DB] Database connection verified successfully")
+        if _DB_POOL_ENABLED and _POOL_AVAILABLE:
+            print(f"[DB] Pool mode: ENABLED (will open on first request, min={_DB_POOL_MIN_SIZE} max={_DB_POOL_MAX_SIZE})")
+        else:
+            print("[DB] Pool mode: DISABLED — using direct connections")
+
+        # Run schema checks with a direct connection too
+        _ensure_schema_direct()
+
+        _DB_STARTUP_READY = True
+        _DB_STARTUP_REASON = ""
+        return True
+    except DatabaseError as e:
+        _DB_STARTUP_READY = False
+        _DB_STARTUP_REASON = str(e)
+        print(f"[DB] ERROR: {e}")
+        raise
+
+
+def ensure_schema() -> None:
+    """Verify critical schema elements exist at startup (uses pool)."""
+    try:
+        with transaction() as cur:
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_provider_payment
+                ON timrx_billing.purchases(provider, provider_payment_id)
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
+                ON timrx_billing.purchases (provider, payment_id)
+                WHERE payment_id IS NOT NULL
+            """)
+
+            # ── History pagination indexes ──
+            # Composite index for cursor-based pagination:
+            # WHERE identity_id = X ORDER BY created_at DESC, id DESC
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_identity_created
+                ON {_APP_SCHEMA}.history_items (identity_id, created_at DESC, id DESC)
+            """)
+            # Per-type pagination (WHERE identity_id = X AND item_type = Y)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_identity_type_created
+                ON {_APP_SCHEMA}.history_items (identity_id, item_type, created_at DESC, id DESC)
+            """)
+            # JSONB expression indexes for PATCH/POST item lookup:
+            # WHERE identity_id = X AND payload->>'original_id' = Y
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_payload_original_id
+                ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_id'))
+                WHERE payload->>'original_id' IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_payload_job_id
+                ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'job_id'))
+                WHERE payload->>'job_id' IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_history_payload_original_job_id
+                ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_job_id'))
+                WHERE payload->>'original_job_id' IS NOT NULL
+            """)
+            # Credit reservations: covers get_all_reserved_credits() query
+            # WHERE identity_id = X AND status = 'held' AND expires_at > NOW()
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_reservations_identity_held
+                ON {_BILLING_SCHEMA}.credit_reservations (identity_id, status, expires_at)
+                WHERE status = 'held'
+            """)
+            # Indexes on FK-join columns used by history LEFT JOINs.
+            # These cover the JOIN conditions: m.upstream_job_id, i.upstream_id, v.upstream_id
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_models_upstream_job_id
+                ON {_APP_SCHEMA}.models (upstream_job_id)
+                WHERE upstream_job_id IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_images_upstream_id
+                ON {_APP_SCHEMA}.images (upstream_id)
+                WHERE upstream_id IS NOT NULL
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_videos_upstream_id
+                ON {_APP_SCHEMA}.videos (upstream_id)
+                WHERE upstream_id IS NOT NULL
+            """)
+
+        print("[DB] Schema indexes ensured")
+
+        try:
+            from backend.services.prompt_safety_service import ensure_safety_schema
+            ensure_safety_schema()
+        except Exception as e:
+            print(f"[DB] Warning: Could not ensure safety schema: {e}")
+    except Exception as e:
+        print(f"[DB] Warning: Could not ensure schema indexes: {e}")
+
+
+def _ensure_schema_direct() -> None:
+    """Verify critical schema elements using a direct connection (no pool).
+    Safe to call in the Gunicorn master before fork."""
+    try:
+        conn = _create_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_purchases_provider_payment
+                    ON timrx_billing.purchases(provider, provider_payment_id)
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS purchases_provider_payment_id_ux
+                    ON timrx_billing.purchases (provider, payment_id)
+                    WHERE payment_id IS NOT NULL
+                """)
+                # History pagination indexes
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_identity_created
+                    ON {_APP_SCHEMA}.history_items (identity_id, created_at DESC, id DESC)
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_identity_type_created
+                    ON {_APP_SCHEMA}.history_items (identity_id, item_type, created_at DESC, id DESC)
+                """)
+                # JSONB expression indexes for PATCH/POST item lookup
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_payload_original_id
+                    ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_id'))
+                    WHERE payload->>'original_id' IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_payload_job_id
+                    ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'job_id'))
+                    WHERE payload->>'job_id' IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_history_payload_original_job_id
+                    ON {_APP_SCHEMA}.history_items (identity_id, (payload->>'original_job_id'))
+                    WHERE payload->>'original_job_id' IS NOT NULL
+                """)
+                # Credit reservations: covers get_all_reserved_credits() query
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_reservations_identity_held
+                    ON {_BILLING_SCHEMA}.credit_reservations (identity_id, status, expires_at)
+                    WHERE status = 'held'
+                """)
+                # FK-join indexes for history LEFT JOINs
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_models_upstream_job_id
+                    ON {_APP_SCHEMA}.models (upstream_job_id)
+                    WHERE upstream_job_id IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_images_upstream_id
+                    ON {_APP_SCHEMA}.images (upstream_id)
+                    WHERE upstream_id IS NOT NULL
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_videos_upstream_id
+                    ON {_APP_SCHEMA}.videos (upstream_id)
+                    WHERE upstream_id IS NOT NULL
+                """)
+                # Inspire opt-in column on models/images/videos
+                for tbl in ('models', 'images', 'videos'):
+                    cur.execute(f"""
+                        ALTER TABLE {_APP_SCHEMA}.{tbl}
+                        ADD COLUMN IF NOT EXISTS share_to_inspire BOOLEAN DEFAULT FALSE
+                    """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_models_inspire
+                    ON {_APP_SCHEMA}.models (share_to_inspire, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_images_inspire
+                    ON {_APP_SCHEMA}.images (share_to_inspire, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_videos_inspire
+                    ON {_APP_SCHEMA}.videos (share_to_inspire, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
+            conn.commit()
+            print("[DB] Schema indexes ensured")
         finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            # Free trimesh/numpy memory back to the Python allocator
-            gc.collect()
+            conn.close()
+
+        try:
+            from backend.services.prompt_safety_service import ensure_safety_schema
+            ensure_safety_schema()
+        except Exception as e:
+            print(f"[DB] Warning: Could not ensure safety schema: {e}")
+    except Exception as e:
+        print(f"[DB] Warning: Could not ensure schema indexes: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Backwards compatibility aliases
+# ─────────────────────────────────────────────────────────────
+get_connection = get_conn
+get_db = get_conn
