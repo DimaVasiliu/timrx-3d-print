@@ -885,6 +885,7 @@ class Tables:
     NOTIFICATION_BROADCAST_DISMISSALS = f"{_BILLING_SCHEMA}.notification_broadcast_dismissals"
 
     # App schema
+    ANALYTICS_EVENTS = f"{_APP_SCHEMA}.analytics_events"
     MODELS = f"{_APP_SCHEMA}.models"
     IMAGES = f"{_APP_SCHEMA}.images"
     VIDEOS = f"{_APP_SCHEMA}.videos"
