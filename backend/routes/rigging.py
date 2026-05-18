@@ -33,6 +33,7 @@ from backend.services.credits_helper import (
 from backend.services.identity_service import require_identity
 from backend.services.job_service import (
     create_internal_job_row,
+    get_job_by_idempotency_key,
     get_job_metadata,
     load_store,
     save_store,
@@ -207,6 +208,25 @@ def rig_start():
 
     body = request.get_json(silent=True) or {}
     print(f"[RIG_SUBMIT] identity={identity_id} keys={list(body.keys())}")
+    idempotency_key = (request.headers.get("Idempotency-Key") or body.get("idempotency_key") or "").strip() or None
+    if idempotency_key:
+        existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+        if existing_job and existing_job.get("upstream_job_id"):
+            balance_info = get_current_balance(identity_id)
+            return jsonify({
+                "ok": True,
+                "job_id": existing_job["upstream_job_id"],
+                "reservation_id": existing_job.get("reservation_id"),
+                "new_balance": balance_info["available"] if balance_info else None,
+                "source": "modular",
+                "was_existing": True,
+            })
+        if existing_job:
+            return jsonify({
+                "ok": False,
+                "error": "JOB_ALREADY_STARTING",
+                "message": "This rigging request is already being started. Please wait a moment.",
+            }), 409
 
     # Prefer input_task_id for rigging — Meshy's original model retains textures.
     # S3 model_url is often a decimated/remeshed GLB without materials.
@@ -289,7 +309,7 @@ def rig_start():
         return credit_error
 
     # Persist job row so status polling / ownership checks work
-    create_internal_job_row(
+    job_row_created = create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
         provider="meshy",
@@ -298,7 +318,33 @@ def rig_start():
         meta=job_meta,
         reservation_id=reservation_id,
         status="queued",
+        idempotency_key=idempotency_key,
     )
+    if USE_DB and not job_row_created:
+        release_job_credits(reservation_id, "job_row_create_failed", internal_job_id)
+        if idempotency_key:
+            existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+            if existing_job and existing_job.get("upstream_job_id"):
+                balance_info = get_current_balance(identity_id)
+                return jsonify({
+                    "ok": True,
+                    "job_id": existing_job["upstream_job_id"],
+                    "reservation_id": existing_job.get("reservation_id"),
+                    "new_balance": balance_info["available"] if balance_info else None,
+                    "source": "modular",
+                    "was_existing": True,
+                })
+            if existing_job:
+                return jsonify({
+                    "ok": False,
+                    "error": "JOB_ALREADY_STARTING",
+                    "message": "This rigging request is already being started. Please wait a moment.",
+                }), 409
+        return jsonify({
+            "ok": False,
+            "error": "JOB_REGISTRATION_FAILED",
+            "message": "Could not register this rigging job. Please try again.",
+        }), 503
 
     def _fail_job(error_msg: str):
         """Mark internal job row as failed so it doesn't linger as 'queued'."""
@@ -631,6 +677,25 @@ def rig_animate():
 
     body = request.get_json(silent=True) or {}
     print(f"[ANIM_SUBMIT] identity={identity_id} rig_task_id={body.get('rig_task_id')} action_id={body.get('action_id')}")
+    idempotency_key = (request.headers.get("Idempotency-Key") or body.get("idempotency_key") or "").strip() or None
+    if idempotency_key:
+        existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+        if existing_job and existing_job.get("upstream_job_id"):
+            balance_info = get_current_balance(identity_id)
+            return jsonify({
+                "ok": True,
+                "job_id": existing_job["upstream_job_id"],
+                "reservation_id": existing_job.get("reservation_id"),
+                "new_balance": balance_info["available"] if balance_info else None,
+                "source": "modular",
+                "was_existing": True,
+            })
+        if existing_job:
+            return jsonify({
+                "ok": False,
+                "error": "JOB_ALREADY_STARTING",
+                "message": "This animation request is already being started. Please wait a moment.",
+            }), 409
 
     # Accept both old field name (rigging_task_id) and correct Meshy name (rig_task_id)
     rig_task_id = (body.get("rig_task_id") or body.get("rigging_task_id") or "").strip()
@@ -688,7 +753,7 @@ def rig_animate():
     if credit_error:
         return credit_error
 
-    create_internal_job_row(
+    job_row_created = create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
         provider="meshy",
@@ -697,7 +762,33 @@ def rig_animate():
         meta=job_meta,
         reservation_id=reservation_id,
         status="queued",
+        idempotency_key=idempotency_key,
     )
+    if USE_DB and not job_row_created:
+        release_job_credits(reservation_id, "job_row_create_failed", internal_job_id)
+        if idempotency_key:
+            existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+            if existing_job and existing_job.get("upstream_job_id"):
+                balance_info = get_current_balance(identity_id)
+                return jsonify({
+                    "ok": True,
+                    "job_id": existing_job["upstream_job_id"],
+                    "reservation_id": existing_job.get("reservation_id"),
+                    "new_balance": balance_info["available"] if balance_info else None,
+                    "source": "modular",
+                    "was_existing": True,
+                })
+            if existing_job:
+                return jsonify({
+                    "ok": False,
+                    "error": "JOB_ALREADY_STARTING",
+                    "message": "This animation request is already being started. Please wait a moment.",
+                }), 409
+        return jsonify({
+            "ok": False,
+            "error": "JOB_REGISTRATION_FAILED",
+            "message": "Could not register this animation job. Please try again.",
+        }), 503
 
     try:
         resp = create_animation_task(rig_task_id, action_id, post_process=post_process)

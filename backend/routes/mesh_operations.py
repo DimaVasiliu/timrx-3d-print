@@ -18,7 +18,7 @@ from backend.services.async_dispatch import update_job_with_upstream_id
 from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
-from backend.services.job_service import create_internal_job_row, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed, _update_job_status_ready
+from backend.services.job_service import create_internal_job_row, get_job_by_idempotency_key, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed, _update_job_status_ready
 from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
 from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
@@ -78,6 +78,25 @@ def mesh_remesh_mod():
     source, err = build_source_payload(body, identity_id=identity_id, prefer="model_url")
     if err:
         return jsonify({"ok": False, "error": err}), 400
+    idempotency_key = (request.headers.get("Idempotency-Key") or body.get("idempotency_key") or "").strip() or None
+    if idempotency_key:
+        existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+        if existing_job and existing_job.get("upstream_job_id"):
+            balance_info = get_current_balance(identity_id)
+            return jsonify({
+                "ok": True,
+                "job_id": existing_job["upstream_job_id"],
+                "reservation_id": existing_job.get("reservation_id"),
+                "new_balance": balance_info["available"] if balance_info else None,
+                "source": "modular",
+                "was_existing": True,
+            })
+        if existing_job:
+            return jsonify({
+                "ok": False,
+                "error": "JOB_ALREADY_STARTING",
+                "message": "This request is already being started. Please wait a moment.",
+            }), 409
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["remesh"]
@@ -212,7 +231,7 @@ def mesh_remesh_mod():
         return credit_error
 
     # Persist job row so status polling/ownership checks work across workers
-    create_internal_job_row(
+    job_row_created = create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
         provider="meshy",
@@ -221,7 +240,33 @@ def mesh_remesh_mod():
         meta=job_meta,
         reservation_id=reservation_id,
         status="queued",
+        idempotency_key=idempotency_key,
     )
+    if USE_DB and not job_row_created:
+        release_job_credits(reservation_id, "job_row_create_failed", internal_job_id)
+        if idempotency_key:
+            existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+            if existing_job and existing_job.get("upstream_job_id"):
+                balance_info = get_current_balance(identity_id)
+                return jsonify({
+                    "ok": True,
+                    "job_id": existing_job["upstream_job_id"],
+                    "reservation_id": existing_job.get("reservation_id"),
+                    "new_balance": balance_info["available"] if balance_info else None,
+                    "source": "modular",
+                    "was_existing": True,
+                })
+            if existing_job:
+                return jsonify({
+                    "ok": False,
+                    "error": "JOB_ALREADY_STARTING",
+                    "message": "This request is already being started. Please wait a moment.",
+                }), 409
+        return jsonify({
+            "ok": False,
+            "error": "JOB_REGISTRATION_FAILED",
+            "message": "Could not register this remesh job. Please try again.",
+        }), 503
 
     try:
         resp = mesh_post("/openapi/v1/remesh", payload)

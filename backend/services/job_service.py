@@ -2096,6 +2096,7 @@ def create_internal_job_row(
     status: str = "queued",
     priority: str = "normal",
     stage: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> bool:
     """
     Create or update a timrx_billing.jobs row for an internal job id.
@@ -2157,9 +2158,9 @@ def create_internal_job_row(
                 cur.execute(
                     f"""
                     INSERT INTO {Tables.JOBS}
-                        (id, identity_id, provider, action_code, status, cost_credits, reservation_id, prompt, meta, priority, stage)
+                        (id, identity_id, provider, action_code, status, cost_credits, reservation_id, prompt, meta, priority, stage, idempotency_key)
                     VALUES
-                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE
                     SET provider = EXCLUDED.provider,
                         reservation_id = COALESCE(EXCLUDED.reservation_id, {Tables.JOBS}.reservation_id),
@@ -2167,6 +2168,7 @@ def create_internal_job_row(
                         meta = COALESCE({Tables.JOBS}.meta, '{{}}'::jsonb) || COALESCE(EXCLUDED.meta, '{{}}'::jsonb),
                         priority = EXCLUDED.priority,
                         stage = COALESCE(EXCLUDED.stage, {Tables.JOBS}.stage),
+                        idempotency_key = COALESCE(EXCLUDED.idempotency_key, {Tables.JOBS}.idempotency_key),
                         updated_at = NOW()
                     """,
                     (
@@ -2181,6 +2183,7 @@ def create_internal_job_row(
                         meta_json,
                         priority,
                         stage,
+                        idempotency_key,
                     ),
                 )
             conn.commit()
@@ -2188,6 +2191,34 @@ def create_internal_job_row(
     except Exception as e:
         print(f"[JOB] ERROR creating internal job row {internal_job_id}: {e}")
         return False
+
+
+def get_job_by_idempotency_key(identity_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
+    """Return an existing job row for a repeated request idempotency key."""
+    if not USE_DB or not identity_id or not idempotency_key:
+        return None
+    try:
+        row = query_one(
+            f"""
+            SELECT id::text AS id,
+                   upstream_job_id,
+                   reservation_id::text AS reservation_id,
+                   status,
+                   stage,
+                   created_at,
+                   updated_at
+            FROM {Tables.JOBS}
+            WHERE identity_id = %s
+              AND idempotency_key = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (identity_id, idempotency_key),
+        )
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[JOB] idempotency lookup failed key={str(idempotency_key)[:12]}... error={e}")
+        return None
 
 
 def _update_job_status_ready(internal_job_id, upstream_job_id, model_id, glb_url):
