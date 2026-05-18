@@ -69,13 +69,27 @@ def serve_hub():
     return send_from_directory(FRONTEND_DIR, "hub.html")
 
 
-@bp.route("/3dprint")
-@bp.route("/3dprint.html")
 def serve_3dprint():
     """Serve 3dprint.html."""
     if not FRONTEND_DIR:
-        return _redirect_to_frontend("3dprint.html")
+        return _redirect_to_frontend("3dprint")
     return send_from_directory(FRONTEND_DIR, "3dprint.html")
+
+
+@bp.route("/3dprint")
+def serve_3dprint_clean():
+    """Serve the canonical 3dprint page."""
+    return serve_3dprint()
+
+
+@bp.route("/3dprint.html")
+def redirect_3dprint_html():
+    """Canonicalize legacy .html URL to /3dprint."""
+    query = request.query_string.decode("utf-8")
+    target = "/3dprint"
+    if query:
+        target = f"{target}?{query}"
+    return redirect(target, code=301)
 
 
 @bp.route("/hub.html")
