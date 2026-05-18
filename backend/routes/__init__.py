@@ -46,12 +46,6 @@ def register_blueprints(app):
     from backend.routes.image_gen import bp as image_gen_bp
     from backend.routes.text_to_3d import bp as text_to_3d_bp
     from backend.routes.image_to_3d import bp as image_to_3d_bp
-    from backend.routes.image_to_3d import (
-        image_to_3d_start_mod,
-        image_to_3d_status_mod,
-        multi_image_to_3d_start_mod,
-        multi_image_to_3d_status_mod,
-    )
     from backend.routes.mesh_operations import bp as mesh_ops_bp
     from backend.routes.rigging import bp as rigging_bp
     from backend.routes.history import bp as history_bp
@@ -84,34 +78,6 @@ def register_blueprints(app):
         print(f"[ROUTES] ERROR importing inspire: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-
-    # Direct image-to-3D rules protect these API endpoints from the frontend
-    # catch-all route if a blueprint registration is skipped or shadowed during
-    # deploy. Keep the normal blueprint registration below for endpoint parity.
-    app.add_url_rule(
-        "/api/_mod/image-to-3d/start",
-        endpoint="image_to_3d_start_direct",
-        view_func=image_to_3d_start_mod,
-        methods=["POST", "OPTIONS"],
-    )
-    app.add_url_rule(
-        "/api/_mod/image-to-3d/status/<job_id>",
-        endpoint="image_to_3d_status_direct",
-        view_func=image_to_3d_status_mod,
-        methods=["GET", "OPTIONS"],
-    )
-    app.add_url_rule(
-        "/api/_mod/multi-image-to-3d/start",
-        endpoint="multi_image_to_3d_start_direct",
-        view_func=multi_image_to_3d_start_mod,
-        methods=["POST", "OPTIONS"],
-    )
-    app.add_url_rule(
-        "/api/_mod/multi-image-to-3d/status/<job_id>",
-        endpoint="multi_image_to_3d_status_direct",
-        view_func=multi_image_to_3d_status_mod,
-        methods=["GET", "OPTIONS"],
-    )
 
     # Frontend routes (no prefix)
     app.register_blueprint(frontend_bp)
@@ -167,6 +133,13 @@ def register_blueprints(app):
         app.register_blueprint(inspire_bp, url_prefix="/api", name="inspire_compat")
     app.register_blueprint(notifications_bp, url_prefix="/api", name="notifications_compat")
     app.register_blueprint(multi_color_print_bp, url_prefix="/api", name="multi_color_print_compat")
+
+    image_to_3d_routes = []
+    for rule in app.url_map.iter_rules():
+        if "image-to-3d" in rule.rule:
+            methods = ",".join(sorted(m for m in rule.methods if m not in ("HEAD", "OPTIONS")))
+            image_to_3d_routes.append(f"{methods or 'OPTIONS'} {rule.rule} -> {rule.endpoint}")
+    print(f"[ROUTES] Image-to-3D routes: {image_to_3d_routes}")
 
     # Temporarily enable route map to debug inspire registration
     # _print_route_map(app)
