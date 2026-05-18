@@ -26,6 +26,7 @@ BASE_RETRY_DELAY = 2
 
 # PiAPI base URL
 PIAPI_API_BASE = "https://api.piapi.ai/api/v1"
+NANO_BANANA_MODEL = "nano-banana-2"
 
 # Polling settings for get-task
 POLL_INTERVAL_INITIAL = 3       # seconds
@@ -138,7 +139,7 @@ def create_nano_banana_task(
     url = f"{PIAPI_API_BASE}/task"
     payload = {
         "model": "gemini",
-        "task_type": "gemini-2.5-flash-image",  # was "nano-banana-2" (deprecated by PiAPI)
+        "task_type": NANO_BANANA_MODEL,
         "input": {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,

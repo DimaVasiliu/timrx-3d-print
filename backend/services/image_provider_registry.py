@@ -53,7 +53,7 @@ IMAGE_PROVIDER_REGISTRY: Dict[str, ImageProviderSpec] = {
     "nano_banana": ImageProviderSpec(
         provider="nano_banana",
         display_name="Nano Banana",
-        model="gemini-2.5-flash-image",
+        model="nano-banana-2",
         action_keys_by_size={
             "1K": "piapi_image_generate",
             "2K": "piapi_image_generate_2k",
@@ -147,4 +147,3 @@ def get_image_action_key(provider: str, image_size: str = "1K", output_mode: str
             return action_key
     normalized_size = (image_size or spec.default_image_size).upper()
     return spec.action_keys_by_size.get(normalized_size, spec.action_keys_by_size[spec.default_image_size])
-

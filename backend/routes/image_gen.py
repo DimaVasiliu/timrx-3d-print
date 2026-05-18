@@ -50,6 +50,7 @@ from backend.services.google_nano_image_service import (
 from backend.services.flux_pro_service import check_flux_pro_configured
 from backend.services.ideogram_v3_service import check_ideogram_v3_configured
 from backend.services.piapi_nano_banana_service import (
+    NANO_BANANA_MODEL,
     check_piapi_configured,
     ALLOWED_ASPECT_RATIOS as PIAPI_ALLOWED_ASPECT_RATIOS,
     ALLOWED_RESOLUTIONS as PIAPI_ALLOWED_RESOLUTIONS,
@@ -421,7 +422,7 @@ def _handle_nano_banana_image_generate(body: dict):
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "model": "gemini-2.5-flash-image", "provider": "nano_banana"},
+        {"prompt": prompt[:100], "model": NANO_BANANA_MODEL, "provider": "nano_banana"},
     )
     if credit_error:
         return credit_error
@@ -431,7 +432,7 @@ def _handle_nano_banana_image_generate(body: dict):
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": "gemini-2.5-flash-image",
+        "model": NANO_BANANA_MODEL,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "output_format": output_format,
@@ -487,7 +488,7 @@ def _handle_nano_banana_image_generate(body: dict):
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
-        "model": "gemini-2.5-flash-image",
+        "model": NANO_BANANA_MODEL,
         "provider": "nano_banana",
     }
 

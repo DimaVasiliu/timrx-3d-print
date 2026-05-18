@@ -68,6 +68,7 @@ from backend.services.recraft_image_service import (
     RecraftValidationError,
 )
 from backend.services.piapi_nano_banana_service import (
+    NANO_BANANA_MODEL,
     create_nano_banana_task,
     poll_nano_banana_task,
     PiAPIAuthError,
@@ -901,7 +902,7 @@ def dispatch_piapi_nano_banana_async(
             image_id=internal_job_id,
             image_url=image_url,
             prompt=prompt,
-            ai_model="gemini-2.5-flash-image",
+            ai_model=NANO_BANANA_MODEL,
             size=f"{aspect_ratio}@{resolution}",
             image_urls=image_urls,
             user_id=identity_id,
