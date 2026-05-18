@@ -91,9 +91,9 @@ def register_blueprints(app):
 
     app.register_blueprint(health_bp, url_prefix="/api/_mod")
     app.register_blueprint(assets_bp, url_prefix="/api/_mod")
-    app.register_blueprint(image_gen_bp, url_prefix="/api/_mod")
+    app.register_blueprint(image_gen_bp, url_prefix="/api/_mod", name="image_gen_mod")
     app.register_blueprint(text_to_3d_bp, url_prefix="/api/_mod")
-    app.register_blueprint(image_to_3d_bp, url_prefix="/api/_mod")
+    app.register_blueprint(image_to_3d_bp, url_prefix="/api/_mod", name="image_to_3d_mod")
     app.register_blueprint(mesh_ops_bp, url_prefix="/api/_mod")
     app.register_blueprint(rigging_bp, url_prefix="/api/_mod")
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
