@@ -1,1606 +1,216 @@
 """
-Image Generation Routes Blueprint (Modular)
-------------------------------------------
+Image-to-3D Routes Blueprint (Modular)
+-------------------------------------
 Registered under /api/_mod.
 """
 
 from __future__ import annotations
 
-import base64
-import os
-import time
-import traceback
 import uuid
-from urllib.parse import urlparse
 
-import requests
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, jsonify, request, g
 
-from backend.config import OPENAI_API_KEY, config
-from backend.db import USE_DB, get_conn, dict_row, Tables
+from backend.config import ACTION_KEYS, MESHY_API_KEY
+from backend.utils import derive_display_title
+from backend.db import USE_DB, get_conn
 from backend.middleware import with_session, with_session_readonly
-from backend.services.async_dispatch import (
-    get_executor,
-    _dispatch_openai_image_async,
-    dispatch_flux_pro_image_async,
-    dispatch_gemini_image_async,
-    dispatch_google_nano_image_async,
-    dispatch_ideogram_v3_image_async,
-    dispatch_piapi_nano_banana_async,
-    dispatch_recraft_v4_image_async,
-    update_job_status_ready,
-    update_job_status_failed,
-)
-from backend.services.credits_helper import get_current_balance, start_paid_job
-from backend.services.expense_guard import ExpenseGuard
-from backend.services.gemini_image_service import (
-    gemini_generate_image,
-    check_gemini_configured,
-    GeminiAuthError,
-    GeminiConfigError,
-    GeminiValidationError,
-    ALLOWED_ASPECT_RATIOS,
-    ALLOWED_IMAGE_SIZES,
-)
-from backend.services.google_nano_image_service import (
-    check_google_nano_configured,
-    ALLOWED_ASPECT_RATIOS as GOOGLE_NANO_ALLOWED_ASPECT_RATIOS,
-    ALLOWED_IMAGE_SIZES as GOOGLE_NANO_ALLOWED_IMAGE_SIZES,
-)
-from backend.services.flux_pro_service import check_flux_pro_configured
-from backend.services.ideogram_v3_service import check_ideogram_v3_configured
-from backend.services.piapi_nano_banana_service import (
-    NANO_BANANA_MODEL,
-    check_piapi_configured,
-    ALLOWED_ASPECT_RATIOS as PIAPI_ALLOWED_ASPECT_RATIOS,
-    ALLOWED_RESOLUTIONS as PIAPI_ALLOWED_RESOLUTIONS,
-)
-from backend.services.recraft_image_service import (
-    check_recraft_v4_configured,
-    ALLOWED_OUTPUT_MODES as RECRAFT_ALLOWED_OUTPUT_MODES,
-    RecraftValidationError,
-    validate_recraft_params,
-)
-from backend.services.image_asset_utils import (
-    coerce_bool,
-    coerce_float,
-    coerce_int,
-    ensure_asset_url,
-    normalize_asset_list,
-    normalize_string_list,
-)
-from backend.services.image_provider_registry import (
-    IMAGE_PROVIDER_REGISTRY,
-    get_allowed_image_providers,
-    get_enabled_image_providers,
-    get_image_action_key as get_registry_image_action_key,
-    get_image_provider_spec,
-    is_image_provider_enabled,
-)
-from backend.services.history_service import get_canonical_image_row, save_image_to_normalized_db
+from backend.services.async_dispatch import _dispatch_meshy_image_to_3d_async, _dispatch_meshy_multi_image_to_3d_async, get_executor
+from backend.services.credits_helper import finalize_job_credits, get_current_balance, release_job_credits, start_paid_job
 from backend.services.identity_service import require_identity
-from backend.services.job_service import create_internal_job_row, load_store, save_store
-from backend.services.s3_service import is_s3_url, parse_s3_key, presign_s3_url
-from backend.services.prompt_safety_service import check_prompt_safety
-from backend.utils.helpers import now_s, log_event
-from backend.utils.upload_validation import UploadValidationError
-
-bp = Blueprint("image_gen", __name__)
-
-
-def _upload_validation_field(provider: str, body: dict) -> str:
-    if provider == "flux_pro":
-        if any(body.get(key) for key in ("source_image", "sourceImage", "input_image")):
-            return "source_image"
-        if any(body.get(key) for key in ("reference_images", "referenceImages", "input_images")):
-            return "reference_images"
-    if any(body.get(key) for key in ("image_data", "imageData")):
-        return "image_data"
-    if any(body.get(key) for key in ("image_url", "imageUrl")):
-        return "image_url"
-    if any(body.get(key) for key in ("mask_image", "maskImage")):
-        return "mask_image"
-    return "asset"
-
-
-def _get_image_action_key(image_size: str = "1K", provider: str = "openai") -> str:
-    """Return the provider-specific canonical action key for the given quality tier."""
-    return get_registry_image_action_key(provider=provider, image_size=image_size)
-
-
-def _validate_provider_image_size(image_size: str, provider: str):
-    """Reject unsupported size tiers per provider. Returns error response or None."""
-    spec = get_image_provider_spec(provider)
-    requested = (image_size or "").upper()
-    if not spec or not requested:
-        return None
-    allowed = list(spec.image_sizes)
-    if requested not in spec.image_sizes:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"{requested} resolution is not available with provider '{provider}'.",
-            "field": "image_size",
-            "allowed": allowed,
-        }), 400
-    return None
-
-
-FLUX_PRO_RESOLUTION_MAP = {
-    "square": (1024, 1024),
-    "portrait": (1024, 1536),
-    "landscape": (1536, 1024),
-}
-
-IDEOGRAM_ASPECT_RATIO_MAP = {
-    "square": "1x1",
-    "portrait": "2x3",
-    "landscape": "3x2",
-}
-
-IDEOGRAM_REFRAME_RESOLUTION_MAP = {
-    "square": "1024x1024",
-    "portrait": "512x1536",
-    "landscape": "1280x800",
-}
-
-RECRAFT_SIZE_MAP = {
-    "square": "1024x1024",
-    "portrait": "1024x1536",
-    "landscape": "1536x1024",
-}
-
-
-def _provider_disabled_response(provider: str):
-    return jsonify({
-        "error": "provider_disabled",
-        "message": f"Image provider '{provider}' is disabled.",
-        "allowed": get_enabled_image_providers(),
-    }), 400
-
-
-def _parse_resolution_pair(raw: str | None, fallback: tuple[int, int]) -> tuple[int, int]:
-    text = (raw or "").strip().lower()
-    if "x" in text:
-        try:
-            width_text, height_text = text.split("x", 1)
-            return int(width_text), int(height_text)
-        except Exception:
-            return fallback
-    return fallback
-
-
-def _body_value(body: dict, *keys: str, default=None):
-    for key in keys:
-        if key in body and body.get(key) is not None:
-            return body.get(key)
-    return default
-
-
-def _normalize_image_inputs(body: dict, *keys: str) -> list[str]:
-    for key in keys:
-        value = body.get(key)
-        if value is not None:
-            return normalize_asset_list(value)
-    return []
-
-
-# OpenAI blob hosts (from monolith)
-ALLOWED_IMAGE_HOSTS = {
-    "oaidalleapiprodscus.blob.core.windows.net",
-    "oaidalleapiprodscus.bblob.core.windows.net",
-    "oaidalleapiprodscus.blob.core.windows.net:443",
-}
-
-_IMAGE_PROVIDER_PUBLIC_ORDER = (
-    "nano_banana",
-    "openai",
-    "google",
-    "google_nano",
-    "flux_pro",
-    "ideogram_v3",
-    "recraft_v4",
+from backend.services.job_service import (
+    _update_job_status_failed,
+    _update_job_status_ready,
+    create_internal_job_row,
+    get_job_metadata,
+    load_store,
+    save_store,
+    verify_job_ownership,
 )
+from backend.services.history_service import get_canonical_model_row
+from backend.services.meshy_service import mesh_get, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
+from backend.services.s3_service import save_finished_job_to_normalized_db
+from backend.services.status_cache import get_cached_status, cache_status
+from backend.utils.helpers import log_event, log_status_summary, now_s
+
+bp = Blueprint("image_to_3d", __name__)
 
 
-@bp.route("/image/providers", methods=["GET"])
-@with_session_readonly
-def image_provider_catalog():
-    enabled_set = set(get_enabled_image_providers())
-    ordered_enabled = [provider for provider in _IMAGE_PROVIDER_PUBLIC_ORDER if provider in enabled_set]
-    if not ordered_enabled:
-        ordered_enabled = [provider for provider in IMAGE_PROVIDER_REGISTRY if provider in enabled_set]
-
-    providers = []
-    for provider in ordered_enabled:
-        spec = get_image_provider_spec(provider)
-        if not spec:
-            continue
-        providers.append(
-            {
-                "id": spec.provider,
-                "name": spec.display_name,
-                "image_sizes": list(spec.image_sizes),
-                "default_image_size": spec.default_image_size,
-                "output_modes": list(spec.output_modes),
-                "provider_variant": spec.provider_variant,
-                "model": spec.model,
-            }
-        )
-
-    default_provider = ordered_enabled[0] if ordered_enabled else None
-
-    return jsonify(
-        {
-            "ok": True,
-            "providers": providers,
-            "enabled_providers": ordered_enabled,
-            "default_provider": default_provider,
-        }
-    )
-
-
-@bp.route("/image/generate", methods=["POST", "OPTIONS"])
+@bp.route("/image-to-3d/start", methods=["POST", "OPTIONS"])
 @with_session
-def image_generate_unified():
-    """
-    Unified image generation endpoint that routes based on provider.
-
-    Request body:
-    {
-        "provider": "google" | "openai" | "nano_banana" | "google_nano" | "flux_pro" | "ideogram_v3" | "recraft_v4",
-        "prompt": "A beautiful sunset...",
-        "aspect_ratio": "16:9",           # For Google: "1:1", "3:4", "4:3", "9:16", "16:9"
-        "image_size": "1K",               # For Google: "1K" or "2K"
-        "size": "1024x1024",              # For OpenAI
-        "model": "gpt-image-1.5",          # For OpenAI (default; gpt-image-1 still supported)
-        "n": 1                            # Number of images
-    }
-
-    Response (success):
-    {
-        "ok": true,
-        "image_url": "...",
-        "image_id": "uuid",
-        "job_id": "uuid",
-        "provider": "google" | "openai"
-    }
-
-    Response (error):
-    {
-        "error": "<machine_code>",
-        "message": "<human readable>",
-        "details": {...}
-    }
-    """
+def image_to_3d_start_mod():
     if request.method == "OPTIONS":
         return ("", 204)
-
-    body = request.get_json(silent=True) or {}
-    provider = (body.get("provider") or "openai").lower()
-
-    spec = get_image_provider_spec(provider)
-    if not spec:
-        return jsonify({
-            "error": "invalid_provider",
-            "message": f"Unknown image provider: {provider}",
-            "allowed": get_allowed_image_providers(),
-        }), 400
-    if not is_image_provider_enabled(provider):
-        return _provider_disabled_response(provider)
-
-    req_size = (body.get("image_size") or body.get("imageSize") or body.get("quality_tier") or "").upper()
-    if req_size:
-        err = _validate_provider_image_size(req_size, provider)
-        if err:
-            return err
-
-    # ── Prompt safety preflight ──
-    raw_prompt = (body.get("prompt") or "").strip()
-    if raw_prompt:
-        from flask import g
-        user_id = getattr(g, "identity_id", None)
-        safety = check_prompt_safety(raw_prompt, medium="image", provider=provider, user_id=user_id)
-        if safety["decision"] in ("block", "warn"):
-            status_code = 451 if safety["decision"] == "block" else 422
-            return jsonify({
-                "ok": False,
-                "error": "prompt_safety",
-                "safety": safety,
-            }), status_code
-
-    try:
-        if provider == "nano_banana":
-            # Route to PiAPI Nano Banana 2
-            return _handle_nano_banana_image_generate(body)
-        elif provider == "google":
-            # Route to Gemini Imagen
-            return _handle_gemini_image_generate(body)
-        elif provider == "google_nano":
-            return _handle_google_nano_image_generate(body)
-        elif provider == "flux_pro":
-            return _handle_flux_pro_image_generate(body)
-        elif provider == "ideogram_v3":
-            return _handle_ideogram_v3_image_generate(body)
-        elif provider == "recraft_v4":
-            return _handle_recraft_v4_image_generate(body)
-        elif provider == "openai":
-            # Route to OpenAI (via existing endpoint logic)
-            return _handle_openai_image_generate(body)
-        else:
-            return jsonify({
-                "error": "invalid_provider",
-                "message": f"Unknown image provider: {provider}",
-                "allowed": get_allowed_image_providers(),
-            }), 400
-    except UploadValidationError as e:
-        print(f"[IMAGE_API] Upload validation failed provider={provider}: {e}")
-        return jsonify({
-            "error": "invalid_params",
-            "message": str(e) or "Invalid uploaded file content",
-            "field": _upload_validation_field(provider, body),
-            "details": {"provider": provider, "reason": "upload_validation"},
-        }), 400
-    except Exception as e:
-        print(f"[IMAGE_API] Unhandled error provider={provider}: {e}")
-        print(traceback.format_exc())
-        return jsonify({
-            "error": "image_generate_internal_error",
-            "message": "Image generation failed before dispatch. Please try again.",
-            "details": {"provider": provider},
-        }), 500
-
-
-def _handle_nano_banana_image_generate(body: dict):
-    """Handle PiAPI Nano Banana 2 image generation (async, returns job_id for polling)."""
-    # Fail-fast: Check if PiAPI is configured
-    is_configured, config_error = check_piapi_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "piapi_not_configured",
-            "message": "Nano Banana image provider is not configured. Set PIAPI_API_KEY.",
-            "details": {"hint": config_error}
-        }), 500
-
-    # Require authentication
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({
-            "error": "invalid_params",
-            "message": "prompt is required",
-            "field": "prompt"
-        }), 400
-
-    # Parse options — map from UI format to PiAPI format
-    # UI sends aspect_ratio in Google-style ("1:1", "9:16", "16:9")
-    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
-    # UI sends image_size ("1K", "2K") — map to PiAPI resolution
-    resolution = body.get("image_size") or body.get("imageSize") or body.get("resolution") or "1K"
-    output_format = body.get("output_format") or "png"
-
-    # Stability guardrails
-    guard_error = ExpenseGuard.check_image_request(n=1)
-    if guard_error:
-        return guard_error
-
-    # Idempotency check. Prefer the per-click key from the browser; deriving the
-    # key from prompt/options makes a second attempt with the same prompt return
-    # the old failed job for the whole idempotency TTL.
-    client_idempotency_key = (
-        request.headers.get("Idempotency-Key")
-        or body.get("idempotency_key")
-        or body.get("client_id")
-        or ""
-    ).strip()
-    if client_idempotency_key:
-        idempotency_key = ExpenseGuard.compute_idempotency_key(
-            identity_id or "", "image_generate", client_idempotency_key,
-            provider="nano_banana"
-        )
-    else:
-        idempotency_key = ExpenseGuard.compute_idempotency_key(
-            identity_id or "", "image_generate", prompt,
-            provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution
-        )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    # Validate aspect_ratio
-    if aspect_ratio not in PIAPI_ALLOWED_ASPECT_RATIOS:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid aspect_ratio: {aspect_ratio}",
-            "field": "aspect_ratio",
-            "allowed": list(PIAPI_ALLOWED_ASPECT_RATIOS)
-        }), 400
-
-    # Validate resolution
-    if resolution not in PIAPI_ALLOWED_RESOLUTIONS:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid resolution: {resolution}",
-            "field": "resolution",
-            "allowed": list(PIAPI_ALLOWED_RESOLUTIONS)
-        }), 400
-
-    # Generate job ID
-    internal_job_id = str(uuid.uuid4())
-
-    # Reserve credits (provider-specific: Nano Banana is premium)
-    action_key = _get_image_action_key(resolution, "nano_banana")
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "model": NANO_BANANA_MODEL, "provider": "nano_banana"},
-    )
-    if credit_error:
-        return credit_error
-
-    # Store metadata for async processing
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": NANO_BANANA_MODEL,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "output_format": output_format,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "nano_banana",
-    }
-
-    # Save to in-memory store
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    # Create job record for tracking
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="nano_banana",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-
-    # Register active job for per-identity concurrent limit tracking
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-
-    # Dispatch async — PiAPI task creation + polling happens in background thread
-    get_executor().submit(
-        dispatch_piapi_nano_banana_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        prompt,
-        aspect_ratio,
-        resolution,
-        output_format,
-        store_meta,
-    )
-
-    log_event("image/generate:nano_banana:queued", {"internal_job_id": internal_job_id})
-
-    # Return immediately with job_id for polling
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": NANO_BANANA_MODEL,
-        "provider": "nano_banana",
-    }
-
-    # Cache response for idempotency
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-
-    return jsonify(response_data)
-
-
-def _handle_gemini_image_generate(body: dict):
-    """Handle Gemini Imagen image generation (async, returns job_id for polling)."""
-    # Fail-fast: Check if Gemini is configured
-    is_configured, config_error = check_gemini_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "gemini_not_configured",
-            "message": "Gemini image provider is not configured. Set GEMINI_API_KEY.",
-            "details": {"hint": config_error}
-        }), 500
-
-    # Require authentication
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({
-            "error": "invalid_params",
-            "message": "prompt is required",
-            "field": "prompt"
-        }), 400
-
-    # Parse options with defaults
-    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
-    image_size = body.get("image_size") or body.get("imageSize") or "1K"
-    sample_count = int(body.get("sample_count") or body.get("sampleCount") or body.get("n") or 1)
-
-    # Stability guardrails: check API limits and concurrent jobs
-    guard_error = ExpenseGuard.check_image_request(n=sample_count)
-    if guard_error:
-        return guard_error
-
-    # Idempotency check: return cached response if duplicate
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="google", aspect_ratio=aspect_ratio, image_size=image_size, n=sample_count
-    )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    # Validate aspect_ratio
-    if aspect_ratio not in ALLOWED_ASPECT_RATIOS:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid aspect_ratio: {aspect_ratio}",
-            "field": "aspect_ratio",
-            "allowed": list(ALLOWED_ASPECT_RATIOS)
-        }), 400
-
-    # Validate image_size
-    if image_size not in ALLOWED_IMAGE_SIZES:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid image_size: {image_size}",
-            "field": "image_size",
-            "allowed": list(ALLOWED_IMAGE_SIZES)
-        }), 400
-
-    # Generate job ID
-    internal_job_id = str(uuid.uuid4())
-
-    # Reserve credits (provider-specific: Gemini uses google tier)
-    action_key = _get_image_action_key(image_size, "google")
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "model": "imagen-4.0", "provider": "google"},
-    )
-    if credit_error:
-        return credit_error
-
-    # Store metadata for async processing
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": "imagen-4.0",
-        "aspect_ratio": aspect_ratio,
-        "image_size": image_size,
-        "sample_count": sample_count,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "google",
-    }
-
-    # Save to in-memory store
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    # Create job record for tracking (same as OpenAI flow)
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="google",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-
-    # Register active job for per-identity concurrent limit tracking
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-
-    # Dispatch async - Gemini API call happens in background thread
-    get_executor().submit(
-        dispatch_gemini_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        prompt,
-        aspect_ratio,
-        image_size,
-        sample_count,
-        store_meta,
-    )
-
-    log_event("image/generate:gemini:queued", {"internal_job_id": internal_job_id})
-
-    # Return immediately with job_id for polling
-    # Credits are now held in DB - frontend can see via /api/credits/wallet
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": "imagen-4.0",
-        "provider": "google",
-    }
-
-    # Cache response for idempotency
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-
-    return jsonify(response_data)
-
-
-def _handle_google_nano_image_generate(body: dict):
-    """Handle direct Google Nano image generation (async)."""
-    is_configured, config_error = check_google_nano_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "google_nano_not_configured",
-            "message": "Google Nano image provider is not configured. Set GEMINI_API_KEY.",
-            "details": {"hint": config_error},
-        }), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
-
-    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
-    image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
-
-    guard_error = ExpenseGuard.check_image_request(n=1)
-    if guard_error:
-        return guard_error
-
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="google_nano", aspect_ratio=aspect_ratio, image_size=image_size,
-    )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    if aspect_ratio not in GOOGLE_NANO_ALLOWED_ASPECT_RATIOS:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid aspect_ratio: {aspect_ratio}",
-            "field": "aspect_ratio",
-            "allowed": list(GOOGLE_NANO_ALLOWED_ASPECT_RATIOS),
-        }), 400
-    if image_size not in GOOGLE_NANO_ALLOWED_IMAGE_SIZES:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid image_size: {image_size}",
-            "field": "image_size",
-            "allowed": list(GOOGLE_NANO_ALLOWED_IMAGE_SIZES),
-        }), 400
-
-    internal_job_id = str(uuid.uuid4())
-    action_key = get_registry_image_action_key("google_nano", image_size)
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "model": "gemini-2.5-flash-image", "provider": "google_nano"},
-    )
-    if credit_error:
-        return credit_error
-
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": "gemini-2.5-flash-image",
-        "aspect_ratio": aspect_ratio,
-        "image_size": image_size,
-        "provider_variant": "direct_google",
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "google_nano",
-    }
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="google_nano",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-    get_executor().submit(
-        dispatch_google_nano_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        prompt,
-        aspect_ratio,
-        image_size,
-        store_meta,
-    )
-
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": "gemini-2.5-flash-image",
-        "provider": "google_nano",
-        "provider_variant": "direct_google",
-    }
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-    return jsonify(response_data)
-
-
-def _handle_flux_pro_image_generate(body: dict):
-    """Handle BFL FLUX.2 image generation / editing (async)."""
-    is_configured, config_error = check_flux_pro_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "flux_pro_not_configured",
-            "message": "FLUX.2 Pro is not configured. Set BFL_API_KEY and enable IMAGE_PROVIDER_FLUX_PRO_ENABLED.",
-            "details": {"hint": config_error},
-        }), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
-
-    shape = body.get("shape") or "square"
-    width, height = _parse_resolution_pair(
-        _body_value(body, "resolution", "size"),
-        FLUX_PRO_RESOLUTION_MAP.get(shape, FLUX_PRO_RESOLUTION_MAP["square"]),
-    )
-    model_variant = str(_body_value(body, "model_variant", "modelVariant", default="pro") or "pro").strip().lower()
-    operation = str(_body_value(body, "operation", default="generate") or "generate").strip().lower()
-    source_images = _normalize_image_inputs(body, "source_image", "sourceImage", "input_image")
-    extra_references = _normalize_image_inputs(body, "reference_images", "referenceImages", "input_images")
-    reference_images = []
-    for index, asset in enumerate(source_images + extra_references, start=1):
-        asset_url = ensure_asset_url(
-            asset,
-            provider="flux_pro",
-            identity_id=identity_id,
-            prefix="source_images",
-            name=f"flux-ref-{index}",
-        )
-        if asset_url:
-            if asset_url.startswith("data:"):
-                return jsonify({
-                    "error": "invalid_params",
-                    "message": "FLUX reference images must resolve to accessible URLs. AWS-backed uploads are required for local data URLs.",
-                    "field": "source_image",
-                }), 400
-            reference_images.append(asset_url)
-    if reference_images and operation == "generate":
-        operation = "edit"
-    if operation == "edit" and not reference_images:
-        return jsonify({
-            "error": "invalid_params",
-            "message": "FLUX Reference / Edit mode requires at least one source or reference image.",
-            "field": "source_image",
-        }), 400
-
-    request_options = {
-        "prompt": prompt,
-        "operation": operation,
-        "model_variant": model_variant,
-        "width": width,
-        "height": height,
-        "reference_images": reference_images,
-        "prompt_upsampling": coerce_bool(_body_value(body, "prompt_upsampling", "promptUpsampling"), True),
-        "seed": coerce_int(body.get("seed")),
-        "guidance": coerce_float(body.get("guidance")),
-        "steps": coerce_int(body.get("steps")),
-        "safety_tolerance": coerce_int(_body_value(body, "safety_tolerance", "safetyTolerance"), 2),
-        "output_format": str(_body_value(body, "output_format", "outputFormat", default="jpeg") or "jpeg").strip().lower(),
-        "transparent_background": coerce_bool(_body_value(body, "transparent_background", "transparentBackground"), False),
-    }
-
-    guard_error = ExpenseGuard.check_image_request(n=1)
-    if guard_error:
-        return guard_error
-
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="flux_pro",
-        width=width,
-        height=height,
-        model_variant=model_variant,
-        operation=operation,
-        source=(reference_images[0] if reference_images else "")[:96],
-        refs=len(reference_images),
-    )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    internal_job_id = str(uuid.uuid4())
-    action_key = get_registry_image_action_key("flux_pro", "1K")
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "model": f"flux-2-{model_variant}", "provider": "flux_pro", "operation": operation},
-    )
-    if credit_error:
-        return credit_error
-
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": f"flux-2-{model_variant}",
-        "width": width,
-        "height": height,
-        "operation": operation,
-        "model_variant": model_variant,
-        "reference_count": len(reference_images),
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "flux_pro",
-    }
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="flux_pro",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-    get_executor().submit(
-        dispatch_flux_pro_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        request_options,
-        store_meta,
-    )
-
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": f"flux-2-{model_variant}",
-        "provider": "flux_pro",
-        "provider_variant": model_variant,
-        "operation": operation,
-    }
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-    return jsonify(response_data)
-
-
-def _handle_ideogram_v3_image_generate(body: dict):
-    """Handle Ideogram V3 generation/edit operations (async wrapper over sync upstream)."""
-    is_configured, config_error = check_ideogram_v3_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "ideogram_v3_not_configured",
-            "message": "Ideogram V3 is not configured. Set IDEOGRAM_API_KEY and enable IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED.",
-            "details": {"hint": config_error},
-        }), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    operation = str(_body_value(body, "operation", default="generate") or "generate").strip().lower()
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt and operation not in {"reframe", "upscale"}:
-        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
-
-    shape = body.get("shape") or "square"
-    aspect_ratio = str(_body_value(body, "aspect_ratio", "aspectRatio", default="") or "").strip()
-    resolution = str(_body_value(body, "resolution", "size", default="") or "").strip()
-
-    if operation == "reframe":
-        if not aspect_ratio and not resolution:
-            resolution = IDEOGRAM_REFRAME_RESOLUTION_MAP.get(shape, IDEOGRAM_REFRAME_RESOLUTION_MAP["square"])
-    elif operation != "upscale":
-        # Ideogram V3 standard generate/edit/remix flows should use aspect ratios.
-        # Older frontends may still send generic 1024x1536-style resolutions, which
-        # Ideogram rejects, so ignore those here and normalize to provider ratios.
-        resolution = ""
-        if not aspect_ratio:
-            aspect_ratio = IDEOGRAM_ASPECT_RATIO_MAP.get(shape, IDEOGRAM_ASPECT_RATIO_MAP["square"])
-
-    request_options = {
-        "prompt": prompt,
-        "operation": operation,
-        "aspect_ratio": aspect_ratio,
-        "resolution": resolution,
-        "source_image": _body_value(body, "source_image", "sourceImage", "input_image"),
-        "mask_image": _body_value(body, "mask_image", "maskImage"),
-        "style_reference_images": _body_value(body, "style_reference_images", "styleReferenceImages"),
-        "character_reference_images": _body_value(body, "character_reference_images", "characterReferenceImages"),
-        "character_reference_masks": _body_value(body, "character_reference_masks", "characterReferenceMasks"),
-        "seed": coerce_int(body.get("seed")),
-        "rendering_speed": str(_body_value(body, "rendering_speed", "renderingSpeed", default="DEFAULT") or "DEFAULT").strip().upper(),
-        "magic_prompt": str(_body_value(body, "magic_prompt", "magicPrompt", default="AUTO") or "AUTO").strip().upper(),
-        "negative_prompt": str(_body_value(body, "negative_prompt", "negativePrompt", default="") or "").strip(),
-        "style_type": str(_body_value(body, "style_type", "styleType", default="") or "").strip().upper(),
-        "style_preset": str(_body_value(body, "style_preset", "stylePreset", default="") or "").strip(),
-        "style_codes": _body_value(body, "style_codes", "styleCodes"),
-        "color_palette_name": str(_body_value(body, "color_palette_name", "colorPaletteName", default="") or "").strip(),
-        "color_palette_members": _body_value(body, "color_palette_members", "colorPaletteMembers"),
-        "image_weight": coerce_float(_body_value(body, "image_weight", "imageWeight")),
-        "upscale_factor": str(_body_value(body, "upscale_factor", "upscaleFactor", default="X1") or "X1").strip().upper(),
-        "detail": coerce_int(body.get("detail"), 50),
-        "resemblance": coerce_int(body.get("resemblance"), 50),
-        "num_images": 1,
-    }
-
-    guard_error = ExpenseGuard.check_image_request(n=1)
-    if guard_error:
-        return guard_error
-
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="ideogram_v3",
-        resolution=resolution,
-        operation=operation,
-        source=str(request_options.get("source_image") or "")[:96],
-        mask=str(request_options.get("mask_image") or "")[:96],
-    )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    internal_job_id = str(uuid.uuid4())
-    action_key = get_registry_image_action_key("ideogram_v3", "1K")
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "model": "ideogram-v3", "provider": "ideogram_v3", "operation": operation},
-    )
-    if credit_error:
-        return credit_error
-
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": "ideogram-v3",
-        "resolution": resolution,
-        "aspect_ratio": aspect_ratio,
-        "operation": operation,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "ideogram_v3",
-    }
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="ideogram_v3",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-    get_executor().submit(
-        dispatch_ideogram_v3_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        request_options,
-        store_meta,
-    )
-
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": "ideogram-v3",
-        "provider": "ideogram_v3",
-        "provider_variant": operation,
-        "operation": operation,
-    }
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-    return jsonify(response_data)
-
-
-def _handle_recraft_v4_image_generate(body: dict):
-    """Handle Recraft generation/edit/vector operations."""
-    is_configured, config_error = check_recraft_v4_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "recraft_v4_not_configured",
-            "message": "Recraft V4 is not configured. Set RECRAFT_API_KEY and enable IMAGE_PROVIDER_RECRAFT_V4_ENABLED.",
-            "details": {"hint": config_error},
-        }), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    operation = str(_body_value(body, "operation", default="generate") or "generate").strip().lower()
-    prompt = (body.get("prompt") or "").strip()
-    if operation in {"generate", "image_to_image", "inpaint", "replace_background", "generate_background"} and not prompt:
-        return jsonify({"error": "invalid_params", "message": "prompt is required", "field": "prompt"}), 400
-
-    shape = body.get("shape") or "square"
-    size = str(_body_value(body, "size", "resolution", default=RECRAFT_SIZE_MAP.get(shape, RECRAFT_SIZE_MAP["square"])) or "").strip()
-    model_variant = str(_body_value(body, "model_variant", "modelVariant", default="") or "").strip()
-    output_mode = (body.get("output_mode") or body.get("outputMode") or "raster").lower()
-    if not model_variant:
-        model_variant = "recraftv4_vector" if output_mode == "vector_svg" else "recraftv4"
-    if operation == "vectorize":
-        output_mode = "vector_svg"
-    if "vector" in model_variant.lower():
-        output_mode = "vector_svg"
-    if output_mode not in RECRAFT_ALLOWED_OUTPUT_MODES:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid output_mode: {output_mode}",
-            "field": "output_mode",
-            "allowed": list(RECRAFT_ALLOWED_OUTPUT_MODES),
-        }), 400
-
-    request_options = {
-        "prompt": prompt,
-        "operation": operation,
-        "size": size,
-        "shape": shape,
-        "model_variant": model_variant,
-        "output_mode": output_mode,
-        "style": str(body.get("style") or "").strip(),
-        "style_id": str(_body_value(body, "style_id", "styleId", default="") or "").strip(),
-        "negative_prompt": str(_body_value(body, "negative_prompt", "negativePrompt", default="") or "").strip(),
-        "source_image": _body_value(body, "source_image", "sourceImage", "input_image"),
-        "mask_image": _body_value(body, "mask_image", "maskImage"),
-        "strength": coerce_float(body.get("strength")),
-        "seed": coerce_int(body.get("seed")),
-        "response_format": str(_body_value(body, "response_format", "responseFormat", default="url") or "url").strip(),
-        "background_color": str(_body_value(body, "background_color", "backgroundColor", default="") or "").strip(),
-        "preferred_colors": _body_value(body, "preferred_colors", "preferredColors"),
-        "artistic_level": coerce_int(_body_value(body, "artistic_level", "artisticLevel")),
-        "no_text": coerce_bool(_body_value(body, "no_text", "noText"), False),
-        "svg_compression": coerce_bool(_body_value(body, "svg_compression", "svgCompression"), False),
-        "limit_num_shapes": coerce_bool(_body_value(body, "limit_num_shapes", "limitNumShapes"), False),
-        "max_num_shapes": coerce_int(_body_value(body, "max_num_shapes", "maxNumShapes")),
-        "text_layout": _body_value(body, "text_layout", "textLayout"),
-    }
-
-    try:
-        validate_recraft_params(request_options)
-    except RecraftValidationError as e:
-        payload = {
-            "error": "invalid_params",
-            "message": e.message,
-            "field": e.field,
-        }
-        if e.allowed:
-            payload["allowed"] = e.allowed
-        return jsonify(payload), 400
-
-    guard_error = ExpenseGuard.check_image_request(n=1)
-    if guard_error:
-        return guard_error
-
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="recraft_v4",
-        size=size,
-        output_mode=output_mode,
-        operation=operation,
-        model_variant=model_variant,
-        source=str(request_options.get("source_image") or "")[:96],
-        mask=str(request_options.get("mask_image") or "")[:96],
-    )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    internal_job_id = str(uuid.uuid4())
-    action_key = get_registry_image_action_key("recraft_v4", "1K", output_mode)
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {
-            "prompt": prompt[:100],
-            "model": model_variant,
-            "provider": "recraft_v4",
-            "output_mode": output_mode,
-            "operation": operation,
-        },
-    )
-    if credit_error:
-        return credit_error
-
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": model_variant,
-        "size": size,
-        "output_mode": output_mode,
-        "operation": operation,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "recraft_v4",
-    }
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="recraft_v4",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-    get_executor().submit(
-        dispatch_recraft_v4_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        request_options,
-        store_meta,
-    )
-
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": model_variant,
-        "provider": "recraft_v4",
-        "output_mode": output_mode,
-        "provider_variant": operation,
-        "operation": operation,
-    }
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-    return jsonify(response_data)
-
-
-def _handle_openai_image_generate(body: dict):
-    """Handle OpenAI image generation (async, returns job_id for polling)."""
-    if not OPENAI_API_KEY:
-        return jsonify({
-            "error": "openai_not_configured",
-            "message": "OpenAI image provider is not configured. Set OPENAI_API_KEY."
-        }), 500
-
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({
-            "error": "invalid_params",
-            "message": "prompt required",
-            "field": "prompt"
-        }), 400
-
-    size_raw = (body.get("size") or body.get("resolution") or "1024x1024").lower()
-    size_map = {
-        "1024x1024": "1024x1024",
-        "1024x1536": "1024x1536",
-        "1536x1024": "1536x1024",
-    }
-    size = "1024x1024"
-    for key in size_map:
-        if key in size_raw:
-            size = size_map[key]
-            break
-
-    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5").strip()
-    n = int(body.get("n") or 1)
-    response_format = (body.get("response_format") or "url").strip()
-
-    # Stability guardrails: check API limits and concurrent jobs
-    guard_error = ExpenseGuard.check_image_request(n=n)
-    if guard_error:
-        return guard_error
-
-    # Idempotency check: return cached response if duplicate
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="openai", size=size, model=model, n=n
-    )
-    cached = ExpenseGuard.is_duplicate_request(idempotency_key)
-    if cached:
-        return jsonify(cached)
-
-    internal_job_id = str(uuid.uuid4())
-    # Resolve provider-specific action key from image_size if provided
-    image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
-    action_key = _get_image_action_key(image_size, "openai")
-
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "n": n, "model": model, "size": size, "provider": "openai"},
-    )
-    if credit_error:
-        return credit_error
-
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": model,
-        "size": size,
-        "n": n,
-        "response_format": response_format,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "openai",
-    }
-
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="openai",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-
-    # Register active job for per-identity concurrent limit tracking
-    ExpenseGuard.register_active_job(internal_job_id, identity_id)
-
-    get_executor().submit(
-        _dispatch_openai_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        {"prompt": prompt, "size": size, "model": model, "n": n, "response_format": response_format},
-        store_meta,
-    )
-
-    log_event("image/generate:openai", {"internal_job_id": internal_job_id})
-
-    balance_info = get_current_balance(identity_id)
-    response_data = {
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": model,
-        "size": size,
-        "provider": "openai",
-    }
-
-    # Cache response for idempotency
-    ExpenseGuard.cache_response(idempotency_key, response_data)
-
-    return jsonify(response_data)
-
-
-@bp.route("/image/gemini", methods=["POST", "OPTIONS"])
-@with_session
-def gemini_image_mod():
-    """
-    Generate an image using Gemini Imagen 4.0.
-
-    Request body:
-    {
-        "prompt": "A beautiful sunset over mountains",
-        "aspect_ratio": "16:9",     # "1:1", "3:4", "4:3", "9:16", "16:9"
-        "image_size": "1K",         # "1K" or "2K"
-        "sample_count": 1           # Number of images (1-4)
-    }
-
-    Response (success):
-    {
-        "ok": true,
-        "image_url": "data:image/png;base64,...",
-        "image_base64": "...",
-        "image_id": "uuid",
-        "provider": "google"
-    }
-
-    Response (error):
-    {
-        "error": "<machine_code>",
-        "message": "<human readable>",
-        "details": {...}
-    }
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    # Fail-fast: Check if Gemini is configured
-    is_configured, config_error = check_gemini_configured()
-    if not is_configured:
-        return jsonify({
-            "error": "gemini_not_configured",
-            "message": "Set GEMINI_API_KEY environment variable",
-            "details": {"hint": config_error}
-        }), 500
-
-    # Require authentication
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-
-    body = request.get_json(silent=True) or {}
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({
-            "error": "invalid_params",
-            "message": "prompt is required",
-            "field": "prompt"
-        }), 400
-
-    # Parse options with defaults
-    aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
-    image_size = body.get("image_size") or body.get("imageSize") or "1K"
-    sample_count = int(body.get("sample_count") or body.get("sampleCount") or 1)
-
-    # Validate aspect_ratio
-    if aspect_ratio not in ALLOWED_ASPECT_RATIOS:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid aspect_ratio: {aspect_ratio}",
-            "field": "aspect_ratio",
-            "allowed": list(ALLOWED_ASPECT_RATIOS)
-        }), 400
-
-    # Validate image_size
-    if image_size not in ALLOWED_IMAGE_SIZES:
-        return jsonify({
-            "error": "invalid_params",
-            "message": f"Invalid image_size: {image_size}",
-            "field": "image_size",
-            "allowed": list(ALLOWED_IMAGE_SIZES)
-        }), 400
-
-    # Generate job ID
-    internal_job_id = str(uuid.uuid4())
-
-    # Reserve credits (provider-specific: Gemini uses google tier)
-    action_key = _get_image_action_key(image_size, "google")
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "model": "imagen-4.0", "provider": "google"},
-    )
-    if credit_error:
-        return credit_error
-
-    # Store metadata for async processing
-    store_meta = {
-        "stage": "image",
-        "created_at": now_s() * 1000,
-        "prompt": prompt,
-        "model": "imagen-4.0",
-        "aspect_ratio": aspect_ratio,
-        "image_size": image_size,
-        "sample_count": sample_count,
-        "user_id": identity_id,
-        "identity_id": identity_id,
-        "reservation_id": reservation_id,
-        "internal_job_id": internal_job_id,
-        "status": "queued",
-        "provider": "google",
-    }
-
-    # Save to in-memory store
-    store = load_store()
-    store[internal_job_id] = store_meta
-    save_store(store)
-
-    # Create job record for tracking (same as OpenAI flow)
-    create_internal_job_row(
-        internal_job_id=internal_job_id,
-        identity_id=identity_id,
-        provider="google",
-        action_key=action_key,
-        prompt=prompt,
-        meta=store_meta,
-        reservation_id=reservation_id,
-        status="queued",
-    )
-
-    # Dispatch async - Gemini API call happens in background thread
-    get_executor().submit(
-        dispatch_gemini_image_async,
-        internal_job_id,
-        identity_id,
-        reservation_id,
-        prompt,
-        aspect_ratio,
-        image_size,
-        sample_count,
-        store_meta,
-    )
-
-    log_event("image/gemini:queued", {"internal_job_id": internal_job_id})
-
-    # Return immediately with job_id for polling
-    # Credits are now held in DB - frontend can see via /api/credits/wallet
-    balance_info = get_current_balance(identity_id)
-    return jsonify({
-        "ok": True,
-        "job_id": internal_job_id,
-        "image_id": internal_job_id,
-        "reservation_id": reservation_id,
-        "new_balance": balance_info["available"] if balance_info else None,
-        "status": "queued",
-        "model": "imagen-4.0",
-        "provider": "google",
-    })
-
-
-# NOTE: Image editing endpoint removed - Imagen 4.0 is text-to-image only.
-# For image editing, consider using a different model or workflow.
-
-
-@bp.route("/image/openai", methods=["POST", "OPTIONS"])
-@with_session
-def openai_image_mod():
-    if request.method == "OPTIONS":
-        return ("", 204)
-
-    if not OPENAI_API_KEY:
-        return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
 
     body = request.get_json(silent=True) or {}
-    prompt = (body.get("prompt") or "").strip()
-    if not prompt:
-        return jsonify({"error": "prompt required"}), 400
-
-    size_raw = (body.get("size") or body.get("resolution") or "1024x1024").lower()
-    # GPT Image 1 supported sizes (gpt-image-1)
-    size_map = {
-        "1024x1024": "1024x1024",
-        "1024x1536": "1024x1536",
-        "1536x1024": "1536x1024",
-    }
-    size = "1024x1024"
-    for key in size_map:
-        if key in size_raw:
-            size = size_map[key]
-            break
-
-    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5").strip()
-    n = int(body.get("n") or 1)
-    response_format = (body.get("response_format") or "url").strip()
+    log_event("image-to-3d/start:incoming[mod]", body)
+    image_url = (body.get("image_url") or "").strip()
+    if not image_url:
+        return jsonify({"error": "image_url required"}), 400
 
     internal_job_id = str(uuid.uuid4())
-    # Resolve provider-specific action key from image_size if provided
-    image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
-    action_key = _get_image_action_key(image_size, "openai")
-
-    # DEBUG: Trace OpenAI image credit flow
-    print(f"[OPENAI_IMAGE:DEBUG] >>> Route handler: identity_id={identity_id}, action_key={action_key}, job_id={internal_job_id}")
-
-    reservation_id, credit_error = start_paid_job(
-        identity_id,
-        action_key,
-        internal_job_id,
-        {"prompt": prompt[:100], "n": n, "model": model, "size": size},
-    )
-
-    print(f"[OPENAI_IMAGE:DEBUG] start_paid_job returned: reservation_id={reservation_id}, credit_error={credit_error is not None}")
-
+    action_key = ACTION_KEYS["image-to-3d"]
+    prompt = (body.get("prompt") or "").strip()
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
+    provider_prompt = merge_negative_prompt(prompt, negative_prompt) if prompt else ""
+    # For image-to-3d, use prompt if available, otherwise use a descriptive fallback
+    title = derive_display_title(prompt, None) if prompt else "Image to 3D Model"
+    # Link to source image history item for lineage grouping
+    source_image_history_id = (body.get("source_image_history_id") or "").strip() or None
+    job_meta = {
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": title,
+        "stage": "image3d",
+    }
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
+        job_meta["provider_prompt"] = provider_prompt
+    if source_image_history_id:
+        job_meta["source_task_id"] = source_image_history_id
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
-        print(f"[OPENAI_IMAGE:DEBUG] !!! Credit error returned, aborting")
         return credit_error
 
+    ai_model = body.get("model") or "latest"
+
+    payload = {
+        "image_url": image_url,
+        "prompt": provider_prompt,
+        "ai_model": ai_model,
+        "enable_pbr": True,
+    }
+
+    if body.get("should_texture") is not None:
+        payload["should_texture"] = bool(body.get("should_texture"))
+    if body.get("enable_pbr") is not None:
+        payload["enable_pbr"] = bool(body.get("enable_pbr"))
+    if body.get("hd_texture") is not None and ai_model != "meshy-5":
+        payload["hd_texture"] = bool(body.get("hd_texture"))
+
+    texture_prompt = (body.get("texture_prompt") or "").strip()
+    texture_negative_prompt = normalize_negative_prompt(body.get("texture_negative_prompt") or body.get("negative_prompt"))
+    if texture_prompt and texture_negative_prompt:
+        texture_prompt = merge_negative_prompt(texture_prompt, texture_negative_prompt)
+    texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip()
+    if texture_prompt:
+        payload["texture_prompt"] = texture_prompt
+    elif texture_image_url:
+        payload["texture_image_url"] = texture_image_url
+
+    # ── Meshy 6+ parameters for print-quality control ──────────────
+    # should_remesh defaults to false in Meshy 6 / "latest", which
+    # preserves the highest-precision triangular mesh.  We intentionally
+    # keep false as default so downstream Remesh panel has full control.
+    should_remesh = body.get("should_remesh")
+    if should_remesh is not None:
+        payload["should_remesh"] = bool(should_remesh)
+
+    # topology + target_polycount only matter when should_remesh is true
+    if payload.get("should_remesh"):
+        topo = (body.get("topology") or "").strip().lower()
+        if topo in ("triangle", "quad"):
+            payload["topology"] = topo
+        try:
+            decimation_mode = int(body.get("decimation_mode"))
+            if decimation_mode in {1, 2, 3, 4}:
+                payload["decimation_mode"] = decimation_mode
+        except (TypeError, ValueError):
+            pass
+        tpc = body.get("target_polycount")
+        if tpc is not None and "decimation_mode" not in payload:
+            try:
+                tpc = int(tpc)
+                if 100 <= tpc <= 300000:
+                    payload["target_polycount"] = tpc
+            except (ValueError, TypeError):
+                pass
+
+    model_type = (body.get("model_type") or "").strip().lower()
+    if model_type in {"standard", "lowpoly"}:
+        payload["model_type"] = model_type
+
+    # image_enhancement — let Meshy optimize the input image or keep
+    # the original.  Default is unset (Meshy decides).
+    img_enhance = body.get("image_enhancement")
+    if img_enhance is not None:
+        payload["image_enhancement"] = bool(img_enhance)
+
+    remove_lighting = body.get("remove_lighting")
+    if remove_lighting is not None and ai_model != "meshy-5":
+        payload["remove_lighting"] = bool(remove_lighting)
+
+    moderation = body.get("moderation")
+    if moderation is not None:
+        payload["moderation"] = bool(moderation)
+
+    raw_target_formats = body.get("target_formats")
+    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
+    target_formats = []
+    if isinstance(raw_target_formats, str):
+        raw_target_formats = [raw_target_formats]
+    if isinstance(raw_target_formats, list):
+        seen_formats = set()
+        for item in raw_target_formats:
+            value = str(item or "").strip().lower()
+            if not value or value not in allowed_target_formats or value in seen_formats:
+                continue
+            seen_formats.add(value)
+            target_formats.append(value)
+    if target_formats:
+        if "glb" not in target_formats:
+            target_formats.insert(0, "glb")
+        payload["target_formats"] = target_formats
+
+    auto_size = None
+    if body.get("auto_size") is not None:
+        auto_size = bool(body.get("auto_size"))
+        payload["auto_size"] = auto_size
+    origin_at = (body.get("origin_at") or "").strip().lower()
+    if auto_size and origin_at in {"bottom", "center"}:
+        payload["origin_at"] = origin_at
+    if auto_size and body.get("multi_view_thumbnails") is not None:
+        payload["multi_view_thumbnails"] = bool(body.get("multi_view_thumbnails"))
+
     store_meta = {
-        "stage": "image",
+        "stage": "image3d",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": model,
-        "size": size,
-        "n": n,
-        "response_format": response_format,
+        "root_prompt": prompt,
+        "title": title,
+        "original_image_url": image_url,
+        "ai_model": ai_model,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
-        "status": "queued",
+        "source_task_id": source_image_history_id,
+        "should_remesh": bool(payload.get("should_remesh", False)),
+        "image_enhancement": payload.get("image_enhancement"),
+        "model_type": payload.get("model_type"),
+        "decimation_mode": payload.get("decimation_mode"),
+        "target_formats": payload.get("target_formats") or [],
+        "auto_size": bool(payload.get("auto_size")),
+        "origin_at": payload.get("origin_at"),
+        "multi_view_thumbnails": bool(payload.get("multi_view_thumbnails")),
+        "hd_texture": bool(payload.get("hd_texture")),
+        "remove_lighting": payload.get("remove_lighting"),
+        "texture_prompt": payload.get("texture_prompt"),
+        "texture_style_mode": "text" if texture_prompt else ("image" if texture_image_url else None),
     }
+    if negative_prompt:
+        store_meta["negative_prompt"] = negative_prompt
+        store_meta["provider_prompt"] = provider_prompt
+    if texture_negative_prompt:
+        store_meta["texture_negative_prompt"] = texture_negative_prompt
 
-    # Persist immediately so status polling works across workers
+    # Persist immediately so status polling can return queued while dispatch runs
     store = load_store()
     store[internal_job_id] = store_meta
     save_store(store)
@@ -1609,7 +219,7 @@ def openai_image_mod():
     create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
-        provider="openai",
+        provider="meshy",
         action_key=action_key,
         prompt=prompt,
         meta=store_meta,
@@ -1618,55 +228,45 @@ def openai_image_mod():
     )
 
     get_executor().submit(
-        _dispatch_openai_image_async,
+        _dispatch_meshy_image_to_3d_async,
         internal_job_id,
         identity_id,
         reservation_id,
-        {"prompt": prompt, "size": size, "model": model, "n": n, "response_format": response_format},
+        payload,
         store_meta,
     )
 
-    log_event("image/openai:dispatched[mod]", {"internal_job_id": internal_job_id})
+    log_event("image-to-3d/start:dispatched[mod]", {"internal_job_id": internal_job_id})
 
     balance_info = get_current_balance(identity_id)
-    # DEBUG: Log wallet state after reservation
-    print(f"[OPENAI_IMAGE:DEBUG] Job dispatched. balance_info={balance_info}, reservation_id={reservation_id}")
-    if balance_info:
-        print(f"[OPENAI_IMAGE:DEBUG] Wallet state: balance={balance_info.get('balance')}, reserved={balance_info.get('reserved')}, available={balance_info.get('available')}")
-
-    return jsonify(
-        {
-            "ok": True,
-            "job_id": internal_job_id,
-            "image_id": internal_job_id,
-            "reservation_id": reservation_id,
-            "new_balance": balance_info["available"] if balance_info else None,
-            "status": "queued",
-            "model": model,
-            "size": size,
-            "source": "modular",
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "source": "modular",
+    })
 
 
-# ─────────────────────────────────────────────────────────────
-# Unified Image Status Endpoint
-# ─────────────────────────────────────────────────────────────
-# Single canonical endpoint for all image providers.
-# Resolves provider from the DB job row, then returns a consistent
-# response shape regardless of which provider generated the image.
-# Legacy provider-specific endpoints below are kept for backward compat.
+@bp.route("/image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def image_to_3d_status_mod(job_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    log_event("image-to-3d/status:incoming[mod]", {"job_id": job_id})
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
-def _image_status_handler(job_id: str, identity_id: str):
-    """
-    Shared image status logic for all providers.
-
-    Checks DB job row first (authoritative), falls back to in-memory store.
-    Returns a consistent response dict or a Flask response tuple on error.
-    """
-    store = load_store()
-    meta = store.get(job_id) or {}
+    identity_id = g.identity_id
+    meshy_job_id = job_id
+    internal_job = None
+    ownership_verified = False  # Track if we already verified ownership via DB
 
     if USE_DB:
         try:
@@ -1674,328 +274,488 @@ def _image_status_handler(job_id: str, identity_id: str):
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        SELECT id, status, error_message, meta, provider
+                        SELECT id, status, upstream_job_id, error_message, meta, reservation_id
                         FROM timrx_billing.jobs
                         WHERE id::text = %s AND identity_id = %s
                         LIMIT 1
                         """,
                         (job_id, identity_id),
                     )
-                    job = cur.fetchone()
+                    internal_job = cur.fetchone()
 
-            if job:
-                job_meta = job.get("meta") or {}
-                if isinstance(job_meta, str):
-                    try:
-                        job_meta = __import__('json').loads(job_meta)
-                    except Exception:
-                        job_meta = {}
-
-                provider = job.get("provider") or meta.get("provider") or job_meta.get("provider") or "unknown"
-
-                if job["status"] in ("queued", "processing"):
-                    return jsonify({"ok": True, "status": "queued", "job_id": job_id, "provider": provider, "message": "Generating image..."})
-
-                if job["status"] == "failed":
-                    return jsonify({"ok": False, "status": "failed", "job_id": job_id, "provider": provider, "error": job.get("error_message", "Image generation failed")})
-
-                if job["status"] == "ready":
-                    image_url = meta.get("image_url") or job_meta.get("image_url")
-                    image_urls = meta.get("image_urls") or job_meta.get("image_urls") or ([] if not image_url else [image_url])
-                    artifact_format = meta.get("artifact_format") or job_meta.get("artifact_format")
-                    provider_variant = meta.get("provider_variant") or job_meta.get("provider_variant")
-                    output_mode = meta.get("output_mode") or job_meta.get("output_mode") or "raster"
-                    upstream_request_id = meta.get("upstream_request_id") or job_meta.get("upstream_request_id")
-                    upstream_cost = meta.get("upstream_cost") or job_meta.get("upstream_cost")
-                    mime_type = meta.get("mime_type") or job_meta.get("mime_type")
-
-                    canonical = get_canonical_image_row(
-                        identity_id,
-                        upstream_id=job_id,
-                        alt_upstream_id=job_meta.get("image_id") or meta.get("image_id"),
-                    )
-                    thumbnail_url = None
-                    if canonical:
-                        if canonical.get("image_url"):
-                            image_url = canonical["image_url"]
-                            image_urls = [image_url]
-                        if canonical.get("thumbnail_url"):
-                            thumbnail_url = canonical["thumbnail_url"]
-                        canonical_meta = canonical.get("meta") or {}
-                        if isinstance(canonical_meta, str):
-                            try:
-                                import json as _json
-                                canonical_meta = _json.loads(canonical_meta)
-                            except Exception:
-                                canonical_meta = {}
-                        if isinstance(canonical_meta, dict):
-                            artifact_format = canonical_meta.get("artifact_format") or canonical_meta.get("format") or artifact_format
-                            provider_variant = canonical_meta.get("provider_variant") or provider_variant
-                            output_mode = canonical_meta.get("output_mode") or output_mode
-                            upstream_request_id = canonical_meta.get("upstream_request_id") or upstream_request_id
-                            upstream_cost = canonical_meta.get("upstream_cost") or upstream_cost
-                            mime_type = canonical_meta.get("mime_type") or mime_type
-
-                    balance_info = get_current_balance(identity_id) if identity_id else None
-
+            if internal_job:
+                ownership_verified = True  # Found in jobs table with matching identity_id
+                if internal_job["status"] == "queued":
                     return jsonify({
-                        "ok": True,
-                        "status": "done",
+                        "status": "queued",
+                        "pct": 0,
+                        "stage": "image3d",
+                        "message": "Job is being dispatched to provider...",
                         "job_id": job_id,
-                        "image_id": job_id,
-                        "image_url": image_url,
-                        "image_urls": image_urls,
-                        "thumbnail_url": thumbnail_url,
-                        "image_base64": meta.get("image_base64") or job_meta.get("image_base64"),
-                        "mime_type": mime_type,
-                        "model": meta.get("model") or job_meta.get("model"),
-                        "provider": provider,
-                        "artifact_format": artifact_format,
-                        "provider_variant": provider_variant,
-                        "output_mode": output_mode,
-                        "upstream_request_id": upstream_request_id,
-                        "upstream_cost": upstream_cost,
-                        "new_balance": balance_info["available"] if balance_info else None,
+                    })
+
+                if internal_job["status"] == "failed":
+                    return jsonify({
+                        "status": "failed",
+                        "error": internal_job.get("error_message", "Job failed"),
+                        "job_id": job_id,
+                    })
+
+                if internal_job["upstream_job_id"]:
+                    meshy_job_id = internal_job["upstream_job_id"]
+                else:
+                    return jsonify({
+                        "status": "pending",
+                        "pct": 0,
+                        "stage": "image3d",
+                        "message": "Waiting for provider response...",
+                        "job_id": job_id,
                     })
         except Exception as e:
-            print(f"[STATUS][mod] Error checking image job {job_id}: {e}")
+            print(f"[STATUS][mod] Error checking internal job {job_id}: {e}")
 
-    # Fallback to in-memory store
-    if meta.get("status") == "done":
-        provider = meta.get("provider") or "unknown"
-        canonical = get_canonical_image_row(
-            identity_id,
-            upstream_id=job_id,
-            alt_upstream_id=meta.get("image_id"),
-        )
-        thumbnail_url = None
-        if canonical:
-            if canonical.get("image_url"):
-                meta["image_url"] = canonical["image_url"]
-                meta["image_urls"] = [canonical["image_url"]]
-            if canonical.get("thumbnail_url"):
-                thumbnail_url = canonical["thumbnail_url"]
-            canonical_meta = canonical.get("meta") or {}
-            if isinstance(canonical_meta, str):
-                try:
-                    import json as _json
-                    canonical_meta = _json.loads(canonical_meta)
-                except Exception:
-                    canonical_meta = {}
-            if isinstance(canonical_meta, dict):
-                meta.setdefault("artifact_format", canonical_meta.get("artifact_format") or canonical_meta.get("format"))
-                meta.setdefault("provider_variant", canonical_meta.get("provider_variant"))
-                meta.setdefault("output_mode", canonical_meta.get("output_mode"))
-                meta.setdefault("upstream_request_id", canonical_meta.get("upstream_request_id"))
-                meta.setdefault("upstream_cost", canonical_meta.get("upstream_cost"))
-                meta.setdefault("mime_type", canonical_meta.get("mime_type"))
+    # If still not verified, check local store for queued jobs (before dispatch finishes)
+    if not ownership_verified:
+        store = load_store()
+        store_meta = store.get(job_id) or {}
+        if store_meta:
+            job_user_id = store_meta.get("identity_id") or store_meta.get("user_id")
+            if identity_id and job_user_id and job_user_id != identity_id:
+                return jsonify({"error": "Job not found or access denied"}), 404
 
-        balance_info = get_current_balance(identity_id) if identity_id else None
+            upstream_hint = store_meta.get("upstream_job_id") or store_meta.get("meshy_task_id")
+            stage_hint = store_meta.get("stage") or "image3d"
+            if not upstream_hint:
+                return jsonify({
+                    "status": "queued",
+                    "pct": 0,
+                    "stage": stage_hint,
+                    "message": "Job is being dispatched to provider...",
+                    "job_id": job_id,
+                })
+            meshy_job_id = upstream_hint
+            ownership_verified = True
 
-        return jsonify({
-            "ok": True,
-            "status": "done",
-            "job_id": job_id,
-            "image_id": job_id,
-            "image_url": meta.get("image_url"),
-            "image_urls": meta.get("image_urls", []),
-            "thumbnail_url": thumbnail_url,
-            "image_base64": meta.get("image_base64"),
-            "mime_type": meta.get("mime_type"),
-            "model": meta.get("model"),
-            "provider": provider,
-            "artifact_format": meta.get("artifact_format"),
-            "provider_variant": meta.get("provider_variant"),
-            "output_mode": meta.get("output_mode") or "raster",
-            "upstream_request_id": meta.get("upstream_request_id"),
-            "upstream_cost": meta.get("upstream_cost"),
-            "new_balance": balance_info["available"] if balance_info else None,
-        })
+    # Skip verify_job_ownership if we already verified via timrx_billing.jobs query
+    if not ownership_verified and not verify_job_ownership(meshy_job_id, identity_id):
+        return jsonify({"error": "Job not found or access denied"}), 404
 
-    return jsonify({"error": "Job not found"}), 404
+    try:
+        ms = mesh_get(f"/openapi/v1/image-to-3d/{meshy_job_id}")
+        log_event("image-to-3d/status:meshy-resp[mod]", ms)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: image-to-3d job_id={job_id} meshy_id={meshy_job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({"status": "failed", "error": "TASK_EXPIRED", "message": "This generation has expired on the provider."}), 200
+    except Exception as e:
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
+        return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
+    out = normalize_meshy_task(ms, stage="image3d")
+    log_status_summary("image-to-3d[mod]", meshy_job_id, out)
 
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(meshy_job_id)
+        except Exception as e:
+            print(f"[image-to-3d/status] auto-refund failed: {e}")
 
-@bp.route("/image/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session_readonly
-def image_status_unified(job_id: str):
-    """
-    Canonical image status endpoint — works for all providers.
+    store = load_store()
+    meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
+    if identity_id and not meta.get("identity_id"):
+        meta["identity_id"] = identity_id
+        meta["user_id"] = identity_id
 
-    Resolves provider from the DB job row. Returns a consistent response shape:
-    - status: "queued" | "done" | "failed"
-    - On done: image_url, image_urls, thumbnail_url, model, provider, new_balance
-    - On failed: error message
-    """
-    if request.method == "OPTIONS":
-        return ("", 204)
+    if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
+        if not meta.get("prompt"):
+            meta["prompt"] = out.get("prompt") or ""
+        if not meta.get("root_prompt"):
+            meta["root_prompt"] = meta.get("prompt")
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
+        if not meta.get("title") or meta.get("title") == "Untitled":
+            # derive_display_title handles generic titles automatically
+            meta["title"] = derive_display_title(
+                meta.get("prompt"),
+                None,
+                root_prompt=meta.get("root_prompt"),
+            )
 
-    return _image_status_handler(job_id, identity_id)
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
+        s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type="image-to-3d", user_id=user_id)
+
+        if s3_result and s3_result.get("success"):
+            if s3_result.get("glb_url"):
+                out["glb_url"] = s3_result["glb_url"]
+            if s3_result.get("thumbnail_url"):
+                out["thumbnail_url"] = s3_result["thumbnail_url"]
+            if s3_result.get("textured_glb_url"):
+                out["textured_glb_url"] = s3_result["textured_glb_url"]
+            if s3_result.get("model_urls"):
+                out["model_urls"] = s3_result["model_urls"]
+            if s3_result.get("texture_urls"):
+                out["texture_urls"] = s3_result["texture_urls"]
+
+            # Resolve reservation_id from store meta first, then fall back to
+            # the DB job row (covers server restart where store was lost).
+            reservation_id = meta.get("reservation_id")
+            if not reservation_id and internal_job:
+                _db_meta = internal_job.get("meta") or {}
+                if isinstance(_db_meta, str):
+                    try:
+                        _db_meta = __import__('json').loads(_db_meta)
+                    except Exception:
+                        _db_meta = {}
+                reservation_id = _db_meta.get("reservation_id") or internal_job.get("reservation_id")
+            internal_job_id = meta.get("internal_job_id")
+            if reservation_id:
+                # Use internal_job_id (not meshy_job_id) for credit finalization tracking
+                finalize_job_credits(reservation_id, internal_job_id or meshy_job_id, user_id)
+
+            if internal_job_id:
+                _update_job_status_ready(
+                    internal_job_id,
+                    upstream_job_id=meshy_job_id,
+                    model_id=s3_result.get("model_id"),
+                    glb_url=s3_result.get("glb_url"),
+                )
+
+    # If DB has the finalized model, prefer S3 URLs for frontend rendering.
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(
+                identity_id,
+                upstream_job_id=meshy_job_id,
+                alt_upstream_job_id=job_id,
+            )
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[image-to-3d][mod] DB lookup for finalized model failed: {e}")
+
+    if out["status"] == "failed":
+        reservation_id = meta.get("reservation_id")
+        internal_job_id = meta.get("internal_job_id")
+        error_msg = out.get("message") or out.get("error") or "Provider job failed"
+
+        if reservation_id:
+            # Use internal_job_id (not meshy_job_id) for credit release tracking
+            release_job_credits(reservation_id, "provider_job_failed", internal_job_id or meshy_job_id)
+
+        if internal_job_id:
+            _update_job_status_failed(internal_job_id, error_msg)
+
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
+    return jsonify(out)
 
 
 # ─────────────────────────────────────────────────────────────
-# Legacy Provider-Specific Status Endpoints (kept for backward compat)
+# Multi-Image to 3D
 # ─────────────────────────────────────────────────────────────
-# These delegate to the shared handler above. The canonical endpoint
-# is /image/status/<job_id> — frontend should migrate to that.
 
-
-@bp.route("/image/openai/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session_readonly
-def openai_image_status_mod(job_id: str):
-    """Legacy OpenAI image status — delegates to unified handler."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    return _image_status_handler(job_id, identity_id)
-
-
-@bp.route("/image/gemini/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session_readonly
-def gemini_image_status_mod(job_id: str):
-    """Legacy Gemini image status — delegates to unified handler."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    return _image_status_handler(job_id, identity_id)
-
-
-@bp.route("/image/piapi/status/<job_id>", methods=["GET", "OPTIONS"])
-@with_session_readonly
-def piapi_image_status_mod(job_id: str):
-    """Legacy PiAPI image status — delegates to unified handler."""
-    if request.method == "OPTIONS":
-        return ("", 204)
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
-    return _image_status_handler(job_id, identity_id)
-
-
-@bp.route("/proxy-image")
+@bp.route("/multi-image-to-3d/start", methods=["POST", "OPTIONS"])
 @with_session
-def proxy_image_mod():
+def multi_image_to_3d_start_mod():
+    """Internal wrapper route around Meshy's /openapi/v1/multi-image-to-3d endpoint.
+    Accepts 1-4 image URLs and dispatches to Meshy via async worker."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
-
-    url = request.args.get("u") or ""
-    if not url:
-        return jsonify({"error": "Missing url"}), 400
-
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
-        return jsonify({"error": "Invalid scheme"}), 400
-    host = (parsed.hostname or "").lower()
-    if host not in ALLOWED_IMAGE_HOSTS and (not config.AWS_BUCKET_MODELS or not host.startswith(config.AWS_BUCKET_MODELS.lower())):
-        return jsonify({"error": "Host not allowed"}), 400
-
-    if not USE_DB:
-        return jsonify({"error": "db_unavailable"}), 503
-
-    s3_key = parse_s3_key(url) if is_s3_url(url) else None
-    try:
-        with get_conn() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                if s3_key:
-                    cur.execute(
-                        f"""
-                        SELECT 1
-                        FROM {Tables.IMAGES}
-                        WHERE identity_id = %s AND (image_s3_key = %s OR thumbnail_s3_key = %s OR source_s3_key = %s)
-                        UNION
-                        SELECT 1
-                        FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s AND (image_url = %s OR thumbnail_url = %s)
-                        LIMIT 1
-                        """,
-                        (identity_id, s3_key, s3_key, s3_key, identity_id, url, url),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        SELECT 1
-                        FROM {Tables.IMAGES}
-                        WHERE identity_id = %s AND (image_url = %s OR thumbnail_url = %s)
-                        UNION
-                        SELECT 1
-                        FROM {Tables.HISTORY_ITEMS}
-                        WHERE identity_id = %s AND (image_url = %s OR thumbnail_url = %s)
-                        LIMIT 1
-                        """,
-                        (identity_id, url, url, identity_id, url, url),
-                    )
-                row = cur.fetchone()
-        if not row:
-            return jsonify({"error": "not_found"}), 404
-    except Exception as e:
-        print(f"[proxy-image][mod] ownership check failed: {e}")
-        return jsonify({"error": "ownership_check_failed"}), 500
-
-    if s3_key and config.AWS_BUCKET_MODELS:
-        signed = presign_s3_url(url)
-        if signed:
-            url = signed
-
-    try:
-        r = requests.get(url, stream=True, timeout=30)
-    except Exception as e:
-        print(f"[PROVIDER_ERROR] provider=image_proxy error={e}")
-        return jsonify({"error": "FETCH_FAILED", "message": "Failed to fetch the requested resource. Please try again."}), 502
-
-    if not r.ok:
-        print(f"[PROVIDER_ERROR] provider=image_proxy error=upstream_http_{r.status_code}")
-        return jsonify({"error": "FETCH_FAILED", "message": "Failed to fetch the requested resource. Please try again."}), 502
-
-    content_type = r.headers.get("Content-Type", "application/octet-stream")
-    return Response(r.content, status=200, mimetype=content_type)
-
-
-@bp.route("/cache-image", methods=["POST", "OPTIONS"])
-def cache_image_mod():
-    if request.method == "OPTIONS":
-        return ("", 204)
 
     body = request.get_json(silent=True) or {}
-    data_url = body.get("data_url") or ""
-    if not data_url.startswith("data:"):
-        return jsonify({"error": "data_url is required and must be a data URI"}), 400
+    log_event("multi-image-to-3d/start:incoming[mod]", body)
 
-    max_bytes = int(os.getenv("CACHE_IMAGE_MAX_BYTES", "5242880"))
-    allowed_mimes = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    image_urls = body.get("image_urls")
+    if not isinstance(image_urls, list) or not (1 <= len(image_urls) <= 4):
+        return jsonify({"error": "image_urls must be an array of 1-4 image URLs"}), 400
+    # Validate each entry is a non-empty string
+    image_urls = [u.strip() for u in image_urls if isinstance(u, str) and u.strip()]
+    if not (1 <= len(image_urls) <= 4):
+        return jsonify({"error": "image_urls must contain 1-4 valid image URLs"}), 400
+
+    internal_job_id = str(uuid.uuid4())
+    action_key = ACTION_KEYS["image-to-3d"]
+    prompt = (body.get("prompt") or "").strip()
+    negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
+    provider_prompt = merge_negative_prompt(prompt, negative_prompt) if prompt else ""
+    title = derive_display_title(prompt, None) if prompt else "Multi-Image to 3D Model"
+    job_meta = {
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": title,
+        "stage": "image3d",
+    }
+    if negative_prompt:
+        job_meta["negative_prompt"] = negative_prompt
+        job_meta["provider_prompt"] = provider_prompt
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
+
+    payload = {
+        "image_urls": image_urls,
+        "ai_model": body.get("model") or "latest",
+        "enable_pbr": body.get("enable_pbr", True),
+    }
+    if provider_prompt:
+        payload["prompt"] = provider_prompt
+
+    store_meta = {
+        "stage": "image3d",
+        "created_at": now_s() * 1000,
+        "prompt": prompt,
+        "root_prompt": prompt,
+        "title": title,
+        "original_image_urls": image_urls,
+        "ai_model": payload.get("ai_model"),
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+    }
+    if negative_prompt:
+        store_meta["negative_prompt"] = negative_prompt
+        store_meta["provider_prompt"] = provider_prompt
+
+    store = load_store()
+    store[internal_job_id] = store_meta
+    save_store(store)
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=prompt,
+        meta=store_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    get_executor().submit(
+        _dispatch_meshy_multi_image_to_3d_async,
+        internal_job_id,
+        identity_id,
+        reservation_id,
+        payload,
+        store_meta,
+    )
+
+    log_event("multi-image-to-3d/start:dispatched[mod]", {"internal_job_id": internal_job_id})
+
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": internal_job_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "status": "queued",
+        "source": "modular",
+    })
+
+
+@bp.route("/multi-image-to-3d/status/<job_id>", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def multi_image_to_3d_status_mod(job_id: str):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    log_event("multi-image-to-3d/status:incoming[mod]", {"job_id": job_id})
+    if not MESHY_API_KEY:
+        return jsonify({"error": "MESHY_API_KEY not configured"}), 503
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
+
+    identity_id = g.identity_id
+    meshy_job_id = job_id
+    internal_job = None
+    ownership_verified = False
+
+    if USE_DB:
+        try:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT id, status, upstream_job_id, error_message, meta, reservation_id
+                        FROM timrx_billing.jobs
+                        WHERE id::text = %s AND identity_id = %s
+                        LIMIT 1
+                        """,
+                        (job_id, identity_id),
+                    )
+                    internal_job = cur.fetchone()
+
+            if internal_job:
+                ownership_verified = True
+                if internal_job["status"] == "queued":
+                    return jsonify({
+                        "status": "queued",
+                        "pct": 0,
+                        "stage": "image3d",
+                        "message": "Job is being dispatched to provider...",
+                        "job_id": job_id,
+                    })
+
+                if internal_job["status"] == "failed":
+                    return jsonify({
+                        "status": "failed",
+                        "error": internal_job.get("error_message", "Job failed"),
+                        "job_id": job_id,
+                    })
+
+                if internal_job["upstream_job_id"]:
+                    meshy_job_id = internal_job["upstream_job_id"]
+                else:
+                    return jsonify({
+                        "status": "pending",
+                        "pct": 0,
+                        "stage": "image3d",
+                        "message": "Waiting for provider response...",
+                        "job_id": job_id,
+                    })
+        except Exception as e:
+            print(f"[STATUS][mod] Error checking internal job {job_id}: {e}")
+
+    if not ownership_verified:
+        store = load_store()
+        store_meta = store.get(job_id) or {}
+        if store_meta:
+            job_user_id = store_meta.get("identity_id") or store_meta.get("user_id")
+            if identity_id and job_user_id and job_user_id != identity_id:
+                return jsonify({"error": "Job not found or access denied"}), 404
+
+            upstream_hint = store_meta.get("upstream_job_id") or store_meta.get("meshy_task_id")
+            stage_hint = store_meta.get("stage") or "image3d"
+            if not upstream_hint:
+                return jsonify({
+                    "status": "queued",
+                    "pct": 0,
+                    "stage": stage_hint,
+                    "message": "Job is being dispatched to provider...",
+                    "job_id": job_id,
+                })
+            meshy_job_id = upstream_hint
+            ownership_verified = True
+
+    if not ownership_verified and not verify_job_ownership(meshy_job_id, identity_id):
+        return jsonify({"error": "Job not found or access denied"}), 404
+
     try:
-        header, b64data = data_url.split(",", 1)
-        meta = header.split(";")[0]
-        mime = meta.replace("data:", "") or "image/png"
-        if mime.lower() not in allowed_mimes:
-            return jsonify({"error": "mime not allowed"}), 400
-        if (len(b64data) * 3) / 4 > max_bytes:
-            return jsonify({"error": "image too large"}), 400
-        ext = ".png" if "png" in mime else ".jpg"
-        file_id = f"{int(time.time()*1000)}"
-        file_path = config.CACHE_DIR / f"{file_id}{ext}"
-        file_path.write_bytes(base64.b64decode(b64data))
+        ms = mesh_get(f"/openapi/v1/multi-image-to-3d/{meshy_job_id}")
+        log_event("multi-image-to-3d/status:meshy-resp[mod]", ms)
+    except MeshyTaskNotFoundError:
+        print(f"[MESHY] Task expired: multi-image-to-3d job_id={job_id} meshy_id={meshy_job_id}")
+        terminalize_expired_meshy_job(job_id, identity_id)
+        return jsonify({"status": "failed", "error": "TASK_EXPIRED", "message": "This generation has expired on the provider."}), 200
     except Exception as e:
-        print(f"[INTERNAL_ERROR] context=data_url_decode error={e}")
-        return jsonify({"error": "INPUT_VALIDATION_FAILED", "message": "Failed to decode image data. Please try again with a different image."}), 400
+        print(f"[PROVIDER_ERROR] provider=meshy job_id={meshy_job_id} error={e}")
+        return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
+    out = normalize_meshy_task(ms, stage="image3d")
+    log_status_summary("multi-image-to-3d[mod]", meshy_job_id, out)
 
-    return jsonify({"url": f"/api/cache-image/{file_path.name}", "mime": mime})
+    # Auto-refund on async failure
+    if out["status"] == "failed":
+        try:
+            from backend.services.credits_helper import refund_failed_job
+            refund_failed_job(meshy_job_id)
+        except Exception as e:
+            print(f"[multi-image-to-3d/status] auto-refund failed: {e}")
 
+    store = load_store()
+    meta = store.get(meshy_job_id) or store.get(job_id) or get_job_metadata(meshy_job_id, store) or {}
+    if identity_id and not meta.get("identity_id"):
+        meta["identity_id"] = identity_id
+        meta["user_id"] = identity_id
 
-@bp.route("/cache-image/<path:filename>", methods=["GET"])
-def cache_image_get_mod(filename: str):
-    # Path traversal protection: resolve and verify target stays within CACHE_DIR
-    cache_dir = config.CACHE_DIR.resolve()
-    target = (cache_dir / filename).resolve()
-    if not str(target).startswith(str(cache_dir) + os.sep) and target != cache_dir:
-        return jsonify({"error": "Not found"}), 404
-    if not target.exists() or not target.is_file():
-        return jsonify({"error": "Not found"}), 404
-    return Response(target.read_bytes(), mimetype="image/png")
+    if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
+        if not meta.get("prompt"):
+            meta["prompt"] = out.get("prompt") or ""
+        if not meta.get("root_prompt"):
+            meta["root_prompt"] = meta.get("prompt")
+
+        if not meta.get("title") or meta.get("title") == "Untitled":
+            meta["title"] = derive_display_title(
+                meta.get("prompt"),
+                None,
+                root_prompt=meta.get("root_prompt"),
+            )
+
+        user_id = meta.get("identity_id") or meta.get("user_id") or getattr(g, 'identity_id', None)
+        s3_result = save_finished_job_to_normalized_db(meshy_job_id, out, meta, job_type="multi-image-to-3d", user_id=user_id)
+
+        if s3_result and s3_result.get("success"):
+            if s3_result.get("glb_url"):
+                out["glb_url"] = s3_result["glb_url"]
+            if s3_result.get("thumbnail_url"):
+                out["thumbnail_url"] = s3_result["thumbnail_url"]
+            if s3_result.get("textured_glb_url"):
+                out["textured_glb_url"] = s3_result["textured_glb_url"]
+            if s3_result.get("model_urls"):
+                out["model_urls"] = s3_result["model_urls"]
+            if s3_result.get("texture_urls"):
+                out["texture_urls"] = s3_result["texture_urls"]
+
+            reservation_id = meta.get("reservation_id")
+            internal_job_id = meta.get("internal_job_id")
+            if reservation_id:
+                finalize_job_credits(reservation_id, internal_job_id or meshy_job_id, user_id)
+
+            if internal_job_id:
+                _update_job_status_ready(
+                    internal_job_id,
+                    upstream_job_id=meshy_job_id,
+                    model_id=s3_result.get("model_id"),
+                    glb_url=s3_result.get("glb_url"),
+                )
+
+    if USE_DB and identity_id:
+        try:
+            canonical = get_canonical_model_row(
+                identity_id,
+                upstream_job_id=meshy_job_id,
+                alt_upstream_job_id=job_id,
+            )
+            if canonical:
+                if canonical.get("glb_url"):
+                    out["glb_url"] = canonical["glb_url"]
+                    if out.get("textured_glb_url"):
+                        out["textured_glb_url"] = canonical["glb_url"]
+                if canonical.get("thumbnail_url"):
+                    out["thumbnail_url"] = canonical["thumbnail_url"]
+                if canonical.get("model_urls"):
+                    out["model_urls"] = canonical["model_urls"]
+                if canonical.get("textured_model_urls"):
+                    out["textured_model_urls"] = canonical["textured_model_urls"]
+        except Exception as e:
+            print(f"[multi-image-to-3d][mod] DB lookup for finalized model failed: {e}")
+
+    if out["status"] == "failed":
+        reservation_id = meta.get("reservation_id")
+        internal_job_id = meta.get("internal_job_id")
+        error_msg = out.get("message") or out.get("error") or "Provider job failed"
+
+        if reservation_id:
+            release_job_credits(reservation_id, "provider_job_failed", internal_job_id or meshy_job_id)
+
+        if internal_job_id:
+            _update_job_status_failed(internal_job_id, error_msg)
+
+    cache_status(job_id, out, is_terminal=(out["status"] in ("done", "failed")))
+    return jsonify(out)

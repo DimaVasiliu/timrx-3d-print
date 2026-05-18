@@ -386,11 +386,25 @@ def _handle_nano_banana_image_generate(body: dict):
     if guard_error:
         return guard_error
 
-    # Idempotency check
-    idempotency_key = ExpenseGuard.compute_idempotency_key(
-        identity_id or "", "image_generate", prompt,
-        provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution
-    )
+    # Idempotency check. Prefer the per-click key from the browser; deriving the
+    # key from prompt/options makes a second attempt with the same prompt return
+    # the old failed job for the whole idempotency TTL.
+    client_idempotency_key = (
+        request.headers.get("Idempotency-Key")
+        or body.get("idempotency_key")
+        or body.get("client_id")
+        or ""
+    ).strip()
+    if client_idempotency_key:
+        idempotency_key = ExpenseGuard.compute_idempotency_key(
+            identity_id or "", "image_generate", client_idempotency_key,
+            provider="nano_banana"
+        )
+    else:
+        idempotency_key = ExpenseGuard.compute_idempotency_key(
+            identity_id or "", "image_generate", prompt,
+            provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution
+        )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)
     if cached:
         return jsonify(cached)
