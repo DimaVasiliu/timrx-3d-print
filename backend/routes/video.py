@@ -18,8 +18,15 @@ Endpoints:
 from __future__ import annotations
 
 import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
 import uuid
-from flask import Blueprint, jsonify, request
+from pathlib import Path
+from flask import Blueprint, jsonify, request, send_file
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import require_admin, with_session, with_session_readonly
@@ -65,6 +72,150 @@ from backend.utils.helpers import now_s, log_event
 from backend.services.status_cache import get_cached_status, cache_status
 
 bp = Blueprint("video", __name__)
+
+_CONVERT_LOCK = threading.Semaphore(int(os.getenv("VIDEO_CONVERT_MAX_PARALLEL", "1")))
+_VIDEO_CONVERT_MAX_UPLOAD_MB = int(os.getenv("VIDEO_CONVERT_MAX_UPLOAD_MB", "200"))
+_VIDEO_CONVERT_TIMEOUT_SECONDS = int(os.getenv("VIDEO_CONVERT_TIMEOUT_SECONDS", "600"))
+_VIDEO_CONVERT_MAX_UPLOAD_BYTES = _VIDEO_CONVERT_MAX_UPLOAD_MB * 1024 * 1024
+
+
+def _safe_video_filename(name: str, fallback: str = "timrx-video") -> str:
+    stem = Path(name or fallback).stem[:80].strip() or fallback
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-") or fallback
+
+
+def _cleanup_dir(path: str) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception as exc:
+        print(f"[VIDEO_CONVERT] cleanup failed path={path}: {exc}")
+
+
+@bp.route("/video/convert/avi-to-mp4", methods=["POST", "OPTIONS"])
+@with_session
+def convert_avi_to_mp4():
+    """Convert one uploaded AVI to MP4 using local temp storage only."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    ffmpeg_bin = shutil.which(os.getenv("FFMPEG_BIN", "ffmpeg"))
+    if not ffmpeg_bin:
+        return jsonify({
+            "ok": False,
+            "error": "ffmpeg_not_available",
+            "message": "FFmpeg is not installed on this server.",
+        }), 503
+
+    content_length = request.content_length or 0
+    if content_length and content_length > _VIDEO_CONVERT_MAX_UPLOAD_BYTES:
+        return jsonify({
+            "ok": False,
+            "error": "file_too_large",
+            "message": f"AVI upload is too large. Maximum is {_VIDEO_CONVERT_MAX_UPLOAD_MB} MB.",
+        }), 413
+
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "missing_file", "message": "Upload one .avi file."}), 400
+
+    original_name = upload.filename
+    if not original_name.lower().endswith(".avi"):
+        return jsonify({"ok": False, "error": "invalid_format", "message": "Only .avi files are accepted."}), 400
+
+    if not _CONVERT_LOCK.acquire(blocking=False):
+        return jsonify({
+            "ok": False,
+            "error": "converter_busy",
+            "message": "Another video conversion is running. Please try again shortly.",
+        }), 429
+
+    tmp_dir = tempfile.mkdtemp(prefix="timrx-avi-convert-")
+    input_path = os.path.join(tmp_dir, "input.avi")
+    output_base = _safe_video_filename(original_name)
+    output_path = os.path.join(tmp_dir, f"{output_base}.mp4")
+    downloaded = 0
+
+    try:
+        with open(input_path, "wb") as fh:
+            while True:
+                chunk = upload.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                if downloaded > _VIDEO_CONVERT_MAX_UPLOAD_BYTES:
+                    return jsonify({
+                        "ok": False,
+                        "error": "file_too_large",
+                        "message": f"AVI upload exceeds {_VIDEO_CONVERT_MAX_UPLOAD_MB} MB.",
+                    }), 413
+                fh.write(chunk)
+
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i", input_path,
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-preset", os.getenv("VIDEO_CONVERT_X264_PRESET", "veryfast"),
+            "-crf", os.getenv("VIDEO_CONVERT_CRF", "23"),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "160k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_VIDEO_CONVERT_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+            stderr = result.stderr.decode("utf-8", errors="ignore")[-1200:]
+            print(f"[VIDEO_CONVERT] ffmpeg failed user={identity_id[:8]} rc={result.returncode} err={stderr}")
+            return jsonify({
+                "ok": False,
+                "error": "conversion_failed",
+                "message": "FFmpeg could not convert this AVI file.",
+            }), 422
+
+        response = send_file(
+            output_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"{output_base}.mp4",
+            max_age=0,
+            conditional=False,
+        )
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.call_on_close(lambda: (_cleanup_dir(tmp_dir), _CONVERT_LOCK.release()))
+        print(
+            f"[VIDEO_CONVERT] success user={identity_id[:8]} "
+            f"in={downloaded} out={os.path.getsize(output_path)}"
+        )
+        return response
+
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "ok": False,
+            "error": "conversion_timeout",
+            "message": "Conversion timed out. Try a shorter or smaller AVI file.",
+        }), 504
+    except Exception as exc:
+        print(f"[VIDEO_CONVERT] failed user={identity_id[:8]} error={exc}")
+        return jsonify({"ok": False, "error": "conversion_error", "message": "Video conversion failed."}), 500
+    finally:
+        if "response" not in locals():
+            _cleanup_dir(tmp_dir)
+            _CONVERT_LOCK.release()
 
 
 @bp.route("/video/generate", methods=["POST", "OPTIONS"])

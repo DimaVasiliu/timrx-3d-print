@@ -100,6 +100,14 @@ def serve_hub_html():
     return send_from_directory(FRONTEND_DIR, "hub.html")
 
 
+@bp.route("/avi-to-mp4")
+def serve_avi_to_mp4_clean():
+    """Serve the AVI to MP4 converter page."""
+    if not FRONTEND_DIR:
+        return _redirect_to_frontend("avi-to-mp4")
+    return send_from_directory(FRONTEND_DIR, "avi-to-mp4.html")
+
+
 @bp.route("/index.html")
 def serve_index_html():
     """Serve index.html."""
