@@ -1188,6 +1188,29 @@ def _ensure_schema_direct() -> None:
                     ON {_APP_SCHEMA}.videos (share_to_inspire, created_at DESC)
                     WHERE share_to_inspire = TRUE
                 """)
+
+                # STL pack entitlements (storefront purchases)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS timrx_billing.stl_pack_entitlements (
+                        id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                        identity_id         uuid NOT NULL REFERENCES timrx_billing.identities(id),
+                        pack_slug           text NOT NULL,
+                        provider            text NOT NULL DEFAULT 'mollie',
+                        provider_payment_id text NOT NULL,
+                        amount              numeric(10,2),
+                        currency            text NOT NULL DEFAULT 'GBP',
+                        status              text NOT NULL DEFAULT 'completed',
+                        created_at          timestamptz NOT NULL DEFAULT now()
+                    )
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_stl_ent_provider_payment
+                    ON timrx_billing.stl_pack_entitlements (provider, provider_payment_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_stl_ent_identity_pack
+                    ON timrx_billing.stl_pack_entitlements (identity_id, pack_slug)
+                """)
             conn.commit()
             print("[DB] Schema indexes ensured")
         finally:

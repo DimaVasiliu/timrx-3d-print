@@ -101,8 +101,8 @@ def ensure_stl_schema() -> None:
     with transaction("ensure_stl_schema") as cur:
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {_TABLE} (
-                id                  uuid PRIMARY KEY,
-                identity_id         uuid NOT NULL,
+                id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                identity_id         uuid NOT NULL REFERENCES {config.BILLING_SCHEMA}.identities(id),
                 pack_slug           text NOT NULL,
                 provider            text NOT NULL DEFAULT 'mollie',
                 provider_payment_id text NOT NULL,
