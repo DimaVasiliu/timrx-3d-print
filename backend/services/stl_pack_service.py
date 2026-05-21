@@ -48,18 +48,32 @@ ALL_ACCESS_SLUG = "*"
 # To add a pack: upload <slug>.zip to R2, then add an entry here.
 # ─────────────────────────────────────────────────────────────────────────────
 STL_PACKS: Dict[str, Dict[str, Any]] = {
-    "airplanes": {
-        "title": "Airplanes STL Pack",
-        "price_gbp": 3.99,
-        "r2_key": "airplanes.zip",
-    },
-    "decorations": {
-        "title": "Decorations STL Pack",
-        "price_gbp": 4.99,
-        "r2_key": "decorations.zip",
-    },
-    # "animals": add this back once animals.zip is uploaded to R2:
-    # "animals": {"title": "Animals STL Pack", "price_gbp": 4.99, "r2_key": "animals.zip"},
+    "airplanes":         {"title": "Airplanes STL Pack",          "price_gbp": 3.99, "r2_key": "airplanes.zip"},
+    "animals":           {"title": "Animals STL Pack",            "price_gbp": 3.99, "r2_key": "animals.zip"},
+    "anime":             {"title": "Anime STL Pack",              "price_gbp": 3.99, "r2_key": "anime.zip"},
+    "articulated-toys":  {"title": "Articulated Toys Pack",       "price_gbp": 3.99, "r2_key": "articulated-toys.zip"},
+    "games":             {"title": "Games STL Pack",              "price_gbp": 3.99, "r2_key": "games.zip"},
+    "busts":             {"title": "Busts STL Pack",              "price_gbp": 3.99, "r2_key": "busts.zip"},
+    "scenes":            {"title": "Scenes STL Pack",             "price_gbp": 3.99, "r2_key": "scenes.zip"},
+    "chibi":             {"title": "Chibi STL Pack",              "price_gbp": 3.99, "r2_key": "chibi.zip"},
+    "keychains":         {"title": "Keychains STL Pack",          "price_gbp": 3.99, "r2_key": "keychains.zip"},
+    "cosplay":           {"title": "Cosplay STL Pack",            "price_gbp": 3.99, "r2_key": "cosplay.zip"},
+    "dv":                {"title": "DV STL Pack",                 "price_gbp": 3.99, "r2_key": "dv.zip"},
+    "decorations":       {"title": "Decorations STL Pack",        "price_gbp": 4.99, "r2_key": "decorations.zip"},
+    "animated-cartoons": {"title": "Animated Cartoons STL Pack",  "price_gbp": 3.99, "r2_key": "animated-cartoons.zip"},
+    "disney":            {"title": "Disney STL Pack",             "price_gbp": 3.99, "r2_key": "disney.zip"},
+    "sculptures":        {"title": "Sculptures STL Pack",         "price_gbp": 3.99, "r2_key": "sculptures.zip"},
+    "dioramas":          {"title": "Dioramas STL Pack",           "price_gbp": 3.99, "r2_key": "dioramas.zip"},
+    "foldable":          {"title": "Foldable STL Pack",           "price_gbp": 3.99, "r2_key": "foldable.zip"},
+    "film":              {"title": "Film STL Pack",               "price_gbp": 3.99, "r2_key": "film.zip"},
+    "mythological":      {"title": "Mythological STL Pack",       "price_gbp": 3.99, "r2_key": "mythological.zip"},
+    "multipart":         {"title": "Multipart STL Pack",          "price_gbp": 3.99, "r2_key": "multipart.zip"},
+    "religion":          {"title": "Religion STL Pack",           "price_gbp": 3.99, "r2_key": "religion.zip"},
+    "vehicles":          {"title": "Vehicles STL Pack",           "price_gbp": 3.99, "r2_key": "vehicles.zip"},
+    "supports":          {"title": "Supports STL Pack",           "price_gbp": 3.99, "r2_key": "supports.zip"},
+    "table-games":       {"title": "Table Games STL Pack",        "price_gbp": 3.99, "r2_key": "table-games.zip"},
+    "utensils":          {"title": "Utensils STL Pack",           "price_gbp": 3.99, "r2_key": "utensils.zip"},
+    "miniatures":        {"title": "Miniatures STL Pack",         "price_gbp": 3.99, "r2_key": "miniatures.zip"},
 }
 
 # All-Access pass — one payment unlocks every pack (entitlement slug "*").
