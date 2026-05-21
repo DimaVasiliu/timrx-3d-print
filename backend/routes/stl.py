@@ -13,7 +13,7 @@ URL, so the backend never streams the large ZIP itself.
 from flask import Blueprint, request, jsonify, g
 
 from backend.middleware import require_session, no_cache
-from backend.services.stl_pack_service import StlPackService, STL_PACKS, ALL_ACCESS
+from backend.services.stl_pack_service import StlPackService, get_pack, STL_PACKS, ALL_ACCESS
 
 bp = Blueprint("stl", __name__)
 
@@ -44,7 +44,7 @@ def stl_checkout():
     if not pack_slug:
         return jsonify({"ok": False, "error": "pack_slug is required"}), 400
 
-    if not StlPackService.get_pack(pack_slug):
+    if not get_pack(pack_slug):
         return jsonify({"ok": False, "error": "unknown_pack",
                         "message": "That pack does not exist."}), 404
 
@@ -74,7 +74,7 @@ def stl_download():
     if not pack_slug:
         return jsonify({"ok": False, "error": "pack_required"}), 400
 
-    if not StlPackService.get_pack(pack_slug):
+    if not get_pack(pack_slug):
         return jsonify({"ok": False, "error": "unknown_pack"}), 404
 
     if not StlPackService.has_entitlement(g.identity_id, pack_slug):
@@ -105,7 +105,7 @@ def stl_my_packs():
     packs = []
     for e in ents:
         slug = e.get("pack_slug")
-        pk = StlPackService.get_pack(slug)
+        pk = get_pack(slug)
         purchased_at = e.get("created_at")
         packs.append({
             "slug": slug,

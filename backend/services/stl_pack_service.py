@@ -49,20 +49,17 @@ ALL_ACCESS_SLUG = "*"
 # ─────────────────────────────────────────────────────────────────────────────
 STL_PACKS: Dict[str, Dict[str, Any]] = {
     "airplanes": {
-        "title": "Airplanes STL Mega Pack",
-        "price_gbp": 19.99,
+        "title": "Airplanes STL Pack",
+        "price_gbp": 3.99,
         "r2_key": "airplanes.zip",
     },
     "decorations": {
         "title": "Decorations STL Pack",
-        "price_gbp": 9.99,
+        "price_gbp": 4.99,
         "r2_key": "decorations.zip",
     },
-    "animals": {
-        "title": "Animals STL Pack",
-        "price_gbp": 9.99,
-        "r2_key": "animals.zip",
-    },
+    # "animals": add this back once animals.zip is uploaded to R2:
+    # "animals": {"title": "Animals STL Pack", "price_gbp": 4.99, "r2_key": "animals.zip"},
 }
 
 # All-Access pass — one payment unlocks every pack (entitlement slug "*").
