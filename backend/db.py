@@ -1094,6 +1094,12 @@ def ensure_schema() -> None:
             ensure_safety_schema()
         except Exception as e:
             print(f"[DB] Warning: Could not ensure safety schema: {e}")
+
+        try:
+            from backend.services.stl_pack_service import ensure_stl_schema
+            ensure_stl_schema()
+        except Exception as e:
+            print(f"[DB] Warning: Could not ensure STL schema: {e}")
     except Exception as e:
         print(f"[DB] Warning: Could not ensure schema indexes: {e}")
 

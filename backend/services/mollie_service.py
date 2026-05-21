@@ -924,6 +924,11 @@ class MollieService:
         if payment_type == "subscription_first":
             return MollieService._handle_subscription_first_paid(payment)
 
+        # STL PACK purchase — grants a file-download entitlement (no credits)
+        if payment_type == "stl_pack":
+            from backend.services.stl_pack_service import StlPackService
+            return StlPackService.handle_payment_paid(payment)
+
         # RECURRING PAYMENT: Automatic charge from Mollie subscription
         # Mollie sets subscriptionId field for payments created by subscriptions
         subscription_id = payment.get("subscriptionId")

@@ -471,6 +471,31 @@ class Config:
         return bool(self.AWS_BUCKET_MODELS and self.AWS_ACCESS_KEY_ID and self.AWS_SECRET_ACCESS_KEY)
 
     # ─────────────────────────────────────────────────────────────
+    # Cloudflare R2 (STL pack downloads)
+    # ─────────────────────────────────────────────────────────────
+    # S3-compatible credentials from: Cloudflare dashboard -> R2 ->
+    # "Manage R2 API Tokens" -> Create API Token.
+    R2_ACCOUNT_ID: str = field(default_factory=lambda: _get_env("R2_ACCOUNT_ID"))
+    R2_ACCESS_KEY_ID: str = field(default_factory=lambda: _get_env("R2_ACCESS_KEY_ID"))
+    R2_SECRET_ACCESS_KEY: str = field(default_factory=lambda: _get_env("R2_SECRET_ACCESS_KEY"))
+    R2_BUCKET: str = field(default_factory=lambda: _get_env("R2_BUCKET", "stllibrary"))
+
+    @property
+    def R2_ENDPOINT(self) -> str:
+        """S3 API endpoint for the R2 account (empty if not configured)."""
+        if not self.R2_ACCOUNT_ID:
+            return ""
+        return f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+    @property
+    def R2_CONFIGURED(self) -> bool:
+        """True if Cloudflare R2 is fully configured for STL downloads."""
+        return bool(
+            self.R2_ACCOUNT_ID and self.R2_ACCESS_KEY_ID
+            and self.R2_SECRET_ACCESS_KEY and self.R2_BUCKET
+        )
+
+    # ─────────────────────────────────────────────────────────────
     # CORS
     # ─────────────────────────────────────────────────────────────
     _ALLOWED_ORIGINS_RAW: str = field(default_factory=lambda: _get_env("ALLOWED_ORIGINS"))

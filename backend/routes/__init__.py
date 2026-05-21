@@ -59,6 +59,7 @@ def register_blueprints(app):
     from backend.routes.multi_color_print import bp as multi_color_print_bp
     from backend.routes.print_orders import bp as print_orders_bp
     from backend.routes.analytics import bp as analytics_bp
+    from backend.routes.stl import bp as stl_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -115,6 +116,7 @@ def register_blueprints(app):
     app.register_blueprint(contact_bp, url_prefix="/api")
     app.register_blueprint(webhooks_bp, url_prefix="/api")
     app.register_blueprint(analytics_bp, url_prefix="/api/analytics")
+    app.register_blueprint(stl_bp, url_prefix="/api/stl")
 
     # Also register under /api for backward compatibility (cached frontend)
     # These must match the legacy app.py routes exactly
