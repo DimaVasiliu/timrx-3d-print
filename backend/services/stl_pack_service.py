@@ -79,7 +79,7 @@ STL_PACKS: Dict[str, Dict[str, Any]] = {
 # All-Access pass — one payment unlocks every pack (entitlement slug "*").
 ALL_ACCESS: Dict[str, Any] = {
     "title": "All-Access Library Pass",
-    "price_gbp": 49.0,
+    "price_gbp": 23.99,
     "r2_key": None,
 }
 
