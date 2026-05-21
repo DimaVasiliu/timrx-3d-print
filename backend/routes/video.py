@@ -131,6 +131,7 @@ def convert_avi_to_mp4():
             "ok": False,
             "error": "converter_busy",
             "message": "Another video conversion is running. Please try again shortly.",
+            "retry_after": 30,
         }), 429
 
     tmp_dir = tempfile.mkdtemp(prefix="timrx-avi-convert-")
@@ -138,6 +139,16 @@ def convert_avi_to_mp4():
     output_base = _safe_video_filename(original_name)
     output_path = os.path.join(tmp_dir, f"{output_base}.mp4")
     downloaded = 0
+    lock_released = False  # guard so the semaphore is released exactly once
+
+    def _release_lock_once():
+        nonlocal lock_released
+        if not lock_released:
+            lock_released = True
+            try:
+                _CONVERT_LOCK.release()
+            except Exception:
+                pass
 
     try:
         with open(input_path, "wb") as fh:
@@ -187,6 +198,14 @@ def convert_avi_to_mp4():
                 "message": "FFmpeg could not convert this AVI file.",
             }), 422
 
+        # ffmpeg has finished — the CPU-heavy work is done. Release the lock NOW
+        # so the next conversion can start. Streaming the finished file back is
+        # cheap I/O and must NOT hold the lock: relying on call_on_close to
+        # release leaks the semaphore forever if the client disconnects or the
+        # gunicorn worker is recycled mid-download (root cause of the permanent
+        # "Another video conversion is running" 429).
+        _release_lock_once()
+
         response = send_file(
             output_path,
             mimetype="video/mp4",
@@ -196,7 +215,8 @@ def convert_avi_to_mp4():
             conditional=False,
         )
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.call_on_close(lambda: (_cleanup_dir(tmp_dir), _CONVERT_LOCK.release()))
+        # call_on_close now only cleans the temp dir once streaming completes.
+        response.call_on_close(lambda: _cleanup_dir(tmp_dir))
         print(
             f"[VIDEO_CONVERT] success user={identity_id[:8]} "
             f"in={downloaded} out={os.path.getsize(output_path)}"
@@ -213,9 +233,13 @@ def convert_avi_to_mp4():
         print(f"[VIDEO_CONVERT] failed user={identity_id[:8]} error={exc}")
         return jsonify({"ok": False, "error": "conversion_error", "message": "Video conversion failed."}), 500
     finally:
+        # Always release the lock. _release_lock_once is idempotent, so this
+        # covers every early-return and exception path with no double-release.
+        _release_lock_once()
+        # The success path defers temp-dir cleanup to call_on_close (after the
+        # file finishes streaming); every other path cleans up here.
         if "response" not in locals():
             _cleanup_dir(tmp_dir)
-            _CONVERT_LOCK.release()
 
 
 @bp.route("/video/generate", methods=["POST", "OPTIONS"])
