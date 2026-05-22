@@ -58,7 +58,7 @@ STL_PACKS: Dict[str, Dict[str, Any]] = {
     "chibi":             {"title": "Chibi STL Pack",              "price_gbp": 3.99, "r2_key": "chibi.zip"},
     "keychains":         {"title": "Keychains STL Pack",          "price_gbp": 3.99, "r2_key": "keychains.zip"},
     "cosplay":           {"title": "Cosplay STL Pack",            "price_gbp": 3.99, "r2_key": "cosplay.zip"},
-    "dv":                {"title": "DV STL Pack",                 "price_gbp": 3.99, "r2_key": "dv.zip"},
+    "dc":                {"title": "DC STL Pack",                 "price_gbp": 3.99, "r2_key": "dc.zip"},
     "decorations":       {"title": "Decorations STL Pack",        "price_gbp": 4.99, "r2_key": "decorations.zip"},
     "animated-cartoons": {"title": "Animated Cartoons STL Pack",  "price_gbp": 3.99, "r2_key": "animated-cartoons.zip"},
     "disney":            {"title": "Disney STL Pack",             "price_gbp": 3.99, "r2_key": "disney.zip"},
