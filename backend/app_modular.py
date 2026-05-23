@@ -29,7 +29,7 @@ def create_app() -> Flask:
         pass  # structlog not installed yet — fall back to print()
 
     if config.IS_DEV:
-        config.print_summary()
+        config.log_summary()
     config_warnings = config.validate()
     if config_warnings:
         print("[CONFIG] Startup configuration warnings:")

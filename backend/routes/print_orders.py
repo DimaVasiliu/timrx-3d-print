@@ -359,7 +359,8 @@ def webhook_paypal():
         if not ok:
             return jsonify({"ok": False, "error": "signature verification failed"}), 401
     else:
-        print("[PAYPAL] WARN: PAYPAL_WEBHOOK_ID not set — accepting unverified webhook")
+        print("[PAYPAL] ERROR: PAYPAL_WEBHOOK_ID not set — rejecting unverified webhook")
+        return jsonify({"ok": False, "error": "webhook_verification_unavailable"}), 503
 
     try:
         event = json.loads(raw.decode("utf-8")) if raw else {}
