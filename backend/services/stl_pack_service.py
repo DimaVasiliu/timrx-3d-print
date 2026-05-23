@@ -73,6 +73,10 @@ STL_PACKS: Dict[str, Dict[str, Any]] = {
     "supports":          {"title": "Supports STL Pack",           "price_gbp": 3.99, "r2_key": "supports.zip"},
     "utensils":          {"title": "Utensils STL Pack",           "price_gbp": 3.99, "r2_key": "utensils.zip"},
     "miniatures":        {"title": "Miniatures STL Pack",         "price_gbp": 3.99, "r2_key": "miniatures.zip"},
+    "rpg":               {"title": "RPG STL Pack",                "price_gbp": 4.99, "r2_key": "rpg.zip"},
+    "famous-characters": {"title": "Famous Characters STL Pack",  "price_gbp": 3.99, "r2_key": "famous-characters.zip"},
+    "funkos":            {"title": "Funkos STL Pack",             "price_gbp": 3.99, "r2_key": "funkos.zip"},
+    "plant-pots-vases":  {"title": "Plant Pots & Vases STL Pack", "price_gbp": 3.99, "r2_key": "plant-pots-vases.zip"},
 }
 
 # All-Access pass — one payment unlocks every pack (entitlement slug "*").
