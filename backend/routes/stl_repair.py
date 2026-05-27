@@ -146,7 +146,9 @@ def repair_existing_model(job_id: str):
             f"job={job_id} engine={result.get('engine')} error={result.get('error')} "
             f"runtime={result.get('repair_runtime_seconds')} "
             f"before_faces={before.get('faces')} before_watertight={before.get('is_watertight')} "
+            f"before_boundary_edges={before.get('boundary_edges')} before_non_manifold_edges={before.get('non_manifold_edges')} "
             f"after_faces={after.get('faces')} after_watertight={after.get('is_watertight')} "
+            f"after_boundary_edges={after.get('boundary_edges')} after_non_manifold_edges={after.get('non_manifold_edges')} "
             f"warnings={result.get('warnings') or []}"
         )
         return jsonify({
@@ -172,7 +174,9 @@ def repair_existing_model(job_id: str):
         "[STL_REPAIR] completed "
         f"job={job_id} engine={result.get('engine')} runtime={result.get('repair_runtime_seconds')} "
         f"before_faces={before.get('faces')} before_watertight={before.get('is_watertight')} "
+        f"before_boundary_edges={before.get('boundary_edges')} before_non_manifold_edges={before.get('non_manifold_edges')} "
         f"after_faces={after.get('faces')} after_watertight={after.get('is_watertight')} "
+        f"after_boundary_edges={after.get('boundary_edges')} after_non_manifold_edges={after.get('non_manifold_edges')} "
         f"warnings={result.get('warnings') or []}"
     )
 

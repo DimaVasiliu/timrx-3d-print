@@ -40,11 +40,29 @@ def _mesh_report(mesh) -> Dict[str, Any]:
         volume_cm3 = None
     vertices = getattr(mesh, "vertices", [])
     faces = getattr(mesh, "faces", [])
+    boundary_edges = None
+    non_manifold_edges = None
+    components = None
+    try:
+        import numpy as np
+
+        edge_counts = np.bincount(mesh.edges_unique_inverse)
+        boundary_edges = int((edge_counts == 1).sum())
+        non_manifold_edges = int((edge_counts > 2).sum())
+    except Exception:
+        pass
+    try:
+        components = int(len(mesh.split(only_watertight=False)))
+    except Exception:
+        pass
     return {
         "vertices": int(len(vertices)),
         "faces": int(len(faces)),
         "is_watertight": bool(getattr(mesh, "is_watertight", False)),
         "is_winding_consistent": bool(getattr(mesh, "is_winding_consistent", False)),
+        "boundary_edges": boundary_edges,
+        "non_manifold_edges": non_manifold_edges,
+        "components": components,
         "volume_cm3": round(volume_cm3, 3) if volume_cm3 is not None else None,
     }
 
@@ -161,6 +179,104 @@ def _repair_with_pymeshlab(mesh):
     except Exception as exc:
         logger.warning("[STL_REPAIR] pymeshlab failed, falling back: %s", exc)
     return None, None
+
+
+def _solid_rebuild_with_pymeshlab(mesh):
+    if not StlRepairService.ALLOW_SOLID_REBUILD:
+        return None, None, []
+
+    try:
+        import pymeshlab
+        import trimesh
+
+        ms = pymeshlab.MeshSet()
+        ps_mesh = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
+        ms.add_mesh(ps_mesh, "solid-rebuild-input")
+
+        try:
+            cellsize = pymeshlab.Percentage(StlRepairService.SOLID_REBUILD_CELL_SIZE_PERCENT)
+            offset = pymeshlab.Percentage(0.0)
+        except Exception:
+            cellsize = StlRepairService.SOLID_REBUILD_CELL_SIZE_PERCENT
+            offset = 0.0
+
+        filter_names = ("generate_resampled_uniform_mesh", "uniform_mesh_resampling")
+        applied = False
+        for filter_name in filter_names:
+            try:
+                ms.apply_filter(
+                    filter_name,
+                    cellsize=cellsize,
+                    offset=offset,
+                    mergeclosevert=True,
+                    discretize=False,
+                )
+                applied = True
+                break
+            except TypeError:
+                try:
+                    ms.apply_filter(filter_name, cellsize=cellsize, offset=offset)
+                    applied = True
+                    break
+                except Exception as exc:
+                    logger.info("[STL_REPAIR] solid rebuild filter skipped %s: %s", filter_name, exc)
+            except Exception as exc:
+                logger.info("[STL_REPAIR] solid rebuild filter skipped %s: %s", filter_name, exc)
+
+        if not applied:
+            return None, None, ["Solid rebuild filter was unavailable in PyMeshLab."]
+
+        cleanup_filters = [
+            ("meshing_remove_duplicate_vertices", {}),
+            ("meshing_remove_duplicate_faces", {}),
+            ("meshing_remove_null_faces", {}),
+            ("meshing_remove_unreferenced_vertices", {}),
+            ("meshing_repair_non_manifold_vertices", {}),
+            ("meshing_repair_non_manifold_edges", {"method": 0}),
+            ("meshing_close_holes", {
+                "maxholesize": StlRepairService.PYMESHLAB_MAX_HOLE_SIZE,
+                "selected": False,
+                "newfaceselected": False,
+                "selfintersection": True,
+            }),
+        ]
+        for name, kwargs in cleanup_filters:
+            try:
+                ms.apply_filter(name, **kwargs)
+            except TypeError:
+                ms.apply_filter(name)
+            except Exception as exc:
+                logger.info("[STL_REPAIR] solid rebuild cleanup skipped %s: %s", name, exc)
+
+        current = ms.current_mesh()
+        rebuilt = trimesh.Trimesh(
+            vertices=current.vertex_matrix(),
+            faces=current.face_matrix(),
+            process=True,
+        )
+
+        try:
+            source_extents = list(map(float, mesh.extents))
+            rebuilt_extents = list(map(float, rebuilt.extents))
+            for source_extent, rebuilt_extent in zip(source_extents, rebuilt_extents):
+                if source_extent <= 0:
+                    continue
+                ratio = rebuilt_extent / source_extent
+                if ratio < 0.45 or ratio > 2.2:
+                    logger.warning("[STL_REPAIR] solid rebuild rejected: bounds changed too much")
+                    return None, None, ["Solid rebuild changed model bounds too much."]
+        except Exception:
+            pass
+
+        if len(rebuilt.faces) > 0:
+            return rebuilt, "pymeshlab-solid-rebuild", [
+                "Used solid rebuild fallback; fine surface detail may be reduced.",
+            ]
+    except ImportError:
+        return None, None, []
+    except Exception as exc:
+        logger.warning("[STL_REPAIR] solid rebuild failed: %s", exc)
+    return None, None, []
 
 
 def _repair_components(mesh):
@@ -302,6 +418,19 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
     after = _mesh_report(repaired)
     if not after["is_watertight"]:
         warnings.append("Fast repair completed, but the mesh is still not fully watertight.")
+        rebuilt, rebuild_engine, rebuild_warnings = _solid_rebuild_with_pymeshlab(mesh)
+        if rebuilt is not None:
+            rebuilt_after = _mesh_report(rebuilt)
+            if rebuilt_after["is_watertight"]:
+                repaired = rebuilt
+                engine = rebuild_engine
+                after = rebuilt_after
+                warnings.extend(rebuild_warnings)
+            else:
+                warnings.extend(rebuild_warnings)
+                warnings.append("Solid rebuild also completed, but the mesh is still not fully watertight.")
+
+    if not after["is_watertight"]:
         return {
             "ok": False,
             "error": "STL repair could not close the mesh without damaging the model.",
@@ -365,7 +494,9 @@ class StlRepairService:
     PYMESHFIX_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
     PYMESHLAB_FACE_LIMIT = _env_int("STL_REPAIR_MESHLAB_FACE_LIMIT", 900000, minimum=10000)
     PYMESHLAB_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHLAB_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
-    PYMESHLAB_MAX_HOLE_SIZE = _env_int("STL_REPAIR_MESHLAB_MAX_HOLE_SIZE", 500, minimum=1)
+    PYMESHLAB_MAX_HOLE_SIZE = _env_int("STL_REPAIR_MESHLAB_MAX_HOLE_SIZE", 5000, minimum=1)
+    ALLOW_SOLID_REBUILD = os.getenv("STL_REPAIR_ALLOW_SOLID_REBUILD", "true").lower() not in ("0", "false", "no")
+    SOLID_REBUILD_CELL_SIZE_PERCENT = float(os.getenv("STL_REPAIR_SOLID_CELL_SIZE_PERCENT", "0.8") or "0.8")
     MIN_COMPONENT_FACES = _env_int("STL_REPAIR_MIN_COMPONENT_FACES", 18, minimum=1)
     MIN_COMPONENT_EXTENT_RATIO = float(os.getenv("STL_REPAIR_MIN_COMPONENT_EXTENT_RATIO", "0.0015") or "0.0015")
     MIN_REPAIRED_FACE_RATIO = float(os.getenv("STL_REPAIR_MIN_REPAIRED_FACE_RATIO", "0.35") or "0.35")
