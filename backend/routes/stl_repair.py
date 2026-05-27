@@ -139,6 +139,10 @@ def repair_existing_model(job_id: str):
 
     result = StlRepairService.repair_from_url(model_url)
     if not result.get("ok"):
+        print(
+            "[STL_REPAIR] failed "
+            f"job={job_id} error={result.get('error')} runtime={result.get('repair_runtime_seconds')}"
+        )
         return jsonify({
             "ok": False,
             "error": result.get("error") or "STL repair failed",
@@ -151,6 +155,16 @@ def repair_existing_model(job_id: str):
     stl_bytes = result.pop("stl_bytes", None)
     if not stl_bytes:
         return jsonify({"ok": False, "error": "Repair did not produce an STL file"}), 500
+
+    before = result.get("before") or {}
+    after = result.get("after") or {}
+    print(
+        "[STL_REPAIR] completed "
+        f"job={job_id} engine={result.get('engine')} runtime={result.get('repair_runtime_seconds')} "
+        f"before_faces={before.get('faces')} before_watertight={before.get('is_watertight')} "
+        f"after_faces={after.get('faces')} after_watertight={after.get('is_watertight')} "
+        f"warnings={result.get('warnings') or []}"
+    )
 
     stem = _safe_filename_stem(body.get("filename") or title)
     digest = hashlib.sha256(stl_bytes).hexdigest()[:12]

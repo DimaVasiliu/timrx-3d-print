@@ -73,6 +73,71 @@ def _repair_with_pymeshfix(mesh):
     return None, None
 
 
+def _repair_components(mesh):
+    import trimesh
+
+    try:
+        components = mesh.split(only_watertight=False)
+    except Exception:
+        return None, None, []
+
+    if not components or len(components) <= 1:
+        return None, None, []
+
+    mesh_bounds = getattr(mesh, "bounds", None)
+    try:
+        diag = float(((mesh_bounds[1] - mesh_bounds[0]) ** 2).sum() ** 0.5) if mesh_bounds is not None else 0.0
+    except Exception:
+        diag = 0.0
+    min_faces = max(12, StlRepairService.MIN_COMPONENT_FACES)
+    min_extent = max(0.01, diag * StlRepairService.MIN_COMPONENT_EXTENT_RATIO) if diag > 0 else 0.01
+
+    repaired_parts = []
+    dropped = 0
+    meshfix_parts = 0
+    trimesh_parts = 0
+
+    components = sorted(components, key=lambda part: int(len(getattr(part, "faces", []))), reverse=True)
+    for index, part in enumerate(components):
+        face_count = int(len(getattr(part, "faces", [])))
+        try:
+            extent = float(max(part.extents))
+        except Exception:
+            extent = 0.0
+
+        if index > 0 and not bool(getattr(part, "is_watertight", False)) and (face_count < min_faces or extent < min_extent):
+            dropped += 1
+            continue
+
+        fixed = None
+        engine = None
+        if face_count <= StlRepairService.PYMESHFIX_COMPONENT_FACE_LIMIT:
+            fixed, engine = _repair_with_pymeshfix(part)
+        if fixed is None:
+            fixed, engine = _repair_with_trimesh(part)
+
+        if fixed is not None and len(fixed.faces) > 0:
+            repaired_parts.append(fixed)
+            if engine == "pymeshfix":
+                meshfix_parts += 1
+            else:
+                trimesh_parts += 1
+
+    if not repaired_parts:
+        return None, None, []
+
+    try:
+        repaired = trimesh.util.concatenate(repaired_parts)
+        repaired.process(validate=True)
+    except Exception:
+        repaired = trimesh.util.concatenate(repaired_parts)
+
+    warnings = []
+    if dropped:
+        warnings.append(f"Dropped {dropped} tiny open mesh fragment(s) during repair.")
+    return repaired, f"components:pymeshfix={meshfix_parts},trimesh={trimesh_parts}", warnings
+
+
 def _repair_with_trimesh(mesh):
     import trimesh
 
@@ -118,16 +183,17 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
     before = _mesh_report(mesh)
     warnings = []
 
-    repaired = None
-    engine = None
-    max_meshfix_faces = StlRepairService.PYMESHFIX_FACE_LIMIT
-    if before["faces"] <= max_meshfix_faces:
-        repaired, engine = _repair_with_pymeshfix(mesh)
-    else:
-        warnings.append(
-            f"MeshFix skipped because this model has {before['faces']:,} faces. "
-            f"Use Remesh with a lower polygon target for aggressive repair."
-        )
+    repaired, engine, component_warnings = _repair_components(mesh)
+    warnings.extend(component_warnings)
+    if repaired is None:
+        max_meshfix_faces = StlRepairService.PYMESHFIX_FACE_LIMIT
+        if before["faces"] <= max_meshfix_faces:
+            repaired, engine = _repair_with_pymeshfix(mesh)
+        else:
+            warnings.append(
+                f"MeshFix skipped because this model has {before['faces']:,} faces. "
+                f"Use Remesh with a lower polygon target for aggressive repair."
+            )
     if repaired is None:
         repaired, engine = _repair_with_trimesh(mesh)
 
@@ -181,7 +247,10 @@ class StlRepairService:
     MAX_DOWNLOAD_BYTES = _env_int("STL_REPAIR_MAX_DOWNLOAD_MB", 30, minimum=1) * 1024 * 1024
     REPAIR_TIMEOUT = _env_int("STL_REPAIR_TIMEOUT_SECONDS", 90, minimum=30)
     REPAIR_MEMORY_LIMIT_MB = _env_int("STL_REPAIR_MEMORY_MB", 1800, minimum=0)
-    PYMESHFIX_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_FACE_LIMIT", 180000, minimum=10000)
+    PYMESHFIX_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_FACE_LIMIT", 900000, minimum=10000)
+    PYMESHFIX_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
+    MIN_COMPONENT_FACES = _env_int("STL_REPAIR_MIN_COMPONENT_FACES", 18, minimum=1)
+    MIN_COMPONENT_EXTENT_RATIO = float(os.getenv("STL_REPAIR_MIN_COMPONENT_EXTENT_RATIO", "0.0015") or "0.0015")
     USE_SUBPROCESS = os.getenv("STL_REPAIR_SUBPROCESS", "true").lower() not in ("0", "false", "no")
 
     @staticmethod
