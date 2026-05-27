@@ -59,7 +59,10 @@ def _repair_with_pymeshfix(mesh):
         import trimesh
 
         fixer = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
-        fixer.repair(verbose=False, joincomp=True, remove_smallest_components=False)
+        try:
+            fixer.repair(joincomp=True, remove_smallest_components=False)
+        except TypeError:
+            fixer.repair()
         repaired = trimesh.Trimesh(vertices=fixer.v, faces=fixer.f, process=True)
         if len(repaired.faces) > 0:
             return repaired, "pymeshfix"
