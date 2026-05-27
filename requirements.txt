@@ -21,6 +21,8 @@ trimesh>=4.0.0
 numpy>=1.24.0
 # Stronger STL topology repair; service falls back to trimesh if unavailable
 pymeshfix>=0.17.0
+# Targeted mesh cleanup filters for non-manifold edges and hole closing
+pymeshlab>=2023.12
 # Spatial indexing for trimesh ray queries (wall thickness analysis)
 rtree>=1.0.0
 # Fallback spatial engine when rtree C lib is unavailable

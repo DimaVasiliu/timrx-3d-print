@@ -112,6 +112,57 @@ def _repair_with_pymeshfix(mesh):
     return None, None
 
 
+def _repair_with_pymeshlab(mesh):
+    try:
+        import pymeshlab
+        import trimesh
+
+        ms = pymeshlab.MeshSet()
+        ps_mesh = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
+        ms.add_mesh(ps_mesh, "repair-input")
+
+        filters = [
+            ("meshing_remove_duplicate_vertices", {}),
+            ("meshing_remove_duplicate_faces", {}),
+            ("meshing_remove_null_faces", {}),
+            ("meshing_repair_non_manifold_vertices", {}),
+            ("meshing_repair_non_manifold_edges", {"method": 0}),
+            ("meshing_close_holes", {
+                "maxholesize": StlRepairService.PYMESHLAB_MAX_HOLE_SIZE,
+                "selected": False,
+                "newfaceselected": False,
+                "selfintersection": True,
+            }),
+            ("meshing_remove_unreferenced_vertices", {}),
+        ]
+
+        for name, kwargs in filters:
+            try:
+                ms.apply_filter(name, **kwargs)
+            except TypeError:
+                ms.apply_filter(name)
+            except Exception as exc:
+                logger.info("[STL_REPAIR] pymeshlab filter skipped %s: %s", name, exc)
+
+        current = ms.current_mesh()
+        repaired = trimesh.Trimesh(
+            vertices=current.vertex_matrix(),
+            faces=current.face_matrix(),
+            process=True,
+        )
+        destructive, reason = _repair_is_destructive(mesh, repaired)
+        if destructive:
+            logger.warning("[STL_REPAIR] pymeshlab result rejected: %s", reason)
+            return None, None
+        if len(repaired.faces) > 0:
+            return repaired, "pymeshlab"
+    except ImportError:
+        return None, None
+    except Exception as exc:
+        logger.warning("[STL_REPAIR] pymeshlab failed, falling back: %s", exc)
+    return None, None
+
+
 def _repair_components(mesh):
     import trimesh
 
@@ -134,6 +185,7 @@ def _repair_components(mesh):
     repaired_parts = []
     dropped = 0
     meshfix_parts = 0
+    pymeshlab_parts = 0
     trimesh_parts = 0
 
     components = sorted(components, key=lambda part: int(len(getattr(part, "faces", []))), reverse=True)
@@ -152,6 +204,8 @@ def _repair_components(mesh):
         engine = None
         if face_count <= StlRepairService.PYMESHFIX_COMPONENT_FACE_LIMIT:
             fixed, engine = _repair_with_pymeshfix(part)
+        if fixed is None and face_count <= StlRepairService.PYMESHLAB_COMPONENT_FACE_LIMIT:
+            fixed, engine = _repair_with_pymeshlab(part)
         if fixed is None:
             fixed, engine = _repair_with_trimesh(part)
 
@@ -159,6 +213,8 @@ def _repair_components(mesh):
             repaired_parts.append(fixed)
             if engine == "pymeshfix":
                 meshfix_parts += 1
+            elif engine == "pymeshlab":
+                pymeshlab_parts += 1
             else:
                 trimesh_parts += 1
 
@@ -174,7 +230,7 @@ def _repair_components(mesh):
     warnings = []
     if dropped:
         warnings.append(f"Dropped {dropped} tiny open mesh fragment(s) during repair.")
-    return repaired, f"components:pymeshfix={meshfix_parts},trimesh={trimesh_parts}", warnings
+    return repaired, f"components:pymeshfix={meshfix_parts},pymeshlab={pymeshlab_parts},trimesh={trimesh_parts}", warnings
 
 
 def _repair_with_trimesh(mesh):
@@ -233,6 +289,8 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
                 f"MeshFix skipped because this model has {before['faces']:,} faces. "
                 f"Use Remesh with a lower polygon target for aggressive repair."
             )
+    if repaired is None and before["faces"] <= StlRepairService.PYMESHLAB_FACE_LIMIT:
+        repaired, engine = _repair_with_pymeshlab(mesh)
     if repaired is None:
         repaired, engine = _repair_with_trimesh(mesh)
 
@@ -300,6 +358,9 @@ class StlRepairService:
     REPAIR_MEMORY_LIMIT_MB = _env_int("STL_REPAIR_MEMORY_MB", 1800, minimum=0)
     PYMESHFIX_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_FACE_LIMIT", 900000, minimum=10000)
     PYMESHFIX_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
+    PYMESHLAB_FACE_LIMIT = _env_int("STL_REPAIR_MESHLAB_FACE_LIMIT", 900000, minimum=10000)
+    PYMESHLAB_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHLAB_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
+    PYMESHLAB_MAX_HOLE_SIZE = _env_int("STL_REPAIR_MESHLAB_MAX_HOLE_SIZE", 500, minimum=1)
     MIN_COMPONENT_FACES = _env_int("STL_REPAIR_MIN_COMPONENT_FACES", 18, minimum=1)
     MIN_COMPONENT_EXTENT_RATIO = float(os.getenv("STL_REPAIR_MIN_COMPONENT_EXTENT_RATIO", "0.0015") or "0.0015")
     MIN_REPAIRED_FACE_RATIO = float(os.getenv("STL_REPAIR_MIN_REPAIRED_FACE_RATIO", "0.35") or "0.35")
