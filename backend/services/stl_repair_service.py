@@ -63,7 +63,14 @@ def _repair_with_pymeshfix(mesh):
             fixer.repair(joincomp=False, remove_smallest_components=False)
         except TypeError:
             fixer.repair()
-        repaired = trimesh.Trimesh(vertices=fixer.v, faces=fixer.f, process=True)
+        vertices = getattr(fixer, "points", None)
+        faces = getattr(fixer, "faces", None)
+        if vertices is None or faces is None:
+            vertices = getattr(fixer, "v", None)
+            faces = getattr(fixer, "f", None)
+        if vertices is None or faces is None:
+            raise RuntimeError("pymeshfix did not expose repaired vertices/faces")
+        repaired = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
         if len(repaired.faces) > 0:
             return repaired, "pymeshfix"
     except ImportError:
