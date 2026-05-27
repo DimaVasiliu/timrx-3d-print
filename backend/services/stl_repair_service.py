@@ -130,6 +130,15 @@ def _repair_with_pymeshfix(mesh):
     return None, None
 
 
+def _apply_pymeshlab_filter(ms, name: str, kwargs: Dict[str, Any]) -> None:
+    try:
+        ms.apply_filter(name, **kwargs)
+    except TypeError:
+        ms.apply_filter(name)
+    except Exception as exc:
+        logger.info("[STL_REPAIR] pymeshlab filter skipped %s: %s", name, exc)
+
+
 def _repair_with_pymeshlab(mesh):
     try:
         import pymeshlab
@@ -139,10 +148,13 @@ def _repair_with_pymeshlab(mesh):
         ps_mesh = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
         ms.add_mesh(ps_mesh, "repair-input")
 
-        filters = [
+        base_filters = [
             ("meshing_remove_duplicate_vertices", {}),
             ("meshing_remove_duplicate_faces", {}),
             ("meshing_remove_null_faces", {}),
+            ("meshing_remove_unreferenced_vertices", {}),
+        ]
+        repair_filters = [
             ("meshing_repair_non_manifold_vertices", {}),
             ("meshing_repair_non_manifold_edges", {"method": 0}),
             ("meshing_close_holes", {
@@ -151,16 +163,16 @@ def _repair_with_pymeshlab(mesh):
                 "newfaceselected": False,
                 "selfintersection": True,
             }),
+            ("meshing_repair_non_manifold_vertices", {}),
+            ("meshing_repair_non_manifold_edges", {"method": 0}),
             ("meshing_remove_unreferenced_vertices", {}),
         ]
 
-        for name, kwargs in filters:
-            try:
-                ms.apply_filter(name, **kwargs)
-            except TypeError:
-                ms.apply_filter(name)
-            except Exception as exc:
-                logger.info("[STL_REPAIR] pymeshlab filter skipped %s: %s", name, exc)
+        for name, kwargs in base_filters:
+            _apply_pymeshlab_filter(ms, name, kwargs)
+        for _ in range(StlRepairService.PYMESHLAB_REPAIR_PASSES):
+            for name, kwargs in repair_filters:
+                _apply_pymeshlab_filter(ms, name, kwargs)
 
         current = ms.current_mesh()
         repaired = trimesh.Trimesh(
@@ -495,6 +507,7 @@ class StlRepairService:
     PYMESHLAB_FACE_LIMIT = _env_int("STL_REPAIR_MESHLAB_FACE_LIMIT", 900000, minimum=10000)
     PYMESHLAB_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHLAB_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
     PYMESHLAB_MAX_HOLE_SIZE = _env_int("STL_REPAIR_MESHLAB_MAX_HOLE_SIZE", 5000, minimum=1)
+    PYMESHLAB_REPAIR_PASSES = _env_int("STL_REPAIR_MESHLAB_REPAIR_PASSES", 3, minimum=1)
     ALLOW_SOLID_REBUILD = os.getenv("STL_REPAIR_ALLOW_SOLID_REBUILD", "true").lower() not in ("0", "false", "no")
     SOLID_REBUILD_CELL_SIZE_PERCENT = float(os.getenv("STL_REPAIR_SOLID_CELL_SIZE_PERCENT", "0.8") or "0.8")
     MIN_COMPONENT_FACES = _env_int("STL_REPAIR_MIN_COMPONENT_FACES", 18, minimum=1)
