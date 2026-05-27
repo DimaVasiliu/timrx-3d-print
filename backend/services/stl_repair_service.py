@@ -49,6 +49,34 @@ def _mesh_report(mesh) -> Dict[str, Any]:
     }
 
 
+def _repair_is_destructive(source, repaired) -> tuple[bool, str | None]:
+    source_faces = int(len(getattr(source, "faces", [])))
+    repaired_faces = int(len(getattr(repaired, "faces", [])))
+    if source_faces <= 0 or repaired_faces <= 0:
+        return True, "repair produced an empty mesh"
+
+    face_ratio = repaired_faces / source_faces
+    if face_ratio < StlRepairService.MIN_REPAIRED_FACE_RATIO:
+        return (
+            True,
+            f"repair collapsed face count from {source_faces:,} to {repaired_faces:,}",
+        )
+
+    try:
+        source_extents = list(map(float, source.extents))
+        repaired_extents = list(map(float, repaired.extents))
+        for source_extent, repaired_extent in zip(source_extents, repaired_extents):
+            if source_extent <= 0:
+                continue
+            ratio = repaired_extent / source_extent
+            if ratio < 0.55 or ratio > 1.8:
+                return True, "repair changed model bounds too much"
+    except Exception:
+        pass
+
+    return False, None
+
+
 def _load_mesh(file_path: str, file_type: str | None):
     return PrintAnalysisService._load_mesh(file_path, file_type=file_type)
 
@@ -71,6 +99,10 @@ def _repair_with_pymeshfix(mesh):
         if vertices is None or faces is None:
             raise RuntimeError("pymeshfix did not expose repaired vertices/faces")
         repaired = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
+        destructive, reason = _repair_is_destructive(mesh, repaired)
+        if destructive:
+            logger.warning("[STL_REPAIR] pymeshfix result rejected: %s", reason)
+            return None, None
         if len(repaired.faces) > 0:
             return repaired, "pymeshfix"
     except ImportError:
@@ -258,6 +290,7 @@ class StlRepairService:
     PYMESHFIX_COMPONENT_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_COMPONENT_FACE_LIMIT", 900000, minimum=1000)
     MIN_COMPONENT_FACES = _env_int("STL_REPAIR_MIN_COMPONENT_FACES", 18, minimum=1)
     MIN_COMPONENT_EXTENT_RATIO = float(os.getenv("STL_REPAIR_MIN_COMPONENT_EXTENT_RATIO", "0.0015") or "0.0015")
+    MIN_REPAIRED_FACE_RATIO = float(os.getenv("STL_REPAIR_MIN_REPAIRED_FACE_RATIO", "0.35") or "0.35")
     USE_SUBPROCESS = os.getenv("STL_REPAIR_SUBPROCESS", "true").lower() not in ("0", "false", "no")
 
     @staticmethod
