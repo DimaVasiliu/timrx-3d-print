@@ -442,7 +442,18 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
                 warnings.extend(rebuild_warnings)
                 warnings.append("Solid rebuild also completed, but the mesh is still not fully watertight.")
 
-    if not after["is_watertight"]:
+    boundary_remaining = int(after.get("boundary_edges") or 0)
+    non_manifold_remaining = int(after.get("non_manifold_edges") or 0)
+    max_allowed_non_manifold = StlRepairService.MAX_NON_MANIFOLD_EDGES
+    # Practical printability gate: most slicers (Cura, PrusaSlicer, Bambu, Orca)
+    # tolerate a small number of non-manifold edges as long as there are no open
+    # holes. Strict is_watertight is academically correct but rejects meshes that
+    # would slice and print fine.
+    printable_despite_non_watertight = (
+        boundary_remaining == 0
+        and non_manifold_remaining <= max_allowed_non_manifold
+    )
+    if not after["is_watertight"] and not printable_despite_non_watertight:
         return {
             "ok": False,
             "error": "STL repair could not close the mesh without damaging the model.",
@@ -455,6 +466,11 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
                 "Try a lower-poly remesh before repairing if the model has many small disconnected details.",
             ],
         }
+    if printable_despite_non_watertight and not after["is_watertight"]:
+        warnings.append(
+            f"Repair complete. Mesh has {non_manifold_remaining} non-manifold edge(s) "
+            f"but no open holes — most slicers will accept it."
+        )
     stl_bytes = repaired.export(file_type="stl")
     if isinstance(stl_bytes, str):
         stl_bytes = stl_bytes.encode("utf-8")
@@ -513,6 +529,9 @@ class StlRepairService:
     MIN_COMPONENT_FACES = _env_int("STL_REPAIR_MIN_COMPONENT_FACES", 18, minimum=1)
     MIN_COMPONENT_EXTENT_RATIO = float(os.getenv("STL_REPAIR_MIN_COMPONENT_EXTENT_RATIO", "0.0015") or "0.0015")
     MIN_REPAIRED_FACE_RATIO = float(os.getenv("STL_REPAIR_MIN_REPAIRED_FACE_RATIO", "0.35") or "0.35")
+    # Practical printability: how many residual non-manifold edges we accept when
+    # the mesh has no open holes. Slicers handle a small number trivially.
+    MAX_NON_MANIFOLD_EDGES = _env_int("STL_REPAIR_MAX_NON_MANIFOLD_EDGES", 10, minimum=0)
     USE_SUBPROCESS = os.getenv("STL_REPAIR_SUBPROCESS", "true").lower() not in ("0", "false", "no")
 
     @staticmethod
