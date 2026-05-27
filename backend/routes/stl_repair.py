@@ -142,6 +142,7 @@ def repair_existing_model(job_id: str):
         return jsonify({
             "ok": False,
             "error": result.get("error") or "STL repair failed",
+            "suggestions": result.get("suggestions") or [],
             "report": {
                 "repair_runtime_seconds": result.get("repair_runtime_seconds"),
             },

@@ -116,12 +116,24 @@ def _repair_with_trimesh(mesh):
 def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
     mesh = _load_mesh(file_path, file_type=file_type)
     before = _mesh_report(mesh)
+    warnings = []
 
-    repaired, engine = _repair_with_pymeshfix(mesh)
+    repaired = None
+    engine = None
+    max_meshfix_faces = StlRepairService.PYMESHFIX_FACE_LIMIT
+    if before["faces"] <= max_meshfix_faces:
+        repaired, engine = _repair_with_pymeshfix(mesh)
+    else:
+        warnings.append(
+            f"MeshFix skipped because this model has {before['faces']:,} faces. "
+            f"Use Remesh with a lower polygon target for aggressive repair."
+        )
     if repaired is None:
         repaired, engine = _repair_with_trimesh(mesh)
 
     after = _mesh_report(repaired)
+    if not after["is_watertight"]:
+        warnings.append("Fast repair completed, but the mesh is still not fully watertight.")
     stl_bytes = repaired.export(file_type="stl")
     if isinstance(stl_bytes, str):
         stl_bytes = stl_bytes.encode("utf-8")
@@ -131,6 +143,7 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
         "engine": engine,
         "before": before,
         "after": after,
+        "warnings": warnings,
         "stl_bytes": bytes(stl_bytes),
     }
 
@@ -168,6 +181,7 @@ class StlRepairService:
     MAX_DOWNLOAD_BYTES = _env_int("STL_REPAIR_MAX_DOWNLOAD_MB", 30, minimum=1) * 1024 * 1024
     REPAIR_TIMEOUT = _env_int("STL_REPAIR_TIMEOUT_SECONDS", 90, minimum=30)
     REPAIR_MEMORY_LIMIT_MB = _env_int("STL_REPAIR_MEMORY_MB", 1800, minimum=0)
+    PYMESHFIX_FACE_LIMIT = _env_int("STL_REPAIR_MESHFIX_FACE_LIMIT", 180000, minimum=10000)
     USE_SUBPROCESS = os.getenv("STL_REPAIR_SUBPROCESS", "true").lower() not in ("0", "false", "no")
 
     @staticmethod
@@ -215,6 +229,10 @@ class StlRepairService:
             return {
                 "ok": False,
                 "error": "STL repair exceeded the safe memory or time budget for this server.",
+                "suggestions": [
+                    "Run Remesh with a lower polygon target, then try STL Repair again.",
+                    "For high-detail AI geometry, use Bambu Studio's built-in repair after import.",
+                ],
                 "repair_runtime_seconds": round(elapsed, 2),
             }
         payload["repair_runtime_seconds"] = round(elapsed, 2)
