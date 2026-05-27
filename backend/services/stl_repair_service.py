@@ -239,6 +239,18 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
     after = _mesh_report(repaired)
     if not after["is_watertight"]:
         warnings.append("Fast repair completed, but the mesh is still not fully watertight.")
+        return {
+            "ok": False,
+            "error": "STL repair could not close the mesh without damaging the model.",
+            "engine": engine,
+            "before": before,
+            "after": after,
+            "warnings": warnings,
+            "suggestions": [
+                "Use the slicer's repair tool for this model, or repair it in a dedicated service such as Formware.",
+                "Try a lower-poly remesh before repairing if the model has many small disconnected details.",
+            ],
+        }
     stl_bytes = repaired.export(file_type="stl")
     if isinstance(stl_bytes, str):
         stl_bytes = stl_bytes.encode("utf-8")

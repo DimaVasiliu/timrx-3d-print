@@ -139,15 +139,25 @@ def repair_existing_model(job_id: str):
 
     result = StlRepairService.repair_from_url(model_url)
     if not result.get("ok"):
+        before = result.get("before") or {}
+        after = result.get("after") or {}
         print(
             "[STL_REPAIR] failed "
-            f"job={job_id} error={result.get('error')} runtime={result.get('repair_runtime_seconds')}"
+            f"job={job_id} engine={result.get('engine')} error={result.get('error')} "
+            f"runtime={result.get('repair_runtime_seconds')} "
+            f"before_faces={before.get('faces')} before_watertight={before.get('is_watertight')} "
+            f"after_faces={after.get('faces')} after_watertight={after.get('is_watertight')} "
+            f"warnings={result.get('warnings') or []}"
         )
         return jsonify({
             "ok": False,
             "error": result.get("error") or "STL repair failed",
             "suggestions": result.get("suggestions") or [],
             "report": {
+                "engine": result.get("engine"),
+                "before": before or None,
+                "after": after or None,
+                "warnings": result.get("warnings") or [],
                 "repair_runtime_seconds": result.get("repair_runtime_seconds"),
             },
         }), 422
