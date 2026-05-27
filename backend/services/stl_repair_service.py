@@ -291,6 +291,11 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
             )
     if repaired is None and before["faces"] <= StlRepairService.PYMESHLAB_FACE_LIMIT:
         repaired, engine = _repair_with_pymeshlab(mesh)
+    elif repaired is None:
+        warnings.append(
+            f"MeshLab skipped because this model has {before['faces']:,} faces, "
+            f"above STL_REPAIR_MESHLAB_FACE_LIMIT={StlRepairService.PYMESHLAB_FACE_LIMIT:,}."
+        )
     if repaired is None:
         repaired, engine = _repair_with_trimesh(mesh)
 
