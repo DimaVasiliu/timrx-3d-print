@@ -16,7 +16,19 @@ IMAGE_MIME_BY_FORMAT = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
     "WEBP": "image/webp",
+    # MPO: Multi-Picture Object — common in Facebook exports and stereoscopic
+    # camera photos. The file IS a valid JPEG with an extra appended frame; we
+    # accept it and treat it as JPEG (normalize_image_bytes re-encodes to plain
+    # JPEG before S3 upload so downstream providers see a clean file).
+    "MPO": "image/jpeg",
+    # HEIC/HEIF: iPhone / modern Android photos.
+    "HEIC": "image/jpeg",
+    "HEIF": "image/jpeg",
 }
+# Formats that need re-encoding to a plain JPEG before being sent to upstream
+# image providers (OpenAI /v1/images/edits, Vertex Imagen, PiAPI, etc.). Some of
+# them won't accept MPO/HEIC even though Pillow can read them.
+_IMAGE_FORMATS_REQUIRING_JPEG_NORMALIZATION = {"MPO", "HEIC", "HEIF"}
 MODEL_MIME_TYPES = {
     "glb": "model/gltf-binary",
     "gltf": "model/gltf+json",
@@ -69,7 +81,12 @@ def parse_data_url(data_url: str) -> tuple[str, bytes]:
 
 
 def sniff_image_content_type(data_bytes: bytes) -> str:
-    """Validate image bytes and return the canonical MIME type."""
+    """Validate image bytes and return the canonical MIME type.
+
+    Note: returns only the MIME — does NOT re-encode the bytes. If the caller
+    needs JPEG-normalized bytes (e.g., before uploading to S3 for an upstream
+    image provider), call `normalize_image_bytes(data_bytes)` after this.
+    """
     if not data_bytes:
         raise UploadValidationError("Empty image upload")
     if len(data_bytes) > MAX_IMAGE_BYTES:
@@ -91,6 +108,39 @@ def sniff_image_content_type(data_bytes: bytes) -> str:
         raise UploadValidationError("Image dimensions exceed maximum size")
 
     return IMAGE_MIME_BY_FORMAT[fmt]
+
+
+def normalize_image_bytes(data_bytes: bytes) -> tuple[bytes, str]:
+    """Re-encode MPO/HEIC/HEIF images to plain JPEG so upstream providers
+    (OpenAI /v1/images/edits, Vertex Imagen, PiAPI Nano Banana, etc.) accept them.
+
+    For PNG / JPEG / WEBP files the bytes are returned UNCHANGED so we don't
+    accidentally re-encode lossily.
+
+    Returns a tuple of (normalized_bytes, mime_type).
+    Raises UploadValidationError on any decode failure.
+    """
+    if not data_bytes:
+        raise UploadValidationError("Empty image upload")
+
+    try:
+        with Image.open(io.BytesIO(data_bytes)) as img:
+            img.load()
+            fmt = (img.format or "").upper()
+
+            if fmt not in _IMAGE_FORMATS_REQUIRING_JPEG_NORMALIZATION:
+                # Plain PNG/JPEG/WEBP — pass through untouched.
+                return data_bytes, IMAGE_MIME_BY_FORMAT.get(fmt, "image/jpeg")
+
+            # MPO/HEIC/HEIF → render first frame to clean JPEG.
+            converted = img.convert("RGB")
+            buf = io.BytesIO()
+            converted.save(buf, format="JPEG", quality=92, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+    except UploadValidationError:
+        raise
+    except Exception as exc:
+        raise UploadValidationError("Invalid image content") from exc
 
 
 def _looks_like_ascii_stl(text: str) -> bool:

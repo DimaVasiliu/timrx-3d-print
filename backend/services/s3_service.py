@@ -26,6 +26,8 @@ from backend.utils import (
     sanitize_filename,
     unpack_upload_result,
     validate_and_normalize_upload_bytes,
+    normalize_image_bytes,
+    IMAGE_PREFIXES,
     wrap_upload_result,
 )
 
@@ -346,6 +348,17 @@ def safe_upload_to_s3(
         raise
 
     resolved_type = validate_and_normalize_upload_bytes(data_bytes, resolved_type, prefix)
+
+    # MPO / HEIC / HEIF → re-encode to clean JPEG before upload so downstream
+    # providers (OpenAI /v1/images/edits, Vertex Imagen, PiAPI Nano Banana 2,
+    # etc.) receive a plain JPEG they can decode.
+    normalized_prefix = (prefix or "").strip().lower()
+    if normalized_prefix in IMAGE_PREFIXES:
+        try:
+            data_bytes, resolved_type = normalize_image_bytes(data_bytes)
+        except Exception as e:
+            print(f"[S3] WARN: image normalization skipped for {prefix}: {e}")
+
     content_hash = compute_sha256(data_bytes)
     s3_key = build_hash_s3_key(prefix, provider, content_hash, resolved_type)
     if s3_key_exists(s3_key):
