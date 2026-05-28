@@ -139,6 +139,69 @@ def _apply_pymeshlab_filter(ms, name: str, kwargs: Dict[str, Any]) -> None:
         logger.info("[STL_REPAIR] pymeshlab filter skipped %s: %s", name, exc)
 
 
+def _stitch_components_with_pymeshlab(mesh):
+    """Post-concatenation cleanup: welds component seams and eliminates the
+    non-manifold edges that appear when independently-repaired components are
+    concatenated. Uses split-vertex non-manifold repair (method=1) so we don't
+    reopen any holes that the per-component pass already closed.
+    Returns a trimesh.Trimesh on success, or None on failure (caller keeps the
+    pre-stitch mesh).
+    """
+    try:
+        import pymeshlab
+        import trimesh
+
+        ms = pymeshlab.MeshSet()
+        ps_mesh = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
+        ms.add_mesh(ps_mesh, "stitch-input")
+
+        try:
+            weld_threshold = pymeshlab.PercentageValue(0.0005)
+        except Exception:
+            try:
+                weld_threshold = pymeshlab.Percentage(0.0005)
+            except Exception:
+                weld_threshold = 0.0005
+
+        cleanup_filters = [
+            # Merge near-duplicate vertices first — this stitches component
+            # boundaries that ended up sharing the same edge after concatenation.
+            ("meshing_merge_close_vertices", {"threshold": weld_threshold}),
+            ("meshing_remove_duplicate_faces", {}),
+            ("meshing_remove_null_faces", {}),
+            ("meshing_remove_unreferenced_vertices", {}),
+            # Split vertices at non-manifold edges (method=1) — preserves the
+            # surface, no holes introduced.
+            ("meshing_repair_non_manifold_edges", {"method": 1}),
+            ("meshing_repair_non_manifold_vertices", {}),
+            ("meshing_remove_unreferenced_vertices", {}),
+        ]
+        for name, kwargs in cleanup_filters:
+            _apply_pymeshlab_filter(ms, name, kwargs)
+
+        current = ms.current_mesh()
+        cleaned = trimesh.Trimesh(
+            vertices=current.vertex_matrix(),
+            faces=current.face_matrix(),
+            process=True,
+        )
+        if len(cleaned.faces) == 0:
+            return None
+        # Don't accept the stitch if it ate the mesh
+        if len(cleaned.faces) < len(mesh.faces) * 0.5:
+            logger.warning(
+                "[STL_REPAIR] stitch cleanup rejected: collapsed %d -> %d faces",
+                len(mesh.faces), len(cleaned.faces),
+            )
+            return None
+        return cleaned
+    except ImportError:
+        return None
+    except Exception as exc:
+        logger.warning("[STL_REPAIR] stitch cleanup failed: %s", exc)
+        return None
+
+
 def _repair_with_pymeshlab(mesh):
     try:
         import pymeshlab
@@ -358,6 +421,14 @@ def _repair_components(mesh):
     warnings = []
     if dropped:
         warnings.append(f"Dropped {dropped} tiny open mesh fragment(s) during repair.")
+
+    # Post-stitch: independently-repaired components, once concatenated, often
+    # leave a small number of non-manifold edges at the seams. Run a cheap
+    # pymeshlab weld + split-vertex pass to clean those up. Detail-preserving.
+    stitched = _stitch_components_with_pymeshlab(repaired)
+    if stitched is not None:
+        repaired = stitched
+
     return repaired, f"components:pymeshfix={meshfix_parts},pymeshlab={pymeshlab_parts},trimesh={trimesh_parts}", warnings
 
 
