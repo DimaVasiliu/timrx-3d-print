@@ -139,6 +139,69 @@ def _apply_pymeshlab_filter(ms, name: str, kwargs: Dict[str, Any]) -> None:
         logger.info("[STL_REPAIR] pymeshlab filter skipped %s: %s", name, exc)
 
 
+def _final_manifold_cleanup(mesh):
+    """Last-resort cleanup for meshes that come out of the main pipeline with a
+    very small number of non-manifold edges still standing (typically 1-5).
+
+    Strategy: use pymeshlab's `meshing_repair_non_manifold_edges` with method=0
+    (remove the offending face — creates a tiny hole), then immediately
+    `meshing_close_holes` to re-seal. This converges where split-vertex
+    (method=1) won't, at the cost of replacing the bad triangle with a
+    fresh patch. Detail loss is microscopic (a single triangle).
+
+    Returns a trimesh.Trimesh if the cleanup improved manifoldness or kept the
+    mesh structurally intact; None otherwise (caller keeps the pre-cleanup mesh).
+    """
+    try:
+        import pymeshlab
+        import trimesh
+        import numpy as np
+
+        ms = pymeshlab.MeshSet()
+        ps_mesh = pymeshlab.Mesh(vertex_matrix=mesh.vertices, face_matrix=mesh.faces)
+        ms.add_mesh(ps_mesh, "final-cleanup-input")
+
+        cleanup_filters = [
+            # Remove the offending face at each non-manifold edge.
+            ("meshing_repair_non_manifold_edges", {"method": 0}),
+            # Immediately re-close the tiny hole we just created.
+            ("meshing_close_holes", {
+                "maxholesize": 200,
+                "selected": False,
+                "newfaceselected": False,
+                "selfintersection": True,
+            }),
+            # Tidy up any non-manifold vertices created in the process.
+            ("meshing_repair_non_manifold_vertices", {}),
+            ("meshing_remove_duplicate_faces", {}),
+            ("meshing_remove_unreferenced_vertices", {}),
+        ]
+        for name, kwargs in cleanup_filters:
+            _apply_pymeshlab_filter(ms, name, kwargs)
+
+        current = ms.current_mesh()
+        cleaned = trimesh.Trimesh(
+            vertices=current.vertex_matrix(),
+            faces=current.face_matrix(),
+            process=True,
+        )
+        if len(cleaned.faces) == 0:
+            return None
+        # Safety: bail if the cleanup ate the mesh.
+        if len(cleaned.faces) < len(mesh.faces) * 0.8:
+            logger.warning(
+                "[STL_REPAIR] final manifold cleanup rejected: collapsed %d -> %d faces",
+                len(mesh.faces), len(cleaned.faces),
+            )
+            return None
+        return cleaned
+    except ImportError:
+        return None
+    except Exception as exc:
+        logger.warning("[STL_REPAIR] final manifold cleanup failed: %s", exc)
+        return None
+
+
 def _stitch_components_with_pymeshlab(mesh):
     """Post-concatenation cleanup: welds component seams and eliminates the
     non-manifold edges that appear when independently-repaired components are
@@ -499,6 +562,25 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
         repaired, engine = _repair_with_trimesh(mesh)
 
     after = _mesh_report(repaired)
+
+    # Final aggressive pass: if we're left with no open holes but a small number
+    # of stubborn non-manifold edges, run the remove-face + close-hole cleanup.
+    # This catches the meshes where split-vertex repair couldn't converge.
+    nm_after = int(after.get("non_manifold_edges") or 0)
+    be_after = int(after.get("boundary_edges") or 0)
+    if nm_after > 0 and be_after == 0 and nm_after <= 50:
+        finalized = _final_manifold_cleanup(repaired)
+        if finalized is not None:
+            finalized_after = _mesh_report(finalized)
+            finalized_nm = int(finalized_after.get("non_manifold_edges") or 0)
+            finalized_be = int(finalized_after.get("boundary_edges") or 0)
+            # Only adopt if it strictly improved manifoldness AND didn't
+            # accidentally introduce open holes.
+            if finalized_nm < nm_after and finalized_be <= be_after:
+                repaired = finalized
+                after = finalized_after
+                engine = f"{engine}+final-cleanup"
+
     if not after["is_watertight"]:
         warnings.append("Fast repair completed, but the mesh is still not fully watertight.")
         rebuilt, rebuild_engine, rebuild_warnings = _solid_rebuild_with_pymeshlab(mesh)
