@@ -535,7 +535,7 @@ def _repair_with_trimesh(mesh):
     return repaired, "trimesh"
 
 
-def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
+def _repair_file(file_path: str, file_type: str | None, target_height_mm: float | None = None) -> Dict[str, Any]:
     mesh = _load_mesh(file_path, file_type=file_type)
     before = _mesh_report(mesh)
     warnings = []
@@ -624,6 +624,40 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
             f"Repair complete. Mesh has {non_manifold_remaining} non-manifold edge(s) "
             f"but no open holes — most slicers will accept it."
         )
+
+    # Optional uniform scale so the exported STL matches the user's target print
+    # height. Applied AFTER repair so topology metrics are unaffected. The
+    # `after` report keeps the pre-scale dimensions; we add a scaled_dimensions
+    # field separately so callers can show before/after.
+    scaled_dimensions = None
+    if target_height_mm and target_height_mm > 0:
+        try:
+            current_extents = list(map(float, repaired.extents))
+            current_height = max(current_extents) if current_extents else 0.0
+            if current_height > 1e-6:
+                scale_factor = float(target_height_mm) / current_height
+                # Clamp to a sane range to prevent absurd input from corrupting
+                # the mesh. 0.001x .. 1000x covers any reasonable conversion.
+                if 0.001 <= scale_factor <= 1000.0:
+                    repaired.apply_scale(scale_factor)
+                    new_extents = list(map(float, repaired.extents))
+                    scaled_dimensions = {
+                        "scale_factor": round(scale_factor, 6),
+                        "width_mm": round(new_extents[0], 3) if len(new_extents) > 0 else None,
+                        "height_mm": round(new_extents[1], 3) if len(new_extents) > 1 else None,
+                        "depth_mm": round(new_extents[2], 3) if len(new_extents) > 2 else None,
+                        "target_height_mm": float(target_height_mm),
+                    }
+                    warnings.append(
+                        f"Scaled uniformly by {scale_factor:.4f}x so the longest axis is {target_height_mm:.1f} mm."
+                    )
+                else:
+                    warnings.append(
+                        f"Target height {target_height_mm:.2f} mm rejected: would require {scale_factor:.4f}x scale (out of safe range)."
+                    )
+        except Exception as exc:
+            logger.warning("[STL_REPAIR] target_height_mm scaling failed: %s", exc)
+
     stl_bytes = repaired.export(file_type="stl")
     if isinstance(stl_bytes, str):
         stl_bytes = stl_bytes.encode("utf-8")
@@ -634,11 +668,12 @@ def _repair_file(file_path: str, file_type: str | None) -> Dict[str, Any]:
         "before": before,
         "after": after,
         "warnings": warnings,
+        "scaled_dimensions": scaled_dimensions,
         "stl_bytes": bytes(stl_bytes),
     }
 
 
-def _repair_worker(conn, file_path: str, file_type: str | None, memory_mb: int) -> None:
+def _repair_worker(conn, file_path: str, file_type: str | None, memory_mb: int, target_height_mm: float | None = None) -> None:
     try:
         os.environ.setdefault("OMP_NUM_THREADS", "1")
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -650,7 +685,7 @@ def _repair_worker(conn, file_path: str, file_type: str | None, memory_mb: int) 
             _set_analysis_child_limits(memory_mb)
         except Exception:
             pass
-        conn.send(_repair_file(file_path, file_type=file_type))
+        conn.send(_repair_file(file_path, file_type=file_type, target_height_mm=target_height_mm))
     except MemoryError:
         conn.send({
             "ok": False,
@@ -688,9 +723,9 @@ class StlRepairService:
     USE_SUBPROCESS = os.getenv("STL_REPAIR_SUBPROCESS", "true").lower() not in ("0", "false", "no")
 
     @staticmethod
-    def _repair_file_safely(file_path: str, file_type: str | None) -> Dict[str, Any]:
+    def _repair_file_safely(file_path: str, file_type: str | None, target_height_mm: float | None = None) -> Dict[str, Any]:
         if not StlRepairService.USE_SUBPROCESS:
-            return _repair_file(file_path, file_type=file_type)
+            return _repair_file(file_path, file_type=file_type, target_height_mm=target_height_mm)
 
         import multiprocessing as mp
         import time
@@ -704,7 +739,7 @@ class StlRepairService:
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         proc = ctx.Process(
             target=_repair_worker,
-            args=(child_conn, file_path, file_type, StlRepairService.REPAIR_MEMORY_LIMIT_MB),
+            args=(child_conn, file_path, file_type, StlRepairService.REPAIR_MEMORY_LIMIT_MB, target_height_mm),
             daemon=True,
         )
 
@@ -744,7 +779,7 @@ class StlRepairService:
         return payload
 
     @staticmethod
-    def repair_from_url(url: str) -> Dict[str, Any]:
+    def repair_from_url(url: str, target_height_mm: float | None = None) -> Dict[str, Any]:
         import requests
         import tempfile
 
@@ -791,7 +826,7 @@ class StlRepairService:
             if not file_type:
                 file_type = PrintAnalysisService._detect_file_type(url, resp.headers.get("content-type"), head)
 
-            return StlRepairService._repair_file_safely(tmp_path, file_type=file_type)
+            return StlRepairService._repair_file_safely(tmp_path, file_type=file_type, target_height_mm=target_height_mm)
         except requests.RequestException as exc:
             return {"ok": False, "error": f"Could not download model: {exc}"}
         except Exception as exc:

@@ -129,6 +129,20 @@ def repair_existing_model(job_id: str):
     body = request.get_json(silent=True) or {}
     fallback_model_url = (body.get("model_url") or "").strip()
 
+    # Optional uniform scale to a user-specified target longest-axis height.
+    # Accept either `target_height_mm` (preferred) or `target_print_height_mm`.
+    raw_height = body.get("target_height_mm")
+    if raw_height is None:
+        raw_height = body.get("target_print_height_mm")
+    target_height_mm: float | None = None
+    if raw_height is not None and str(raw_height).strip() != "":
+        try:
+            parsed = float(raw_height)
+            if parsed > 0:
+                target_height_mm = parsed
+        except (TypeError, ValueError):
+            target_height_mm = None
+
     try:
         model_url, title = _resolve_owned_model_url(job_id, identity_id, fallback_model_url=fallback_model_url)
     except Exception as exc:
@@ -137,7 +151,7 @@ def repair_existing_model(job_id: str):
     if not model_url:
         return jsonify({"ok": False, "error": "Model not found or no repairable model URL available"}), 404
 
-    result = StlRepairService.repair_from_url(model_url)
+    result = StlRepairService.repair_from_url(model_url, target_height_mm=target_height_mm)
     if not result.get("ok"):
         before = result.get("before") or {}
         after = result.get("after") or {}
