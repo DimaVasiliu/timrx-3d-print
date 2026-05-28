@@ -177,10 +177,20 @@ def _body_value(body: dict, *keys: str, default=None):
 
 
 def _normalize_image_inputs(body: dict, *keys: str) -> list[str]:
+    """Return the first NON-EMPTY normalized list across the given keys.
+
+    Empty strings, empty arrays, and None all count as "not provided" so the
+    helper continues to the next candidate key. This matters when the frontend
+    sends both `reference_images: []` and `source_image: "data:..."` — without
+    this skip, the empty array would shadow the real source image.
+    """
     for key in keys:
         value = body.get(key)
-        if value is not None:
-            return normalize_asset_list(value)
+        if value is None:
+            continue
+        normalized = normalize_asset_list(value)
+        if normalized:
+            return normalized
     return []
 
 
