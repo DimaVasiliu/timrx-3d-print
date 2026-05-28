@@ -381,6 +381,31 @@ def _handle_nano_banana_image_generate(body: dict):
     resolution = body.get("image_size") or body.get("imageSize") or body.get("resolution") or "1K"
     output_format = body.get("output_format") or "png"
 
+    # Reference image(s) for image-to-image. PiAPI Nano Banana 2 accepts a single
+    # `image` URL (and optional `images` array). Data: URLs are uploaded to S3.
+    raw_refs = _normalize_image_inputs(
+        body, "reference_images", "referenceImages",
+        "source_image", "sourceImage", "input_image",
+    )
+    reference_images: list[str] = []
+    for index, asset in enumerate(raw_refs, start=1):
+        asset_url = ensure_asset_url(
+            asset,
+            provider="nano_banana",
+            identity_id=identity_id,
+            prefix="source_images",
+            name=f"nano-banana-ref-{index}",
+        )
+        if asset_url:
+            if asset_url.startswith("data:"):
+                return jsonify({
+                    "error": "invalid_params",
+                    "message": "Nano Banana reference images must be uploadable to S3. Check AWS configuration.",
+                    "field": "reference_images",
+                }), 400
+            reference_images.append(asset_url)
+    operation = "edit" if reference_images else "generate"
+
     # Stability guardrails
     guard_error = ExpenseGuard.check_image_request(n=1)
     if guard_error:
@@ -398,12 +423,13 @@ def _handle_nano_banana_image_generate(body: dict):
     if client_idempotency_key:
         idempotency_key = ExpenseGuard.compute_idempotency_key(
             identity_id or "", "image_generate", client_idempotency_key,
-            provider="nano_banana"
+            provider="nano_banana", refs=len(reference_images),
         )
     else:
         idempotency_key = ExpenseGuard.compute_idempotency_key(
             identity_id or "", "image_generate", prompt,
-            provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution
+            provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution,
+            refs=len(reference_images),
         )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)
     if cached:
@@ -450,6 +476,8 @@ def _handle_nano_banana_image_generate(body: dict):
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "output_format": output_format,
+        "operation": operation,
+        "reference_count": len(reference_images),
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -489,6 +517,7 @@ def _handle_nano_banana_image_generate(body: dict):
         resolution,
         output_format,
         store_meta,
+        reference_images,
     )
 
     log_event("image/generate:nano_banana:queued", {"internal_job_id": internal_job_id})
@@ -541,6 +570,42 @@ def _handle_gemini_image_generate(body: dict):
     image_size = body.get("image_size") or body.get("imageSize") or "1K"
     sample_count = int(body.get("sample_count") or body.get("sampleCount") or body.get("n") or 1)
 
+    # Reference image(s) for image-to-image. When present, the dispatcher routes
+    # to Vertex AI Imagen 3 capability (reuses Veo's service-account auth).
+    raw_refs = _normalize_image_inputs(
+        body, "reference_images", "referenceImages",
+        "source_image", "sourceImage", "input_image",
+    )
+    reference_images: list[str] = []
+    for index, asset in enumerate(raw_refs, start=1):
+        asset_url = ensure_asset_url(
+            asset,
+            provider="google",
+            identity_id=identity_id,
+            prefix="source_images",
+            name=f"google-imagen-ref-{index}",
+        )
+        if asset_url:
+            # Vertex Imagen consumes inline base64, so data: URLs are OK here
+            # (the service re-encodes them before sending). HTTP URLs are also OK.
+            reference_images.append(asset_url)
+
+    mask_asset = _body_value(body, "mask_image", "maskImage")
+    mask_image = None
+    if mask_asset:
+        mask_image = ensure_asset_url(
+            mask_asset,
+            provider="google",
+            identity_id=identity_id,
+            prefix="source_images",
+            name="google-imagen-mask",
+        )
+
+    edit_mode = str(
+        _body_value(body, "edit_mode", "editMode", default="EDIT_MODE_DEFAULT") or "EDIT_MODE_DEFAULT"
+    ).strip().upper()
+    operation = "edit" if reference_images else "generate"
+
     # Stability guardrails: check API limits and concurrent jobs
     guard_error = ExpenseGuard.check_image_request(n=sample_count)
     if guard_error:
@@ -549,7 +614,8 @@ def _handle_gemini_image_generate(body: dict):
     # Idempotency check: return cached response if duplicate
     idempotency_key = ExpenseGuard.compute_idempotency_key(
         identity_id or "", "image_generate", prompt,
-        provider="google", aspect_ratio=aspect_ratio, image_size=image_size, n=sample_count
+        provider="google", aspect_ratio=aspect_ratio, image_size=image_size, n=sample_count,
+        refs=len(reference_images), mask=bool(mask_image), edit_mode=edit_mode if reference_images else "",
     )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)
     if cached:
@@ -592,10 +658,14 @@ def _handle_gemini_image_generate(body: dict):
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": "imagen-4.0",
+        "model": "imagen-3.0-capability-001" if reference_images else "imagen-4.0",
         "aspect_ratio": aspect_ratio,
         "image_size": image_size,
         "sample_count": sample_count,
+        "operation": operation,
+        "reference_count": len(reference_images),
+        "edit_mode": edit_mode if reference_images else "",
+        "provider_variant": "vertex" if reference_images else "gemini_dev_api",
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -624,7 +694,7 @@ def _handle_gemini_image_generate(body: dict):
     # Register active job for per-identity concurrent limit tracking
     ExpenseGuard.register_active_job(internal_job_id, identity_id)
 
-    # Dispatch async - Gemini API call happens in background thread
+    # Dispatch async - text-to-image hits Gemini Developer API; edit hits Vertex.
     get_executor().submit(
         dispatch_gemini_image_async,
         internal_job_id,
@@ -635,9 +705,12 @@ def _handle_gemini_image_generate(body: dict):
         image_size,
         sample_count,
         store_meta,
+        reference_images,
+        mask_image,
+        edit_mode,
     )
 
-    log_event("image/generate:gemini:queued", {"internal_job_id": internal_job_id})
+    log_event("image/generate:gemini:queued", {"internal_job_id": internal_job_id, "operation": operation})
 
     # Return immediately with job_id for polling
     # Credits are now held in DB - frontend can see via /api/credits/wallet
@@ -649,8 +722,10 @@ def _handle_gemini_image_generate(body: dict):
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
-        "model": "imagen-4.0",
+        "model": store_meta["model"],
         "provider": "google",
+        "provider_variant": store_meta["provider_variant"],
+        "operation": operation,
     }
 
     # Cache response for idempotency
@@ -680,6 +755,26 @@ def _handle_google_nano_image_generate(body: dict):
     aspect_ratio = body.get("aspect_ratio") or body.get("aspectRatio") or "1:1"
     image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
 
+    # Reference image(s) for native Gemini 2.5 Flash Image image-to-image.
+    raw_refs = _normalize_image_inputs(
+        body, "reference_images", "referenceImages",
+        "source_image", "sourceImage", "input_image",
+    )
+    reference_images: list[str] = []
+    for index, asset in enumerate(raw_refs, start=1):
+        asset_url = ensure_asset_url(
+            asset,
+            provider="google_nano",
+            identity_id=identity_id,
+            prefix="source_images",
+            name=f"google-nano-ref-{index}",
+        )
+        if asset_url:
+            # Gemini accepts data: URLs natively (we re-encode them as inline_data),
+            # so both data: and https URLs are fine here.
+            reference_images.append(asset_url)
+    operation = "edit" if reference_images else "generate"
+
     guard_error = ExpenseGuard.check_image_request(n=1)
     if guard_error:
         return guard_error
@@ -687,6 +782,7 @@ def _handle_google_nano_image_generate(body: dict):
     idempotency_key = ExpenseGuard.compute_idempotency_key(
         identity_id or "", "image_generate", prompt,
         provider="google_nano", aspect_ratio=aspect_ratio, image_size=image_size,
+        refs=len(reference_images),
     )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)
     if cached:
@@ -726,6 +822,8 @@ def _handle_google_nano_image_generate(body: dict):
         "aspect_ratio": aspect_ratio,
         "image_size": image_size,
         "provider_variant": "direct_google",
+        "operation": operation,
+        "reference_count": len(reference_images),
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -757,6 +855,7 @@ def _handle_google_nano_image_generate(body: dict):
         aspect_ratio,
         image_size,
         store_meta,
+        reference_images,
     )
 
     balance_info = get_current_balance(identity_id)
@@ -770,6 +869,7 @@ def _handle_google_nano_image_generate(body: dict):
         "model": "gemini-2.5-flash-image",
         "provider": "google_nano",
         "provider_variant": "direct_google",
+        "operation": operation,
     }
     ExpenseGuard.cache_response(idempotency_key, response_data)
     return jsonify(response_data)
@@ -1276,6 +1376,37 @@ def _handle_openai_image_generate(body: dict):
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
+    # Reference image(s) for image-to-image (OpenAI /v1/images/edits).
+    raw_refs = _normalize_image_inputs(
+        body, "reference_images", "referenceImages",
+        "source_image", "sourceImage", "input_image",
+    )
+    reference_images: list[str] = []
+    for index, asset in enumerate(raw_refs, start=1):
+        asset_url = ensure_asset_url(
+            asset,
+            provider="openai",
+            identity_id=identity_id,
+            prefix="source_images",
+            name=f"openai-ref-{index}",
+        )
+        if asset_url:
+            # OpenAI is given multipart bytes — the service downloads URLs or
+            # decodes data: URLs server-side. Both are acceptable here.
+            reference_images.append(asset_url)
+
+    mask_asset = _body_value(body, "mask_image", "maskImage")
+    mask_image = None
+    if mask_asset:
+        mask_image = ensure_asset_url(
+            mask_asset,
+            provider="openai",
+            identity_id=identity_id,
+            prefix="source_images",
+            name="openai-mask",
+        )
+    operation = "edit" if reference_images else "generate"
+
     # Stability guardrails: check API limits and concurrent jobs
     guard_error = ExpenseGuard.check_image_request(n=n)
     if guard_error:
@@ -1284,7 +1415,8 @@ def _handle_openai_image_generate(body: dict):
     # Idempotency check: return cached response if duplicate
     idempotency_key = ExpenseGuard.compute_idempotency_key(
         identity_id or "", "image_generate", prompt,
-        provider="openai", size=size, model=model, n=n
+        provider="openai", size=size, model=model, n=n,
+        refs=len(reference_images), mask=bool(mask_image),
     )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)
     if cached:
@@ -1312,6 +1444,10 @@ def _handle_openai_image_generate(body: dict):
         "size": size,
         "n": n,
         "response_format": response_format,
+        "operation": operation,
+        "reference_count": len(reference_images),
+        "reference_images": reference_images,
+        "mask_image": mask_image or "",
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -1343,11 +1479,19 @@ def _handle_openai_image_generate(body: dict):
         internal_job_id,
         identity_id,
         reservation_id,
-        {"prompt": prompt, "size": size, "model": model, "n": n, "response_format": response_format},
+        {
+            "prompt": prompt,
+            "size": size,
+            "model": model,
+            "n": n,
+            "response_format": response_format,
+            "reference_images": reference_images,
+            "mask_image": mask_image,
+        },
         store_meta,
     )
 
-    log_event("image/generate:openai", {"internal_job_id": internal_job_id})
+    log_event("image/generate:openai", {"internal_job_id": internal_job_id, "operation": operation})
 
     balance_info = get_current_balance(identity_id)
     response_data = {
@@ -1360,6 +1504,7 @@ def _handle_openai_image_generate(body: dict):
         "model": model,
         "size": size,
         "provider": "openai",
+        "operation": operation,
     }
 
     # Cache response for idempotency
@@ -1372,32 +1517,39 @@ def _handle_openai_image_generate(body: dict):
 @with_session
 def gemini_image_mod():
     """
-    Generate an image using Gemini Imagen 4.0.
+    Legacy dedicated endpoint — delegates to the unified Google handler.
 
-    Request body:
-    {
-        "prompt": "A beautiful sunset over mountains",
-        "aspect_ratio": "16:9",     # "1:1", "3:4", "4:3", "9:16", "16:9"
-        "image_size": "1K",         # "1K" or "2K"
-        "sample_count": 1           # Number of images (1-4)
-    }
-
-    Response (success):
-    {
-        "ok": true,
-        "image_url": "data:image/png;base64,...",
-        "image_base64": "...",
-        "image_id": "uuid",
-        "provider": "google"
-    }
-
-    Response (error):
-    {
-        "error": "<machine_code>",
-        "message": "<human readable>",
-        "details": {...}
-    }
+    Body accepts the same fields as POST /image/generate with provider="google":
+        prompt, aspect_ratio, image_size, sample_count,
+        source_image / reference_images (for image-to-image via Vertex Imagen),
+        mask_image, edit_mode.
     """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    body.setdefault("provider", "google")
+    try:
+        return _handle_gemini_image_generate(body)
+    except UploadValidationError as e:
+        return jsonify({
+            "error": "invalid_params",
+            "message": str(e) or "Invalid uploaded file content",
+            "field": _upload_validation_field("google", body),
+            "details": {"provider": "google", "reason": "upload_validation"},
+        }), 400
+    except Exception as e:
+        print(f"[IMAGE_API] Unhandled error on /image/gemini: {e}")
+        print(traceback.format_exc())
+        return jsonify({
+            "error": "image_generate_internal_error",
+            "message": "Image generation failed before dispatch. Please try again.",
+            "details": {"provider": "google"},
+        }), 500
+
+
+@bp.route("/image/gemini__legacy_disabled", methods=["POST", "OPTIONS"])
+def _gemini_image_mod_legacy_disabled():
+    """Original implementation preserved below for historical reference but no longer routed."""
     if request.method == "OPTIONS":
         return ("", 204)
 
@@ -1532,6 +1684,40 @@ def gemini_image_mod():
 @bp.route("/image/openai", methods=["POST", "OPTIONS"])
 @with_session
 def openai_image_mod():
+    """
+    Legacy dedicated endpoint — delegates to the unified OpenAI handler.
+
+    Body accepts the same fields as POST /image/generate with provider="openai":
+        prompt, size, model, n,
+        source_image / reference_images (for image-to-image via /v1/images/edits),
+        mask_image (for inpainting).
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+    body = request.get_json(silent=True) or {}
+    body.setdefault("provider", "openai")
+    try:
+        return _handle_openai_image_generate(body)
+    except UploadValidationError as e:
+        return jsonify({
+            "error": "invalid_params",
+            "message": str(e) or "Invalid uploaded file content",
+            "field": _upload_validation_field("openai", body),
+            "details": {"provider": "openai", "reason": "upload_validation"},
+        }), 400
+    except Exception as e:
+        print(f"[IMAGE_API] Unhandled error on /image/openai: {e}")
+        print(traceback.format_exc())
+        return jsonify({
+            "error": "image_generate_internal_error",
+            "message": "Image generation failed before dispatch. Please try again.",
+            "details": {"provider": "openai"},
+        }), 500
+
+
+@bp.route("/image/openai__legacy_disabled", methods=["POST", "OPTIONS"])
+def _openai_image_mod_legacy_disabled():
+    """Original implementation preserved below for historical reference but no longer routed."""
     if request.method == "OPTIONS":
         return ("", 204)
 

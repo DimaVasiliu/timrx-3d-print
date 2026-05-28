@@ -114,6 +114,7 @@ def create_nano_banana_task(
     aspect_ratio: str = "1:1",
     resolution: str = "1K",
     output_format: str = "png",
+    reference_images: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
     Create a Nano Banana 2 image generation task on PiAPI.
@@ -123,6 +124,9 @@ def create_nano_banana_task(
         aspect_ratio: "1:1", "9:16", "16:9", "3:4", "4:3"
         resolution: "1K", "2K", or "4K"
         output_format: "png" or "jpg"
+        reference_images: Optional list of public/HTTPS image URLs to enable
+                          image-to-image. PiAPI accepts `image` (single ref) or
+                          `images` (multi). Items must be publicly reachable.
 
     Returns:
         Dict with task_id and raw response.
@@ -137,15 +141,24 @@ def create_nano_banana_task(
     validate_nano_banana_params(aspect_ratio, resolution, output_format)
 
     url = f"{PIAPI_API_BASE}/task"
+    input_block: Dict[str, Any] = {
+        "prompt": prompt,
+        "aspect_ratio": aspect_ratio,
+        "resolution": resolution,
+        "output_format": output_format,
+    }
+    refs = [str(r).strip() for r in (reference_images or []) if r]
+    if refs:
+        # PiAPI Nano Banana 2 accepts a single URL via `image` or an array via `images`.
+        # Use array form for ≥1 to keep payload consistent.
+        input_block["image"] = refs[0]
+        if len(refs) > 1:
+            input_block["images"] = refs
+
     payload = {
         "model": "gemini",
         "task_type": NANO_BANANA_MODEL,
-        "input": {
-            "prompt": prompt,
-            "aspect_ratio": aspect_ratio,
-            "resolution": resolution,
-            "output_format": output_format,
-        },
+        "input": input_block,
         "config": {
             "webhook_config": {
                 "endpoint": "",
@@ -154,7 +167,10 @@ def create_nano_banana_task(
         }
     }
 
-    print(f"[PiAPI NanoBanana] Creating task: aspect_ratio={aspect_ratio}, resolution={resolution}, format={output_format}")
+    print(
+        f"[PiAPI NanoBanana] Creating task: aspect_ratio={aspect_ratio}, "
+        f"resolution={resolution}, format={output_format}, refs={len(refs)}"
+    )
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):

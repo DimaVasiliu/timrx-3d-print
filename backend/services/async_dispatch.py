@@ -593,6 +593,8 @@ def dispatch_openai_image_async(
     n: int,
     response_format: str,
     store_meta: dict,
+    reference_images: Optional[list] = None,
+    mask_image: Optional[str] = None,
 ):
     start_time = time.time()
     breaker = _breakers.get("openai")
@@ -606,7 +608,19 @@ def dispatch_openai_image_async(
         return
 
     try:
-        resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
+        if reference_images:
+            # Image-to-image / reference-guided edit via OpenAI /v1/images/edits
+            from backend.services.openai_service import openai_image_edit
+            resp = openai_image_edit(
+                prompt=prompt,
+                reference_images=reference_images,
+                mask_image=mask_image,
+                size=size,
+                model=model,
+                n=n,
+            )
+        else:
+            resp = openai_image_generate(prompt=prompt, size=size, model=model, n=n, response_format=response_format)
 
         duration_ms = int((time.time() - start_time) * 1000)
         # print(f"[ASYNC] OpenAI returned for job {internal_job_id} in {duration_ms}ms")
@@ -704,12 +718,19 @@ def dispatch_gemini_image_async(
     image_size: str,
     sample_count: int,
     store_meta: dict,
+    reference_images: Optional[list] = None,
+    mask_image: Optional[str] = None,
+    edit_mode: str = "EDIT_MODE_DEFAULT",
 ):
     """
-    Async dispatch for Gemini/Imagen image generation.
+    Async dispatch for Google image generation.
 
-    This runs in a background thread to allow the endpoint to return immediately
-    with job_id + reservation_id, so frontend can see the held credits.
+    Routing:
+      - text-to-image           → gemini_generate_image (Gemini Developer API, Imagen 4.0 Fast)
+      - reference / image-to-image → vertex_imagen_edit_image (Vertex AI Imagen 3 capability)
+                                     — reuses Veo's service-account auth.
+
+    Runs in a background thread so the endpoint returns immediately with job_id.
     """
     start_time = time.time()
     breaker = _breakers.get("gemini")
@@ -723,13 +744,32 @@ def dispatch_gemini_image_async(
         return
 
     try:
-        # Call Gemini API
-        result = gemini_generate_image(
-            prompt=prompt,
-            aspect_ratio=aspect_ratio,
-            image_size=image_size,
-            sample_count=sample_count,
-        )
+        if reference_images:
+            # Image-to-image / reference-guided edit via Vertex AI Imagen 3 capability.
+            from backend.services.vertex_imagen_service import (
+                vertex_imagen_edit_image,
+                VertexImagenError,
+            )
+            try:
+                result = vertex_imagen_edit_image(
+                    prompt=prompt,
+                    reference_images=reference_images,
+                    mask_image=mask_image,
+                    edit_mode=edit_mode or "EDIT_MODE_DEFAULT",
+                    sample_count=sample_count,
+                )
+            except VertexImagenError as e:
+                # Vertex-specific failure — re-raise as generic RuntimeError so the
+                # outer Exception handler sanitizes and persists it.
+                raise RuntimeError(str(e)) from e
+        else:
+            # Text-to-image via Gemini Developer API (Imagen 4.0 Fast)
+            result = gemini_generate_image(
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                sample_count=sample_count,
+            )
 
         duration_ms = int((time.time() - start_time) * 1000)
         # print(f"[ASYNC] Gemini returned for job {internal_job_id} in {duration_ms}ms")
@@ -747,12 +787,15 @@ def dispatch_gemini_image_async(
             update_job_status_failed(internal_job_id, "Image generation failed. Please try again.")
             return
 
-        # Save to normalized DB (creates images row + history_items row)
+        # Save to normalized DB (creates images row + history_items row).
+        # Use the actual model returned (imagen-3.0-capability-001 for edit,
+        # imagen-4.0-fast for plain generate); fall back to "imagen-4.0".
+        ai_model = result.get("model") or "imagen-4.0"
         persisted_result = save_image_to_normalized_db(
             image_id=internal_job_id,
             image_url=image_url or image_urls[0],
             prompt=prompt,
-            ai_model="imagen-4.0",
+            ai_model=ai_model,
             size=f"{aspect_ratio}@{image_size}",
             image_urls=image_urls,
             user_id=identity_id,
@@ -771,6 +814,11 @@ def dispatch_gemini_image_async(
         store_meta["image_url"] = final_image_url
         store_meta["image_urls"] = final_image_urls
         store_meta["image_base64"] = image_base64
+        store_meta["model"] = ai_model
+        if result.get("provider_variant"):
+            store_meta["provider_variant"] = result["provider_variant"]
+        if result.get("operation"):
+            store_meta["operation"] = result["operation"]
         store[internal_job_id] = store_meta
         save_store(store)
 
@@ -850,15 +898,20 @@ def dispatch_piapi_nano_banana_async(
     resolution: str,
     output_format: str,
     store_meta: dict,
+    reference_images: Optional[list] = None,
 ):
     """
     Async dispatch for PiAPI Nano Banana 2 image generation.
+
+    When `reference_images` is provided, Nano Banana 2 runs in image-to-image
+    mode (image guides the generation). Public/HTTPS URLs required.
 
     Runs in background thread: creates PiAPI task, polls until complete,
     saves result, finalizes credits.
     """
     start_time = time.time()
-    print(f"[ASYNC] Starting PiAPI Nano Banana dispatch for job {internal_job_id}")
+    ref_count = len(reference_images) if reference_images else 0
+    print(f"[ASYNC] Starting PiAPI Nano Banana dispatch for job {internal_job_id} (refs={ref_count})")
 
     try:
         # Create PiAPI task
@@ -867,6 +920,7 @@ def dispatch_piapi_nano_banana_async(
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             output_format=output_format,
+            reference_images=reference_images,
         )
         upstream_task_id = task_result["task_id"]
         print(f"[ASYNC] PiAPI task created: upstream_task_id={upstream_task_id} for job {internal_job_id}")
@@ -877,6 +931,9 @@ def dispatch_piapi_nano_banana_async(
         store = load_store()
         store_meta["upstream_task_id"] = upstream_task_id
         store_meta["status"] = "processing"
+        if reference_images:
+            store_meta["operation"] = "edit"
+            store_meta["reference_count"] = len(reference_images)
         store[internal_job_id] = store_meta
         save_store(store)
 
@@ -992,6 +1049,7 @@ def dispatch_google_nano_image_async(
     aspect_ratio: str,
     image_size: str,
     store_meta: dict,
+    reference_images: Optional[list] = None,
 ):
     start_time = time.time()
     breaker = _breakers.get("google_nano")
@@ -1004,7 +1062,12 @@ def dispatch_google_nano_image_async(
         return
 
     try:
-        result = google_nano_generate_image(prompt=prompt, aspect_ratio=aspect_ratio, image_size=image_size)
+        result = google_nano_generate_image(
+            prompt=prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            reference_images=reference_images,
+        )
         _complete_image_job(
             internal_job_id,
             identity_id,
@@ -1020,6 +1083,7 @@ def dispatch_google_nano_image_async(
             size=f"{aspect_ratio}@{image_size}",
             artifact_format="png",
             provider_variant=result.get("provider_variant") or "direct_google",
+            operation=("edit" if reference_images else "generate"),
             upstream_request_id=internal_job_id,
             discord_title="🖼️ New AI Image Generated (Google Nano)",
         )
@@ -1630,8 +1694,13 @@ def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, p
     model = payload.get("model") or store_meta.get("model") or "gpt-image-1.5"
     n = int(payload.get("n") or store_meta.get("n") or 1)
     response_format = payload.get("response_format") or store_meta.get("response_format") or "url"
+    reference_images = payload.get("reference_images") or store_meta.get("reference_images") or None
+    mask_image = payload.get("mask_image") or store_meta.get("mask_image") or None
     return dispatch_openai_image_async(
-        internal_job_id, identity_id, reservation_id, prompt, size, model, n, response_format, store_meta
+        internal_job_id, identity_id, reservation_id,
+        prompt, size, model, n, response_format, store_meta,
+        reference_images=reference_images,
+        mask_image=mask_image,
     )
 
 

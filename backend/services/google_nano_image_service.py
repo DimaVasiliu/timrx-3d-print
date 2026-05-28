@@ -8,9 +8,10 @@ and cost before changing defaults.
 
 from __future__ import annotations
 
+import base64
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -82,20 +83,60 @@ def validate_google_nano_params(aspect_ratio: str, image_size: str) -> None:
         raise GoogleNanoValidationError("image_size", image_size, sorted(ALLOWED_IMAGE_SIZES))
 
 
+_GOOGLE_NANO_FETCH_TIMEOUT = (15, 60)
+
+
+def _fetch_image_bytes(img_src: str) -> Tuple[bytes, str]:
+    """Resolve a URL or data: URL into (bytes, mime_type)."""
+    if not img_src:
+        raise RuntimeError("google_nano: empty image source")
+    src = str(img_src).strip()
+    if src.startswith("data:"):
+        try:
+            header, _, b64data = src.partition(",")
+            mime = "image/png"
+            if ":" in header and ";" in header:
+                mime = header.split(":", 1)[1].split(";", 1)[0] or "image/png"
+            return base64.b64decode(b64data), mime
+        except Exception as exc:
+            raise RuntimeError(f"google_nano: invalid data URL: {exc}") from exc
+    try:
+        resp = requests.get(src, timeout=_GOOGLE_NANO_FETCH_TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"google_nano: failed to fetch reference image: {exc}") from exc
+    mime = (resp.headers.get("content-type") or "image/png").split(";")[0].strip() or "image/png"
+    return resp.content, mime
+
+
 def google_nano_generate_image(
     prompt: str,
     aspect_ratio: str = "1:1",
     image_size: str = "1K",
+    reference_images: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    """
+    Generate or edit an image with Gemini 2.5 Flash Image (Google Nano).
+
+    When `reference_images` is provided, the model performs image-to-image /
+    reference-guided generation (Gemini natively supports inline_data parts).
+    """
     validate_google_nano_params(aspect_ratio, image_size)
+
+    parts: List[Dict[str, Any]] = [{"text": prompt}]
+    if reference_images:
+        for src in reference_images:
+            img_bytes, mime = _fetch_image_bytes(src)
+            parts.append({
+                "inline_data": {
+                    "mime_type": mime,
+                    "data": base64.b64encode(img_bytes).decode("utf-8"),
+                }
+            })
 
     url = f"{GOOGLE_API_BASE}/models/{GOOGLE_NANO_MODEL}:generateContent"
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-            ]
-        }],
+        "contents": [{"parts": parts}],
         "generationConfig": {
             "responseModalities": ["IMAGE"],
             "imageConfig": {
@@ -175,4 +216,5 @@ def _parse_google_nano_response(result: Dict[str, Any]) -> Dict[str, Any]:
         "provider": "google_nano",
         "provider_variant": "direct_google",
         "model": GOOGLE_NANO_MODEL,
+        "image_count": len(images),
     }
