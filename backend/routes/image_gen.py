@@ -391,12 +391,19 @@ def _handle_nano_banana_image_generate(body: dict):
     resolution = body.get("image_size") or body.get("imageSize") or body.get("resolution") or "1K"
     output_format = body.get("output_format") or "png"
 
-    # Reference image(s) for image-to-image. PiAPI Nano Banana 2 accepts a single
-    # `image` URL (and optional `images` array). Data: URLs are uploaded to S3.
+    # Reference image(s) for image-to-image. PiAPI Nano Banana 2 accepts an
+    # `image_urls` array of public HTTPS URLs. Data: URLs are uploaded to S3.
+    print(
+        f"[NB_ROUTE] body keys={list(body.keys())} "
+        f"source_image_set={bool(body.get('source_image'))} "
+        f"reference_images_len={len(body.get('reference_images') or [])}"
+    )
     raw_refs = _normalize_image_inputs(
         body, "reference_images", "referenceImages",
         "source_image", "sourceImage", "input_image",
     )
+    print(f"[NB_ROUTE] raw_refs extracted: count={len(raw_refs)} "
+          f"first_kind={('data' if raw_refs and str(raw_refs[0]).startswith('data:') else 'url') if raw_refs else 'none'}")
     reference_images: list[str] = []
     for index, asset in enumerate(raw_refs, start=1):
         asset_url = ensure_asset_url(
@@ -414,7 +421,9 @@ def _handle_nano_banana_image_generate(body: dict):
                     "field": "reference_images",
                 }), 400
             reference_images.append(asset_url)
+            print(f"[NB_ROUTE] ref {index} → S3: {asset_url[:120]}")
     operation = "edit" if reference_images else "generate"
+    print(f"[NB_ROUTE] final: operation={operation}, reference_images_count={len(reference_images)}")
 
     # Stability guardrails
     guard_error = ExpenseGuard.check_image_request(n=1)

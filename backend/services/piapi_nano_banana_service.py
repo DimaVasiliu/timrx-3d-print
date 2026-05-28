@@ -149,8 +149,10 @@ def create_nano_banana_task(
     }
     refs = [str(r).strip() for r in (reference_images or []) if r]
     if refs:
-        # PiAPI Nano Banana 2 accepts a single URL via `image` or an array via `images`.
-        # Use array form for ≥1 to keep payload consistent.
+        # PiAPI Nano Banana 2 accepts reference images via `image_urls` (array of
+        # public HTTPS URLs). We also include legacy `image` / `images` aliases
+        # to handle any upstream variation between PiAPI task variants.
+        input_block["image_urls"] = refs
         input_block["image"] = refs[0]
         if len(refs) > 1:
             input_block["images"] = refs
@@ -167,10 +169,14 @@ def create_nano_banana_task(
         }
     }
 
+    # Loud log so we can see the exact request shape in production logs.
     print(
         f"[PiAPI NanoBanana] Creating task: aspect_ratio={aspect_ratio}, "
-        f"resolution={resolution}, format={output_format}, refs={len(refs)}"
+        f"resolution={resolution}, format={output_format}, refs={len(refs)}, "
+        f"input_keys={list(input_block.keys())}"
     )
+    if refs:
+        print(f"[PiAPI NanoBanana] First ref URL: {refs[0][:120]}")
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
