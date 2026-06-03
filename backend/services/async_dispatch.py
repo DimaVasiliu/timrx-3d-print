@@ -1877,36 +1877,74 @@ def _dispatch_to_vertex_with_fallback(
     """
     Route video generation via the provider router.
 
-    For text2video and image2video: delegates to router.route_*() which
+    For text2video and image2video: delegates to router.route_*(), which
     iterates all configured providers (vertex > seedance > fal_seedance)
     with automatic fallback on auth/config/quota errors.
 
-    For image_transition: dispatches directly to Vertex (the only provider
-    with first-frame + last-frame conditioning). No fallback — transition
-    is Vertex-only.
+    For image_transition: try Vertex first, then fall back to Seedance providers.
+    Seedance 2 GA and fal Seedance both support start/end image conditioning.
     """
     from backend.services.video_router import (
         resolve_video_provider,
         ProviderUnavailableError,
     )
 
-    # image_transition is Vertex-only (requires first-frame + last-frame conditioning)
     if task == "image_transition":
         vertex = resolve_video_provider("vertex")
-        if not vertex:
-            raise ProviderUnavailableError("Vertex provider not available for transition")
-        configured, config_err = vertex.is_configured()
-        if not configured:
-            raise ProviderUnavailableError(f"Vertex not configured for transition: {config_err}")
         fp = payload.get("motion") or prompt
-        resp = vertex.start_image_transition(
-            start_image=payload.get("start_image", ""),
-            end_image=payload.get("end_image", ""),
-            prompt=fp,
-            **route_params,
-        )
-        print(f"[ASYNC] image_transition routed to vertex for job {internal_job_id}")
-        return resp, "vertex"
+        if vertex:
+            configured, config_err = vertex.is_configured()
+            if configured:
+                try:
+                    resp = vertex.start_image_transition(
+                        start_image=payload.get("start_image", ""),
+                        end_image=payload.get("end_image", ""),
+                        prompt=fp,
+                        **route_params,
+                    )
+                    print(f"[ASYNC] image_transition routed to vertex for job {internal_job_id}")
+                    return resp, "vertex"
+                except Exception as e:
+                    print(
+                        f"[ASYNC] vertex image_transition failed for job {internal_job_id}: {e}; "
+                        "trying Seedance fallback"
+                    )
+            else:
+                print(
+                    f"[ASYNC] vertex not configured for image_transition job {internal_job_id}: "
+                    f"{config_err}; trying Seedance fallback"
+                )
+
+        # Seedance 2 GA can do native first/last-frame interpolation. If PiAPI
+        # is unavailable, fal Seedance remains the final transition fallback.
+        try:
+            return _dispatch_to_seedance(
+                internal_job_id, task, fp, payload, route_params.copy(), store_meta,
+            )
+        except Exception as seedance_err:
+            print(
+                f"[ASYNC] seedance image_transition fallback failed for job {internal_job_id}: "
+                f"{seedance_err}; trying fal Seedance"
+            )
+            try:
+                fal = resolve_video_provider("fal_seedance")
+                if not fal:
+                    raise ProviderUnavailableError("fal Seedance provider not available")
+                configured, fal_config_err = fal.is_configured()
+                if not configured:
+                    raise ProviderUnavailableError(f"fal Seedance not configured: {fal_config_err}")
+                resp = fal.start_image_transition(
+                    start_image=payload.get("start_image", ""),
+                    end_image=payload.get("end_image", ""),
+                    prompt=fp,
+                    **route_params,
+                )
+                return resp, "fal_seedance"
+            except Exception as fal_err:
+                raise ProviderUnavailableError(
+                    "No image transition providers available after Vertex fallback: "
+                    f"seedance={seedance_err}; fal_seedance={fal_err}"
+                )
 
     # text2video and image2video: use the router's full provider chain with fallback
     if task == "image2video":
