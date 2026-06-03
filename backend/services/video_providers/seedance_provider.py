@@ -342,8 +342,8 @@ class SeedanceProvider:
 
         Cost note (caller's responsibility to surface): PiAPI bills
         ``unit_price × output_duration + (unit_price/2) × total_input_video_seconds``,
-        so reference *videos* add to the upstream cost. This method does not block;
-        the route layer computes and surfaces the surcharge (warn-only policy).
+        so reference *videos* add to the upstream cost. The route layer computes
+        and reserves the matching credit surcharge before dispatch.
         """
         clean = normalize_seedance_params(
             duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),

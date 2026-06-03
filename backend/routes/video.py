@@ -26,7 +26,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, g, jsonify, request, send_file
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import require_admin, with_session, with_session_readonly
@@ -77,6 +77,146 @@ _CONVERT_LOCK = threading.Semaphore(int(os.getenv("VIDEO_CONVERT_MAX_PARALLEL", 
 _VIDEO_CONVERT_MAX_UPLOAD_MB = int(os.getenv("VIDEO_CONVERT_MAX_UPLOAD_MB", "200"))
 _VIDEO_CONVERT_TIMEOUT_SECONDS = int(os.getenv("VIDEO_CONVERT_TIMEOUT_SECONDS", "600"))
 _VIDEO_CONVERT_MAX_UPLOAD_BYTES = _VIDEO_CONVERT_MAX_UPLOAD_MB * 1024 * 1024
+
+REFERENCE_LIMITS_PUBLIC = {
+    "max_total_refs": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_TOTAL_REFS", "8")),
+    "max_image_refs": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_IMAGE_REFS", "6")),
+    "max_video_refs": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_VIDEO_REFS", "2")),
+    "max_audio_refs": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_AUDIO_REFS", "1")),
+    "max_image_mb": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_IMAGE_MB", "10")),
+    "max_video_mb": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_VIDEO_MB", "30")),
+    "max_audio_mb": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_AUDIO_MB", "15")),
+    "max_input_video_seconds": float(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_INPUT_VIDEO_SECONDS", "15.4")),
+    "max_audio_seconds": float(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_AUDIO_SECONDS", "15")),
+    "input_retention_hours": int(os.getenv("VIDEO_REFERENCE_PUBLIC_INPUT_RETENTION_HOURS", "24")),
+    "failed_input_retention_hours": int(os.getenv("VIDEO_REFERENCE_FAILED_INPUT_RETENTION_HOURS", "6")),
+}
+REFERENCE_LIMITS_BETA = {
+    **REFERENCE_LIMITS_PUBLIC,
+    "max_total_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_TOTAL_REFS", "12")),
+    "max_image_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_IMAGE_REFS", "6")),
+    "max_video_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_VIDEO_REFS", "2")),
+    "max_audio_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_AUDIO_REFS", "1")),
+    "max_total_upload_mb": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_TOTAL_UPLOAD_MB", "150")),
+    "input_retention_hours": int(os.getenv("VIDEO_REFERENCE_BETA_INPUT_RETENTION_HOURS", "168")),
+}
+REFERENCE_LIMITS_PUBLIC["max_total_upload_mb"] = int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_TOTAL_UPLOAD_MB", "75"))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _has_video_beta_access() -> bool:
+    """Admin/beta gate for higher-risk video features."""
+    from backend.config import config
+
+    admin_token = request.headers.get("X-Admin-Token")
+    if admin_token and config.ADMIN_TOKEN and admin_token == config.ADMIN_TOKEN:
+        return True
+    identity = getattr(g, "identity", None) or {}
+    email = identity.get("email")
+    return bool(email and config.is_admin_email(email))
+
+
+def _reference_video_policy() -> dict:
+    beta_access = _has_video_beta_access()
+    return {
+        "tier": "beta" if beta_access else "public",
+        "reference_video": True,
+        "image_refs": True,
+        "video_refs": beta_access or _env_bool("VIDEO_REFERENCE_VIDEO_REFS_PUBLIC", False),
+        "audio_refs": beta_access or _env_bool("VIDEO_REFERENCE_AUDIO_REFS_PUBLIC", False),
+        "quality_1080p": beta_access or _env_bool("VIDEO_REFERENCE_1080P_PUBLIC", False),
+        "audio_output": _env_bool("VIDEO_AUDIO_OUTPUT_PUBLIC", False),
+        "limits": REFERENCE_LIMITS_BETA if beta_access else REFERENCE_LIMITS_PUBLIC,
+    }
+
+
+def _media_payload_size_bytes(value: str) -> int:
+    if not value:
+        return 0
+    if value.startswith("data:"):
+        payload = value.split(",", 1)[1] if "," in value else ""
+        return int(len(payload) * 0.75)
+    return 0
+
+
+def _validate_reference_media_limits(image_urls: list, video_urls: list, audio_urls: list, input_video_seconds: float, resolution: str) -> tuple[dict, tuple | None]:
+    policy = _reference_video_policy()
+    limits = policy["limits"]
+
+    if video_urls and not policy["video_refs"]:
+        return policy, (jsonify({
+            "error": "feature_not_enabled",
+            "message": "Video references are currently in private beta.",
+            "field": "video_urls",
+        }), 403)
+    if audio_urls and not policy["audio_refs"]:
+        return policy, (jsonify({
+            "error": "feature_not_enabled",
+            "message": "Audio references are currently in private beta.",
+            "field": "audio_urls",
+        }), 403)
+    if resolution == "1080p" and not policy["quality_1080p"]:
+        return policy, (jsonify({
+            "error": "feature_not_enabled",
+            "message": "1080p Reference-Guided Video is currently in private beta.",
+            "field": "resolution",
+            "allowed": ["480p", "720p"],
+        }), 403)
+
+    checks = [
+        ("image_urls", len(image_urls), limits["max_image_refs"]),
+        ("video_urls", len(video_urls), limits["max_video_refs"]),
+        ("audio_urls", len(audio_urls), limits["max_audio_refs"]),
+        ("references", len(image_urls) + len(video_urls) + len(audio_urls), limits["max_total_refs"]),
+    ]
+    for field, count, max_count in checks:
+        if count > max_count:
+            return policy, (jsonify({
+                "error": "invalid_params",
+                "message": f"{field} accepts at most {max_count} item(s)",
+                "field": field,
+            }), 400)
+
+    per_kind = [
+        ("image_urls", image_urls, limits["max_image_mb"]),
+        ("video_urls", video_urls, limits["max_video_mb"]),
+        ("audio_urls", audio_urls, limits["max_audio_mb"]),
+    ]
+    total_bytes = 0
+    for field, values, max_mb in per_kind:
+        max_bytes = int(max_mb) * 1024 * 1024
+        for value in values:
+            size = _media_payload_size_bytes(value)
+            total_bytes += size
+            if size and size > max_bytes:
+                return policy, (jsonify({
+                    "error": "invalid_params",
+                    "message": f"{field} item is too large. Maximum is {max_mb} MB.",
+                    "field": field,
+                }), 400)
+
+    max_total_bytes = int(limits["max_total_upload_mb"]) * 1024 * 1024
+    if total_bytes and total_bytes > max_total_bytes:
+        return policy, (jsonify({
+            "error": "invalid_params",
+            "message": f"Reference upload payload is too large. Maximum is {limits['max_total_upload_mb']} MB.",
+            "field": "references",
+        }), 400)
+
+    if float(input_video_seconds or 0.0) > float(limits["max_input_video_seconds"]):
+        return policy, (jsonify({
+            "error": "invalid_params",
+            "message": f"Reference videos can total at most {limits['max_input_video_seconds']} seconds.",
+            "field": "input_video_seconds",
+        }), 400)
+
+    return policy, None
 
 
 def _safe_video_filename(name: str, fallback: str = "timrx-video") -> str:
@@ -374,6 +514,7 @@ def _dispatch_video_job(
     video_urls: list | None = None,
     audio_urls: list | None = None,
     input_video_seconds: float = 0.0,
+    reference_policy: dict | None = None,
 ):
     """
     Shared helper: validate, reserve credits, create job row, dispatch async, return response.
@@ -498,6 +639,7 @@ def _dispatch_video_job(
             "motion_preset": motion_preset,
             "expected_cost": expected_cost,
             "input_video_seconds": float(input_video_seconds or 0.0),
+            "reference_policy": reference_policy,
         },
     )
     if credit_error:
@@ -529,6 +671,9 @@ def _dispatch_video_job(
         "ref_image_count": len(image_urls or []),
         "ref_video_count": len(video_urls or []),
         "ref_audio_count": len(audio_urls or []),
+        "reference_policy": reference_policy,
+        "reference_input_retention_hours": (reference_policy or {}).get("limits", {}).get("input_retention_hours"),
+        "reference_failed_input_retention_hours": (reference_policy or {}).get("limits", {}).get("failed_input_retention_hours"),
         "seedance_tier": seedance_tier if provider == "seedance" else None,
         # Human-readable tier label for history cards / admin display.
         # `preview` (legacy frontend) is shown as "Quality" — the actual model identity.
@@ -1017,7 +1162,7 @@ def video_reference():
         input_video_seconds = float(body.get("input_video_seconds") or 0.0)
     except (TypeError, ValueError):
         input_video_seconds = 0.0
-    input_video_seconds = max(0.0, min(input_video_seconds, 15.4))
+    input_video_seconds = max(0.0, input_video_seconds)
 
     sc = normalize_seedance_params(
         duration_seconds=raw_duration,
@@ -1026,6 +1171,15 @@ def video_reference():
         seedance_variant=body.get("seedance_variant"),
         resolution=resolution,
     )
+    reference_policy, policy_error = _validate_reference_media_limits(
+        image_urls,
+        video_urls,
+        audio_urls,
+        input_video_seconds,
+        sc["resolution"],
+    )
+    if policy_error:
+        return policy_error
 
     prompt = sanitize_prompt(prompt, provider=provider)
 
@@ -1047,6 +1201,7 @@ def video_reference():
         video_urls=video_urls,
         audio_urls=audio_urls,
         input_video_seconds=input_video_seconds,
+        reference_policy=reference_policy,
     )
 
 
@@ -1675,6 +1830,75 @@ def video_admin_process_queue():
         "ok": True,
         "dispatched": dispatched,
         "queue_remaining": video_queue.size,
+    })
+
+
+# ── GET /video/providers — Public provider capabilities catalog ─────────
+@bp.route("/video/providers", methods=["GET", "OPTIONS"])
+@with_session_readonly
+def video_providers_catalog():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    available = video_router.get_available_providers()
+    enabled = [p.name for p in available]
+    reference_policy = _reference_video_policy()
+
+    providers = {
+        "vertex": {
+            "label": "Cinematic",
+            "provider_label": "Veo",
+            "enabled": "vertex" in enabled,
+            "modes": ["text_to_video", "animate_image", "image_transition"],
+            "durations": [4, 6, 8],
+            "resolutions": ["720p", "1080p", "4k"],
+            "aspects": ["16:9", "9:16"],
+            "audio_output": False,
+            "beta": {"extend_video": False},
+        },
+        "seedance": {
+            "label": "Fast / Quality",
+            "provider_label": "Seedance",
+            "enabled": "seedance" in enabled,
+            "modes": ["text_to_video", "animate_image", "image_transition", "reference_guided"],
+            "durations": [5, 10, 15],
+            "resolutions": {
+                "fast": ["480p", "720p"],
+                "quality": ["480p", "720p", "1080p"],
+            },
+            "aspects": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "auto"],
+            "reference_guided": reference_policy,
+            "retention": {
+                "reference_inputs_hours": reference_policy["limits"]["input_retention_hours"],
+                "failed_inputs_hours": reference_policy["limits"]["failed_input_retention_hours"],
+            },
+        },
+        "fal_seedance": {
+            "label": "Legacy",
+            "provider_label": "Seedance 1.5",
+            "enabled": "fal_seedance" in enabled,
+            "modes": ["text_to_video", "animate_image", "image_transition"],
+            "durations": [5, 10, 12],
+            "resolutions": ["720p"],
+            "aspects": ["16:9", "9:16", "1:1"],
+            "deprecated": True,
+        },
+    }
+
+    return jsonify({
+        "ok": True,
+        "enabled_providers": enabled,
+        "default_provider": enabled[0] if enabled else None,
+        "providers": providers,
+        "user_facing_names": {
+            "vertex": "Cinematic",
+            "seedance_fast": "Fast",
+            "seedance_quality": "Quality",
+            "reference_video": "Reference-Guided",
+            "image2video": "Animate",
+            "image_transition": "Transition",
+            "text2video": "Text",
+        },
     })
 
 
