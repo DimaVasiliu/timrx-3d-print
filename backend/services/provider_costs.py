@@ -77,19 +77,72 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
 # imports from here so there is a single source of truth.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PiAPI Seedance 2.0 pricing (USD per second), May 2026:
+#   seedance-2-fast       480p $0.08   720p $0.16     (no 1080p)
+#   seedance-2            480p $0.10   720p $0.20   1080p $0.50
+#   Legacy preview/VIP variants share the same per-second rates at matching res.
+# Converted at USD/GBP ≈ 0.80. Update if exchange rate moves >5%.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Per-second GBP rates by (variant, resolution). Used as both an explicit
+# lookup and the source for legacy duration-keyed tables.
+_SEEDANCE_RATE_GBP: Dict[Tuple[str, str], float] = {
+    ("seedance_fast",    "480p"): 0.064,  # $0.08 × 0.80
+    ("seedance_fast",    "720p"): 0.128,  # $0.16 × 0.80
+    ("seedance_quality", "480p"): 0.080,  # $0.10 × 0.80
+    ("seedance_quality", "720p"): 0.160,  # $0.20 × 0.80
+    ("seedance_quality", "1080p"): 0.400, # $0.50 × 0.80
+}
+
+def estimate_seedance_provider_cost(
+    tier: str,
+    duration_seconds: int,
+    resolution: str = "480p",
+    input_video_seconds: float = 0.0,
+) -> float:
+    """Estimate the GBP cost charged by PiAPI for a Seedance job.
+
+    PiAPI's Seedance 2 billing formula:
+        cost = unit_price × output_duration
+             + (unit_price / 2) × total_input_video_duration
+
+    ``input_video_seconds`` is the summed duration of any reference videos
+    (omni_reference / Reference Video mode). It is billed at half the per-second
+    rate. Pass 0 (default) for text/image/first-last jobs.
+    """
+    from backend.services.pricing_service import normalize_seedance_tier  # late import to avoid cycle
+    canon_tier = normalize_seedance_tier(tier)
+    variant = f"seedance_{canon_tier}"
+    res = (resolution or "480p").lower()
+    rate = _SEEDANCE_RATE_GBP.get((variant, res))
+    if rate is None:
+        # Fast 1080p doesn't exist; fall back to 720p rate so reports don't crash.
+        rate = _SEEDANCE_RATE_GBP.get((variant, "720p"))
+    if rate is None:
+        rate = 0.08  # generic Seedance fallback
+    base = rate * int(duration_seconds)
+    surcharge = (rate / 2.0) * max(0.0, float(input_video_seconds or 0.0))
+    return round(base + surcharge, 4)
+
+
 VIDEO_COST_GBP: Dict[Tuple[str, int], float] = {
     # Vertex (Veo)
     ("vertex", 4):            0.30,
     ("vertex", 6):            0.45,
     ("vertex", 8):            0.60,
-    # Seedance 2.0 Fast (PiAPI) — $0.08/sec USD, converted at USD/GBP ≈ 0.80
-    ("seedance_fast", 5):     0.32,
-    ("seedance_fast", 10):    0.64,
-    ("seedance_fast", 15):    0.96,
-    # Seedance 2.0 Preview (PiAPI) — $0.15/sec USD, converted at USD/GBP ≈ 0.80
-    ("seedance_preview", 5):  0.60,
-    ("seedance_preview", 10): 1.20,
-    ("seedance_preview", 15): 1.80,
+    # Seedance 2.0 Fast (480p baseline — PiAPI $0.08/s)
+    ("seedance_fast", 5):     round(0.064 * 5,  4),
+    ("seedance_fast", 10):    round(0.064 * 10, 4),
+    ("seedance_fast", 15):    round(0.064 * 15, 4),
+    # Seedance 2.0 Quality (480p baseline — PiAPI $0.10/s) — replaces legacy "preview" rate.
+    ("seedance_quality", 5):  round(0.080 * 5,  4),
+    ("seedance_quality", 10): round(0.080 * 10, 4),
+    ("seedance_quality", 15): round(0.080 * 15, 4),
+    # Legacy "preview" key — pre-GA preview-only PiAPI charge was $0.10/s, not the $0.15 we previously stored.
+    ("seedance_preview", 5):  round(0.080 * 5,  4),
+    ("seedance_preview", 10): round(0.080 * 10, 4),
+    ("seedance_preview", 15): round(0.080 * 15, 4),
     # fal Seedance 1.5 Pro
     ("fal_seedance", 5):      0.25,
     ("fal_seedance", 10):     0.50,
@@ -98,8 +151,9 @@ VIDEO_COST_GBP: Dict[Tuple[str, int], float] = {
 # Fallback per-second rates for unknown durations (GBP)
 _VIDEO_FALLBACK_RATE: Dict[str, float] = {
     "vertex":           0.075,
-    "seedance_fast":    0.064,   # $0.08/sec × 0.80
-    "seedance_preview": 0.12,    # $0.15/sec × 0.80
+    "seedance_fast":    0.064,   # 480p baseline; 720p costs ~2× this
+    "seedance_quality": 0.080,   # 480p baseline; 720p ~2×, 1080p ~5×
+    "seedance_preview": 0.080,   # legacy alias of quality at 480p
     "fal_seedance":     0.05,
 }
 
@@ -108,26 +162,49 @@ _VIDEO_FALLBACK_RATE: Dict[str, float] = {
 # VIDEO COST HELPER (same logic as the original estimate_video_provider_cost)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def estimate_video_cost(provider: str, duration_seconds: int, seedance_tier: str = "fast") -> float:
+def estimate_video_cost(
+    provider: str,
+    duration_seconds: int,
+    seedance_tier: str = "fast",
+    resolution: str | None = None,
+    input_video_seconds: float = 0.0,
+) -> float:
     """
     Estimate the real GBP cost of a video job to the provider.
+
+    Args:
+        provider:            "vertex" | "seedance" | "fal_seedance"
+        duration_seconds:    Duration in seconds
+        seedance_tier:       "fast" | "quality" (legacy "preview" → quality). Ignored for non-seedance.
+        resolution:          "480p" / "720p" / "1080p" — Seedance only; defaults to 480p.
+        input_video_seconds: Total reference-video duration (Seedance omni_reference). Billed
+                             by PiAPI at half-rate. Ignored for non-seedance providers.
 
     This is the canonical implementation; video_limits.py delegates here.
     """
     if provider == "fal_seedance":
         key = ("fal_seedance", int(duration_seconds))
-    elif provider == "seedance":
-        key = (f"seedance_{seedance_tier}", int(duration_seconds))
-    else:
-        key = ("vertex", int(duration_seconds))
+        cost = VIDEO_COST_GBP.get(key)
+        if cost is not None:
+            return cost
+        rate = _VIDEO_FALLBACK_RATE.get("fal_seedance", 0.05)
+        return round(rate * int(duration_seconds), 2)
 
+    if provider == "seedance":
+        # Prefer the explicit (tier, resolution) lookup — it reflects the real PiAPI rate.
+        from backend.services.pricing_service import normalize_seedance_tier  # late import
+        canon_tier = normalize_seedance_tier(seedance_tier)
+        return estimate_seedance_provider_cost(
+            canon_tier, int(duration_seconds), resolution or "480p",
+            input_video_seconds=float(input_video_seconds or 0.0),
+        )
+
+    # Vertex
+    key = ("vertex", int(duration_seconds))
     cost = VIDEO_COST_GBP.get(key)
     if cost is not None:
         return cost
-
-    # Fallback: linear estimate
-    variant = key[0]
-    rate = _VIDEO_FALLBACK_RATE.get(variant, 0.075)
+    rate = _VIDEO_FALLBACK_RATE.get("vertex", 0.075)
     return round(rate * int(duration_seconds), 2)
 
 
@@ -161,7 +238,9 @@ def estimate_provider_cost(
         meta = meta or {}
         duration = meta.get("duration_seconds", 6)
         tier = meta.get("seedance_tier", "fast")
-        return estimate_video_cost(provider, int(duration), tier)
+        resolution = meta.get("resolution")
+        input_video_seconds = meta.get("input_video_seconds", 0.0)
+        return estimate_video_cost(provider, int(duration), tier, resolution, input_video_seconds)
 
     # 3. Legacy / video action_code fallback
     # Some older jobs stored VIDEO_GENERATE, GEMINI_VIDEO, etc.
@@ -173,7 +252,9 @@ def estimate_provider_cost(
         prov = provider or "vertex"
         duration = meta.get("duration_seconds", 6)
         tier = meta.get("seedance_tier", "fast")
-        return estimate_video_cost(prov, int(duration), tier)
+        resolution = meta.get("resolution")
+        input_video_seconds = meta.get("input_video_seconds", 0.0)
+        return estimate_video_cost(prov, int(duration), tier, resolution, input_video_seconds)
 
     return 0.0
 

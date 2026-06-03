@@ -48,6 +48,18 @@ def _ensure_public_image_url(image_data: str) -> str:
     return ensure_public_image_url(image_data, provider_name="seedance")
 
 
+def _ensure_public_media_url(media_data: str, kind: str) -> str:
+    """Make any reference media (image/video/audio) publicly downloadable for PiAPI."""
+    from backend.services.video_providers.image_utils import ensure_public_media_url
+    return ensure_public_media_url(media_data, provider_name="seedance", kind=kind)
+
+
+# omni_reference reference ceilings (PiAPI Seedance 2 GA).
+OMNI_MAX_TOTAL_REFS = 12          # images + videos + audios combined
+OMNI_MAX_AUDIO_SECONDS = 15       # total audio duration ceiling
+OMNI_MAX_INPUT_VIDEO_SECONDS = 15.4  # total reference-video duration ceiling
+
+
 # ── Seedance constraints (GA) ───────────────────────────────────
 # Backend is permissive: GA PiAPI accepts 4–15s. We don't reject 4/6/7/8/9/11/12/13/14
 # even though the UI currently only exposes 5/10/15 — keeps the door open for future UX.
@@ -309,6 +321,95 @@ class SeedanceProvider:
     # Back-compat alias — old callers that call `start_experimental_morph` keep working
     # but now route through the proper first_last_frames path.
     start_experimental_morph = start_image_transition
+
+    def start_reference_video(
+        self,
+        prompt: str,
+        image_data_list: Optional[list] = None,
+        video_data_list: Optional[list] = None,
+        audio_data_list: Optional[list] = None,
+        **params,
+    ) -> Dict[str, Any]:
+        """
+        Reference Video generation — PiAPI Seedance 2 GA `omni_reference` mode.
+
+        Accepts up to 12 mixed references (images + videos + audio combined) and
+        weaves them into the output. References are addressable in the prompt via
+        @image1 / @video1 / @audio1 (1-based per media kind); PiAPI maps these to
+        ByteDance's upstream 【@图片N / @视频N / @音频N】 form.
+
+        Each input is normalised to a public URL (base64/data-URI → S3 presign).
+
+        Cost note (caller's responsibility to surface): PiAPI bills
+        ``unit_price × output_duration + (unit_price/2) × total_input_video_seconds``,
+        so reference *videos* add to the upstream cost. This method does not block;
+        the route layer computes and surfaces the surcharge (warn-only policy).
+        """
+        clean = normalize_seedance_params(
+            duration_seconds=params.get("duration_seconds", DEFAULT_DURATION),
+            aspect_ratio=params.get("aspect_ratio", DEFAULT_ASPECT),
+            tier=params.get("tier"),
+            seedance_variant=params.get("task_type") or params.get("seedance_variant"),
+            resolution=params.get("resolution"),
+        )
+
+        image_data_list = image_data_list or []
+        video_data_list = video_data_list or []
+        audio_data_list = audio_data_list or []
+
+        total_refs = len(image_data_list) + len(video_data_list) + len(audio_data_list)
+        if total_refs == 0:
+            raise RuntimeError("reference_video requires at least one image, video, or audio reference")
+        if total_refs > OMNI_MAX_TOTAL_REFS:
+            raise RuntimeError(
+                f"reference_video accepts at most {OMNI_MAX_TOTAL_REFS} combined references "
+                f"(got {total_refs})"
+            )
+        # Audio-only is not allowed by PiAPI — at least one image or video must accompany audio.
+        if audio_data_list and not (image_data_list or video_data_list):
+            raise RuntimeError("reference_video: audio references require at least one image or video reference")
+
+        image_urls = [_ensure_public_media_url(x, "image") for x in image_data_list if x]
+        video_urls = [_ensure_public_media_url(x, "video") for x in video_data_list if x]
+        audio_urls = [_ensure_public_media_url(x, "audio") for x in audio_data_list if x]
+
+        # If the caller didn't reference any media in the prompt, prepend a sensible
+        # default mention chain so the model actually uses the supplied references.
+        ref_prompt = prompt or ""
+        if "@image" not in ref_prompt and "@video" not in ref_prompt and "@audio" not in ref_prompt:
+            mentions = []
+            mentions += [f"@image{i+1}" for i in range(len(image_urls))]
+            mentions += [f"@video{i+1}" for i in range(len(video_urls))]
+            mentions += [f"@audio{i+1}" for i in range(len(audio_urls))]
+            if mentions:
+                ref_prompt = f"{' '.join(mentions)} {ref_prompt}".strip()
+
+        print(
+            f"[SEEDANCE] omni_reference: tier={clean['tier']} duration={clean['duration_seconds']}s "
+            f"resolution={clean['resolution']} images={len(image_urls)} videos={len(video_urls)} "
+            f"audios={len(audio_urls)}"
+        )
+
+        try:
+            return create_seedance_task(
+                prompt=ref_prompt,
+                duration=clean["duration_seconds"],
+                aspect_ratio=clean["aspect_ratio"],
+                image_urls=image_urls or None,
+                video_urls=video_urls or None,
+                audio_urls=audio_urls or None,
+                task_type=clean["task_type"],
+                mode="omni_reference",
+                resolution=clean["resolution"],
+            )
+        except SeedanceQuotaError as e:
+            from backend.services.video_router import QuotaExhaustedError
+            raise QuotaExhaustedError(self.name, str(e))
+        except RuntimeError as e:
+            if _is_quota_error(str(e)):
+                from backend.services.video_router import QuotaExhaustedError
+                raise QuotaExhaustedError(self.name, str(e))
+            raise
 
     def check_status(self, task_id: str) -> Dict[str, Any]:
         """Check status of a Seedance task."""

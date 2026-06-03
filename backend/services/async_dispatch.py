@@ -1843,7 +1843,16 @@ def _dispatch_to_seedance(
     )
     route_params["tier"] = seedance_tier
 
-    if task in ("image_transition", "experimental_morph"):
+    if task == "reference_video":
+        # PiAPI Seedance 2 GA omni_reference — mixed image/video/audio references.
+        resp = seedance.start_reference_video(
+            prompt=prompt,
+            image_data_list=payload.get("image_urls") or [],
+            video_data_list=payload.get("video_urls") or [],
+            audio_data_list=payload.get("audio_urls") or [],
+            **route_params,
+        )
+    elif task in ("image_transition", "experimental_morph"):
         # Native first_last_frames (Seedance 2 GA). `experimental_morph` retained
         # as a legacy task name from older clients — routes through the same path.
         prompt = payload.get("motion") or prompt

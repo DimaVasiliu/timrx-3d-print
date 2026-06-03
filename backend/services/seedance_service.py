@@ -125,6 +125,8 @@ def create_seedance_task(
     duration: int = 5,
     aspect_ratio: str = "16:9",
     image_urls: Optional[List[str]] = None,
+    video_urls: Optional[List[str]] = None,
+    audio_urls: Optional[List[str]] = None,
     task_type: str = "seedance-2-fast",
     mode: Optional[str] = None,
     resolution: Optional[str] = None,
@@ -141,7 +143,9 @@ def create_seedance_task(
                        • text_to_video mode MUST omit image_urls.
                        • first_last_frames mode accepts 1 image (animate from single ref)
                          or 2 images (transition from first → last frame).
-                       • omni_reference accepts up to 12.
+                       • omni_reference accepts up to 12 (shared with video/audio refs).
+        video_urls:   Optional video reference URLs (omni_reference only; mp4/mov).
+        audio_urls:   Optional audio reference URLs (omni_reference only; mp3/wav, ≤15s total).
         task_type:    PiAPI task type. Defaults to GA `seedance-2-fast`. Legacy preview
                       types are accepted (and silently upgraded to their GA equivalent).
         mode:         "text_to_video" | "first_last_frames" | "omni_reference"
@@ -177,17 +181,30 @@ def create_seedance_task(
         "aspect_ratio": aspect_ratio,
     }
 
+    has_av_refs = bool(video_urls or audio_urls)
+
     if is_ga:
         # mode is REQUIRED on GA. Default to text_to_video if caller didn't say.
-        # If images are present and no mode was given, prefer first_last_frames.
+        # PiAPI auto-infers mode from inputs; we mirror that here:
+        #   video/audio refs (any combo) → omni_reference
+        #   1–2 images only              → first_last_frames
+        #   no refs                      → text_to_video
         if mode and mode in VALID_MODES:
             resolved_mode = mode
+        elif has_av_refs:
+            resolved_mode = "omni_reference"
         elif image_urls:
             resolved_mode = "first_last_frames"
         else:
             resolved_mode = "text_to_video"
 
-        # GA contract: text_to_video does NOT accept image_urls. Strip them to avoid 400.
+        # If A/V refs are present the mode MUST be omni_reference (first_last_frames
+        # and text_to_video both reject video/audio per the PiAPI spec).
+        if has_av_refs and resolved_mode != "omni_reference":
+            print("[Seedance] video/audio refs present — forcing mode=omni_reference per PiAPI spec")
+            resolved_mode = "omni_reference"
+
+        # GA contract: text_to_video does NOT accept any references. Strip them to avoid 400.
         if resolved_mode == "text_to_video" and image_urls:
             print("[Seedance] WARNING: text_to_video mode rejects image_urls — stripping per PiAPI spec")
             image_urls = None
@@ -196,6 +213,11 @@ def create_seedance_task(
 
         if resolution:
             input_obj["resolution"] = resolution.lower()
+    else:
+        # Legacy preview types never carried video/audio refs.
+        has_av_refs = False
+        video_urls = None
+        audio_urls = None
 
     body = {
         "model": "seedance",
@@ -205,6 +227,11 @@ def create_seedance_task(
 
     if image_urls:
         body["input"]["image_urls"] = image_urls
+    # Video / audio references — omni_reference mode only (guaranteed by the logic above).
+    if video_urls:
+        body["input"]["video_urls"] = video_urls
+    if audio_urls:
+        body["input"]["audio_urls"] = audio_urls
 
     # Best-effort webhook config: PiAPI currently strips this for Seedance models,
     # but we include it for forward compatibility. Polling is the primary path.
@@ -230,6 +257,8 @@ def create_seedance_task(
         "duration": _input_view.get("duration"),
         "aspect_ratio": _input_view.get("aspect_ratio"),
         "image_url_count": len(_input_view.get("image_urls") or []),
+        "video_url_count": len(_input_view.get("video_urls") or []),
+        "audio_url_count": len(_input_view.get("audio_urls") or []),
         "input_keys": sorted(_input_view.keys()),
         "prompt_preview": _prompt_preview,
         "webhook_config": (body.get("config") or {}).get("webhook_config", "NOT_SET"),

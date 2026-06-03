@@ -15,6 +15,21 @@ def ensure_public_image_url(image_data: str, *, provider_name: str = "provider")
     """
     Ensure image_data is a publicly accessible URL for an external provider API.
 
+    Backward-compatible thin wrapper around ensure_public_media_url(kind="image").
+    Existing image-only callers stay unchanged.
+    """
+    return ensure_public_media_url(image_data, provider_name=provider_name, kind="image")
+
+
+def ensure_public_media_url(media_data: str, *, provider_name: str = "provider", kind: str = "image") -> str:
+    """
+    Ensure media_data is a publicly accessible URL for an external provider API.
+
+    The PiAPI Seedance 2 omni_reference (Reference Video) mode accepts images,
+    videos and audio as references, all of which must be publicly downloadable
+    URLs. The S3 upload + presign path is mime-agnostic, so this generalises the
+    original image-only helper to any media kind.
+
     Handles:
     - Public HTTP(S) URLs → pass through
     - Private S3 URLs (our bucket) → presign for 1h
@@ -22,8 +37,9 @@ def ensure_public_image_url(image_data: str, *, provider_name: str = "provider")
     - Empty/None → return as-is
 
     Args:
-        image_data: Image URL string, data URI, or empty.
-        provider_name: Provider label for log messages (e.g., "seedance", "fal_seedance").
+        media_data:    Media URL string, data URI, or empty.
+        provider_name: Provider label for log messages (e.g., "seedance").
+        kind:          "image" | "video" | "audio" — used for S3 prefix + log labels.
 
     Returns:
         A publicly accessible URL string.
@@ -31,7 +47,8 @@ def ensure_public_image_url(image_data: str, *, provider_name: str = "provider")
     from backend.services.s3_service import presign_s3_key, upload_base64_to_s3
     from backend.config import config as app_config
 
-    tag = provider_name.upper()
+    tag = f"{provider_name.upper()}:{kind.upper()}"
+    image_data = media_data  # internal alias keeps the proven logic below unchanged
 
     if not image_data:
         return image_data
@@ -58,8 +75,8 @@ def ensure_public_image_url(image_data: str, *, provider_name: str = "provider")
         try:
             result = upload_base64_to_s3(
                 data_url=image_data,
-                prefix="video-input",
-                name=f"{provider_name}_ref",
+                prefix=f"video-input/{kind}",
+                name=f"{provider_name}_{kind}_ref",
                 user_id=provider_name,
             )
             s3_key = None

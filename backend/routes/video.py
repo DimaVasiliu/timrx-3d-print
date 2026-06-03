@@ -370,6 +370,10 @@ def _dispatch_video_job(
     seedance_tier: str = "fast",
     start_image: str | None = None,
     end_image: str | None = None,
+    image_urls: list | None = None,
+    video_urls: list | None = None,
+    audio_urls: list | None = None,
+    input_video_seconds: float = 0.0,
 ):
     """
     Shared helper: validate, reserve credits, create job row, dispatch async, return response.
@@ -511,6 +515,12 @@ def _dispatch_video_job(
         "style_preset": style_preset,
         "motion_preset": motion_preset,
         "seedance_variant": seedance_variant,
+        # Total duration of reference videos (omni_reference). PiAPI bills an extra
+        # (unit_price / 2) × input_video_seconds, so we persist it for cost stamping.
+        "input_video_seconds": float(input_video_seconds or 0.0),
+        "ref_image_count": len(image_urls or []),
+        "ref_video_count": len(video_urls or []),
+        "ref_audio_count": len(audio_urls or []),
         "seedance_tier": seedance_tier if provider == "seedance" else None,
         # Human-readable tier label for history cards / admin display.
         # `preview` (legacy frontend) is shown as "Quality" — the actual model identity.
@@ -622,6 +632,13 @@ def _dispatch_video_job(
         payload["start_image"] = start_image
     if end_image:
         payload["end_image"] = end_image
+    # Reference Video (omni_reference) media — carried through to the Seedance provider.
+    if image_urls:
+        payload["image_urls"] = image_urls
+    if video_urls:
+        payload["video_urls"] = video_urls
+    if audio_urls:
+        payload["audio_urls"] = audio_urls
 
     from backend.services.async_dispatch import dispatch_gemini_video_async
 
@@ -639,7 +656,8 @@ def _dispatch_video_job(
     # D1: Return fast — skip balance query (frontend caches wallet separately)
     from backend.services.video_limits import get_estimated_render_time
     rtime = get_estimated_render_time(provider)
-    return jsonify({
+
+    resp_body = {
         "ok": True,
         "job_id": internal_job_id,
         "video_id": internal_job_id,
@@ -653,7 +671,32 @@ def _dispatch_video_job(
             "duration_seconds": duration_seconds,
         },
         "estimated_duration_seconds": rtime["estimated_duration_seconds"],
-    })
+    }
+
+    # Warn-only cost notice: surface PiAPI's input-video surcharge for visibility.
+    # Never blocks the job — the base reservation already covers the render.
+    if provider == "seedance" and float(input_video_seconds or 0) > 0:
+        try:
+            from backend.services.provider_costs import estimate_seedance_provider_cost
+            base_gbp = estimate_seedance_provider_cost(seedance_tier, duration_seconds, resolution)
+            total_gbp = estimate_seedance_provider_cost(
+                seedance_tier, duration_seconds, resolution, input_video_seconds=float(input_video_seconds)
+            )
+            resp_body["cost_notice"] = {
+                "kind": "input_video_surcharge",
+                "input_video_seconds": round(float(input_video_seconds), 2),
+                "base_provider_cost_gbp": round(base_gbp, 4),
+                "surcharge_provider_cost_gbp": round(max(0.0, total_gbp - base_gbp), 4),
+                "total_provider_cost_gbp": round(total_gbp, 4),
+                "message": (
+                    "Reference videos add to the upstream provider cost "
+                    "(PiAPI bills half the per-second rate for each second of input video)."
+                ),
+            }
+        except Exception as _ce:
+            print(f"[VIDEO] cost_notice computation skipped: {_ce}")
+
+    return jsonify(resp_body)
 
 
 # ── POST /video/text — Text → short cinematic clip ───────────
@@ -888,6 +931,111 @@ def video_animate():
         seedance_tier=seedance_tier,
         start_image=start_image if is_two_image else None,
         end_image=end_image if is_two_image else None,
+    )
+
+
+# ── POST /video/reference — Reference Video (Seedance omni_reference) ─────────
+@bp.route("/video/reference", methods=["POST", "OPTIONS"])
+@with_session
+def video_reference():
+    """
+    Reference Video generation (PiAPI Seedance 2 GA `omni_reference`).
+
+    Accepts up to 12 combined references — images, videos, and audio — plus a
+    prompt that can address them via @image1 / @video1 / @audio1. Seedance-only;
+    other providers don't support multi-modal references.
+
+    Body:
+        provider:            must resolve to "seedance"
+        prompt:              text (may contain @-mentions)
+        image_urls:          list of image data-URIs/URLs (optional)
+        video_urls:          list of video data-URIs/URLs (optional)
+        audio_urls:          list of audio data-URIs/URLs (optional)
+        input_video_seconds: client-reported total reference-video duration (warn-only cost)
+        duration_sec, aspect_ratio, resolution, seedance_tier, seedance_variant, negative_prompt, seed
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    available_providers = video_router.get_available_providers()
+    if not available_providers:
+        return jsonify({"error": "video_not_configured", "message": "No video generation providers are configured"}), 500
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+
+    body = request.get_json(silent=True) or {}
+
+    provider = normalize_provider_name(body.get("provider"))
+    if provider != "seedance":
+        return jsonify({
+            "error": "unsupported_provider",
+            "message": "Reference Video mode is only available on Seedance 2.0 (PiAPI).",
+            "field": "provider",
+            "allowed": ["seedance"],
+        }), 400
+
+    def _as_list(v):
+        if not v:
+            return []
+        return v if isinstance(v, list) else [v]
+
+    image_urls = [x for x in _as_list(body.get("image_urls") or body.get("images")) if x]
+    video_urls = [x for x in _as_list(body.get("video_urls") or body.get("videos")) if x]
+    audio_urls = [x for x in _as_list(body.get("audio_urls") or body.get("audios")) if x]
+
+    total_refs = len(image_urls) + len(video_urls) + len(audio_urls)
+    if total_refs == 0:
+        return jsonify({"error": "invalid_params", "message": "At least one image, video, or audio reference is required", "field": "image_urls"}), 400
+    if total_refs > 12:
+        return jsonify({"error": "invalid_params", "message": "Reference Video accepts at most 12 combined references", "field": "references"}), 400
+    if audio_urls and not (image_urls or video_urls):
+        return jsonify({"error": "invalid_params", "message": "Audio references require at least one image or video reference", "field": "audio_urls"}), 400
+
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "invalid_params", "message": "prompt is required for Reference Video", "field": "prompt"}), 400
+
+    raw_duration = body.get("duration_sec") or body.get("seconds") or 5
+    aspect_ratio = body.get("aspect_ratio") or "16:9"
+    resolution = body.get("resolution") or "720p"
+    negative_prompt = (body.get("negative_prompt") or "").strip()
+    seed = body.get("seed")
+
+    try:
+        input_video_seconds = float(body.get("input_video_seconds") or 0.0)
+    except (TypeError, ValueError):
+        input_video_seconds = 0.0
+
+    sc = normalize_seedance_params(
+        duration_seconds=raw_duration,
+        aspect_ratio=aspect_ratio,
+        tier=body.get("seedance_tier"),
+        seedance_variant=body.get("seedance_variant"),
+        resolution=resolution,
+    )
+
+    prompt = sanitize_prompt(prompt, provider=provider)
+
+    return _dispatch_video_job(
+        identity_id=identity_id or "",
+        task="reference_video",
+        prompt=prompt,
+        image_data=None,
+        aspect_ratio=sc["aspect_ratio"],
+        resolution=sc["resolution"],
+        duration_seconds=sc["duration_seconds"],
+        motion=prompt,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        provider=provider,
+        seedance_variant=sc["task_type"],
+        seedance_tier=sc["tier"],
+        image_urls=image_urls,
+        video_urls=video_urls,
+        audio_urls=audio_urls,
+        input_video_seconds=input_video_seconds,
     )
 
 
