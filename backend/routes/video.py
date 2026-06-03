@@ -430,7 +430,14 @@ def _dispatch_video_job(
 
     # Credit calculation — server is sole authority on action code
     action_key = get_video_action_code(task, duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier)
-    expected_cost = get_video_credit_cost(duration_seconds, resolution, provider=provider, seedance_tier=seedance_tier, task=task)
+    expected_cost = get_video_credit_cost(
+        duration_seconds,
+        resolution,
+        provider=provider,
+        seedance_tier=seedance_tier,
+        task=task,
+        input_video_seconds=float(input_video_seconds or 0.0),
+    )
 
     print(
         f"[VIDEO] resolved provider={provider} task={task} duration={duration_seconds}s "
@@ -490,6 +497,7 @@ def _dispatch_video_job(
             "style_preset": style_preset,
             "motion_preset": motion_preset,
             "expected_cost": expected_cost,
+            "input_video_seconds": float(input_video_seconds or 0.0),
         },
     )
     if credit_error:
@@ -669,12 +677,14 @@ def _dispatch_video_job(
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
             "duration_seconds": duration_seconds,
+            "input_video_seconds": round(float(input_video_seconds or 0.0), 2),
         },
+        "credits_reserved": expected_cost,
         "estimated_duration_seconds": rtime["estimated_duration_seconds"],
     }
 
-    # Warn-only cost notice: surface PiAPI's input-video surcharge for visibility.
-    # Never blocks the job — the base reservation already covers the render.
+    # Surface PiAPI's input-video surcharge for visibility; this is already
+    # included in the credit reservation above.
     if provider == "seedance" and float(input_video_seconds or 0) > 0:
         try:
             from backend.services.provider_costs import estimate_seedance_provider_cost
@@ -951,7 +961,7 @@ def video_reference():
         image_urls:          list of image data-URIs/URLs (optional)
         video_urls:          list of video data-URIs/URLs (optional)
         audio_urls:          list of audio data-URIs/URLs (optional)
-        input_video_seconds: client-reported total reference-video duration (warn-only cost)
+        input_video_seconds: client-reported total reference-video duration
         duration_sec, aspect_ratio, resolution, seedance_tier, seedance_variant, negative_prompt, seed
     """
     if request.method == "OPTIONS":
@@ -1007,6 +1017,7 @@ def video_reference():
         input_video_seconds = float(body.get("input_video_seconds") or 0.0)
     except (TypeError, ValueError):
         input_video_seconds = 0.0
+    input_video_seconds = max(0.0, min(input_video_seconds, 15.4))
 
     sc = normalize_seedance_params(
         duration_seconds=raw_duration,

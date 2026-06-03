@@ -149,8 +149,15 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
         )
 
     try:
-        # Use canonical key for cost lookup
-        cost = PricingService.get_action_cost(canonical_action)
+        # Use canonical key for cost lookup. Some actions have a dynamic
+        # surcharge on top of the DB base cost (Seedance Reference Video input
+        # videos, for example), so allow callers to pass an exact expected_cost.
+        base_cost = PricingService.get_action_cost(canonical_action)
+        try:
+            expected_cost = int((job_meta or {}).get("expected_cost") or 0)
+        except (TypeError, ValueError):
+            expected_cost = 0
+        cost = max(base_cost, expected_cost)
         # print(f"[CREDITS:DEBUG] PricingService.get_action_cost('{canonical_action}') = {cost}")
         if cost == 0:
             # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - No cost for {canonical_action}, no reservation needed")
@@ -178,17 +185,19 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
             )
 
         # Debug: confirm action code accepted by wallet + pricing
-        print(f"[CREDITS] action={canonical_action} wallet_accepted=true db_cost={cost} available={available}")
+        print(f"[CREDITS] action={canonical_action} wallet_accepted=true cost={cost} base_cost={base_cost} available={available}")
 
         # Use canonical key for reservation
         result = ReservationService.reserve_credits(
             identity_id=identity_id,
             action_key=canonical_action,
             job_id=internal_job_id,
+            amount_override=cost,
             meta={
                 "action_key": canonical_action,
                 "requested_action_key": action_key,  # Original key for debugging
                 "source": "paid_job_pipeline",
+                "base_cost": base_cost,
                 **(job_meta or {}),
             },
         )
