@@ -106,7 +106,7 @@ def execute_refund(
 
     identity_id = purchase["identity_id"]
     credits_granted = purchase.get("credits_granted", 0) or 0
-    amount_gbp = purchase.get("amount", 0) or 0
+    amount_usd = purchase.get("amount", 0) or 0
     plan_code = purchase.get("plan_code") or ""
     purchase_status = purchase.get("status", "")
     payment_provider = purchase.get("provider", "stripe")
@@ -118,7 +118,7 @@ def execute_refund(
             identity_id=identity_id,
             reason="purchase_already_refunded",
             message="This purchase has already been marked as refunded.",
-            amount_gbp=amount_gbp,
+            amount_usd=amount_usd,
             credits_granted=credits_granted,
             executed_by=executed_by,
             admin_note=admin_note,
@@ -130,7 +130,7 @@ def execute_refund(
             identity_id=identity_id,
             reason="purchase_not_completed",
             message=f"Purchase status is '{purchase_status}', not 'completed'. Cannot refund.",
-            amount_gbp=amount_gbp,
+            amount_usd=amount_usd,
             credits_granted=credits_granted,
             executed_by=executed_by,
             admin_note=admin_note,
@@ -151,7 +151,7 @@ def execute_refund(
             identity_id=identity_id,
             reason="duplicate_refund",
             message=f"An executed refund already exists for this purchase (refund_id={existing_refund['id']}).",
-            amount_gbp=amount_gbp,
+            amount_usd=amount_usd,
             credits_granted=credits_granted,
             executed_by=executed_by,
             admin_note=admin_note,
@@ -200,7 +200,7 @@ def execute_refund(
                 f"Automatic credit reversal is not safe. "
                 f"Use manual_record_only=true to record the refund decision without altering credits."
             ),
-            amount_gbp=amount_gbp,
+            amount_usd=amount_usd,
             credits_granted=credits_granted,
             credits_used=credits_used,
             credits_remaining=credits_remaining,
@@ -227,7 +227,7 @@ def execute_refund(
                 f"discrepancy. Use manual_record_only=true to record the decision, then adjust "
                 f"credits manually if needed."
             ),
-            amount_gbp=amount_gbp,
+            amount_usd=amount_usd,
             credits_granted=credits_granted,
             credits_used=credits_used,
             credits_remaining=credits_remaining,
@@ -298,7 +298,7 @@ def execute_refund(
                         identity_id=identity_id,
                         reason="ledger_refund_exists",
                         message="A refund ledger entry already exists for this purchase (likely from payment webhook).",
-                        amount_gbp=amount_gbp,
+                        amount_usd=amount_usd,
                         credits_granted=credits_granted,
                         credits_used=credits_used,
                         credits_remaining=credits_remaining,
@@ -332,7 +332,7 @@ def execute_refund(
 
             print(
                 f"[ADMIN_REFUND_EXECUTE] purchase_id={purchase_id} "
-                f"amount={amount_gbp} status=executed "
+                f"amount={amount_usd} status=executed "
                 f"credits_reversed={credits_to_reverse} "
                 f"balance: {current_balance} -> {new_balance}"
             )
@@ -345,7 +345,7 @@ def execute_refund(
                 payment_provider=payment_provider,
                 refund_type=refund_type,
                 refund_status="failed",
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 credits_reversed=0,
                 credit_type=credit_type,
                 reason=reason,
@@ -370,7 +370,7 @@ def execute_refund(
         external_refund_id, external_refund_executed, external_refund_error = (
             _attempt_mollie_refund(
                 payment_id=payment_reference,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 reason=reason or "Admin refund",
                 purchase_id=purchase_id,
             )
@@ -402,7 +402,7 @@ def execute_refund(
         payment_reference=purchase.get("provider_payment_id"),
         refund_type=refund_type,
         refund_status=refund_status,
-        amount_gbp=amount_gbp,
+        amount_usd=amount_usd,
         credits_reversed=credits_to_reverse,
         credit_type=credit_type,
         reason=reason,
@@ -427,7 +427,7 @@ def execute_refund(
             identity_id=identity_id,
             refund_id=refund_record["id"],
             purchase_id=purchase_id,
-            amount_gbp=amount_gbp,
+            amount_usd=amount_usd,
             credits_reversed=credits_to_reverse,
             credits_granted=credits_granted,
             refund_type=refund_type,
@@ -468,7 +468,7 @@ def execute_refund(
         "summary": {
             "purchase_id": purchase_id,
             "identity_id": identity_id,
-            "amount_gbp": amount_gbp,
+            "amount_usd": amount_usd,
             "credits_granted": credits_granted,
             "credits_used": credits_used,
             "credits_remaining_before": credits_remaining,
@@ -552,7 +552,7 @@ def list_refunds(
         f"""
         SELECT r.id, r.purchase_id, r.subscription_id, r.identity_id,
                r.payment_provider, r.payment_reference, r.refund_type, r.refund_status,
-               r.amount_gbp, r.currency, r.credits_reversed, r.credit_type,
+               r.amount_usd, r.currency, r.credits_reversed, r.credit_type,
                r.reason, r.admin_note, r.executed_by, r.external_refund_id,
                r.metadata, r.created_at, r.executed_at,
                i.email AS identity_email,
@@ -603,7 +603,7 @@ def list_refunds(
             "payment_reference": r["payment_reference"],
             "refund_type": r["refund_type"],
             "refund_status": r["refund_status"],
-            "amount_gbp": float(r["amount_gbp"]) if r["amount_gbp"] is not None else 0,
+            "amount_usd": float(r["amount_usd"]) if r["amount_usd"] is not None else 0,
             "currency": r["currency"],
             "credits_reversed": r["credits_reversed"],
             "credit_type": r["credit_type"],
@@ -656,7 +656,7 @@ def resolve_refund(
 
     # Fetch current refund
     refund = query_one(
-        f"SELECT id, identity_id, purchase_id, refund_status, amount_gbp, currency, reason, metadata FROM {_TABLE} WHERE id = %s::uuid",
+        f"SELECT id, identity_id, purchase_id, refund_status, amount_usd, currency, reason, metadata FROM {_TABLE} WHERE id = %s::uuid",
         (refund_id,),
     )
     if not refund:
@@ -707,8 +707,8 @@ def resolve_refund(
             identity_id=str(refund["identity_id"]),
             refund_id=str(refund["id"]),
             purchase_id=str(refund["purchase_id"]) if refund["purchase_id"] else None,
-            amount_gbp=float(refund["amount_gbp"]) if refund["amount_gbp"] is not None else 0,
-            currency=refund["currency"] or "GBP",
+            amount_usd=float(refund["amount_usd"]) if refund["amount_usd"] is not None else 0,
+            currency=refund["currency"] or "USD",
             resolution=resolution,
             reason=reason,
         )
@@ -735,7 +735,7 @@ def _queue_resolution_email(
     identity_id: str,
     refund_id: str,
     purchase_id: Optional[str],
-    amount_gbp: float,
+    amount_usd: float,
     currency: str,
     resolution: str,
     reason: Optional[str],
@@ -773,7 +773,7 @@ def _queue_resolution_email(
 
         payload = {
             "refund_id": refund_id,
-            "amount_gbp": amount_gbp,
+            "amount_usd": amount_usd,
             "currency": currency,
             "purchase_id": purchase_id,
             "resolution": resolution,
@@ -850,7 +850,7 @@ def execute_approved_refund(
     identity_id = str(refund["identity_id"])
     payment_provider = refund["payment_provider"]
     refund_type = refund["refund_type"]
-    amount_gbp = float(refund["amount_gbp"]) if refund["amount_gbp"] is not None else 0
+    amount_usd = float(refund["amount_usd"]) if refund["amount_usd"] is not None else 0
     existing_meta = refund["metadata"] or {}
 
     if not purchase_id:
@@ -1001,7 +1001,7 @@ def execute_approved_refund(
         external_refund_id, external_refund_executed, external_refund_error = (
             _attempt_mollie_refund(
                 payment_id=payment_reference,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 reason=reason or refund["reason"] or "Admin refund",
                 purchase_id=purchase_id,
             )
@@ -1062,7 +1062,7 @@ def execute_approved_refund(
         identity_id=identity_id,
         refund_id=refund_id,
         purchase_id=purchase_id,
-        amount_gbp=amount_gbp,
+        amount_usd=amount_usd,
         credits_reversed=credits_to_reverse,
         credits_granted=credits_granted,
         refund_type=refund_type,
@@ -1107,7 +1107,7 @@ def execute_approved_refund(
         "summary": {
             "purchase_id": purchase_id,
             "identity_id": identity_id,
-            "amount_gbp": amount_gbp,
+            "amount_usd": amount_usd,
             "credits_granted": credits_granted,
             "credits_used": credits_used,
             "credits_remaining_before": credits_remaining,
@@ -1175,7 +1175,7 @@ def _queue_refund_email(
     identity_id: str,
     refund_id: str,
     purchase_id: str,
-    amount_gbp: float,
+    amount_usd: float,
     credits_reversed: int,
     credits_granted: int,
     refund_type: str,
@@ -1222,8 +1222,8 @@ def _queue_refund_email(
 
         payload = {
             "refund_id": refund_id,
-            "amount_gbp": amount_gbp,
-            "currency": "GBP",
+            "amount_usd": amount_usd,
+            "currency": "USD",
             "credits_reversed": credits_reversed,
             "credits_granted": credits_granted,
             "refund_type": refund_type,
@@ -1240,7 +1240,7 @@ def _queue_refund_email(
                 to_email=user_email,
                 template=EmailTemplate.REFUND_CONFIRMATION,
                 payload=payload,
-                subject=f"TimrX Refund Confirmation - \u00a3{amount_gbp:.2f}",
+                subject=f"TimrX Refund Confirmation - \u00a3{amount_usd:.2f}",
                 identity_id=identity_id,
                 purchase_id=purchase_id,
             )
@@ -1263,7 +1263,7 @@ def _queue_refund_email(
 def _attempt_mollie_refund(
     *,
     payment_id: str,
-    amount_gbp: float,
+    amount_usd: float,
     reason: str,
     purchase_id: str,
 ) -> tuple:
@@ -1288,8 +1288,8 @@ def _attempt_mollie_refund(
             },
             json={
                 "amount": {
-                    "currency": "GBP",
-                    "value": f"{amount_gbp:.2f}",
+                    "currency": "USD",
+                    "value": f"{amount_usd:.2f}",
                 },
                 "description": f"Admin refund for purchase {purchase_id}: {reason}",
             },
@@ -1328,7 +1328,7 @@ def _record_refund(
     payment_provider: str,
     refund_type: str,
     refund_status: str,
-    amount_gbp: float,
+    amount_usd: float,
     credits_reversed: int = 0,
     credit_type: str = "general",
     reason: Optional[str] = None,
@@ -1346,16 +1346,16 @@ def _record_refund(
         f"""
         INSERT INTO {_TABLE}
             (purchase_id, identity_id, payment_provider, payment_reference,
-             refund_type, refund_status, amount_gbp, currency,
+             refund_type, refund_status, amount_usd, currency,
              credits_reversed, credit_type, reason, admin_note,
              executed_by, external_refund_id, metadata, executed_at)
-        VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, 'GBP',
+        VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s, 'USD',
                 %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
         RETURNING id, created_at
         """,
         (
             purchase_id, identity_id, payment_provider, payment_reference,
-            refund_type, refund_status, amount_gbp,
+            refund_type, refund_status, amount_usd,
             credits_reversed, credit_type,
             (reason or "")[:2000] if reason else None,
             (admin_note or "")[:2000] if admin_note else None,
@@ -1367,7 +1367,7 @@ def _record_refund(
     return {
         "id": str(row["id"]) if row else None,
         "refund_status": refund_status,
-        "amount_gbp": float(amount_gbp),
+        "amount_usd": float(amount_usd),
         "credits_reversed": credits_reversed,
         "credit_type": credit_type,
         "external_refund_id": external_refund_id,
@@ -1382,7 +1382,7 @@ def _blocked_response(
     identity_id: str,
     reason: str,
     message: str,
-    amount_gbp: float,
+    amount_usd: float,
     credits_granted: int,
     credits_used: int = 0,
     credits_remaining: int = 0,
@@ -1399,7 +1399,7 @@ def _blocked_response(
         payment_provider="unknown",
         refund_type="full_purchase_refund",
         refund_status="manual_review_required",
-        amount_gbp=amount_gbp,
+        amount_usd=amount_usd,
         credits_reversed=0,
         reason=reason,
         admin_note=admin_note,
@@ -1421,7 +1421,7 @@ def _blocked_response(
         "summary": {
             "purchase_id": purchase_id,
             "identity_id": identity_id,
-            "amount_gbp": amount_gbp,
+            "amount_usd": amount_usd,
             "credits_granted": credits_granted,
             "credits_used": credits_used,
             "credits_remaining": credits_remaining,
@@ -1452,7 +1452,7 @@ def start_refund_from_purchase(
     # 1. Fetch purchase
     purchase = query_one(
         f"""
-        SELECT p.id, p.identity_id, p.amount_gbp, p.credits_granted,
+        SELECT p.id, p.identity_id, p.amount_usd, p.credits_granted,
                p.status, p.provider, p.provider_payment_id, p.meta,
                i.email
         FROM {Tables.PURCHASES} p
@@ -1471,7 +1471,7 @@ def start_refund_from_purchase(
     # 2. Check existing refund records for this purchase
     existing = query_all(
         f"""
-        SELECT id, refund_status, refund_type, amount_gbp, created_at
+        SELECT id, refund_status, refund_type, amount_usd, created_at
         FROM {_TABLE}
         WHERE purchase_id = %s::uuid
         ORDER BY created_at DESC
@@ -1493,7 +1493,7 @@ def start_refund_from_purchase(
                     "id": str(latest["id"]),
                     "refund_status": ls,
                     "purchase_id": purchase_id,
-                    "amount_gbp": float(latest["amount_gbp"]),
+                    "amount_usd": float(latest["amount_usd"]),
                 },
             }
 
@@ -1506,14 +1506,14 @@ def start_refund_from_purchase(
                     "id": str(latest["id"]),
                     "refund_status": ls,
                     "purchase_id": purchase_id,
-                    "amount_gbp": float(latest["amount_gbp"]),
+                    "amount_usd": float(latest["amount_usd"]),
                 },
             }
 
         # If denied/closed/failed — allow creating a new refund record
 
     # 3. Create refund record in manual_review_required state
-    amount = float(purchase["amount_gbp"]) if purchase["amount_gbp"] else 0
+    amount = float(purchase["amount_usd"]) if purchase["amount_usd"] else 0
     identity_id = str(purchase["identity_id"])
     payment_provider = purchase["provider"] or "unknown"
     payment_ref = purchase["provider_payment_id"]
@@ -1525,7 +1525,7 @@ def start_refund_from_purchase(
         payment_reference=payment_ref,
         refund_type="full_purchase_refund",
         refund_status="manual_review_required",
-        amount_gbp=amount,
+        amount_usd=amount,
         credits_reversed=0,
         reason=reason,
         admin_note=admin_note or "Refund initiated from purchase view",
@@ -1547,6 +1547,6 @@ def start_refund_from_purchase(
             "id": refund_record.get("id"),
             "refund_status": "manual_review_required",
             "purchase_id": purchase_id,
-            "amount_gbp": amount,
+            "amount_usd": amount,
         },
     }

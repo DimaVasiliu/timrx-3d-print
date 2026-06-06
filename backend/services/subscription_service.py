@@ -101,8 +101,8 @@ def cron_lock(job_name: str, timeout_minutes: int = 10):
 # Yearly: Credits granted monthly over 12 months (not all at once)
 #
 # PRICING (Feb 2026):
-#   Monthly: Starter £9.99 (400c), Creator £24.99 (1300c), Studio £49.99 (3200c)
-#   Yearly:  Starter £99 (4800c/yr), Creator £249 (15600c/yr), Studio £499 (38400c/yr)
+#   Monthly: Starter $9.99 (400c), Creator $24.99 (1300c), Studio $49.99 (3200c)
+#   Yearly:  Starter $99 (4800c/yr), Creator $249 (15600c/yr), Studio $499 (38400c/yr)
 #   (Yearly = ~2 months free equivalent)
 #
 # TIER PERKS:
@@ -120,7 +120,7 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "name": "Starter",
         "credits_per_month": 300,               # General credits (was 400)
         "video_credits_per_month": 100,         # Video bridge credits (NEW)
-        "price_gbp": 9.99,
+        "price_usd": 9.99,
         "cadence": "monthly",
         "tier": "starter",
         "max_concurrent_jobs": 5,
@@ -130,7 +130,7 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "name": "Creator",
         "credits_per_month": 800,               # General credits (was 1300)
         "video_credits_per_month": 300,         # Video bridge credits (NEW)
-        "price_gbp": 24.99,
+        "price_usd": 24.99,
         "cadence": "monthly",
         "tier": "creator",
         "max_concurrent_jobs": 10,
@@ -140,7 +140,7 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "name": "Studio",
         "credits_per_month": 2000,              # General credits (was 3200)
         "video_credits_per_month": 800,         # Video bridge credits (NEW)
-        "price_gbp": 49.99,
+        "price_usd": 49.99,
         "cadence": "monthly",
         "tier": "studio",
         "max_concurrent_jobs": 20,
@@ -153,7 +153,7 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "video_credits_per_month": 100,         # Video: 1200/year ÷ 12
         "credits_total_yearly": 3600,           # General total for UI
         "video_credits_total_yearly": 1200,     # Video total for UI
-        "price_gbp": 99.00,
+        "price_usd": 99.00,
         "cadence": "yearly",
         "tier": "starter",
         "max_concurrent_jobs": 5,
@@ -165,7 +165,7 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "video_credits_per_month": 300,         # Video: 3600/year ÷ 12
         "credits_total_yearly": 9600,
         "video_credits_total_yearly": 3600,
-        "price_gbp": 249.00,
+        "price_usd": 249.00,
         "cadence": "yearly",
         "tier": "creator",
         "max_concurrent_jobs": 10,
@@ -177,7 +177,7 @@ SUBSCRIPTION_PLANS: Dict[str, Dict[str, Any]] = {
         "video_credits_per_month": 800,         # Video: 9600/year ÷ 12
         "credits_total_yearly": 24000,
         "video_credits_total_yearly": 9600,
-        "price_gbp": 499.00,
+        "price_usd": 499.00,
         "cadence": "yearly",
         "tier": "studio",
         "max_concurrent_jobs": 20,

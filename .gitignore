@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Env
+.env
+.env.local
+*.env
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Local helpers
+.local/
+.wrangler/
+
+# Migrations folder — hidden from git (run manually via TablePlus)
+backend/migrations/
+migrations/

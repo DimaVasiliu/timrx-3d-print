@@ -458,7 +458,7 @@ def redeem_restore():
             "video_balance": video_balance,
             "video_reserved": video_reserved,
             "video_available": video_available,
-            "currency": "GBP",
+            "currency": "USD",
         },
     })
 

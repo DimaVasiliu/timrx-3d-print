@@ -1,7 +1,7 @@
 """
 Unified provider cost estimation registry.
 
-Single source of truth for estimated upstream provider costs (GBP) across
+Single source of truth for estimated upstream provider costs (USD) across
 all generation providers: 3D, image, and video.
 
 These are *estimates* used for spend visibility and dashboard metrics.
@@ -20,7 +20,7 @@ from backend.db import USE_DB, get_conn, Tables, query_one
 # NON-VIDEO COSTS — keyed by action_code
 # ─────────────────────────────────────────────────────────────────────────────
 
-ACTION_CODE_COST_GBP: Dict[str, float] = {
+ACTION_CODE_COST_USD: Dict[str, float] = {
     # Meshy 3D generation
     "MESHY_TEXT_TO_3D":   0.05,
     "MESHY_IMAGE_TO_3D":  0.06,
@@ -45,7 +45,6 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
 
     # PiAPI Nano Banana 2 image generation
     # Source: PiAPI pricing page — $0.06/0.08/0.12 per image (USD)
-    # Converted at USD/GBP ≈ 0.80 (conservative, update if rate shifts >5%)
     "PIAPI_IMAGE":              0.048,
     "PIAPI_IMAGE_2K":           0.064,
     "PIAPI_IMAGE_4K":           0.096,
@@ -73,7 +72,7 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
 # ─────────────────────────────────────────────────────────────────────────────
 # VIDEO COSTS — keyed by (provider_variant, duration_seconds)
 #
-# Migrated from video_limits.py PROVIDER_COST_GBP.  video_limits.py now
+# Migrated from video_limits.py PROVIDER_COST_USD.  video_limits.py now
 # imports from here so there is a single source of truth.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -82,12 +81,11 @@ ACTION_CODE_COST_GBP: Dict[str, float] = {
 #   seedance-2-fast       480p $0.08   720p $0.16     (no 1080p)
 #   seedance-2            480p $0.10   720p $0.20   1080p $0.50
 #   Legacy preview/VIP variants share the same per-second rates at matching res.
-# Converted at USD/GBP ≈ 0.80. Update if exchange rate moves >5%.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Per-second GBP rates by (variant, resolution). Used as both an explicit
+# Per-second USD rates by (variant, resolution). Used as both an explicit
 # lookup and the source for legacy duration-keyed tables.
-_SEEDANCE_RATE_GBP: Dict[Tuple[str, str], float] = {
+_SEEDANCE_RATE_USD: Dict[Tuple[str, str], float] = {
     ("seedance_fast",    "480p"): 0.064,  # $0.08 × 0.80
     ("seedance_fast",    "720p"): 0.128,  # $0.16 × 0.80
     ("seedance_quality", "480p"): 0.080,  # $0.10 × 0.80
@@ -101,7 +99,7 @@ def estimate_seedance_provider_cost(
     resolution: str = "480p",
     input_video_seconds: float = 0.0,
 ) -> float:
-    """Estimate the GBP cost charged by PiAPI for a Seedance job.
+    """Estimate the USD cost charged by PiAPI for a Seedance job.
 
     PiAPI's Seedance 2 billing formula:
         cost = unit_price × output_duration
@@ -115,10 +113,10 @@ def estimate_seedance_provider_cost(
     canon_tier = normalize_seedance_tier(tier)
     variant = f"seedance_{canon_tier}"
     res = (resolution or "480p").lower()
-    rate = _SEEDANCE_RATE_GBP.get((variant, res))
+    rate = _SEEDANCE_RATE_USD.get((variant, res))
     if rate is None:
         # Fast 1080p doesn't exist; fall back to 720p rate so reports don't crash.
-        rate = _SEEDANCE_RATE_GBP.get((variant, "720p"))
+        rate = _SEEDANCE_RATE_USD.get((variant, "720p"))
     if rate is None:
         rate = 0.08  # generic Seedance fallback
     base = rate * int(duration_seconds)
@@ -126,7 +124,7 @@ def estimate_seedance_provider_cost(
     return round(base + surcharge, 4)
 
 
-VIDEO_COST_GBP: Dict[Tuple[str, int], float] = {
+VIDEO_COST_USD: Dict[Tuple[str, int], float] = {
     # Vertex (Veo)
     ("vertex", 4):            0.30,
     ("vertex", 6):            0.45,
@@ -148,7 +146,7 @@ VIDEO_COST_GBP: Dict[Tuple[str, int], float] = {
     ("fal_seedance", 10):     0.50,
 }
 
-# Fallback per-second rates for unknown durations (GBP)
+# Fallback per-second rates for unknown durations (USD)
 _VIDEO_FALLBACK_RATE: Dict[str, float] = {
     "vertex":           0.075,
     "seedance_fast":    0.064,   # 480p baseline; 720p costs ~2× this
@@ -170,7 +168,7 @@ def estimate_video_cost(
     input_video_seconds: float = 0.0,
 ) -> float:
     """
-    Estimate the real GBP cost of a video job to the provider.
+    Estimate the real USD cost of a video job to the provider.
 
     Args:
         provider:            "vertex" | "seedance" | "fal_seedance"
@@ -184,7 +182,7 @@ def estimate_video_cost(
     """
     if provider == "fal_seedance":
         key = ("fal_seedance", int(duration_seconds))
-        cost = VIDEO_COST_GBP.get(key)
+        cost = VIDEO_COST_USD.get(key)
         if cost is not None:
             return cost
         rate = _VIDEO_FALLBACK_RATE.get("fal_seedance", 0.05)
@@ -201,7 +199,7 @@ def estimate_video_cost(
 
     # Vertex
     key = ("vertex", int(duration_seconds))
-    cost = VIDEO_COST_GBP.get(key)
+    cost = VIDEO_COST_USD.get(key)
     if cost is not None:
         return cost
     rate = _VIDEO_FALLBACK_RATE.get("vertex", 0.075)
@@ -218,7 +216,7 @@ def estimate_provider_cost(
     meta: Optional[dict] = None,
 ) -> float:
     """
-    Estimate upstream provider cost in GBP for any job.
+    Estimate upstream provider cost in USD for any job.
 
     Args:
         provider:    Provider name (meshy, openai, google, google_nano, flux_pro, ideogram_v3, recraft_v4, vertex, seedance, fal_seedance)
@@ -226,12 +224,12 @@ def estimate_provider_cost(
         meta:        Job metadata (used for video duration/tier)
 
     Returns:
-        Estimated GBP cost.  Returns 0.0 if unknown.
+        Estimated USD cost.  Returns 0.0 if unknown.
     """
     # 1. Try direct action_code lookup (covers 3D + image)
     upper_code = (action_code or "").upper()
-    if upper_code in ACTION_CODE_COST_GBP:
-        return ACTION_CODE_COST_GBP[upper_code]
+    if upper_code in ACTION_CODE_COST_USD:
+        return ACTION_CODE_COST_USD[upper_code]
 
     # 2. For video providers, use duration-based lookup
     if provider in ("vertex", "seedance", "fal_seedance"):
@@ -265,7 +263,7 @@ def estimate_provider_cost(
 
 def stamp_estimated_cost(job_id: str) -> Optional[float]:
     """
-    Compute and persist estimated_provider_cost_gbp on a job row.
+    Compute and persist estimated_provider_cost_usd on a job row.
 
     Reads the job's provider, action_code, and meta, computes the estimate,
     and writes it to the column.  Returns the cost or None on error.
@@ -304,7 +302,7 @@ def stamp_estimated_cost(job_id: str) -> Optional[float]:
                 cur.execute(
                     f"""
                     UPDATE {Tables.JOBS}
-                    SET estimated_provider_cost_gbp = %s
+                    SET estimated_provider_cost_usd = %s
                     WHERE id::text = %s
                     """,
                     (cost, str(job_id)),

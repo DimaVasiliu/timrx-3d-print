@@ -7,7 +7,7 @@ DESIGN NOTES
 The previous implementation priced everything in USD and FX-converted to
 the customer's currency. That had two problems:
   • UK customers saw inflated shipping because we converted US-export rates
-    to GBP, not Royal Mail's actual domestic rates.
+    to USD, not Royal Mail's actual domestic rates.
   • The product itself looked too cheap (just filament cost), so customers
     perceived shipping as the dominant cost — bad psychology.
 
@@ -146,62 +146,6 @@ def _infill_floor_multiplier(process: str, infill_pct: int) -> float:
 # adjust pricing.  Three native currencies are supported; everything
 # else falls back to EUR.
 PRICING: Dict[str, Dict[str, Any]] = {
-    # ── United Kingdom (Royal Mail Tracked) ───────────────────────────
-    "GBP": {
-        "production_fee":           9.75,   # setup + slicing + cleaning + QC + standard packaging + fee/failure reserve
-        "print_time_per_hour":      1.10,   # electricity + nozzle/build-plate wear + operator supervision
-        "min_order":                14.95,  # absolute PLA mini floor per unit (material premiums apply on top)
-        "packaging_premium":        3.99,   # optional gift box + crinkle + certificate
-        "free_shipping_threshold":  40.00,
-        "shipping": {
-            # Customer-visible secure packaging + tracked delivery.  Rates
-            # include postage, box/padding/label, courier variance and damage reserve.
-            "small":     {"standard": 4.95,  "express": 7.95,  "priority": 12.95},
-            "parcel":    {"standard": 5.95,  "express": 8.95,  "priority": 14.95},
-            "medium":    {"standard": 7.95,  "express": 10.95, "priority": 18.95},
-            "oversized": {"standard": 14.95, "express": 19.95, "priority": 29.95},
-        },
-        "materials": {
-            "fdm": {
-                "pla":     78,    # £/kg — retail, not wholesale
-                "plaplus": 95,
-                "petg":   105,
-                "abs":    115,
-                "tpu":    145,
-                "silk":   110,
-            },
-            "resin": {
-                "std":   145,
-                "tough": 175,
-                "clear": 190,
-                "flex":  220,
-            },
-        },
-    },
-
-    # ── Eurozone (DPD / Royal Mail International Tracked) ─────────────
-    "EUR": {
-        "production_fee":          11.50,
-        "print_time_per_hour":      1.25,
-        "min_order":                17.95,
-        "packaging_premium":        4.99,
-        "free_shipping_threshold":  65.00,
-        "shipping": {
-            "small":     {"standard": 8.95,  "express": 15.95, "priority": 24.95},
-            "parcel":    {"standard": 11.95, "express": 18.95, "priority": 28.95},
-            "medium":    {"standard": 16.95, "express": 24.95, "priority": 36.95},
-            "oversized": {"standard": 29.95, "express": 42.95, "priority": 64.95},
-        },
-        "materials": {
-            "fdm": {
-                "pla":     92, "plaplus": 112, "petg":   122,
-                "abs":    135, "tpu":     170, "silk":   130,
-            },
-            "resin": {
-                "std":   170, "tough": 205, "clear": 220, "flex":  255,
-            },
-        },
-    },
 
     # ── US / CA / AU (DHL Economy or USPS/Royal Mail Int'l Tracked) ──
     "USD": {
@@ -226,11 +170,35 @@ PRICING: Dict[str, Dict[str, Any]] = {
             },
         },
     },
+
+    # ── Eurozone (DPD / Royal Mail International Tracked) ─────────────
+    "EUR": {
+        "production_fee":          11.50,
+        "print_time_per_hour":      1.25,
+        "min_order":               17.95,
+        "packaging_premium":        4.99,
+        "free_shipping_threshold": 65.00,
+        "shipping": {
+            "small":     {"standard":  8.95, "express": 15.95, "priority": 24.95},
+            "parcel":    {"standard": 11.95, "express": 18.95, "priority": 28.95},
+            "medium":    {"standard": 16.95, "express": 24.95, "priority": 36.95},
+            "oversized": {"standard": 29.95, "express": 42.95, "priority": 64.95},
+        },
+        "materials": {
+            "fdm": {
+                "pla":      92, "plaplus": 112, "petg":    122,
+                "abs":     135, "tpu":     170, "silk":    130,
+            },
+            "resin": {
+                "std":   170, "tough": 205, "clear": 220, "flex":  255,
+            },
+        },
+    },
 }
 
 # Currency mapping by shipping country.
 USD_COUNTRIES = {"US", "CA", "AU"}
-GBP_COUNTRIES = {"GB"}
+UK_COUNTRIES = {"GB"}
 # Everything else (EU bucket + JP + OTHER) bills in EUR.
 
 
@@ -250,7 +218,7 @@ class PriceBreakdown:
     time_min: int
 
     # Per-unit
-    per_unit_base: float           # before quantity multiplier — useful for "qty × £14 = £42" UX
+    per_unit_base: float           # before quantity multiplier — useful for "qty × $14 = $42" UX
     quantity: int
     quantity_discount_pct: float
 
@@ -290,8 +258,8 @@ def pick_currency(country: Optional[str]) -> str:
     c = (country or "").upper()
     if c in USD_COUNTRIES:
         return "USD"
-    if c in GBP_COUNTRIES:
-        return "GBP"
+    if c in UK_COUNTRIES:
+        return "USD"
     return "EUR"
 
 
@@ -534,7 +502,7 @@ def _shipping_label(currency: str, speed: str, free: bool, tier: str = "small") 
     if free:
         return "Free secure packaging & tracked delivery"
     tier_hint = "oversized " if tier == "oversized" else ""
-    if currency == "GBP":
+    if currency == "USD":
         return {
             "standard": f"Secure packaging & {tier_hint}tracked delivery",
             "express":  f"Express secure packaging & {tier_hint}tracked delivery",

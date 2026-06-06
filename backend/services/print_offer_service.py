@@ -21,7 +21,7 @@ from backend.services.print_order_pricing import PriceBreakdown
 FIRST_SMALL_PRINT_FREE = "FIRST_SMALL_PRINT_FREE"
 REFERRAL_REWARD = "REFERRAL_REWARD"
 QUALIFYING_PAID_STATUSES = ("paid", "in_production", "shipped", "delivered")
-REFERRAL_REWARD_CENTS = {"GBP": 500, "EUR": 500, "USD": 500}
+REFERRAL_REWARD_CENTS = {"USD": 500, "EUR": 500, "USD": 500}
 MIN_PROVIDER_CHARGE_CENTS = 100
 
 
@@ -534,7 +534,7 @@ def _grant_referral_rewards_if_eligible(cur, identity_id: str, order: Dict[str, 
         return
 
     order_id = str(order["id"])
-    currency = str(order.get("currency") or "GBP")
+    currency = str(order.get("currency") or "USD")
     reward_cents = REFERRAL_REWARD_CENTS.get(currency, 500)
 
     cur.execute(

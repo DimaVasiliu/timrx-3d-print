@@ -156,7 +156,7 @@ class ReconciliationService:
         # Find purchases with status='paid' or 'complete' missing ledger entry
         missing = query_all(
             f"""
-            SELECT p.id, p.identity_id, p.credits_granted, p.amount_gbp, p.currency,
+            SELECT p.id, p.identity_id, p.credits_granted, p.amount_usd, p.currency,
                    p.status, p.created_at
             FROM {Tables.PURCHASES} p
             WHERE p.status IN ('paid', 'complete', 'completed')
@@ -1894,7 +1894,7 @@ class ReconciliationService:
 
         credits_amount = int(credits_str) if credits_str else 0
         amount_data = payment.get("amount", {})
-        amount_gbp = float(amount_data.get("value", 0))
+        amount_usd = float(amount_data.get("value", 0))
 
         # Check if purchase already exists
         existing = PurchaseService.get_purchase_by_provider_id(payment_id)
@@ -1920,7 +1920,7 @@ class ReconciliationService:
                 "identity_id": identity_id,
                 "plan_code": plan_code,
                 "credits": credits_amount,
-                "amount_gbp": amount_gbp,
+                "amount_usd": amount_usd,
             }
 
         # Create the purchase
@@ -1931,7 +1931,7 @@ class ReconciliationService:
                 plan_id=plan_id or "",
                 plan_code=plan_code,
                 provider_payment_id=payment_id,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 credits_granted=credits_amount,
                 customer_email=customer_email,
             )
@@ -1946,7 +1946,7 @@ class ReconciliationService:
                     identity_id=identity_id,
                     credits_delta=credits_amount,
                     plan_code=plan_code,
-                    amount_gbp=amount_gbp,
+                    amount_usd=amount_usd,
                     mollie_status="paid",
                     details={
                         "customer_email": customer_email,
@@ -2078,7 +2078,7 @@ class ReconciliationService:
                         identity_id=identity_id,
                         credits_delta=credits_per_month,
                         plan_code=plan_code,
-                        amount_gbp=plan.get("price_gbp", 0),
+                        amount_usd=plan.get("price_usd", 0),
                         mollie_status="paid",
                         details={
                             "subscription_id": result.get("purchase_id"),
@@ -2165,7 +2165,7 @@ class ReconciliationService:
                     identity_id=identity_id,
                     credits_delta=credits_per_month,
                     plan_code=plan_code,
-                    amount_gbp=plan.get("price_gbp", 0),
+                    amount_usd=plan.get("price_usd", 0),
                     mollie_status="paid",
                     details={
                         "subscription_id": subscription_id,
@@ -2354,7 +2354,7 @@ class ReconciliationService:
         identity_id: Optional[str] = None,
         credits_delta: int = 0,
         plan_code: Optional[str] = None,
-        amount_gbp: Optional[float] = None,
+        amount_usd: Optional[float] = None,
         mollie_status: Optional[str] = None,
         details: Optional[Dict] = None,
     ):
@@ -2364,7 +2364,7 @@ class ReconciliationService:
                 """
                 INSERT INTO timrx_billing.reconciliation_fixes
                 (run_id, provider, provider_payment_id, fix_type,
-                 identity_id, credits_delta, plan_code, amount_gbp,
+                 identity_id, credits_delta, plan_code, amount_usd,
                  mollie_status, details_json, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (provider, provider_payment_id, fix_type) DO NOTHING
@@ -2377,7 +2377,7 @@ class ReconciliationService:
                     identity_id,
                     credits_delta,
                     plan_code,
-                    amount_gbp,
+                    amount_usd,
                     mollie_status,
                     json.dumps(details) if details else None,
                 ),

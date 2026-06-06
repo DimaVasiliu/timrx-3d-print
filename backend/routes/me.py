@@ -128,7 +128,7 @@ def get_wallet():
             "video_balance": video_balance,
             "video_reserved": video_reserved,
             "video_available": video_available,
-            "currency": "GBP",
+            "currency": "USD",
             "updated_at": updated_at.isoformat() if updated_at else None,
         })
     except Exception:
@@ -141,7 +141,7 @@ def get_wallet():
             "video_balance": 0,
             "video_reserved": 0,
             "video_available": 0,
-            "currency": "GBP",
+            "currency": "USD",
             "updated_at": None,
         })
 

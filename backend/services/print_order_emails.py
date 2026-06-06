@@ -68,7 +68,7 @@ def _esc(s: Any) -> str:
 
 
 def _fmt_money(amount: float, currency: str) -> str:
-    sym = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, "")
+    sym = {"USD": "$", "EUR": "€", "USD": "$"}.get(currency, "")
     return f"{sym}{amount:,.2f} {currency}"
 
 

@@ -133,7 +133,7 @@ def get_plans():
                 "id": "uuid",
                 "code": "starter_250",
                 "name": "Starter",
-                "price_gbp": 7.99,
+                "price_usd": 7.99,
                 "credits": 250,
                 "perks": {
                     "priority": false,
@@ -592,7 +592,7 @@ def create_mollie_checkout():
         }), 400
 
     # Log plan details (credit_grant is mapped to "credits" key)
-    print(f"[BILLING] Plan found: {plan_code} -> {plan.get('credits')} credits @ £{plan.get('price')}")
+    print(f"[BILLING] Plan found: {plan_code} -> {plan.get('credits')} credits @ ${plan.get('price')}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # CHECKOUT IDEMPOTENCY: Prevent concurrent double-submit creating two
@@ -1152,7 +1152,7 @@ def get_purchase(purchase_id):
             "plan_code": "starter_250",
             "plan_name": "Starter",
             "amount": 7.99,
-            "currency": "GBP",
+            "currency": "USD",
             "credits_granted": 80,
             "status": "completed",
             "purchased_at": "2024-01-15T12:00:00Z"
@@ -1349,14 +1349,14 @@ def subscription_payment_methods():
     plan_code = request.args.get("plan_code", "").strip()
 
     # Default amount for method availability check
-    amount_gbp = 9.99  # Starter monthly price
+    amount_usd = 9.99  # Starter monthly price
 
     if plan_code:
         plan = SUBSCRIPTION_PLANS.get(plan_code)
         if plan:
-            amount_gbp = plan.get("price_gbp", 9.99)
+            amount_usd = plan.get("price_usd", 9.99)
 
-    result = MollieService.get_recurring_payment_methods(amount_gbp)
+    result = MollieService.get_recurring_payment_methods(amount_usd)
 
     return jsonify({
         "ok": True,
@@ -2081,7 +2081,7 @@ def debug_test_invoice_pdf():
         "receipt_number": "RCPT-2026-TEST",
         "paid_at": None,
         "payment_method": "mollie",
-        "currency": "GBP",
+        "currency": "USD",
         "amount_paid": 9.99,
     }
     mock_items = [
@@ -2123,7 +2123,7 @@ def debug_test_invoice_pdf():
                 receipt_number="RCPT-2026-TEST",
                 plan_name="Test Plan",
                 credits=100,
-                amount_gbp=9.99,
+                amount_usd=9.99,
                 invoice_pdf=invoice_pdf or b"",
                 receipt_pdf=receipt_pdf or b"",
                 logo_bytes=logo,
@@ -2193,15 +2193,15 @@ def debug_email_preview():
         )
 
     elif template == "invoice":
-        amount_display = render_amount_display("9.99", "GBP", "Paid February 5, 2026")
+        amount_display = render_amount_display("9.99", "USD", "Paid February 5, 2026")
         ref_card = render_detail_card([
             ("Invoice number", "INV-2026-0001"),
             ("Receipt number", "RCPT-2026-0001"),
         ], header="Reference")
         summary_card = render_detail_card([
-            ("Starter Plan", "&pound;9.99"),
+            ("Starter Plan", "$9.99"),
             ("Credits added", "100"),
-            ("Amount paid", "&pound;9.99"),
+            ("Amount paid", "$9.99"),
         ], header="Summary")
         body_html = f'''
             {amount_display}
@@ -2234,7 +2234,7 @@ def debug_email_preview():
             ("Email", "user@example.com"),
             ("Plan", "Starter Plan"),
             ("Credits", "100"),
-            ("Amount", "9.99 GBP"),
+            ("Amount", "9.99 USD"),
         ], header="Details")
         body_html = f'''
             <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
@@ -2255,11 +2255,11 @@ def debug_email_preview():
         )
 
     else:  # purchase_receipt (default)
-        amount_display = render_amount_display("9.99", "GBP", "Paid February 5, 2026")
+        amount_display = render_amount_display("9.99", "USD", "Paid February 5, 2026")
         summary_card = render_detail_card([
-            ("Starter Plan", "&pound;9.99"),
+            ("Starter Plan", "$9.99"),
             ("Credits added", "100"),
-            ("Amount paid", "&pound;9.99"),
+            ("Amount paid", "$9.99"),
         ], header="Summary")
         body_html = f'''
             {amount_display}
@@ -2340,12 +2340,12 @@ _FX_FALLBACK_RATES = {
 def _fetch_fx_rates():
     """
     Fetch current FX rates from exchangerate-api.com (free tier).
-    Returns rates dict with GBP as base, or None on failure.
+    Returns rates dict with USD as base, or None on failure.
     """
     try:
-        # Free API - no key required for GBP base
+        # Free API - no key required for USD base
         resp = http_requests.get(
-            "https://api.exchangerate-api.com/v4/latest/GBP",
+            "https://api.exchangerate-api.com/v4/latest/USD",
             timeout=5,
         )
         if resp.status_code == 200:
@@ -2399,12 +2399,12 @@ def public_fx_rates():
     Public endpoint for FX rates (no auth required).
 
     Used by frontend to display estimated prices in user's local currency.
-    All billing remains in GBP - this is display only.
+    All billing remains in USD - this is display only.
 
     Returns:
     {
         "ok": true,
-        "base": "GBP",
+        "base": "USD",
         "rates": {
             "USD": 1.26,
             "EUR": 1.17,
@@ -2420,7 +2420,7 @@ def public_fx_rates():
 
     response = jsonify({
         "ok": True,
-        "base": "GBP",
+        "base": "USD",
         "rates": rates,
         "as_of": date.today().isoformat(),
     })

@@ -111,7 +111,7 @@ class AdminService:
 
         # Revenue (sum of completed purchase amounts)
         revenue = query_one(
-            f"SELECT COALESCE(SUM(amount_gbp), 0) as total FROM {Tables.PURCHASES} WHERE status = 'completed'"
+            f"SELECT COALESCE(SUM(amount_usd), 0) as total FROM {Tables.PURCHASES} WHERE status = 'completed'"
         )
 
         # Calculate job success rate
@@ -134,7 +134,7 @@ class AdminService:
             "jobs_by_status": jobs_by_status,
             "total_jobs": total_jobs,
             "job_success_rate": job_success_rate,
-            "total_revenue_gbp": float(revenue["total"]) if revenue else 0.0,
+            "total_revenue_usd": float(revenue["total"]) if revenue else 0.0,
         }
 
     @staticmethod
@@ -401,7 +401,7 @@ class AdminService:
         # Get recent purchases (last 10)
         purchases = query_all(
             f"""
-            SELECT id, plan_id, amount_gbp, credits_granted, status, created_at, paid_at
+            SELECT id, plan_id, amount_usd, credits_granted, status, created_at, paid_at
             FROM {Tables.PURCHASES}
             WHERE identity_id = %s
             ORDER BY created_at DESC
@@ -449,7 +449,7 @@ class AdminService:
             "purchases": [
                 {
                     "id": str(p["id"]),
-                    "amount_gbp": float(p["amount_gbp"]) if p["amount_gbp"] else 0,
+                    "amount_usd": float(p["amount_usd"]) if p["amount_usd"] else 0,
                     "credits_granted": p["credits_granted"],
                     "status": p["status"],
                     "created_at": p["created_at"].isoformat() if p["created_at"] else None,
@@ -552,7 +552,7 @@ class AdminService:
                 p.provider,
                 p.provider_payment_id,
                 p.payment_id,
-                p.amount_gbp,
+                p.amount_usd,
                 p.currency,
                 p.credits_granted,
                 p.status,
@@ -581,7 +581,7 @@ class AdminService:
         refund_rows = query_all(
             f"""
             SELECT purchase_id, id AS refund_id, refund_status, refund_type,
-                   amount_gbp AS refund_amount_gbp, credits_reversed, created_at
+                   amount_usd AS refund_amount_usd, credits_reversed, created_at
             FROM {Tables.REFUNDS}
             WHERE purchase_id::text IN ({placeholders})
             ORDER BY created_at DESC
@@ -597,7 +597,7 @@ class AdminService:
                     "refund_id": str(rr["refund_id"]),
                     "refund_status": rr["refund_status"],
                     "refund_type": rr["refund_type"],
-                    "refund_amount_gbp": float(rr["refund_amount_gbp"]) if rr["refund_amount_gbp"] else 0,
+                    "refund_amount_usd": float(rr["refund_amount_usd"]) if rr["refund_amount_usd"] else 0,
                     "credits_reversed": rr["credits_reversed"] or 0,
                     "refund_created_at": rr["created_at"].isoformat() if rr["created_at"] else None,
                 }
@@ -667,7 +667,7 @@ class AdminService:
                 "provider": row["provider"],
                 "payment_reference": row["provider_payment_id"],
                 "payment_id": row["payment_id"],
-                "amount_gbp": float(row["amount_gbp"]) if row["amount_gbp"] else 0,
+                "amount_usd": float(row["amount_usd"]) if row["amount_usd"] else 0,
                 "currency": row["currency"],
                 "credits_granted": credits_granted,
                 "credit_type": credit_type,
@@ -705,7 +705,7 @@ class AdminService:
             f"""
             SELECT p.id, p.identity_id, p.plan_id, p.provider,
                    p.provider_payment_id, p.payment_id,
-                   p.amount_gbp, p.currency, p.credits_granted,
+                   p.amount_usd, p.currency, p.credits_granted,
                    p.status, p.meta, p.created_at, p.paid_at,
                    i.email,
                    pl.code AS plan_code, pl.name AS plan_name
@@ -758,7 +758,7 @@ class AdminService:
         # 3. Refunds for this purchase
         refund_rows = query_all(
             f"""
-            SELECT id, refund_type, refund_status, amount_gbp,
+            SELECT id, refund_type, refund_status, amount_usd,
                    credits_reversed, credit_type, reason, admin_note,
                    executed_by, external_refund_id, metadata,
                    created_at, executed_at
@@ -774,7 +774,7 @@ class AdminService:
                 "id": str(rf["id"]),
                 "refund_type": rf["refund_type"],
                 "refund_status": rf["refund_status"],
-                "amount_gbp": float(rf["amount_gbp"]) if rf["amount_gbp"] else 0,
+                "amount_usd": float(rf["amount_usd"]) if rf["amount_usd"] else 0,
                 "credits_reversed": rf["credits_reversed"] or 0,
                 "credit_type": rf["credit_type"],
                 "reason": rf["reason"],
@@ -790,7 +790,7 @@ class AdminService:
         job_rows = query_all(
             f"""
             SELECT id, provider, action_code, status, cost_credits,
-                   estimated_provider_cost_gbp, created_at
+                   estimated_provider_cost_usd, created_at
             FROM {Tables.JOBS}
             WHERE identity_id = %s::uuid
               AND created_at >= %s
@@ -811,7 +811,7 @@ class AdminService:
                 "action_code": jb["action_code"],
                 "status": jb["status"],
                 "cost_credits": cost,
-                "estimated_cost_gbp": float(jb["estimated_provider_cost_gbp"]) if jb["estimated_provider_cost_gbp"] else None,
+                "estimated_cost_usd": float(jb["estimated_provider_cost_usd"]) if jb["estimated_provider_cost_usd"] else None,
                 "created_at": jb["created_at"].isoformat() if jb["created_at"] else None,
             })
 
@@ -852,7 +852,7 @@ class AdminService:
             "identity_id": iid,
             "email": purchase["email"],
             "status": p_status,
-            "amount_gbp": float(purchase["amount_gbp"]) if purchase["amount_gbp"] else 0,
+            "amount_usd": float(purchase["amount_usd"]) if purchase["amount_usd"] else 0,
             "currency": purchase["currency"],
             "credits_granted": credits_granted,
             "credit_type": credit_type,
@@ -941,7 +941,7 @@ def _build_timeline(purchase, wallet_effects, refunds, jobs, disputes):
             "type": "purchase",
             "event": "Purchase created",
             "timestamp": purchase["created_at"].isoformat(),
-            "detail": f"£{float(purchase['amount_gbp'] or 0):.2f}, {purchase['credits_granted'] or 0} credits",
+            "detail": f"${float(purchase['amount_usd'] or 0):.2f}, {purchase['credits_granted'] or 0} credits",
         })
     if purchase["paid_at"]:
         events.append({
@@ -965,7 +965,7 @@ def _build_timeline(purchase, wallet_effects, refunds, jobs, disputes):
             "type": "refund",
             "event": f"Refund {rf['refund_status']}",
             "timestamp": rf["created_at"],
-            "detail": f"£{rf['amount_gbp']:.2f}" + (f", {rf['credits_reversed']} credits reversed" if rf["credits_reversed"] else ""),
+            "detail": f"${rf['amount_usd']:.2f}" + (f", {rf['credits_reversed']} credits reversed" if rf["credits_reversed"] else ""),
         })
         if rf["executed_at"]:
             events.append({
@@ -1457,8 +1457,8 @@ class IdentityInspectionService:
         Calculate revenue, cost, and margin analytics.
 
         Uses:
-        - purchases.amount_gbp for revenue
-        - jobs.estimated_provider_cost_gbp for cost
+        - purchases.amount_usd for revenue
+        - jobs.estimated_provider_cost_usd for cost
         - jobs.action_code / provider for breakdowns
         """
         from decimal import Decimal
@@ -1468,14 +1468,14 @@ class IdentityInspectionService:
 
         # ── Overview: total revenue, cost, margin ──
         revenue_row = query_one(f"""
-            SELECT COALESCE(SUM(amount_gbp), 0) AS total
+            SELECT COALESCE(SUM(amount_usd), 0) AS total
             FROM {Tables.PURCHASES}
             WHERE status = 'completed'
         """)
         total_revenue = _dec(revenue_row["total"]) if revenue_row else 0.0
 
         cost_row = query_one(f"""
-            SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS total
+            SELECT COALESCE(SUM(estimated_provider_cost_usd), 0) AS total
             FROM {Tables.JOBS}
             WHERE status IN ('completed', 'succeeded', 'ready', 'done')
         """)
@@ -1485,7 +1485,7 @@ class IdentityInspectionService:
 
         # ── Revenue in period ──
         period_revenue_row = query_one(f"""
-            SELECT COALESCE(SUM(amount_gbp), 0) AS total
+            SELECT COALESCE(SUM(amount_usd), 0) AS total
             FROM {Tables.PURCHASES}
             WHERE status = 'completed'
               AND created_at >= NOW() - INTERVAL '{int(days)} days'
@@ -1493,7 +1493,7 @@ class IdentityInspectionService:
         period_revenue = _dec(period_revenue_row["total"]) if period_revenue_row else 0.0
 
         period_cost_row = query_one(f"""
-            SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS total
+            SELECT COALESCE(SUM(estimated_provider_cost_usd), 0) AS total
             FROM {Tables.JOBS}
             WHERE status IN ('completed', 'succeeded', 'ready', 'done')
               AND created_at >= NOW() - INTERVAL '{int(days)} days'
@@ -1516,18 +1516,18 @@ class IdentityInspectionService:
                 END AS category,
                 COUNT(*) AS jobs,
                 COALESCE(SUM(cost_credits), 0) AS credits_used,
-                COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_gbp
+                COALESCE(SUM(estimated_provider_cost_usd), 0) AS cost_usd
             FROM {Tables.JOBS}
             WHERE status IN ('completed', 'succeeded', 'ready', 'done')
               AND created_at >= NOW() - INTERVAL '{int(days)} days'
             GROUP BY category
-            ORDER BY cost_gbp DESC
+            ORDER BY cost_usd DESC
         """)
 
         by_product = []
         for row in product_rows:
             cat = row["category"]
-            cost = _dec(row["cost_gbp"])
+            cost = _dec(row["cost_usd"])
             credits_used = int(row["credits_used"])
             jobs = int(row["jobs"])
             # Estimate revenue from credits: credits_used × avg revenue per credit
@@ -1536,7 +1536,7 @@ class IdentityInspectionService:
                 "category": cat,
                 "jobs": jobs,
                 "credits_used": credits_used,
-                "cost_gbp": round(cost, 2),
+                "cost_usd": round(cost, 2),
                 "cost_per_job": round(cost / jobs, 4) if jobs > 0 else 0,
             })
 
@@ -1546,21 +1546,21 @@ class IdentityInspectionService:
                 provider,
                 COUNT(*) AS jobs,
                 COALESCE(SUM(cost_credits), 0) AS credits_used,
-                COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_gbp
+                COALESCE(SUM(estimated_provider_cost_usd), 0) AS cost_usd
             FROM {Tables.JOBS}
             WHERE status IN ('completed', 'succeeded', 'ready', 'done')
               AND created_at >= NOW() - INTERVAL '{int(days)} days'
               AND provider IS NOT NULL
             GROUP BY provider
-            ORDER BY cost_gbp DESC
+            ORDER BY cost_usd DESC
         """)
 
         by_provider = [{
             "provider": row["provider"],
             "jobs": int(row["jobs"]),
             "credits_used": int(row["credits_used"]),
-            "cost_gbp": round(_dec(row["cost_gbp"]), 2),
-            "cost_per_job": round(_dec(row["cost_gbp"]) / int(row["jobs"]), 4) if int(row["jobs"]) > 0 else 0,
+            "cost_usd": round(_dec(row["cost_usd"]), 2),
+            "cost_per_job": round(_dec(row["cost_usd"]) / int(row["jobs"]), 4) if int(row["jobs"]) > 0 else 0,
         } for row in provider_rows]
 
         # ── Top users by spend (cost) ──
@@ -1570,20 +1570,20 @@ class IdentityInspectionService:
                 i.email,
                 COUNT(*) AS jobs,
                 COALESCE(SUM(j.cost_credits), 0) AS credits_used,
-                COALESCE(SUM(j.estimated_provider_cost_gbp), 0) AS cost_gbp
+                COALESCE(SUM(j.estimated_provider_cost_usd), 0) AS cost_usd
             FROM {Tables.JOBS} j
             LEFT JOIN {Tables.IDENTITIES} i ON i.id = j.identity_id
             WHERE j.status IN ('completed', 'succeeded', 'ready', 'done')
               AND j.created_at >= NOW() - INTERVAL '{int(days)} days'
             GROUP BY j.identity_id, i.email
-            ORDER BY cost_gbp DESC
+            ORDER BY cost_usd DESC
             LIMIT 30
         """)
 
         # Get revenue per user from purchases
         user_revenue = {}
         rev_rows = query_all(f"""
-            SELECT identity_id, COALESCE(SUM(amount_gbp), 0) AS revenue
+            SELECT identity_id, COALESCE(SUM(amount_usd), 0) AS revenue
             FROM {Tables.PURCHASES}
             WHERE status = 'completed'
             GROUP BY identity_id
@@ -1594,7 +1594,7 @@ class IdentityInspectionService:
         by_user = []
         for row in user_rows:
             uid = str(row["identity_id"])
-            cost = _dec(row["cost_gbp"])
+            cost = _dec(row["cost_usd"])
             rev = user_revenue.get(uid, 0.0)
             margin = ((rev - cost) / rev * 100) if rev > 0 else (0.0 if cost == 0 else -100.0)
             by_user.append({
@@ -1602,34 +1602,34 @@ class IdentityInspectionService:
                 "email": row["email"] or uid[:8],
                 "jobs": int(row["jobs"]),
                 "credits_used": int(row["credits_used"]),
-                "revenue_gbp": round(rev, 2),
-                "cost_gbp": round(cost, 2),
-                "profit_gbp": round(rev - cost, 2),
+                "revenue_usd": round(rev, 2),
+                "cost_usd": round(cost, 2),
+                "profit_usd": round(rev - cost, 2),
                 "margin_pct": round(margin, 1),
             })
 
         # ── Risk alerts ──
         alerts = []
         for u in by_user:
-            if u["margin_pct"] < 40 and u["cost_gbp"] > 0.50:
+            if u["margin_pct"] < 40 and u["cost_usd"] > 0.50:
                 alerts.append({
                     "email": u["email"],
                     "margin_pct": u["margin_pct"],
-                    "cost_gbp": u["cost_gbp"],
-                    "revenue_gbp": u["revenue_gbp"],
+                    "cost_usd": u["cost_usd"],
+                    "revenue_usd": u["revenue_usd"],
                     "severity": "critical" if u["margin_pct"] < 20 else "warning",
                 })
 
         return {
             "overview": {
-                "total_revenue_gbp": round(total_revenue, 2),
-                "total_cost_gbp": round(total_cost, 2),
-                "total_profit_gbp": round(total_revenue - total_cost, 2),
+                "total_revenue_usd": round(total_revenue, 2),
+                "total_cost_usd": round(total_cost, 2),
+                "total_profit_usd": round(total_revenue - total_cost, 2),
                 "overall_margin_pct": round(overall_margin, 1),
                 "period_days": days,
-                "period_revenue_gbp": round(period_revenue, 2),
-                "period_cost_gbp": round(period_cost, 2),
-                "period_profit_gbp": round(period_revenue - period_cost, 2),
+                "period_revenue_usd": round(period_revenue, 2),
+                "period_cost_usd": round(period_cost, 2),
+                "period_profit_usd": round(period_revenue - period_cost, 2),
                 "period_margin_pct": round(period_margin, 1),
             },
             "by_product": by_product,

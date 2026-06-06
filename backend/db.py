@@ -1198,7 +1198,7 @@ def _ensure_schema_direct() -> None:
                         provider            text NOT NULL DEFAULT 'mollie',
                         provider_payment_id text NOT NULL,
                         amount              numeric(10,2),
-                        currency            text NOT NULL DEFAULT 'GBP',
+                        currency            text NOT NULL DEFAULT 'USD',
                         status              text NOT NULL DEFAULT 'completed',
                         created_at          timestamptz NOT NULL DEFAULT now()
                     )

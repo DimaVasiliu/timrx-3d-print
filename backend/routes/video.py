@@ -833,16 +833,16 @@ def _dispatch_video_job(
     if provider == "seedance" and float(input_video_seconds or 0) > 0:
         try:
             from backend.services.provider_costs import estimate_seedance_provider_cost
-            base_gbp = estimate_seedance_provider_cost(seedance_tier, duration_seconds, resolution)
-            total_gbp = estimate_seedance_provider_cost(
+            base_usd = estimate_seedance_provider_cost(seedance_tier, duration_seconds, resolution)
+            total_usd = estimate_seedance_provider_cost(
                 seedance_tier, duration_seconds, resolution, input_video_seconds=float(input_video_seconds)
             )
             resp_body["cost_notice"] = {
                 "kind": "input_video_surcharge",
                 "input_video_seconds": round(float(input_video_seconds), 2),
-                "base_provider_cost_gbp": round(base_gbp, 4),
-                "surcharge_provider_cost_gbp": round(max(0.0, total_gbp - base_gbp), 4),
-                "total_provider_cost_gbp": round(total_gbp, 4),
+                "base_provider_cost_usd": round(base_usd, 4),
+                "surcharge_provider_cost_usd": round(max(0.0, total_usd - base_usd), 4),
+                "total_provider_cost_usd": round(total_usd, 4),
                 "message": (
                     "Reference videos add to the upstream provider cost "
                     "(PiAPI bills half the per-second rate for each second of input video)."

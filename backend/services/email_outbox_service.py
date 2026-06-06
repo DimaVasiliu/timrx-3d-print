@@ -136,7 +136,7 @@ class EmailOutboxService:
         to_email: str,
         plan_name: str,
         credits: int,
-        amount_gbp: float,
+        amount_usd: float,
         plan_code: Optional[str] = None,
         credit_type: str = "general",
     ) -> List[Dict[str, Any]]:
@@ -153,7 +153,7 @@ class EmailOutboxService:
             to_email: Buyer's email address
             plan_name: Display name of the purchased plan
             credits: Number of credits purchased
-            amount_gbp: Amount paid in GBP
+            amount_usd: Amount paid in USD
             plan_code: Optional plan code for invoice generation
             credit_type: 'general' or 'video'
 
@@ -170,7 +170,7 @@ class EmailOutboxService:
             "plan_name": plan_name,
             "plan_code": plan_code,
             "credits": credits,
-            "amount_gbp": amount_gbp,
+            "amount_usd": amount_usd,
             "credit_type": credit_type,
         }
 
@@ -193,7 +193,7 @@ class EmailOutboxService:
                 "email": to_email,
                 "plan_name": plan_name,
                 "credits": credits,
-                "amount_gbp": amount_gbp,
+                "amount_usd": amount_usd,
             }
             admin_row = EmailOutboxService.queue_email(
                 cur,
@@ -476,7 +476,7 @@ class EmailOutboxService:
         plan_name = payload.get("plan_name")
         plan_code = payload.get("plan_code")
         credits = payload.get("credits")
-        amount_gbp = payload.get("amount_gbp")
+        amount_usd = payload.get("amount_usd")
         credit_type = payload.get("credit_type", "general")
 
         # Try full invoice pipeline first
@@ -488,7 +488,7 @@ class EmailOutboxService:
                 plan_code=plan_code,
                 plan_name=plan_name,
                 credits=credits,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 customer_email=to_email,
                 credit_type=credit_type,
             )
@@ -507,7 +507,7 @@ class EmailOutboxService:
             to_email=to_email,
             plan_name=payload.get("plan_name"),
             credits=payload.get("credits"),
-            amount_gbp=payload.get("amount_gbp"),
+            amount_usd=payload.get("amount_usd"),
             credit_type=payload.get("credit_type", "general"),
         )
 
@@ -524,7 +524,7 @@ class EmailOutboxService:
             to_email=to_email,
             plan_name=payload.get("plan_name"),
             credits=payload.get("credits"),
-            amount_gbp=payload.get("amount_gbp"),
+            amount_usd=payload.get("amount_usd"),
             credit_type=payload.get("credit_type", "general"),
         )
 
@@ -555,8 +555,8 @@ class EmailOutboxService:
         success = send_refund_confirmation(
             to_email=to_email,
             refund_id=payload.get("refund_id", ""),
-            amount_gbp=payload.get("amount_gbp", 0),
-            currency=payload.get("currency", "GBP"),
+            amount_usd=payload.get("amount_usd", 0),
+            currency=payload.get("currency", "USD"),
             credits_reversed=payload.get("credits_reversed", 0),
             credits_granted=payload.get("credits_granted", 0),
             refund_type=payload.get("refund_type", "full_purchase_refund"),
@@ -579,8 +579,8 @@ class EmailOutboxService:
         success = send_refund_review_email(
             to_email=to_email,
             refund_id=payload.get("refund_id", ""),
-            amount_gbp=payload.get("amount_gbp", 0),
-            currency=payload.get("currency", "GBP"),
+            amount_usd=payload.get("amount_usd", 0),
+            currency=payload.get("currency", "USD"),
             purchase_id=payload.get("purchase_id"),
             reason=payload.get("reason"),
         )
@@ -597,8 +597,8 @@ class EmailOutboxService:
             success = send_refund_resolution_approved(
                 to_email=to_email,
                 refund_id=payload.get("refund_id", ""),
-                amount_gbp=payload.get("amount_gbp", 0),
-                currency=payload.get("currency", "GBP"),
+                amount_usd=payload.get("amount_usd", 0),
+                currency=payload.get("currency", "USD"),
                 purchase_id=payload.get("purchase_id"),
                 reason=payload.get("reason"),
             )
@@ -607,8 +607,8 @@ class EmailOutboxService:
             success = send_refund_resolution_denied(
                 to_email=to_email,
                 refund_id=payload.get("refund_id", ""),
-                amount_gbp=payload.get("amount_gbp", 0),
-                currency=payload.get("currency", "GBP"),
+                amount_usd=payload.get("amount_usd", 0),
+                currency=payload.get("currency", "USD"),
                 purchase_id=payload.get("purchase_id"),
                 reason=payload.get("reason"),
             )

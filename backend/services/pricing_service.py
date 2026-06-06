@@ -512,7 +512,7 @@ SEEDANCE_CREDIT_COSTS: Dict[str, Dict[str, Dict[int, int]]] = {
         "480p":  {5: 100, 10: 200, 15: 300},
         "720p":  {5: 160, 10: 320, 15: 480},
         # 1080p bumped 20% (250→300, 500→600, 750→900) in migration 069 to
-        # protect ~43% net margin against the £2.00/$2.50 PiAPI charge for 5s 1080p.
+        # protect ~43% net margin against the $2.00/$2.50 PiAPI charge for 5s 1080p.
         "1080p": {5: 300, 10: 600, 15: 900},
     },
 }
@@ -690,7 +690,7 @@ DEFAULT_PLANS = [
         "code": "starter_250",
         "name": "Starter",
         "description": "Perfect for exploring AI-powered 3D creation.",
-        "price_gbp": 7.99,
+        "price_usd": 7.99,
         "credit_grant": 350,          # Pricing refactor Mar 2026 (was 250)
         "includes_priority": False,
     },
@@ -698,7 +698,7 @@ DEFAULT_PLANS = [
         "code": "creator_900",
         "name": "Creator",
         "description": "For serious creators building their portfolio.",
-        "price_gbp": 19.99,
+        "price_usd": 19.99,
         "credit_grant": 1100,         # Pricing refactor Mar 2026 (was 900)
         "includes_priority": False,
     },
@@ -706,7 +706,7 @@ DEFAULT_PLANS = [
         "code": "studio_2200",
         "name": "Studio",
         "description": "Maximum value for professional workflows.",
-        "price_gbp": 37.99,
+        "price_usd": 37.99,
         "credit_grant": 2400,         # Margin stabilization Mar 2026 (was 2600)
         "includes_priority": True,
     },
@@ -715,7 +715,7 @@ DEFAULT_PLANS = [
         "code": "video_starter_300",
         "name": "Video Starter",
         "description": "Get started with AI video generation.",
-        "price_gbp": 9.99,
+        "price_usd": 9.99,
         "credit_grant": 550,          # Pricing refactor Mar 2026 (was 300)
         "includes_priority": False,
     },
@@ -723,7 +723,7 @@ DEFAULT_PLANS = [
         "code": "video_creator_900",
         "name": "Video Creator",
         "description": "Consistent workflow for content creators.",
-        "price_gbp": 29.99,
+        "price_usd": 29.99,
         "credit_grant": 1800,         # Pricing refactor Mar 2026 (was 900)
         "includes_priority": False,
     },
@@ -731,7 +731,7 @@ DEFAULT_PLANS = [
         "code": "video_studio_2000",
         "name": "Video Studio",
         "description": "High-volume production. Priority queue.",
-        "price_gbp": 59.99,
+        "price_usd": 59.99,
         "credit_grant": 4000,         # Pricing refactor Mar 2026 (was 2000)
         "includes_priority": True,
     },
@@ -772,20 +772,20 @@ class PricingService:
         if active_only:
             plans = query_all(
                 f"""
-                SELECT id, code, name, description, price_gbp, currency,
+                SELECT id, code, name, description, price_usd, currency,
                        credit_grant, includes_priority, meta, created_at
                 FROM {Tables.PLANS}
                 WHERE is_active = TRUE
-                ORDER BY price_gbp ASC
+                ORDER BY price_usd ASC
                 """
             )
         else:
             plans = query_all(
                 f"""
-                SELECT id, code, name, description, price_gbp, currency,
+                SELECT id, code, name, description, price_usd, currency,
                        credit_grant, includes_priority, is_active, meta, created_at
                 FROM {Tables.PLANS}
-                ORDER BY price_gbp ASC
+                ORDER BY price_usd ASC
                 """
             )
 
@@ -796,8 +796,8 @@ class PricingService:
                 "code": plan["code"],
                 "name": plan["name"],
                 "description": plan.get("description"),
-                "price": float(plan["price_gbp"]),
-                "currency": plan.get("currency", "GBP"),
+                "price": float(plan["price_usd"]),
+                "currency": plan.get("currency", "USD"),
                 "credits": plan["credit_grant"],
                 "includes_priority": plan.get("includes_priority", False),
             }
@@ -812,7 +812,7 @@ class PricingService:
         """
         plan = query_one(
             f"""
-            SELECT id, code, name, description, price_gbp, currency,
+            SELECT id, code, name, description, price_usd, currency,
                    credit_grant, includes_priority, meta, created_at
             FROM {Tables.PLANS}
             WHERE code = %s AND is_active = TRUE
@@ -828,8 +828,8 @@ class PricingService:
             "code": plan["code"],
             "name": plan["name"],
             "description": plan.get("description"),
-            "price": float(plan["price_gbp"]),
-            "currency": plan.get("currency", "GBP"),
+            "price": float(plan["price_usd"]),
+            "currency": plan.get("currency", "USD"),
             "credits": plan["credit_grant"],
             "includes_priority": plan.get("includes_priority", False),
         }
@@ -846,7 +846,7 @@ class PricingService:
                 "id": "uuid",
                 "code": "starter_250",
                 "name": "Starter",
-                "price_gbp": 7.99,
+                "price_usd": 7.99,
                 "credits": 250,
                 "perks": {
                     "priority": false,
@@ -859,20 +859,20 @@ class PricingService:
         if active_only:
             plans = query_all(
                 f"""
-                SELECT id, code, name, description, price_gbp, currency,
+                SELECT id, code, name, description, price_usd, currency,
                        credit_grant, includes_priority, meta, created_at
                 FROM {Tables.PLANS}
                 WHERE is_active = TRUE
-                ORDER BY price_gbp ASC
+                ORDER BY price_usd ASC
                 """
             )
         else:
             plans = query_all(
                 f"""
-                SELECT id, code, name, description, price_gbp, currency,
+                SELECT id, code, name, description, price_usd, currency,
                        credit_grant, includes_priority, is_active, meta, created_at
                 FROM {Tables.PLANS}
-                ORDER BY price_gbp ASC
+                ORDER BY price_usd ASC
                 """
             )
 
@@ -885,7 +885,7 @@ class PricingService:
                 "id": str(plan["id"]),
                 "code": plan["code"],
                 "name": plan["name"],
-                "price_gbp": float(plan["price_gbp"]),
+                "price_usd": float(plan["price_usd"]),
                 "credits": plan["credit_grant"],
                 "perks": {
                     "priority": plan.get("includes_priority", False),
@@ -907,7 +907,7 @@ class PricingService:
                 "id": "uuid",
                 "code": "starter_250",
                 "name": "Starter",
-                "price_gbp": 7.99,
+                "price_usd": 7.99,
                 "credits": 250,
                 "perks": {"priority": false, "retention_days": 30},
                 "estimates": {
@@ -1259,13 +1259,13 @@ class PricingService:
                 execute(
                     f"""
                     INSERT INTO {Tables.PLANS}
-                        (code, name, description, price_gbp, currency, credit_grant, includes_priority, is_active, created_at)
+                        (code, name, description, price_usd, currency, credit_grant, includes_priority, is_active, created_at)
                     VALUES
-                        (%s, %s, %s, %s, 'GBP', %s, %s, TRUE, NOW())
+                        (%s, %s, %s, %s, 'USD', %s, %s, TRUE, NOW())
                     ON CONFLICT (code) DO UPDATE SET
                         name = EXCLUDED.name,
                         description = EXCLUDED.description,
-                        price_gbp = EXCLUDED.price_gbp,
+                        price_usd = EXCLUDED.price_usd,
                         credit_grant = EXCLUDED.credit_grant,
                         includes_priority = EXCLUDED.includes_priority,
                         is_active = TRUE
@@ -1274,13 +1274,13 @@ class PricingService:
                         plan["code"],
                         plan["name"],
                         plan["description"],
-                        plan["price_gbp"],
+                        plan["price_usd"],
                         plan["credit_grant"],
                         plan["includes_priority"],
                     ),
                 )
                 seeded += 1
-                # print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ £{plan['price_gbp']})")
+                # print(f"[PRICING] Seeded plan: {plan['code']} ({plan['credit_grant']} credits @ ${plan['price_usd']})")
             except Exception as e:
                 print(f"[PRICING] Error seeding plan {plan['code']}: {e}")
                 import traceback

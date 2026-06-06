@@ -154,10 +154,10 @@ def get_provider_health() -> Dict[str, Any]:
     """)
     wallet_24h_map = {r["provider"]: r["cnt"] for r in wallet_alerts_24h}
 
-    # 6. Estimated spend today + this month (from estimated_provider_cost_gbp)
+    # 6. Estimated spend today + this month (from estimated_provider_cost_usd)
     spend_today = query_all(f"""
         SELECT provider,
-               COALESCE(SUM(estimated_provider_cost_gbp), 0) AS spend
+               COALESCE(SUM(estimated_provider_cost_usd), 0) AS spend
         FROM {Tables.JOBS}
         WHERE created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
           AND status IN ('succeeded', 'ready')
@@ -168,7 +168,7 @@ def get_provider_health() -> Dict[str, Any]:
 
     spend_month = query_all(f"""
         SELECT provider,
-               COALESCE(SUM(estimated_provider_cost_gbp), 0) AS spend
+               COALESCE(SUM(estimated_provider_cost_usd), 0) AS spend
         FROM {Tables.JOBS}
         WHERE created_at >= DATE_TRUNC('month', NOW() AT TIME ZONE 'UTC')
           AND status IN ('succeeded', 'ready')
@@ -252,12 +252,12 @@ def get_provider_health() -> Dict[str, Any]:
             "active_alerts": alert_info.get("count", 0),
             "credits_consumed_24h": credits_today_map.get(prov, 0),
             "avg_success_latency_ms_24h": latency_map.get(prov),
-            "estimated_spend_today_gbp": round(spend_today_map.get(prov, 0), 2),
-            "estimated_spend_month_gbp": round(spend_month_map.get(prov, 0), 2),
+            "estimated_spend_today_usd": round(spend_today_map.get(prov, 0), 2),
+            "estimated_spend_month_usd": round(spend_month_map.get(prov, 0), 2),
         })
 
-    total_spend_today = round(sum(p["estimated_spend_today_gbp"] for p in providers), 2)
-    total_spend_month = round(sum(p["estimated_spend_month_gbp"] for p in providers), 2)
+    total_spend_today = round(sum(p["estimated_spend_today_usd"] for p in providers), 2)
+    total_spend_month = round(sum(p["estimated_spend_month_usd"] for p in providers), 2)
     total_active_alerts = sum(p["active_alerts"] for p in providers)
 
     return {
@@ -268,8 +268,8 @@ def get_provider_health() -> Dict[str, Any]:
             "warning_count": summary_warning,
             "down_count": summary_down,
             "alerts_active": total_active_alerts,
-            "estimated_spend_today_gbp": total_spend_today,
-            "estimated_spend_month_gbp": total_spend_month,
+            "estimated_spend_today_usd": total_spend_today,
+            "estimated_spend_month_usd": total_spend_month,
         },
     }
 
@@ -545,7 +545,7 @@ def get_refund_review(
             SELECT
                 p.id AS purchase_id,
                 p.identity_id,
-                p.amount_gbp,
+                p.amount_usd,
                 p.credits_granted,
                 p.status AS purchase_status,
                 p.provider AS payment_provider,
@@ -563,7 +563,7 @@ def get_refund_review(
                 rp.purchase_id,
                 rp.identity_id,
                 rp.email,
-                rp.amount_gbp,
+                rp.amount_usd,
                 rp.credits_granted,
                 rp.purchase_status,
                 rp.payment_provider,
@@ -577,7 +577,7 @@ def get_refund_review(
                AND j.created_at > rp.purchase_date
                AND j.created_at < rp.purchase_date + INTERVAL '7 days'
             GROUP BY rp.purchase_id, rp.identity_id, rp.email,
-                     rp.amount_gbp, rp.credits_granted,
+                     rp.amount_usd, rp.credits_granted,
                      rp.purchase_status, rp.payment_provider, rp.purchase_date
         )
         SELECT *
@@ -593,7 +593,7 @@ def get_refund_review(
         SELECT
             p.id AS purchase_id,
             p.identity_id,
-            p.amount_gbp,
+            p.amount_usd,
             p.credits_granted,
             p.status AS purchase_status,
             p.provider AS payment_provider,
@@ -615,7 +615,7 @@ def get_refund_review(
         SELECT
             p.id AS purchase_id,
             p.identity_id,
-            p.amount_gbp,
+            p.amount_usd,
             p.credits_granted,
             p.status AS purchase_status,
             p.provider AS payment_provider,
@@ -694,7 +694,7 @@ def _build_review_item(row: Dict, reason: str, recommendation: str) -> Dict:
         "purchase_id": str(row["purchase_id"]),
         "identity_id": identity_id,
         "email": row.get("email"),
-        "amount_gbp": float(row.get("amount_gbp", 0)),
+        "amount_usd": float(row.get("amount_usd", 0)),
         "credits_granted": row.get("credits_granted", 0),
         "credits_used": credits_used,
         "credits_remaining": credits_remaining,

@@ -37,7 +37,7 @@ def _row_to_dict(r) -> Dict[str, Any]:
         "payment_reference": r["payment_reference"],
         "dispute_status": r["dispute_status"],
         "dispute_reason": r["dispute_reason"],
-        "amount_gbp": float(r["amount_gbp"]) if r["amount_gbp"] is not None else None,
+        "amount_usd": float(r["amount_usd"]) if r["amount_usd"] is not None else None,
         "currency": r["currency"],
         "admin_note": r["admin_note"],
         "evidence_summary": r["evidence_summary"],
@@ -135,7 +135,7 @@ def create_dispute(
     # Fetch purchase
     purchase = query_one(
         f"""
-        SELECT p.id, p.identity_id, p.amount_gbp, p.currency,
+        SELECT p.id, p.identity_id, p.amount_usd, p.currency,
                p.provider, p.provider_payment_id, i.email
         FROM {Tables.PURCHASES} p
         LEFT JOIN {Tables.IDENTITIES} i ON i.id = p.identity_id
@@ -175,7 +175,7 @@ def create_dispute(
                 f"""
                 INSERT INTO {_TABLE}
                     (purchase_id, identity_id, payment_provider, payment_reference,
-                     dispute_status, dispute_reason, amount_gbp, currency,
+                     dispute_status, dispute_reason, amount_usd, currency,
                      admin_note, metadata)
                 VALUES (%s::uuid, %s::uuid, %s, %s, 'open', %s, %s, %s, %s, %s::jsonb)
                 RETURNING id, created_at
@@ -186,8 +186,8 @@ def create_dispute(
                     purchase["provider"] or "unknown",
                     purchase["provider_payment_id"],
                     (dispute_reason or "")[:2000] if dispute_reason else None,
-                    float(purchase["amount_gbp"]) if purchase["amount_gbp"] else None,
-                    purchase["currency"] or "GBP",
+                    float(purchase["amount_usd"]) if purchase["amount_usd"] else None,
+                    purchase["currency"] or "USD",
                     (admin_note or "")[:2000] if admin_note else None,
                     json.dumps(meta, default=str),
                 ),

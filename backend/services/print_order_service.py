@@ -66,7 +66,7 @@ def _create_mollie_payment(
     if not config.MOLLIE_CONFIGURED:
         raise PrintOrderError("Mollie is not configured")
 
-    # Mollie supports USD/EUR/GBP — currency must be one Mollie accepts.
+    # Mollie supports USD/EUR/USD — currency must be one Mollie accepts.
     payload = {
         "amount":      {"currency": currency, "value": f"{amount:.2f}"},
         "description": description[:255],

@@ -48,7 +48,7 @@ def sanitize_pdf_text(text: str) -> str:
         '≥': '>=',     # greater than or equal
         '≠': '!=',     # not equal
         '±': '+/-',    # plus-minus
-        '€': 'EUR',    # euro (keep £ as it's in Latin-1)
+        '€': 'EUR',    # euro (keep $ as it's in Latin-1)
         '™': '(TM)',   # trademark
         '®': '(R)',    # registered
         '©': '(C)',    # copyright
@@ -58,7 +58,7 @@ def sanitize_pdf_text(text: str) -> str:
     for unicode_char, ascii_char in replacements.items():
         text = text.replace(unicode_char, ascii_char)
 
-    # Remove any remaining non-Latin-1 characters (keep £ which is \u00a3)
+    # Remove any remaining non-Latin-1 characters (keep $ which is \u00a3)
     # Latin-1 range is 0x00-0xFF
     result = []
     for char in text:
@@ -152,7 +152,7 @@ class InvoicingService:
         plan_code: str,
         plan_name: str,
         credits: int,
-        amount_gbp: float,
+        amount_usd: float,
         customer_email: Optional[str] = None,
         credit_type: str = "general",
     ) -> Optional[Dict[str, Any]]:
@@ -178,7 +178,7 @@ class InvoicingService:
                             (identity_id, purchase_id, invoice_number, status,
                              currency, subtotal, tax_amount, total,
                              customer_email, issued_at)
-                        VALUES (%s, %s, %s, 'paid', 'GBP', %s, 0, %s, %s, %s)
+                        VALUES (%s, %s, %s, 'paid', 'USD', %s, 0, %s, %s, %s)
                         ON CONFLICT (purchase_id) WHERE purchase_id IS NOT NULL
                         DO NOTHING
                         RETURNING *
@@ -187,8 +187,8 @@ class InvoicingService:
                             identity_id,
                             purchase_id,
                             invoice_number,
-                            amount_gbp,
-                            amount_gbp,
+                            amount_usd,
+                            amount_usd,
                             customer_email,
                             now,
                         ),
@@ -213,8 +213,8 @@ class InvoicingService:
                         (
                             invoice_id,
                             f"{plan_name} — {credits:,} {'Video Credits' if credit_type == 'video' else 'General Credits'}",
-                            amount_gbp,
-                            amount_gbp,
+                            amount_usd,
+                            amount_usd,
                         ),
                     )
                     item = fetch_one(cur)
@@ -225,11 +225,11 @@ class InvoicingService:
                         INSERT INTO {Tables.RECEIPTS}
                             (invoice_id, identity_id, receipt_number,
                              amount_paid, currency, payment_method, paid_at)
-                        VALUES (%s, %s, %s, %s, 'GBP', 'mollie', %s)
+                        VALUES (%s, %s, %s, %s, 'USD', 'mollie', %s)
                         ON CONFLICT (invoice_id) DO NOTHING
                         RETURNING *
                         """,
-                        (invoice_id, identity_id, receipt_number, amount_gbp, now),
+                        (invoice_id, identity_id, receipt_number, amount_usd, now),
                     )
                     receipt = fetch_one(cur)
 
@@ -751,7 +751,7 @@ class InvoicingService:
         plan_code: str,
         plan_name: str,
         credits: int,
-        amount_gbp: float,
+        amount_usd: float,
         customer_email: Optional[str] = None,
         credit_type: str = "general",
     ) -> Optional[Dict[str, Any]]:
@@ -775,7 +775,7 @@ class InvoicingService:
                 plan_code=plan_code,
                 plan_name=plan_name,
                 credits=credits,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 customer_email=customer_email,
                 credit_type=credit_type,
             )
@@ -829,7 +829,7 @@ class InvoicingService:
                             receipt_number=receipt_number or "",
                             plan_name=sanitize_pdf_text(plan_name),
                             credits=credits,
-                            amount_gbp=amount_gbp,
+                            amount_usd=amount_usd,
                             invoice_pdf=invoice_pdf,
                             receipt_pdf=receipt_pdf,
                             logo_bytes=logo,
@@ -842,7 +842,7 @@ class InvoicingService:
                             to_email=customer_email,
                             plan_name=sanitize_pdf_text(plan_name),
                             credits=credits,
-                            amount_gbp=amount_gbp,
+                            amount_usd=amount_usd,
                         )
                         print(f"[INVOICE] Fallback email sent to {customer_email} (PDF error: {pdf_error})")
                 except Exception as email_err:

@@ -189,13 +189,13 @@ def _compute_economics() -> Dict[str, Any]:
           AND created_at >= NOW() - INTERVAL '7 days'
     """)
 
-    # Provider cost today + 7d (estimated GBP)
+    # Provider cost today + 7d (estimated USD)
     cost_row = query_one(f"""
         SELECT
-            COALESCE(SUM(estimated_provider_cost_gbp) FILTER (
+            COALESCE(SUM(estimated_provider_cost_usd) FILTER (
                 WHERE created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
             ), 0) AS cost_today,
-            COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_7d
+            COALESCE(SUM(estimated_provider_cost_usd), 0) AS cost_7d
         FROM {Tables.JOBS}
         WHERE status IN ('succeeded', 'ready')
           AND created_at >= NOW() - INTERVAL '7 days'
@@ -204,10 +204,10 @@ def _compute_economics() -> Dict[str, Any]:
     # Revenue today + 7d (from purchases)
     rev_row = query_one(f"""
         SELECT
-            COALESCE(SUM(amount_gbp) FILTER (
+            COALESCE(SUM(amount_usd) FILTER (
                 WHERE paid_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
             ), 0) AS rev_today,
-            COALESCE(SUM(amount_gbp), 0) AS rev_7d,
+            COALESCE(SUM(amount_usd), 0) AS rev_7d,
             COUNT(*) FILTER (
                 WHERE paid_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
             ) AS purchases_today,
@@ -230,10 +230,10 @@ def _compute_economics() -> Dict[str, Any]:
         "credits_spent_7d": int(credits_row["spent_7d"]) if credits_row else 0,
         "credits_granted_today": int(granted_row["granted_today"]) if granted_row else 0,
         "credits_granted_7d": int(granted_row["granted_7d"]) if granted_row else 0,
-        "provider_cost_today_gbp": round(float(cost_row["cost_today"]), 2) if cost_row else 0.0,
-        "provider_cost_7d_gbp": round(float(cost_row["cost_7d"]), 2) if cost_row else 0.0,
-        "revenue_today_gbp": round(float(rev_row["rev_today"]), 2) if rev_row else 0.0,
-        "revenue_7d_gbp": round(float(rev_row["rev_7d"]), 2) if rev_row else 0.0,
+        "provider_cost_today_usd": round(float(cost_row["cost_today"]), 2) if cost_row else 0.0,
+        "provider_cost_7d_usd": round(float(cost_row["cost_7d"]), 2) if cost_row else 0.0,
+        "revenue_today_usd": round(float(rev_row["rev_today"]), 2) if rev_row else 0.0,
+        "revenue_7d_usd": round(float(rev_row["rev_7d"]), 2) if rev_row else 0.0,
         "purchases_today": rev_row["purchases_today"] if rev_row else 0,
         "purchases_7d": rev_row["purchases_7d"] if rev_row else 0,
         "active_subscriptions": sub_row["active"] if sub_row else 0,

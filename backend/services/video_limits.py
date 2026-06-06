@@ -46,22 +46,22 @@ VIDEO_PLAN_LIMITS: Dict[str, Dict[str, int]] = {
     "free": {
         "max_concurrent_video": 1,
         "max_video_per_hour": 10,
-        "daily_provider_spend_gbp": 5,
+        "daily_provider_spend_usd": 5,
     },
     "starter": {
         "max_concurrent_video": 1,
         "max_video_per_hour": 20,
-        "daily_provider_spend_gbp": 10,
+        "daily_provider_spend_usd": 10,
     },
     "creator": {
         "max_concurrent_video": 2,
         "max_video_per_hour": 60,
-        "daily_provider_spend_gbp": 40,
+        "daily_provider_spend_usd": 40,
     },
     "studio": {
         "max_concurrent_video": 4,
         "max_video_per_hour": 150,
-        "daily_provider_spend_gbp": 120,
+        "daily_provider_spend_usd": 120,
     },
 }
 
@@ -72,9 +72,9 @@ _VIDEO_PACK_TIER_MAP = {
     "video_studio_2000": "studio",
 }
 
-# Estimated provider cost per video job in GBP (used for daily spend guardrails)
+# Estimated provider cost per video job in USD (used for daily spend guardrails)
 # Canonical data now lives in provider_costs.py; re-exported here for compatibility.
-from backend.services.provider_costs import VIDEO_COST_GBP as PROVIDER_COST_GBP  # noqa: E402
+from backend.services.provider_costs import VIDEO_COST_USD as PROVIDER_COST_USD  # noqa: E402
 
 # Cooldown between video starts (seconds)
 VIDEO_COOLDOWN_SECONDS = 10
@@ -136,7 +136,7 @@ def get_video_plan_limits(identity_id: str) -> Dict[str, Any]:
             "tier": "starter",
             "max_concurrent_video": 1,
             "max_video_per_hour": 20,
-            "daily_provider_spend_gbp": 10,
+            "daily_provider_spend_usd": 10,
             "cooldown_seconds": 10,
         }
     """
@@ -227,9 +227,9 @@ def estimate_video_provider_cost(
     resolution: str | None = None,
 ) -> float:
     """
-    Estimate the real GBP cost of a video job to the provider.
+    Estimate the real USD cost of a video job to the provider.
 
-    Returns approximate cost in GBP.
+    Returns approximate cost in USD.
     Delegates to the canonical implementation in provider_costs.py.
     """
     from backend.services.provider_costs import estimate_video_cost
@@ -244,7 +244,7 @@ def estimate_video_provider_cost(
 
 def get_daily_user_video_provider_spend(identity_id: str) -> float:
     """
-    Sum estimated provider GBP spend for this user today (UTC midnight to now).
+    Sum estimated provider USD spend for this user today (UTC midnight to now).
 
     Uses the meta->provider and meta->duration_seconds stored on each job row,
     falling back to a flat estimate if meta is missing.
@@ -283,7 +283,7 @@ def get_daily_user_video_provider_spend(identity_id: str) -> float:
 
 def get_daily_global_video_provider_spend() -> float:
     """
-    Sum estimated provider GBP spend across ALL users today.
+    Sum estimated provider USD spend across ALL users today.
     Used for the global daily budget cap.
     """
     if not USE_DB:
@@ -397,20 +397,20 @@ def validate_video_rate_limits(
     # ── 4. Daily per-user provider spend ─────────────────────────────────
     est_cost = estimate_video_provider_cost_safe(provider, duration_seconds, seedance_tier)
     user_spend = get_daily_user_video_provider_spend(identity_id)
-    max_user_daily = limits["daily_provider_spend_gbp"]
+    max_user_daily = limits["daily_provider_spend_usd"]
     if user_spend + est_cost > max_user_daily:
         print(f"[VIDEO_LIMITS] USER_DAILY_SPEND identity={identity_id} spend={user_spend} +{est_cost} max={max_user_daily} tier={tier}")
         return jsonify({
             "ok": False,
             "error": "video_daily_spend_limit",
             "message": f"Daily video spend limit reached for your {tier.title()} plan. Resets at midnight UTC.",
-            "spend_gbp": user_spend,
-            "limit_gbp": max_user_daily,
+            "spend_usd": user_spend,
+            "limit_usd": max_user_daily,
             "tier": tier,
         }), 429
 
     # ── 5. Global daily provider budget ──────────────────────────────────
-    global_budget = getattr(cfg, "VIDEO_DAILY_PROVIDER_BUDGET_GBP", 500)
+    global_budget = getattr(cfg, "VIDEO_DAILY_PROVIDER_BUDGET_USD", 500)
     global_spend = get_daily_global_video_provider_spend()
     if global_spend + est_cost > global_budget:
         print(f"[VIDEO_LIMITS] GLOBAL_BUDGET global_spend={global_spend} +{est_cost} budget={global_budget}")

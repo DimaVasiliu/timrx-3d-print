@@ -274,9 +274,9 @@ KNOWN_ACTION_CODES = VIDEO_ACTION_CODES | GENERAL_ACTION_CODES
 
 # Video plan codes — grant VIDEO credits (separate pool, sold separately)
 VIDEO_PLAN_CODES = {
-    "video_starter_300",   # £9.99 → 550 video credits  (refactor Mar 2026)
-    "video_creator_900",   # £29.99 → 1800 video credits (refactor Mar 2026)
-    "video_studio_2000",   # £59.99 → 4000 video credits (refactor Mar 2026)
+    "video_starter_300",   # $9.99 → 550 video credits  (refactor Mar 2026)
+    "video_creator_900",   # $29.99 → 1800 video credits (refactor Mar 2026)
+    "video_studio_2000",   # $59.99 → 4000 video credits (refactor Mar 2026)
 }
 
 # Plan codes that grant GENERAL credits (one-time purchases)

@@ -475,7 +475,7 @@ def _apply_credit_penalty(user_id, amount):
                 # ── 2. Credit platform revenue (provider_ledger) ──
                 cur.execute(f"""
                     INSERT INTO {Tables.PROVIDER_LEDGER}
-                        (provider, entry_type, amount_gbp, currency, description,
+                        (provider, entry_type, amount_usd, currency, description,
                          reference, metadata, recorded_by, created_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 """, (

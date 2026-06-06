@@ -307,9 +307,9 @@ def render_highlight_box(content: str, bg_color: str = BG_LIGHT) -> str:
         </table>'''
 
 
-def render_amount_display(amount: str, currency: str = "GBP", status: str = "Paid") -> str:
+def render_amount_display(amount: str, currency: str = "USD", status: str = "Paid") -> str:
     """Render a large amount display with status."""
-    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    symbol = "$" if currency == "USD" else "$" if currency == "USD" else "€"
     return f'''
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
             <tr>
@@ -434,7 +434,7 @@ def send_purchase_receipt(
     to_email: str,
     plan_name: str,
     credits: int,
-    amount_gbp: float,
+    amount_usd: float,
     credit_type: str = "general",
 ) -> bool:
     """Send a purchase confirmation receipt. credit_type: 'general' or 'video'."""
@@ -450,12 +450,12 @@ def send_purchase_receipt(
     pool_label = "video credits" if credit_type == "video" else "general credits"
 
     # Build body HTML using helper functions
-    amount_display = render_amount_display(f"{amount_gbp:.2f}", "GBP", f"Paid {paid_date}")
+    amount_display = render_amount_display(f"{amount_usd:.2f}", "USD", f"Paid {paid_date}")
 
     summary_card = render_detail_card([
-        (plan_name, f"&pound;{amount_gbp:.2f}"),
+        (plan_name, f"${amount_usd:.2f}"),
         (f"{pool_label.title()} added", f"{credits:,}"),
-        ("Amount paid", f"&pound;{amount_gbp:.2f}"),
+        ("Amount paid", f"${amount_usd:.2f}"),
     ], header="Summary")
 
     body_html = f'''
@@ -485,13 +485,13 @@ def send_purchase_receipt(
 
     text_body = f"""Receipt from TimrX
 
-Amount: £{amount_gbp:.2f}
+Amount: ${amount_usd:.2f}
 Paid: {paid_date}
 
 Summary:
-  {plan_name}: £{amount_gbp:.2f}
+  {plan_name}: ${amount_usd:.2f}
   {pool_label.title()} added: {credits:,}
-  Amount paid: £{amount_gbp:.2f}
+  Amount paid: ${amount_usd:.2f}
 
 Your {pool_label} are now available in your account.
 
@@ -533,7 +533,7 @@ def send_invoice_email(
     receipt_number: str,
     plan_name: str,
     credits: int,
-    amount_gbp: float,
+    amount_usd: float,
     invoice_pdf: bytes,
     receipt_pdf: bytes,
     logo_bytes: Optional[bytes] = None,
@@ -554,7 +554,7 @@ def send_invoice_email(
         logo_bytes = _load_logo()
 
     # Build body HTML using helper functions
-    amount_display = render_amount_display(f"{amount_gbp:.2f}", "GBP", f"Paid {paid_date}")
+    amount_display = render_amount_display(f"{amount_usd:.2f}", "USD", f"Paid {paid_date}")
 
     ref_card = render_detail_card([
         ("Invoice number", invoice_number),
@@ -562,9 +562,9 @@ def send_invoice_email(
     ], header="Reference")
 
     summary_card = render_detail_card([
-        (plan_name, f"&pound;{amount_gbp:.2f}"),
+        (plan_name, f"${amount_usd:.2f}"),
         ("Credits added", f"{credits:,}"),
-        ("Amount paid", f"&pound;{amount_gbp:.2f}"),
+        ("Amount paid", f"${amount_usd:.2f}"),
     ], header="Summary")
 
     body_html = f'''
@@ -603,16 +603,16 @@ def send_invoice_email(
 
     text_body = f"""Receipt from TimrX
 
-Amount: £{amount_gbp:.2f}
+Amount: ${amount_usd:.2f}
 Paid: {paid_date}
 
 Invoice: {invoice_number}
 Receipt: {receipt_number}
 
 Summary:
-  {plan_name}: £{amount_gbp:.2f}
+  {plan_name}: ${amount_usd:.2f}
   Credits added: {credits:,}
-  Amount paid: £{amount_gbp:.2f}
+  Amount paid: ${amount_usd:.2f}
 
 Your invoice and receipt PDFs are attached.
 Your credits are now available in your account.
@@ -660,7 +660,7 @@ Need help? Reply to this email or contact support@timrx.live
     except Exception as e:
         print(f"[EMAIL] send_invoice_email error: {e}")
         # Fallback to simple receipt (no attachments)
-        return send_purchase_receipt(to_email, plan_name, credits, amount_gbp)
+        return send_purchase_receipt(to_email, plan_name, credits, amount_usd)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -670,7 +670,7 @@ def send_payment_received(
     to_email: str,
     plan_name: str,
     credits: int,
-    amount_gbp: float,
+    amount_usd: float,
     credit_type: str = "general",
 ) -> bool:
     """
@@ -713,7 +713,7 @@ def send_payment_received(
                         <strong>Plan:</strong> {plan_name}
                     </p>
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
-                        <strong>Amount:</strong> &pound;{amount_gbp:.2f}
+                        <strong>Amount:</strong> ${amount_usd:.2f}
                     </p>
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_SECONDARY};font-family:Arial,Helvetica,sans-serif;">
                         <strong>{pool_label.title()}:</strong> {credits:,}
@@ -746,7 +746,7 @@ def send_payment_received(
 Thank you for your purchase! Your payment has been confirmed.
 
 Plan: {plan_name}
-Amount: £{amount_gbp:.2f}
+Amount: ${amount_usd:.2f}
 {pool_label.title()}: {credits:,}
 Date: {paid_date}
 
@@ -894,7 +894,7 @@ def notify_purchase(
     email: str,
     plan_name: str,
     credits: int,
-    amount_gbp: float,
+    amount_usd: float,
 ) -> bool:
     """Notify admin when a purchase is completed."""
     if not config.NOTIFY_ON_PURCHASE:
@@ -908,7 +908,7 @@ def notify_purchase(
             "Email": email,
             "Plan": plan_name,
             "Credits": f"{credits:,}",
-            "Amount": f"{amount_gbp:.2f} GBP",
+            "Amount": f"{amount_usd:.2f} USD",
         },
     )
 
@@ -933,7 +933,7 @@ def send_subscription_confirmation(
     plan_name: str,
     plan_code: str,  # noqa: ARG001 - reserved for future invoice generation
     credits_per_month: int,
-    price_gbp: float,
+    price_usd: float,
     cadence: str = "monthly",
     video_credits_per_month: int = 0,
 ) -> bool:
@@ -952,10 +952,10 @@ def send_subscription_confirmation(
 
     # Calculate billing info
     if cadence == "yearly":
-        price_display = f"£{price_gbp:.2f}/year"
+        price_display = f"${price_usd:.2f}/year"
         next_billing = "in 12 months"
     else:
-        price_display = f"£{price_gbp:.2f}/month"
+        price_display = f"${price_usd:.2f}/month"
         next_billing = "in 30 days"
 
     # Build credits description for dual pool
@@ -1834,8 +1834,8 @@ REFUND_COLOR = "#b45309"  # Warm amber for refund status
 def send_refund_confirmation(
     to_email: str,
     refund_id: str,
-    amount_gbp: float,
-    currency: str = "GBP",
+    amount_usd: float,
+    currency: str = "USD",
     credits_reversed: int = 0,
     credits_granted: int = 0,
     refund_type: str = "full_purchase_refund",
@@ -1854,7 +1854,7 @@ def send_refund_confirmation(
     from datetime import datetime, timezone
 
     logo_bytes = _load_logo()
-    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    symbol = "$" if currency == "USD" else "$" if currency == "USD" else "€"
 
     # Determine headline and status based on external refund state
     if external_refund_executed:
@@ -1909,7 +1909,7 @@ def send_refund_confirmation(
             <tr>
                 <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund amount</p>
-                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_usd:.2f}</p>
                     <p style="margin:0;font-size:14px;font-weight:600;color:{status_color};font-family:Arial,Helvetica,sans-serif;">{status_text} &bull; {refund_date}</p>
                 </td>
             </tr>
@@ -1919,7 +1919,7 @@ def send_refund_confirmation(
     summary_rows = [
         ("Refund reference", refund_id[:8].upper() if refund_id else "\u2014"),
         ("Type", type_label),
-        ("Amount refunded", f"&pound;{amount_gbp:.2f}"),
+        ("Amount refunded", f"${amount_usd:.2f}"),
         ("Date", refund_date),
     ]
 
@@ -1985,7 +1985,7 @@ def send_refund_confirmation(
         </table>
     '''
 
-    subject = f"TimrX Refund Confirmation - {symbol}{amount_gbp:.2f}"
+    subject = f"TimrX Refund Confirmation - {symbol}{amount_usd:.2f}"
 
     html_body = render_email_html(
         title=headline,
@@ -2000,7 +2000,7 @@ def send_refund_confirmation(
     reason_text = f"\nReason: {reason}" if reason else ""
     text_body = f"""{headline}
 
-Amount refunded: {symbol}{amount_gbp:.2f}
+Amount refunded: {symbol}{amount_usd:.2f}
 Date: {refund_date}
 Type: {type_label}
 Refund reference: {refund_id[:8].upper() if refund_id else '\u2014'}
@@ -2047,8 +2047,8 @@ REVIEW_COLOR = "#d97706"  # Amber for review/pending status
 def send_refund_review_email(
     to_email: str,
     refund_id: str,
-    amount_gbp: float,
-    currency: str = "GBP",
+    amount_usd: float,
+    currency: str = "USD",
     purchase_id: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> bool:
@@ -2062,7 +2062,7 @@ def send_refund_review_email(
     from datetime import datetime, timezone
 
     logo_bytes = _load_logo()
-    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    symbol = "$" if currency == "USD" else "$" if currency == "USD" else "€"
 
     headline = "Refund Under Review"
     intro = (
@@ -2077,7 +2077,7 @@ def send_refund_review_email(
             <tr>
                 <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund request</p>
-                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_usd:.2f}</p>
                     <p style="margin:0;font-size:14px;font-weight:600;color:{REVIEW_COLOR};font-family:Arial,Helvetica,sans-serif;">Under review &bull; {request_date}</p>
                 </td>
             </tr>
@@ -2086,7 +2086,7 @@ def send_refund_review_email(
     # Summary card
     summary_rows = [
         ("Reference", refund_id[:8].upper() if refund_id else "\u2014"),
-        ("Amount", f"&pound;{amount_gbp:.2f}"),
+        ("Amount", f"${amount_usd:.2f}"),
         ("Date submitted", request_date),
         ("Status", "Under review"),
     ]
@@ -2143,7 +2143,7 @@ def send_refund_review_email(
         </table>
     '''
 
-    subject = f"TimrX Refund Request Under Review - {symbol}{amount_gbp:.2f}"
+    subject = f"TimrX Refund Request Under Review - {symbol}{amount_usd:.2f}"
 
     html_body = render_email_html(
         title=headline,
@@ -2160,7 +2160,7 @@ def send_refund_review_email(
 
 We've received your refund request and it is currently being reviewed.
 
-Amount: {symbol}{amount_gbp:.2f}
+Amount: {symbol}{amount_usd:.2f}
 Reference: {refund_id[:8].upper() if refund_id else '\u2014'}{purchase_text}
 Date: {request_date}
 Status: Under review{reason_text}
@@ -2209,8 +2209,8 @@ DENIED_COLOR = "#b91c1c"
 def send_refund_resolution_approved(
     to_email: str,
     refund_id: str,
-    amount_gbp: float,
-    currency: str = "GBP",
+    amount_usd: float,
+    currency: str = "USD",
     purchase_id: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> bool:
@@ -2223,7 +2223,7 @@ def send_refund_resolution_approved(
     from datetime import datetime, timezone
 
     logo_bytes = _load_logo()
-    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    symbol = "$" if currency == "USD" else "$" if currency == "USD" else "€"
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
     amount_display = f'''
@@ -2231,7 +2231,7 @@ def send_refund_resolution_approved(
             <tr>
                 <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund amount</p>
-                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_usd:.2f}</p>
                     <p style="margin:0;font-size:14px;font-weight:600;color:{APPROVED_COLOR};font-family:Arial,Helvetica,sans-serif;">Approved &bull; {today}</p>
                 </td>
             </tr>
@@ -2239,7 +2239,7 @@ def send_refund_resolution_approved(
 
     summary_rows = [
         ("Reference", refund_id[:8].upper() if refund_id else "\u2014"),
-        ("Amount", f"&pound;{amount_gbp:.2f}"),
+        ("Amount", f"${amount_usd:.2f}"),
         ("Date approved", today),
         ("Status", "Approved"),
     ]
@@ -2280,7 +2280,7 @@ def send_refund_resolution_approved(
         </table>
     '''
 
-    subject = f"TimrX Refund Approved - {symbol}{amount_gbp:.2f}"
+    subject = f"TimrX Refund Approved - {symbol}{amount_usd:.2f}"
     html_body = render_email_html(
         title="Refund Approved",
         intro="Good news — your refund request has been approved.",
@@ -2295,7 +2295,7 @@ def send_refund_resolution_approved(
 
 Your refund request has been approved.
 
-Amount: {symbol}{amount_gbp:.2f}
+Amount: {symbol}{amount_usd:.2f}
 Reference: {refund_id[:8].upper() if refund_id else '\u2014'}{purchase_text}
 Date: {today}{reason_text}
 
@@ -2327,8 +2327,8 @@ TimrX - 3D Print Hub
 def send_refund_resolution_denied(
     to_email: str,
     refund_id: str,
-    amount_gbp: float,
-    currency: str = "GBP",
+    amount_usd: float,
+    currency: str = "USD",
     purchase_id: Optional[str] = None,
     reason: Optional[str] = None,
 ) -> bool:
@@ -2340,7 +2340,7 @@ def send_refund_resolution_denied(
     from datetime import datetime, timezone
 
     logo_bytes = _load_logo()
-    symbol = "£" if currency == "GBP" else "$" if currency == "USD" else "€"
+    symbol = "$" if currency == "USD" else "$" if currency == "USD" else "€"
     today = datetime.now(timezone.utc).strftime("%B %d, %Y")
 
     amount_display = f'''
@@ -2348,7 +2348,7 @@ def send_refund_resolution_denied(
             <tr>
                 <td style="padding-bottom:24px;border-bottom:1px solid {BORDER_COLOR};">
                     <p style="margin:0 0 8px 0;font-size:14px;color:{TEXT_MUTED};font-family:Arial,Helvetica,sans-serif;">Refund request</p>
-                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_gbp:.2f}</p>
+                    <p style="margin:0 0 8px 0;font-size:36px;font-weight:700;color:{TEXT_PRIMARY};font-family:Arial,Helvetica,sans-serif;line-height:1;">{symbol}{amount_usd:.2f}</p>
                     <p style="margin:0;font-size:14px;font-weight:600;color:{DENIED_COLOR};font-family:Arial,Helvetica,sans-serif;">Not approved &bull; {today}</p>
                 </td>
             </tr>
@@ -2356,7 +2356,7 @@ def send_refund_resolution_denied(
 
     summary_rows = [
         ("Reference", refund_id[:8].upper() if refund_id else "\u2014"),
-        ("Amount", f"&pound;{amount_gbp:.2f}"),
+        ("Amount", f"${amount_usd:.2f}"),
         ("Date reviewed", today),
         ("Status", "Not approved"),
     ]
@@ -2411,7 +2411,7 @@ def send_refund_resolution_denied(
         </table>
     '''
 
-    subject = f"TimrX Refund Request Reviewed - {symbol}{amount_gbp:.2f}"
+    subject = f"TimrX Refund Request Reviewed - {symbol}{amount_usd:.2f}"
     html_body = render_email_html(
         title="Refund Request Reviewed",
         intro="After careful review, we're unable to approve this refund request at this time.",
@@ -2426,7 +2426,7 @@ def send_refund_resolution_denied(
 
 After careful review, we're unable to approve this refund request at this time.
 
-Amount: {symbol}{amount_gbp:.2f}
+Amount: {symbol}{amount_usd:.2f}
 Reference: {refund_id[:8].upper() if refund_id else '\u2014'}{purchase_text}
 Date: {today}{reason_text}
 

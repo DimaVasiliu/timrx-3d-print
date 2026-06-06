@@ -84,7 +84,7 @@ class MollieService:
 
     @staticmethod
     def get_recurring_payment_methods(
-        amount_gbp: float,
+        amount_usd: float,
         include_inactive: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -99,7 +99,7 @@ class MollieService:
         and are filtered out.
 
         Args:
-            amount_gbp: Payment amount (some methods have minimums)
+            amount_usd: Payment amount (some methods have minimums)
             include_inactive: Include methods not yet activated (for testing)
 
         Returns:
@@ -120,8 +120,8 @@ class MollieService:
             # This filters to only methods that can establish a mandate
             params = {
                 "sequenceType": "first",
-                "amount[currency]": "GBP",
-                "amount[value]": f"{amount_gbp:.2f}",
+                "amount[currency]": "USD",
+                "amount[value]": f"{amount_usd:.2f}",
             }
             if include_inactive:
                 params["includeWallets"] = "applepay"
@@ -149,7 +149,7 @@ class MollieService:
             ]
 
             print(
-                f"[MOLLIE] Recurring methods for £{amount_gbp:.2f}: "
+                f"[MOLLIE] Recurring methods for ${amount_usd:.2f}: "
                 f"{[m['id'] for m in recurring_methods]}"
             )
 
@@ -232,7 +232,7 @@ class MollieService:
         # Get plan details
         plan_id = plan["id"]
         plan_name = plan["name"]
-        price_gbp = plan["price"]
+        price_usd = plan["price"]
         credits = plan["credits"]
 
         # Build redirect URL - Mollie redirects user HERE after payment
@@ -264,8 +264,8 @@ class MollieService:
         # Note: profileId is NOT a valid field - profile is determined by API key
         payment_data = {
             "amount": {
-                "currency": "GBP",
-                "value": f"{price_gbp:.2f}",
+                "currency": "USD",
+                "value": f"{price_usd:.2f}",
             },
             "description": f"{plan_name} - {credits} Credits",
             "redirectUrl": success_url,
@@ -950,7 +950,7 @@ class MollieService:
 
         # Get amount from payment
         amount_data = payment.get("amount", {})
-        amount_gbp = float(amount_data.get("value", 0))
+        amount_usd = float(amount_data.get("value", 0))
 
         # Get plan name
         plan = PricingService.get_plan_by_code(plan_code)
@@ -972,7 +972,7 @@ class MollieService:
                 plan_id=plan_id,
                 plan_code=plan_code,
                 provider_payment_id=payment_id,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 credits_granted=credits,
                 customer_email=customer_email,
             )
@@ -1000,13 +1000,13 @@ class MollieService:
                             payload={
                                 # GA4 standard ecommerce fields
                                 "transaction_id": payment_id,
-                                "value": float(amount_gbp),
-                                "currency": (amount_data.get("currency") or "GBP").upper(),
+                                "value": float(amount_usd),
+                                "currency": (amount_data.get("currency") or "USD").upper(),
                                 "items": [{
                                     "item_id":     plan_code,
                                     "item_name":   plan_name,
                                     "item_category": credit_type,
-                                    "price":       float(amount_gbp),
+                                    "price":       float(amount_usd),
                                     "quantity":    1,
                                 }],
                                 # TimrX-specific extras (available as variables in GTM)
@@ -1033,7 +1033,7 @@ class MollieService:
                             plan_code=plan_code,
                             plan_name=plan_name,
                             credits=credits,
-                            amount_gbp=amount_gbp,
+                            amount_usd=amount_usd,
                             customer_email=customer_email,
                             credit_type="video" if (plan_code or "").startswith("video_") else "general",
                         )
@@ -1046,7 +1046,7 @@ class MollieService:
                                 to_email=customer_email,
                                 plan_name=plan_name,
                                 credits=credits,
-                                amount_gbp=amount_gbp,
+                                amount_usd=amount_usd,
                                 credit_type="video" if (plan_code or "").startswith("video_") else "general",
                             )
                         except Exception as email_err:
@@ -1060,7 +1060,7 @@ class MollieService:
                             email=customer_email,
                             plan_name=plan_name,
                             credits=credits,
-                            amount_gbp=amount_gbp,
+                            amount_usd=amount_usd,
                         )
                     except Exception as admin_err:
                         print(f"[MOLLIE] WARNING: Admin notification failed: {admin_err}")
@@ -1406,7 +1406,7 @@ class MollieService:
         plan_id: str,
         plan_code: str,
         provider_payment_id: str,
-        amount_gbp: float,
+        amount_usd: float,
         credits_granted: int,
         customer_email: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -1432,7 +1432,7 @@ class MollieService:
                 f"""
                 INSERT INTO {Tables.PURCHASES}
                 (identity_id, plan_id, provider, provider_payment_id,
-                 amount_gbp, currency, credits_granted, status, paid_at)
+                 amount_usd, currency, credits_granted, status, paid_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (provider, provider_payment_id) DO NOTHING
                 RETURNING *
@@ -1442,8 +1442,8 @@ class MollieService:
                     plan_id,
                     "mollie",
                     provider_payment_id,
-                    amount_gbp,
-                    "GBP",
+                    amount_usd,
+                    "USD",
                     credits_granted,
                     PurchaseStatus.COMPLETED,
                 ),
@@ -1521,7 +1521,7 @@ class MollieService:
                     credits_granted,  # Positive amount
                     "purchase",
                     purchase_id,
-                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "provider": "mollie", "credit_type": credit_type}),
+                    json.dumps({"plan_code": plan_code, "amount_usd": amount_usd, "provider": "mollie", "credit_type": credit_type}),
                     credit_type,
                 ),
             )
@@ -1694,14 +1694,14 @@ class MollieService:
                 plan_name = plan_info.get("name", plan_code)
                 credits_per_month = plan_info.get("credits_per_month", 0)
                 video_credits_per_month = plan_info.get("video_credits_per_month", 0)
-                price_gbp = plan_info.get("price_gbp", 0)
+                price_usd = plan_info.get("price_usd", 0)
 
                 send_subscription_confirmation(
                     to_email=customer_email,
                     plan_name=plan_name,
                     plan_code=plan_code,
                     credits_per_month=credits_per_month,
-                    price_gbp=price_gbp,
+                    price_usd=price_usd,
                     cadence=cadence,
                     video_credits_per_month=video_credits_per_month,
                 )
@@ -1717,7 +1717,7 @@ class MollieService:
                         "Plan": plan_name,
                         "Cadence": cadence,
                         "Credits/month": f"{credits_per_month:,}",
-                        "Price": f"£{price_gbp:.2f}/{cadence}",
+                        "Price": f"${price_usd:.2f}/{cadence}",
                     },
                 )
             except Exception as email_err:
@@ -1981,14 +1981,14 @@ class MollieService:
                     plan_name = plan.get("name", plan_code)
                     credits_per_month = plan.get("credits_per_month", 0)
                     video_credits_per_month = plan.get("video_credits_per_month", 0)
-                    price_gbp = plan.get("price_gbp", 0)
+                    price_usd = plan.get("price_usd", 0)
 
                     send_subscription_confirmation(
                         to_email=customer_email,
                         plan_name=plan_name,
                         plan_code=plan_code,
                         credits_per_month=credits_per_month,
-                        price_gbp=price_gbp,
+                        price_usd=price_usd,
                         cadence=cadence,
                         video_credits_per_month=video_credits_per_month,
                     )
@@ -2003,7 +2003,7 @@ class MollieService:
                             "Plan": plan_name,
                             "Cadence": cadence,
                             "Credits/month": f"{credits_per_month:,}",
-                            "Price": f"£{price_gbp:.2f}/{cadence}",
+                            "Price": f"${price_usd:.2f}/{cadence}",
                             "Mollie Sub ID": mollie_subscription_id,
                             "Next Payment": next_payment_date or "N/A",
                         },
@@ -2287,7 +2287,7 @@ class MollieService:
         if not plan:
             raise ValueError(f"Unknown subscription plan: {plan_code}")
 
-        price_gbp = plan["price_gbp"]
+        price_usd = plan["price_usd"]
         plan_name = plan["name"]
         cadence = plan["cadence"]
         credits = plan["credits_per_month"]
@@ -2319,8 +2319,8 @@ class MollieService:
 
         payment_data = {
             "amount": {
-                "currency": "GBP",
-                "value": f"{price_gbp:.2f}",
+                "currency": "USD",
+                "value": f"{price_usd:.2f}",
             },
             "description": description,
             "redirectUrl": success_url,
@@ -2536,7 +2536,7 @@ class MollieService:
         customer_result = MollieService.get_or_create_customer(identity_id, email)
         mollie_customer_id = customer_result["mollie_customer_id"]
 
-        price_gbp = plan["price_gbp"]
+        price_usd = plan["price_usd"]
         plan_name = plan["name"]
         cadence = plan["cadence"]
         credits = plan["credits_per_month"]
@@ -2569,8 +2569,8 @@ class MollieService:
         # Create first payment with sequenceType=first to establish mandate
         payment_data = {
             "amount": {
-                "currency": "GBP",
-                "value": f"{price_gbp:.2f}",
+                "currency": "USD",
+                "value": f"{price_usd:.2f}",
             },
             "customerId": mollie_customer_id,
             "sequenceType": "first",  # CRITICAL: Establishes mandate for recurring
@@ -2731,7 +2731,7 @@ class MollieService:
         if not plan:
             raise ValueError(f"Unknown subscription plan: {plan_code}")
 
-        price_gbp = plan["price_gbp"]
+        price_usd = plan["price_usd"]
         plan_name = plan["name"]
         cadence = plan["cadence"]
         credits = plan["credits_per_month"]
@@ -2760,8 +2760,8 @@ class MollieService:
 
         subscription_data = {
             "amount": {
-                "currency": "GBP",
-                "value": f"{price_gbp:.2f}",
+                "currency": "USD",
+                "value": f"{price_usd:.2f}",
             },
             "interval": interval,
             "startDate": start_date_str,  # PREVENTS immediate duplicate charge

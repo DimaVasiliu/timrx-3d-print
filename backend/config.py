@@ -778,8 +778,8 @@ class Config:
     VIDEO_ENFORCE_LIMITS: bool = field(
         default_factory=lambda: _get_env_bool("VIDEO_ENFORCE_LIMITS", True)
     )
-    VIDEO_DAILY_PROVIDER_BUDGET_GBP: int = field(
-        default_factory=lambda: _get_env_int("VIDEO_DAILY_PROVIDER_BUDGET_GBP", 500)
+    VIDEO_DAILY_PROVIDER_BUDGET_USD: int = field(
+        default_factory=lambda: _get_env_int("VIDEO_DAILY_PROVIDER_BUDGET_USD", 500)
     )
     MAX_VIDEO_WORKERS: int = field(
         default_factory=lambda: _get_env_int("MAX_VIDEO_WORKERS", 8)

@@ -45,7 +45,7 @@ def submit_contact():
         "name": "John Doe",
         "email": "john@example.com",
         "subject": "Project Inquiry",  (optional)
-        "budget": "£1,500–£3,000",
+        "budget": "$1,500–$3,000",
         "message": "Tell me about your project..."
     }
     """

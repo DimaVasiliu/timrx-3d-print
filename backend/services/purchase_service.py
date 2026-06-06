@@ -122,11 +122,11 @@ class PurchaseService:
         # Get plan details
         plan_id = plan["id"]
         plan_name = plan["name"]
-        price_gbp = plan["price"]
+        price_usd = plan["price"]
         credits = plan["credits"]
 
         # Price in pence (Stripe uses smallest currency unit)
-        price_pence = int(price_gbp * 100)
+        price_pence = int(price_usd * 100)
 
         try:
             # Create Stripe Checkout session
@@ -137,7 +137,7 @@ class PurchaseService:
                 line_items=[
                     {
                         "price_data": {
-                            "currency": "gbp",
+                            "currency": "usd",
                             "unit_amount": price_pence,
                             "product_data": {
                                 "name": f"{plan_name} - {credits} Credits",
@@ -286,7 +286,7 @@ class PurchaseService:
 
         # Get amount from session (in pence)
         amount_total = session.get("amount_total", 0)
-        amount_gbp = amount_total / 100.0
+        amount_usd = amount_total / 100.0
 
         # Get plan name
         plan = PricingService.get_plan_by_code(plan_code)
@@ -308,7 +308,7 @@ class PurchaseService:
                 plan_id=plan_id,
                 plan_code=plan_code,
                 provider_payment_id=session_id,
-                amount_gbp=amount_gbp,
+                amount_usd=amount_usd,
                 credits_granted=credits,
                 customer_email=customer_email,
             )
@@ -350,7 +350,7 @@ class PurchaseService:
         plan_id: str,
         plan_code: str,
         provider_payment_id: str,
-        amount_gbp: float,
+        amount_usd: float,
         credits_granted: int,
         customer_email: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
@@ -369,7 +369,7 @@ class PurchaseService:
             plan_id: The plan UUID
             plan_code: The plan code (for reference)
             provider_payment_id: Stripe session/payment ID
-            amount_gbp: Amount paid in GBP
+            amount_usd: Amount paid in USD
             credits_granted: Number of credits to grant
             customer_email: Customer email from checkout
 
@@ -396,8 +396,8 @@ class PurchaseService:
                     plan_id,
                     "stripe",
                     provider_payment_id,
-                    amount_gbp,
-                    "GBP",
+                    amount_usd,
+                    "USD",
                     credits_granted,
                     PurchaseStatus.COMPLETED,
                 ),
@@ -468,7 +468,7 @@ class PurchaseService:
                     credits_granted,  # Positive amount
                     "purchase",
                     purchase_id,
-                    json.dumps({"plan_code": plan_code, "amount_gbp": amount_gbp, "credit_type": credit_type}),
+                    json.dumps({"plan_code": plan_code, "amount_usd": amount_usd, "credit_type": credit_type}),
                     credit_type,
                 ),
             )
@@ -526,7 +526,7 @@ class PurchaseService:
                         to_email=customer_email,
                         plan_name=plan_name,
                         credits=credits_granted,
-                        amount_gbp=amount_gbp,
+                        amount_usd=amount_usd,
                         plan_code=plan_code,
                         credit_type="video" if (plan_code or "").startswith("video_") else "general",
                     )
@@ -638,8 +638,8 @@ class PurchaseService:
     @staticmethod
     def _format_purchase(purchase: Dict[str, Any]) -> Dict[str, Any]:
         """Format purchase for API response."""
-        # amount column: schema uses amount_gbp, some code paths use amount
-        amount_val = purchase.get("amount_gbp") or purchase.get("amount") or 0
+        # amount column: schema uses amount_usd, some code paths use amount
+        amount_val = purchase.get("amount_usd") or purchase.get("amount") or 0
         # date column: schema uses paid_at, some code paths use purchased_at
         date_val = purchase.get("paid_at") or purchase.get("purchased_at")
         return {
@@ -651,8 +651,8 @@ class PurchaseService:
             "provider": purchase.get("provider"),
             "provider_payment_id": purchase.get("provider_payment_id"),
             "amount": float(amount_val),
-            "amount_gbp": float(amount_val),
-            "currency": purchase.get("currency", "GBP"),
+            "amount_usd": float(amount_val),
+            "currency": purchase.get("currency", "USD"),
             "credits_granted": purchase.get("credits_granted", 0),
             "status": purchase.get("status"),
             "meta": purchase.get("meta") or {},

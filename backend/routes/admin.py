@@ -78,7 +78,7 @@ def get_stats():
         - jobs_by_status: Job counts grouped by status
         - total_jobs: Total job count
         - job_success_rate: Percentage of completed vs failed jobs
-        - total_revenue_gbp: Total revenue in GBP
+        - total_revenue_usd: Total revenue in USD
     """
     try:
         stats = AdminService.get_stats()
@@ -1041,7 +1041,7 @@ def reconciliation_fixes():
         fixes = query_all(
             f"""
             SELECT id, run_id, provider, provider_payment_id, fix_type,
-                   identity_id, credits_delta, plan_code, amount_gbp,
+                   identity_id, credits_delta, plan_code, amount_usd,
                    mollie_status, created_at
             FROM timrx_billing.reconciliation_fixes
             WHERE {where_clause}
@@ -1063,7 +1063,7 @@ def reconciliation_fixes():
                     "identity_id": str(f["identity_id"]) if f["identity_id"] else None,
                     "credits_delta": f["credits_delta"],
                     "plan_code": f["plan_code"],
-                    "amount_gbp": float(f["amount_gbp"]) if f["amount_gbp"] else None,
+                    "amount_usd": float(f["amount_usd"]) if f["amount_usd"] else None,
                     "mollie_status": f["mollie_status"],
                     "created_at": f["created_at"].isoformat() if f["created_at"] else None,
                 }
@@ -1154,7 +1154,7 @@ def debug_user():
         # ── Get last purchase ──────────────────────────────────────
         last_purchase = query_one(
             f"""
-            SELECT id, amount_gbp, credits_granted, status, created_at
+            SELECT id, amount_usd, credits_granted, status, created_at
             FROM {Tables.PURCHASES}
             WHERE identity_id = %s
             ORDER BY created_at DESC
@@ -1166,7 +1166,7 @@ def debug_user():
         if last_purchase:
             last_purchase_summary = {
                 "id": str(last_purchase["id"]),
-                "amount_gbp": float(last_purchase["amount_gbp"]) if last_purchase["amount_gbp"] else None,
+                "amount_usd": float(last_purchase["amount_usd"]) if last_purchase["amount_usd"] else None,
                 "credits": last_purchase["credits_granted"],
                 "status": last_purchase["status"],
                 "created_at": last_purchase["created_at"].isoformat() if last_purchase["created_at"] else None,
@@ -2624,9 +2624,9 @@ def provider_ledger_create():
         entry = create_ledger_entry(
             provider=data.get("provider", ""),
             entry_type=data.get("entry_type", ""),
-            amount_gbp=data.get("amount_gbp"),
-            currency=data.get("currency", "GBP"),
-            balance_snapshot_gbp=data.get("balance_snapshot_gbp"),
+            amount_usd=data.get("amount_usd"),
+            currency=data.get("currency", "USD"),
+            balance_snapshot_usd=data.get("balance_snapshot_usd"),
             description=data.get("description"),
             reference=data.get("reference"),
             period_month=data.get("period_month"),
@@ -2753,7 +2753,7 @@ def refunds_send_review_email(refund_id):
 
         # Fetch refund
         refund = query_one(
-            f"SELECT id, identity_id, purchase_id, refund_status, amount_gbp, currency, reason FROM {Tables.REFUNDS} WHERE id = %s::uuid",
+            f"SELECT id, identity_id, purchase_id, refund_status, amount_usd, currency, reason FROM {Tables.REFUNDS} WHERE id = %s::uuid",
             (refund_id,),
         )
         if not refund:
@@ -2790,8 +2790,8 @@ def refunds_send_review_email(refund_id):
         # Queue email
         payload = {
             "refund_id": str(refund["id"]),
-            "amount_gbp": float(refund["amount_gbp"]) if refund["amount_gbp"] else 0,
-            "currency": refund["currency"] or "GBP",
+            "amount_usd": float(refund["amount_usd"]) if refund["amount_usd"] else 0,
+            "currency": refund["currency"] or "USD",
             "purchase_id": str(refund["purchase_id"]) if refund["purchase_id"] else None,
             "reason": refund["reason"],
         }
@@ -2967,7 +2967,7 @@ def purchases_export_csv():
             "purchase_id", "created_at", "paid_at", "status",
             "email", "identity_id", "plan_code", "plan_name",
             "provider", "payment_reference", "payment_id",
-            "amount_gbp", "currency", "credits_granted", "credits_remaining",
+            "amount_usd", "currency", "credits_granted", "credits_remaining",
             "credit_type", "is_subscription_purchase",
             "refund_exists", "latest_refund_status", "latest_refund_id",
             "refund_action_state", "refund_risk_level", "refund_risk_reason",
@@ -2988,7 +2988,7 @@ def purchases_export_csv():
                 "provider": p.get("provider", ""),
                 "payment_reference": p.get("payment_reference", ""),
                 "payment_id": p.get("payment_id", ""),
-                "amount_gbp": p.get("amount_gbp", ""),
+                "amount_usd": p.get("amount_usd", ""),
                 "currency": p.get("currency", ""),
                 "credits_granted": p.get("credits_granted", ""),
                 "credits_remaining": p.get("credits_remaining", ""),
@@ -3032,7 +3032,7 @@ def refunds_export_csv():
         fieldnames = [
             "refund_id", "created_at", "executed_at", "refund_status", "refund_type",
             "email", "identity_id", "purchase_id", "subscription_id", "purchase_type",
-            "amount_gbp", "currency", "credits_reversed", "credits_granted", "credits_used",
+            "amount_usd", "currency", "credits_reversed", "credits_granted", "credits_used",
             "credit_type", "payment_provider",
             "external_refund_attempted", "external_refund_executed", "external_refund_id", "external_refund_error",
             "executed_by", "reason", "admin_note", "display_summary",
@@ -3052,7 +3052,7 @@ def refunds_export_csv():
                 "purchase_id": rf.get("purchase_id", ""),
                 "subscription_id": rf.get("subscription_id", ""),
                 "purchase_type": rf.get("purchase_type", ""),
-                "amount_gbp": rf.get("amount_gbp", ""),
+                "amount_usd": rf.get("amount_usd", ""),
                 "currency": rf.get("currency", ""),
                 "credits_reversed": rf.get("credits_reversed", ""),
                 "credits_granted": rf.get("credits_granted", ""),
@@ -3105,7 +3105,7 @@ def disputes_export_csv():
             "dispute_id", "created_at", "updated_at", "dispute_status",
             "email", "identity_id", "purchase_id",
             "payment_provider", "payment_reference",
-            "amount_gbp", "currency",
+            "amount_usd", "currency",
             "dispute_reason", "admin_note", "evidence_summary",
         ] + _evd_flag_cols + ["evidence_links"]
 
@@ -3123,7 +3123,7 @@ def disputes_export_csv():
                 "purchase_id": d.get("purchase_id", ""),
                 "payment_provider": d.get("payment_provider", ""),
                 "payment_reference": d.get("payment_reference", ""),
-                "amount_gbp": d.get("amount_gbp", ""),
+                "amount_usd": d.get("amount_usd", ""),
                 "currency": d.get("currency", ""),
                 "dispute_reason": d.get("dispute_reason", ""),
                 "admin_note": d.get("admin_note", ""),
@@ -3164,8 +3164,8 @@ def provider_ledger_export_csv():
         )
 
         fieldnames = [
-            "id", "created_at", "provider", "entry_type", "amount_gbp", "currency",
-            "balance_snapshot_gbp", "description", "reference", "period_month", "recorded_by",
+            "id", "created_at", "provider", "entry_type", "amount_usd", "currency",
+            "balance_snapshot_usd", "description", "reference", "period_month", "recorded_by",
         ]
 
         rows = []
@@ -3175,9 +3175,9 @@ def provider_ledger_export_csv():
                 "created_at": e.get("created_at", ""),
                 "provider": e.get("provider", ""),
                 "entry_type": e.get("entry_type", ""),
-                "amount_gbp": e.get("amount_gbp", ""),
+                "amount_usd": e.get("amount_usd", ""),
                 "currency": e.get("currency", ""),
-                "balance_snapshot_gbp": e.get("balance_snapshot_gbp", ""),
+                "balance_snapshot_usd": e.get("balance_snapshot_usd", ""),
                 "description": e.get("description", ""),
                 "reference": e.get("reference", ""),
                 "period_month": e.get("period_month", ""),
@@ -3205,10 +3205,10 @@ def provider_spend_monthly_export_csv():
         )
 
         fieldnames = [
-            "month", "provider", "estimated_usage_gbp", "job_count",
-            "topups_gbp", "topup_count", "invoices_gbp", "invoice_count",
-            "adjustments_gbp", "adjustment_count",
-            "latest_balance_snapshot_gbp", "latest_balance_snapshot_recorded_at",
+            "month", "provider", "estimated_usage_usd", "job_count",
+            "topups_usd", "topup_count", "invoices_usd", "invoice_count",
+            "adjustments_usd", "adjustment_count",
+            "latest_balance_snapshot_usd", "latest_balance_snapshot_recorded_at",
         ]
 
         snapshots = result.get("latest_snapshots", {})
@@ -3219,15 +3219,15 @@ def provider_spend_monthly_export_csv():
             rows.append({
                 "month": row.get("month", ""),
                 "provider": provider,
-                "estimated_usage_gbp": row.get("estimated_usage_gbp", ""),
+                "estimated_usage_usd": row.get("estimated_usage_usd", ""),
                 "job_count": row.get("job_count", ""),
-                "topups_gbp": row.get("topups_gbp", ""),
+                "topups_usd": row.get("topups_usd", ""),
                 "topup_count": row.get("topup_count", ""),
-                "invoices_gbp": row.get("invoices_gbp", ""),
+                "invoices_usd": row.get("invoices_usd", ""),
                 "invoice_count": row.get("invoice_count", ""),
-                "adjustments_gbp": row.get("adjustments_gbp", ""),
+                "adjustments_usd": row.get("adjustments_usd", ""),
                 "adjustment_count": row.get("adjustment_count", ""),
-                "latest_balance_snapshot_gbp": snap.get("balance_gbp", ""),
+                "latest_balance_snapshot_usd": snap.get("balance_usd", ""),
                 "latest_balance_snapshot_recorded_at": snap.get("recorded_at", ""),
             })
 
@@ -3823,7 +3823,7 @@ def margin_analytics():
         by_product: margin breakdown by image/video/3D
         by_provider: cost breakdown by provider
         by_user: top 30 users by spend with revenue/cost/margin
-        alerts: users below 40% margin with >£0.50 cost
+        alerts: users below 40% margin with >$0.50 cost
     """
     days = min(int(request.args.get("days", 30)), 365)
     try:

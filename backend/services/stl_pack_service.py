@@ -42,48 +42,48 @@ ALL_ACCESS_SLUG = "*"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CATALOG — edit this to manage the store.
-#   price_gbp : source of truth at checkout (the client cannot tamper with it)
+#   price_usd : source of truth at checkout (the client cannot tamper with it)
 #   r2_key    : the object name in the R2 bucket (config.R2_BUCKET)
 # Slugs MUST match the frontend catalog in js/stl-packs.js.
 # To add a pack: upload <slug>.zip to R2, then add an entry here.
 # ─────────────────────────────────────────────────────────────────────────────
 STL_PACKS: Dict[str, Dict[str, Any]] = {
-    "airplanes":         {"title": "Airplanes STL Pack",          "price_gbp": 2.49, "r2_key": "airplanes.zip"},
-    "animals":           {"title": "Animals STL Pack",            "price_gbp": 2.49, "r2_key": "animals.zip"},
-    "anime":             {"title": "Anime STL Pack",              "price_gbp": 2.49, "r2_key": "anime.zip"},
-    "articulated-toys":  {"title": "Articulated Toys Pack",       "price_gbp": 2.49, "r2_key": "articulated-toys.zip"},
-    "games":             {"title": "Games STL Pack",              "price_gbp": 2.49, "r2_key": "games.zip"},
-    "busts":             {"title": "Busts STL Pack",              "price_gbp": 2.49, "r2_key": "busts.zip"},
-    "scenes":            {"title": "Scenes STL Pack",             "price_gbp": 2.49, "r2_key": "scenes.zip"},
-    "chibi":             {"title": "Chibi STL Pack",              "price_gbp": 2.49, "r2_key": "chibi.zip"},
-    "keychains":         {"title": "Keychains STL Pack",          "price_gbp": 2.49, "r2_key": "keychains.zip"},
-    "cosplay":           {"title": "Cosplay STL Pack",            "price_gbp": 2.49, "r2_key": "cosplay.zip"},
-    "dc":                {"title": "DC STL Pack",                 "price_gbp": 2.49, "r2_key": "dc.zip"},
-    "decorations":       {"title": "Decorations STL Pack",        "price_gbp": 2.49, "r2_key": "decorations.zip"},
-    "animated-cartoons": {"title": "Animated Cartoons STL Pack",  "price_gbp": 2.49, "r2_key": "animated-cartoons.zip"},
-    "disney":            {"title": "Disney STL Pack",             "price_gbp": 2.49, "r2_key": "disney.zip"},
-    "sculptures":        {"title": "Sculptures STL Pack",         "price_gbp": 2.49, "r2_key": "sculptures.zip"},
-    "dioramas":          {"title": "Dioramas STL Pack",           "price_gbp": 2.49, "r2_key": "dioramas.zip"},
-    "foldable":          {"title": "Foldable STL Pack",           "price_gbp": 2.49, "r2_key": "foldable.zip"},
-    "film":              {"title": "Film STL Pack",               "price_gbp": 2.49, "r2_key": "film.zip"},
-    "mythological":      {"title": "Mythological STL Pack",       "price_gbp": 2.49, "r2_key": "mythological.zip"},
-    "multipart":         {"title": "Multipart STL Pack",          "price_gbp": 2.49, "r2_key": "multipart.zip"},
-    "religion":          {"title": "Religion STL Pack",           "price_gbp": 2.49, "r2_key": "religion.zip"},
-    "vehicles":          {"title": "Vehicles STL Pack",           "price_gbp": 2.49, "r2_key": "vehicles.zip"},
-    "supports":          {"title": "Supports STL Pack",           "price_gbp": 2.49, "r2_key": "supports.zip"},
-    "utensils":          {"title": "Utensils STL Pack",           "price_gbp": 2.49, "r2_key": "utensils.zip"},
-    "miniatures":        {"title": "Miniatures STL Pack",         "price_gbp": 2.49, "r2_key": "miniatures.zip"},
-    "rpg":               {"title": "RPG STL Pack",                "price_gbp": 2.49, "r2_key": "rpg.zip"},
-    "famous-characters": {"title": "Famous Characters STL Pack",  "price_gbp": 2.49, "r2_key": "famous-characters.zip"},
-    "funkos":            {"title": "Funkos STL Pack",             "price_gbp": 2.49, "r2_key": "funkos.zip"},
-    "plant-pots-vases":  {"title": "Plant Pots & Vases STL Pack", "price_gbp": 2.49, "r2_key": "plant-pots-vases.zip"},
-    "marvel":            {"title": "Marvel STL Pack",             "price_gbp": 2.49, "r2_key": "marvel.zip"},
+    "airplanes":         {"title": "Airplanes STL Pack",          "price_usd": 1.99, "r2_key": "airplanes.zip"},
+    "animals":           {"title": "Animals STL Pack",            "price_usd": 1.99, "r2_key": "animals.zip"},
+    "anime":             {"title": "Anime STL Pack",              "price_usd": 1.99, "r2_key": "anime.zip"},
+    "articulated-toys":  {"title": "Articulated Toys Pack",       "price_usd": 1.99, "r2_key": "articulated-toys.zip"},
+    "games":             {"title": "Games STL Pack",              "price_usd": 1.99, "r2_key": "games.zip"},
+    "busts":             {"title": "Busts STL Pack",              "price_usd": 1.99, "r2_key": "busts.zip"},
+    "scenes":            {"title": "Scenes STL Pack",             "price_usd": 1.99, "r2_key": "scenes.zip"},
+    "chibi":             {"title": "Chibi STL Pack",              "price_usd": 1.99, "r2_key": "chibi.zip"},
+    "keychains":         {"title": "Keychains STL Pack",          "price_usd": 1.99, "r2_key": "keychains.zip"},
+    "cosplay":           {"title": "Cosplay STL Pack",            "price_usd": 1.99, "r2_key": "cosplay.zip"},
+    "dc":                {"title": "DC STL Pack",                 "price_usd": 1.99, "r2_key": "dc.zip"},
+    "decorations":       {"title": "Decorations STL Pack",        "price_usd": 1.99, "r2_key": "decorations.zip"},
+    "animated-cartoons": {"title": "Animated Cartoons STL Pack",  "price_usd": 1.99, "r2_key": "animated-cartoons.zip"},
+    "disney":            {"title": "Disney STL Pack",             "price_usd": 1.99, "r2_key": "disney.zip"},
+    "sculptures":        {"title": "Sculptures STL Pack",         "price_usd": 1.99, "r2_key": "sculptures.zip"},
+    "dioramas":          {"title": "Dioramas STL Pack",           "price_usd": 1.99, "r2_key": "dioramas.zip"},
+    "foldable":          {"title": "Foldable STL Pack",           "price_usd": 1.99, "r2_key": "foldable.zip"},
+    "film":              {"title": "Film STL Pack",               "price_usd": 1.99, "r2_key": "film.zip"},
+    "mythological":      {"title": "Mythological STL Pack",       "price_usd": 1.99, "r2_key": "mythological.zip"},
+    "multipart":         {"title": "Multipart STL Pack",          "price_usd": 1.99, "r2_key": "multipart.zip"},
+    "religion":          {"title": "Religion STL Pack",           "price_usd": 1.99, "r2_key": "religion.zip"},
+    "vehicles":          {"title": "Vehicles STL Pack",           "price_usd": 1.99, "r2_key": "vehicles.zip"},
+    "supports":          {"title": "Supports STL Pack",           "price_usd": 1.99, "r2_key": "supports.zip"},
+    "utensils":          {"title": "Utensils STL Pack",           "price_usd": 1.99, "r2_key": "utensils.zip"},
+    "miniatures":        {"title": "Miniatures STL Pack",         "price_usd": 1.99, "r2_key": "miniatures.zip"},
+    "rpg":               {"title": "RPG STL Pack",                "price_usd": 1.99, "r2_key": "rpg.zip"},
+    "famous-characters": {"title": "Famous Characters STL Pack",  "price_usd": 1.99, "r2_key": "famous-characters.zip"},
+    "funkos":            {"title": "Funkos STL Pack",             "price_usd": 1.99, "r2_key": "funkos.zip"},
+    "plant-pots-vases":  {"title": "Plant Pots & Vases STL Pack", "price_usd": 1.99, "r2_key": "plant-pots-vases.zip"},
+    "marvel":            {"title": "Marvel STL Pack",             "price_usd": 1.99, "r2_key": "marvel.zip"},
 }
 
 # All-Access pass — one payment unlocks every pack (entitlement slug "*").
 ALL_ACCESS: Dict[str, Any] = {
     "title": "All-Access Library Pass",
-    "price_gbp": 14.99,
+    "price_usd": 14.99,
     "r2_key": None,
 }
 
@@ -111,7 +111,7 @@ def ensure_stl_schema() -> None:
                 provider            text NOT NULL DEFAULT 'mollie',
                 provider_payment_id text NOT NULL,
                 amount              numeric(10,2),
-                currency            text NOT NULL DEFAULT 'GBP',
+                currency            text NOT NULL DEFAULT 'USD',
                 status              text NOT NULL DEFAULT 'completed',
                 created_at          timestamptz NOT NULL DEFAULT now()
             )
@@ -172,7 +172,7 @@ class StlPackService:
             "email": email or "",
         }
         payment_data = {
-            "amount": {"currency": "GBP", "value": f"{float(pack['price_gbp']):.2f}"},
+            "amount": {"currency": "USD", "value": f"{float(pack['price_usd']):.2f}"},
             "description": f"TimrX STL Pack — {pack['title']}",
             "redirectUrl": success_url,
             "webhookUrl": webhook_url,
@@ -209,7 +209,7 @@ class StlPackService:
         pack_slug: str,
         provider_payment_id: str,
         amount: Optional[float] = None,
-        currency: str = "GBP",
+        currency: str = "USD",
         provider: str = "mollie",
     ) -> Optional[Dict[str, Any]]:
         """Insert an entitlement row. Idempotent on (provider, provider_payment_id)."""
@@ -273,7 +273,7 @@ class StlPackService:
         pack_slug = metadata.get("pack_slug")
 
         amount_data = payment.get("amount", {}) or {}
-        currency = amount_data.get("currency", "GBP")
+        currency = amount_data.get("currency", "USD")
         try:
             amount = float(amount_data.get("value")) if amount_data.get("value") else None
         except (TypeError, ValueError):

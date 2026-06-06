@@ -9,7 +9,7 @@ Manages the provider_ledger table for recording:
   - Notes (free-text operational notes)
 
 Also provides monthly spend reporting that combines:
-  - Estimated usage cost from jobs.estimated_provider_cost_gbp
+  - Estimated usage cost from jobs.estimated_provider_cost_usd
   - Manual ledger entries (top-ups, invoices, etc.)
 """
 
@@ -166,8 +166,8 @@ def list_ledger_entries(
     params.extend([limit, offset])
     rows = query_all(
         f"""
-        SELECT id, provider, entry_type, amount_gbp, currency,
-               balance_snapshot_gbp, description, reference,
+        SELECT id, provider, entry_type, amount_usd, currency,
+               balance_snapshot_usd, description, reference,
                period_month, metadata, recorded_by, created_at
         FROM {_TABLE}
         {where}
@@ -186,9 +186,9 @@ def list_ledger_entries(
             "display_label": display["display_label"],
             "display_subtitle": display["display_subtitle"],
             "entry_type": r["entry_type"],
-            "amount_gbp": float(r["amount_gbp"]) if r["amount_gbp"] is not None else None,
+            "amount_usd": float(r["amount_usd"]) if r["amount_usd"] is not None else None,
             "currency": r["currency"],
-            "balance_snapshot_gbp": float(r["balance_snapshot_gbp"]) if r["balance_snapshot_gbp"] is not None else None,
+            "balance_snapshot_usd": float(r["balance_snapshot_usd"]) if r["balance_snapshot_usd"] is not None else None,
             "description": r["description"],
             "reference": r["reference"],
             "period_month": _iso(r["period_month"]),
@@ -209,9 +209,9 @@ def create_ledger_entry(
     *,
     provider: str,
     entry_type: str,
-    amount_gbp: Optional[float] = None,
-    currency: str = "GBP",
-    balance_snapshot_gbp: Optional[float] = None,
+    amount_usd: Optional[float] = None,
+    currency: str = "USD",
+    balance_snapshot_usd: Optional[float] = None,
     description: Optional[str] = None,
     reference: Optional[str] = None,
     period_month: Optional[str] = None,
@@ -224,8 +224,8 @@ def create_ledger_entry(
     Validates:
       - provider is required
       - entry_type must be one of: topup, invoice, balance_snapshot, adjustment, note
-      - amount_gbp is required for topup, invoice, adjustment
-      - balance_snapshot_gbp is only meaningful for balance_snapshot type
+      - amount_usd is required for topup, invoice, adjustment
+      - balance_snapshot_usd is only meaningful for balance_snapshot type
       - period_month is normalized to first day of month
     """
     # Validate
@@ -236,8 +236,8 @@ def create_ledger_entry(
     if entry_type not in _VALID_ENTRY_TYPES:
         raise ValueError(f"entry_type must be one of: {', '.join(sorted(_VALID_ENTRY_TYPES))}")
 
-    if entry_type in _AMOUNT_REQUIRED_TYPES and amount_gbp is None:
-        raise ValueError(f"amount_gbp is required for entry_type={entry_type}")
+    if entry_type in _AMOUNT_REQUIRED_TYPES and amount_usd is None:
+        raise ValueError(f"amount_usd is required for entry_type={entry_type}")
 
     # Normalize period_month
     period_date = None
@@ -255,8 +255,8 @@ def create_ledger_entry(
             cur.execute(
                 f"""
                 INSERT INTO {_TABLE}
-                    (provider, entry_type, amount_gbp, currency,
-                     balance_snapshot_gbp, description, reference,
+                    (provider, entry_type, amount_usd, currency,
+                     balance_snapshot_usd, description, reference,
                      period_month, metadata, recorded_by)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 RETURNING id, created_at
@@ -264,9 +264,9 @@ def create_ledger_entry(
                 (
                     provider,
                     entry_type,
-                    amount_gbp,
+                    amount_usd,
                     currency,
-                    balance_snapshot_gbp,
+                    balance_snapshot_usd,
                     (description or "")[:2000] if description else None,
                     (reference or "")[:500] if reference else None,
                     period_date,
@@ -280,7 +280,7 @@ def create_ledger_entry(
     entry_id = str(row["id"])
     created_at = _iso(row["created_at"])
 
-    amt_str = f"{amount_gbp:.2f}" if amount_gbp is not None else "null"
+    amt_str = f"{amount_usd:.2f}" if amount_usd is not None else "null"
     print(f"[ADMIN_PROVIDER_LEDGER] created provider={provider} type={entry_type} amount={amt_str}")
 
     return {
@@ -289,9 +289,9 @@ def create_ledger_entry(
         "display_label": get_provider_display(provider)["display_label"],
         "display_subtitle": get_provider_display(provider)["display_subtitle"],
         "entry_type": entry_type,
-        "amount_gbp": float(amount_gbp) if amount_gbp is not None else None,
+        "amount_usd": float(amount_usd) if amount_usd is not None else None,
         "currency": currency,
-        "balance_snapshot_gbp": float(balance_snapshot_gbp) if balance_snapshot_gbp is not None else None,
+        "balance_snapshot_usd": float(balance_snapshot_usd) if balance_snapshot_usd is not None else None,
         "description": description,
         "reference": reference,
         "period_month": _iso(period_date),
@@ -314,7 +314,7 @@ def get_monthly_spend_report(
     Monthly provider spend report combining estimated job costs + manual ledger.
 
     Returns per-provider, per-month breakdown with:
-      - estimated_usage_gbp: sum of jobs.estimated_provider_cost_gbp
+      - estimated_usage_usd: sum of jobs.estimated_provider_cost_usd
       - job_count: number of succeeded/ready jobs
       - ledger totals by entry_type (topups, invoices, adjustments)
       - latest balance snapshot if available
@@ -339,7 +339,7 @@ def get_monthly_spend_report(
         SELECT
             provider,
             DATE_TRUNC('month', created_at)::date AS month,
-            COALESCE(SUM(estimated_provider_cost_gbp), 0) AS estimated_usage_gbp,
+            COALESCE(SUM(estimated_provider_cost_usd), 0) AS estimated_usage_usd,
             COUNT(*) AS job_count
         FROM {Tables.JOBS}
         WHERE status IN ('succeeded', 'ready')
@@ -359,7 +359,7 @@ def get_monthly_spend_report(
             provider,
             COALESCE(period_month, DATE_TRUNC('month', created_at)::date) AS month,
             entry_type,
-            COALESCE(SUM(amount_gbp), 0) AS total_gbp,
+            COALESCE(SUM(amount_usd), 0) AS total_usd,
             COUNT(*) AS entry_count
         FROM {_TABLE}
         WHERE created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '%s months'
@@ -377,11 +377,11 @@ def get_monthly_spend_report(
         f"""
         SELECT DISTINCT ON (provider)
             provider,
-            balance_snapshot_gbp,
+            balance_snapshot_usd,
             created_at
         FROM {_TABLE}
         WHERE entry_type = 'balance_snapshot'
-          AND balance_snapshot_gbp IS NOT NULL
+          AND balance_snapshot_usd IS NOT NULL
           {ledger_filter}
         ORDER BY provider, created_at DESC
         """,
@@ -396,7 +396,7 @@ def get_monthly_spend_report(
             continue
         display = get_provider_display(account)
         snapshots[account] = {
-            "balance_gbp": float(r["balance_snapshot_gbp"]),
+            "balance_usd": float(r["balance_snapshot_usd"]),
             "recorded_at": _iso(r["created_at"]),
             "display_label": display["display_label"],
             "display_subtitle": display["display_subtitle"],
@@ -412,8 +412,8 @@ def get_monthly_spend_report(
             data[prov] = {}
         if month_str not in data[prov]:
             data[prov][month_str] = _empty_month()
-        data[prov][month_str]["estimated_usage_gbp"] = round(
-            data[prov][month_str]["estimated_usage_gbp"] + float(r["estimated_usage_gbp"]),
+        data[prov][month_str]["estimated_usage_usd"] = round(
+            data[prov][month_str]["estimated_usage_usd"] + float(r["estimated_usage_usd"]),
             2,
         )
         data[prov][month_str]["job_count"] += r["job_count"]
@@ -427,17 +427,17 @@ def get_monthly_spend_report(
             data[prov][month_str] = _empty_month()
 
         et = r["entry_type"]
-        total = round(float(r["total_gbp"]), 2)
+        total = round(float(r["total_usd"]), 2)
         count = r["entry_count"]
 
         if et == "topup":
-            data[prov][month_str]["topups_gbp"] = round(data[prov][month_str]["topups_gbp"] + total, 2)
+            data[prov][month_str]["topups_usd"] = round(data[prov][month_str]["topups_usd"] + total, 2)
             data[prov][month_str]["topup_count"] += count
         elif et == "invoice":
-            data[prov][month_str]["invoices_gbp"] = round(data[prov][month_str]["invoices_gbp"] + total, 2)
+            data[prov][month_str]["invoices_usd"] = round(data[prov][month_str]["invoices_usd"] + total, 2)
             data[prov][month_str]["invoice_count"] += count
         elif et == "adjustment":
-            data[prov][month_str]["adjustments_gbp"] = round(data[prov][month_str]["adjustments_gbp"] + total, 2)
+            data[prov][month_str]["adjustments_usd"] = round(data[prov][month_str]["adjustments_usd"] + total, 2)
             data[prov][month_str]["adjustment_count"] += count
 
     # 5. Flatten to list format
@@ -463,13 +463,13 @@ def get_monthly_spend_report(
 
 def _empty_month() -> Dict[str, Any]:
     return {
-        "estimated_usage_gbp": 0.0,
+        "estimated_usage_usd": 0.0,
         "job_count": 0,
-        "topups_gbp": 0.0,
+        "topups_usd": 0.0,
         "topup_count": 0,
-        "invoices_gbp": 0.0,
+        "invoices_usd": 0.0,
         "invoice_count": 0,
-        "adjustments_gbp": 0.0,
+        "adjustments_usd": 0.0,
         "adjustment_count": 0,
     }
 
@@ -481,8 +481,8 @@ def _empty_month() -> Dict[str, Any]:
 # Thresholds
 _STALE_SNAPSHOT_DAYS = 7          # snapshot older than this → warning
 _ACTION_NEEDED_SNAPSHOT_DAYS = 14  # snapshot older than this → action_needed
-_LOW_BALANCE_GBP = 10.0           # balance below this → warning
-_CRITICAL_BALANCE_GBP = 3.0       # balance below this → action_needed
+_LOW_BALANCE_USD = 10.0           # balance below this → warning
+_CRITICAL_BALANCE_USD = 3.0       # balance below this → action_needed
 
 
 def get_provider_balances() -> Dict[str, Any]:
@@ -491,8 +491,8 @@ def get_provider_balances() -> Dict[str, Any]:
     wallet alerts, and computed balance_status per provider.
 
     Status logic:
-      action_needed — snapshot stale >14d, balance <£3, or active wallet_depleted alert
-      warning       — snapshot stale >7d, balance <£10
+      action_needed — snapshot stale >14d, balance <$3, or active wallet_depleted alert
+      warning       — snapshot stale >7d, balance <$10
       ok            — recent snapshot, balance looks fine
       unknown       — no snapshot recorded
     """
@@ -501,10 +501,10 @@ def get_provider_balances() -> Dict[str, Any]:
     # 1. Latest balance snapshot per provider
     snapshot_rows = query_all(f"""
         SELECT DISTINCT ON (provider)
-            provider, balance_snapshot_gbp, created_at, description
+            provider, balance_snapshot_usd, created_at, description
         FROM {_TABLE}
         WHERE entry_type = 'balance_snapshot'
-          AND balance_snapshot_gbp IS NOT NULL
+          AND balance_snapshot_usd IS NOT NULL
         ORDER BY provider, created_at DESC
     """)
     snapshots: Dict[str, Dict[str, Any]] = {}
@@ -515,7 +515,7 @@ def get_provider_balances() -> Dict[str, Any]:
         if existing_dt and current_dt and existing_dt >= current_dt:
             continue
         snapshots[account] = {
-            "balance_gbp": float(r["balance_snapshot_gbp"]),
+            "balance_usd": float(r["balance_snapshot_usd"]),
             "recorded_at": r["created_at"],
             "description": r["description"],
         }
@@ -532,7 +532,7 @@ def get_provider_balances() -> Dict[str, Any]:
             params = (*members, snap["recorded_at"])
         row = query_one(
             f"""
-            SELECT COALESCE(SUM(estimated_provider_cost_gbp), 0) AS spend,
+            SELECT COALESCE(SUM(estimated_provider_cost_usd), 0) AS spend,
                    COALESCE(SUM(cost_credits), 0) AS credits,
                    COUNT(*) AS job_count
             FROM {Tables.JOBS}
@@ -544,7 +544,7 @@ def get_provider_balances() -> Dict[str, Any]:
         )
         if row:
             spend_since[prov] = {
-                "estimated_spend_gbp": round(float(row["spend"]), 2),
+                "estimated_spend_usd": round(float(row["spend"]), 2),
                 "credits_consumed": int(row["credits"]),
                 "job_count": row["job_count"],
             }
@@ -579,7 +579,7 @@ def get_provider_balances() -> Dict[str, Any]:
             SELECT provider,
                    action_code,
                    COUNT(*) AS job_count,
-                   COALESCE(SUM(estimated_provider_cost_gbp), 0) AS cost_gbp,
+                   COALESCE(SUM(estimated_provider_cost_usd), 0) AS cost_usd,
                    COALESCE(SUM(cost_credits), 0) AS credits
             FROM {Tables.JOBS}
             WHERE provider IN ('nano_banana', 'seedance')
@@ -596,7 +596,7 @@ def get_provider_balances() -> Dict[str, Any]:
             prov_name = br["provider"]
             ac = (br.get("action_code") or "").lower()
             cnt = br["job_count"]
-            cost = float(br["cost_gbp"])
+            cost = float(br["cost_usd"])
             creds = int(br["credits"])
             if prov_name == "seedance":
                 video_jobs += cnt
@@ -614,10 +614,10 @@ def get_provider_balances() -> Dict[str, Any]:
                     nb_standard += cnt
         piapi_breakdown = {
             "video_jobs_since_snapshot": video_jobs,
-            "video_cost_since_gbp": round(video_cost, 2),
+            "video_cost_since_usd": round(video_cost, 2),
             "video_credits_since_snapshot": video_credits,
             "image_jobs_since_snapshot": image_jobs,
-            "image_cost_since_gbp": round(image_cost, 2),
+            "image_cost_since_usd": round(image_cost, 2),
             "image_credits_since_snapshot": image_credits,
             "nano_banana_standard_count": nb_standard,
             "nano_banana_2k_count": nb_2k,
@@ -632,7 +632,7 @@ def get_provider_balances() -> Dict[str, Any]:
 
     for prov in sorted(all_providers):
         snap = snapshots.get(prov)
-        spend = spend_since.get(prov, {"estimated_spend_gbp": 0.0, "job_count": 0})
+        spend = spend_since.get(prov, {"estimated_spend_usd": 0.0, "job_count": 0})
         wallet = wallet_alert_map.get(prov)
         display = get_provider_display(prov)
 
@@ -644,17 +644,17 @@ def get_provider_balances() -> Dict[str, Any]:
         else:
             recorded_at = _as_utc_datetime(snap["recorded_at"])
             days_since = (now - recorded_at).days if recorded_at else None
-            balance = snap["balance_gbp"]
-            estimated_remaining = round(balance - spend["estimated_spend_gbp"], 2)
+            balance = snap["balance_usd"]
+            estimated_remaining = round(balance - spend["estimated_spend_usd"], 2)
 
             # Status determination
             has_wallet_alert = wallet is not None
             if ((days_since is not None and days_since >= _ACTION_NEEDED_SNAPSHOT_DAYS)
-                    or estimated_remaining <= _CRITICAL_BALANCE_GBP
+                    or estimated_remaining <= _CRITICAL_BALANCE_USD
                     or has_wallet_alert):
                 status = "action_needed"
             elif ((days_since is not None and days_since >= _STALE_SNAPSHOT_DAYS)
-                  or estimated_remaining <= _LOW_BALANCE_GBP):
+                  or estimated_remaining <= _LOW_BALANCE_USD):
                 status = "warning"
             else:
                 status = "ok"
@@ -669,14 +669,14 @@ def get_provider_balances() -> Dict[str, Any]:
             "display_label": display["display_label"],
             "display_subtitle": display["display_subtitle"],
             "balance_status": status,
-            "last_snapshot_gbp": balance,
+            "last_snapshot_usd": balance,
             "last_snapshot_at": _iso(snap["recorded_at"]) if snap else None,
             "last_snapshot_description": snap["description"] if snap else None,
             "days_since_snapshot": days_since,
-            "estimated_spend_since_gbp": spend["estimated_spend_gbp"],
+            "estimated_spend_since_usd": spend["estimated_spend_usd"],
             "credits_consumed_since_snapshot": spend.get("credits_consumed", 0),
             "jobs_since_snapshot": spend["job_count"],
-            "estimated_remaining_gbp": estimated_remaining,
+            "estimated_remaining_usd": estimated_remaining,
             "wallet_alerts_7d": wallet["count"] if wallet else 0,
             "wallet_alert_latest": wallet["latest"] if wallet else None,
         }

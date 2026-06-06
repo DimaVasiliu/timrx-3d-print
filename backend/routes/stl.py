@@ -22,14 +22,14 @@ bp = Blueprint("stl", __name__)
 def stl_catalog():
     """Public — the price list. Useful for the storefront / debugging."""
     packs = [
-        {"slug": slug, "title": p["title"], "price_gbp": p["price_gbp"]}
+        {"slug": slug, "title": p["title"], "price_usd": p["price_usd"]}
         for slug, p in STL_PACKS.items()
     ]
     return jsonify({
         "ok": True,
         "packs": packs,
         "all_access": {"slug": "*", "title": ALL_ACCESS["title"],
-                       "price_gbp": ALL_ACCESS["price_gbp"]},
+                       "price_usd": ALL_ACCESS["price_usd"]},
     })
 
 
