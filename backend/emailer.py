@@ -375,6 +375,8 @@ def send_marketing_email(
     subject: str,
     html_body: str,
     text_body: Optional[str] = None,
+    identity_id: Optional[str] = None,
+    category: str = "marketing",
     unsubscribe_url: Optional[str] = None,
 ) -> bool:
     """
@@ -382,9 +384,17 @@ def send_marketing_email(
     feature announcements). Uses hello@timrx.live as the from-address so the
     transactional sender's reputation stays clean.
 
-    Set unsubscribe_url to a one-click unsubscribe endpoint to add the
-    List-Unsubscribe header (Gmail bulk-sender requirement).
+    If ``identity_id`` is provided, an HMAC-signed one-click unsubscribe URL
+    is generated automatically (Gmail bulk-sender requirement, RFC 8058).
+    Pass ``unsubscribe_url`` explicitly to override.
     """
+    # Auto-build the unsubscribe URL from identity_id + category if not given.
+    if not unsubscribe_url and identity_id:
+        try:
+            from backend.services.unsubscribe_signer import build_unsubscribe_url
+            unsubscribe_url = build_unsubscribe_url(identity_id, category)
+        except Exception as e:
+            print(f"[EMAIL] send_marketing_email: unsubscribe URL build failed: {e}")
     if EMAIL_SERVICE_AVAILABLE and _send_email is not None:
         # _send_email signature already supports from_email/from_name; the
         # List-Unsubscribe header is handled by the underlying EmailService

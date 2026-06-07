@@ -61,6 +61,7 @@ def register_blueprints(app):
     from backend.routes.print_orders import bp as print_orders_bp
     from backend.routes.analytics import bp as analytics_bp
     from backend.routes.stl import bp as stl_bp
+    from backend.routes.email_prefs import bp as email_prefs_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -87,6 +88,7 @@ def register_blueprints(app):
     app.register_blueprint(me_bp, url_prefix="/api/me")
     app.register_blueprint(billing_bp, url_prefix="/api/billing")
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
+    app.register_blueprint(email_prefs_bp, url_prefix="/api/email")
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(jobs_bp, url_prefix="/api/jobs")
     app.register_blueprint(credits_bp, url_prefix="/api/credits")
