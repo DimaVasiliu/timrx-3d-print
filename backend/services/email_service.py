@@ -144,6 +144,7 @@ class EmailService:
         from_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         reply_to_name: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> EmailResult:
         """
         Send an email. Never throws - returns EmailResult.
@@ -157,6 +158,10 @@ class EmailService:
             from_name: Override from name
             reply_to: Reply-To email address (for contact forms, use this instead of from_email)
             reply_to_name: Reply-To display name
+            extra_headers: Optional dict of additional MIME headers to include,
+                e.g. {"List-Unsubscribe": "<mailto:...>",
+                      "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}.
+                Required for Gmail bulk-sender compliance on non-transactional mail.
 
         Returns:
             EmailResult with success status and message
@@ -173,9 +178,17 @@ class EmailService:
             print(f"[EMAIL] NOT CONFIGURED - Would send to {to}: {subject}")
             return EmailResult(success=True, message="Email not configured - logged only")
 
-        # Route to appropriate provider
+        # Route to appropriate provider — for non-default extra_headers, prefer the
+        # raw-MIME path which can attach arbitrary headers.
         provider = config.EMAIL_PROVIDER.lower()
         if provider == "ses":
+            if extra_headers:
+                return cls.send_raw(
+                    to=to, subject=subject, html=html, text=text,
+                    from_email=from_email, from_name=from_name,
+                    reply_to=reply_to, reply_to_name=reply_to_name,
+                    extra_headers=extra_headers,
+                )
             return cls._send_via_ses(to, subject, html, text, from_email, from_name, reply_to, reply_to_name)
 
         # Default: SMTP providers (neo, sendgrid, etc.)
@@ -264,22 +277,31 @@ class EmailService:
         from_name: Optional[str] = None,
         attachments: Optional[List[Dict[str, Any]]] = None,
         inline_images: Optional[List[Dict[str, Any]]] = None,
+        reply_to: Optional[str] = None,
+        reply_to_name: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ) -> EmailResult:
         """
-        Send an email with attachments and/or inline images via SES send_raw_email.
+        Send an email with attachments, inline images, or extra headers via
+        SES send_raw_email.
 
         attachments: [{"filename": "invoice.pdf", "data": bytes, "content_type": "application/pdf"}]
         inline_images: [{"cid": "logo", "data": bytes, "content_type": "image/png"}]
+        extra_headers: {"List-Unsubscribe": "<mailto:...>", ...}
+            Use for non-transactional / bulk mail to satisfy Gmail's
+            bulk-sender requirements.
 
-        Falls back to simple send() if no attachments/inline_images provided.
+        Falls back to simple send() if none of the raw-only params are set.
         Never throws - returns EmailResult.
         """
         cls._log_config()
 
-        # If no attachments, use the simpler send() path
-        if not attachments and not inline_images:
+        # If no raw-only params, use the simpler send() path (which doesn't
+        # itself recurse — extra_headers is the marker we need raw MIME).
+        if not attachments and not inline_images and not extra_headers:
             return cls.send(to=to, subject=subject, html=html, text=text,
-                            from_email=from_email, from_name=from_name)
+                            from_email=from_email, from_name=from_name,
+                            reply_to=reply_to, reply_to_name=reply_to_name)
 
         if not config.EMAIL_ENABLED:
             print(f"[EMAIL] DISABLED - Would send raw to {to}: {subject}")
@@ -317,6 +339,21 @@ class EmailService:
             msg_mixed["Subject"] = subject
             msg_mixed["From"] = sender
             msg_mixed["To"] = to
+
+            # Reply-To (transactional emails from no-reply@ benefit from a
+            # monitored Reply-To — Gmail downgrades sends with no Reply-To
+            # for friendly-from senders).
+            if reply_to:
+                rt = f"{reply_to_name} <{reply_to}>" if reply_to_name else reply_to
+                msg_mixed["Reply-To"] = rt
+
+            # Extra headers (List-Unsubscribe, List-Unsubscribe-Post,
+            # custom X-* headers, etc.)
+            for hk, hv in (extra_headers or {}).items():
+                # Some MIME libs will choke on duplicate keys, so del first.
+                if hk in msg_mixed:
+                    del msg_mixed[hk]
+                msg_mixed[hk] = hv
 
             msg_related = MIMEMultipart("related")
 
@@ -611,11 +648,24 @@ def send_email(
     from_name: Optional[str] = None,
     reply_to: Optional[str] = None,
     reply_to_name: Optional[str] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> bool:
     """
     Send an email (backward compatible function).
     Returns True on success, False on failure.
+
+    extra_headers is forwarded to EmailService.send; pass things like
+    {"List-Unsubscribe": "<mailto:...>"} for bulk-sender compliance.
     """
+    # Default Reply-To: when sending from the transactional no-reply@ address,
+    # auto-fill a Reply-To pointing at hello@timrx.live so recipients can
+    # actually reach a monitored mailbox. Gmail down-ranks sends without one.
+    if not reply_to:
+        effective_from = (from_email or config.SES_FROM_EMAIL or config.EMAIL_FROM_ADDRESS or "").lower()
+        if effective_from.startswith("no-reply@") or effective_from.startswith("noreply@"):
+            reply_to = "hello@timrx.live"
+            reply_to_name = reply_to_name or "TimrX"
+
     result = EmailService.send(
         to=to_email,
         subject=subject,
@@ -625,6 +675,7 @@ def send_email(
         from_name=from_name,
         reply_to=reply_to,
         reply_to_name=reply_to_name,
+        extra_headers=extra_headers,
     )
     return result.success
 

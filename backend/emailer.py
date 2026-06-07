@@ -323,6 +323,23 @@ def render_amount_display(amount: str, currency: str = "USD", status: str = "Pai
 
 
 # ─────────────────────────────────────────────────────────────
+# Email From-Address Routing
+# ─────────────────────────────────────────────────────────────
+# Two from-addresses are used:
+#   - no-reply@timrx.live  (config.SES_FROM_EMAIL, default)  → transactional
+#                                                              (access codes, receipts,
+#                                                              refunds, sub updates)
+#   - hello@timrx.live     (MARKETING_FROM_EMAIL)            → bulk / non-transactional
+#                                                              (blog posts, campaigns,
+#                                                              feature announcements,
+#                                                              newsletters)
+# Both must be verified identities in SES. Splitting them protects the
+# transactional sender's reputation when marketing volume spikes.
+MARKETING_FROM_EMAIL = "hello@timrx.live"
+MARKETING_FROM_NAME = "TimrX"
+
+
+# ─────────────────────────────────────────────────────────────
 # Core Email Function
 # ─────────────────────────────────────────────────────────────
 def send_email(
@@ -350,6 +367,57 @@ def send_email(
 
     # Fallback if email_service not available
     print(f"[EMAIL] Would send to {to_email}: {subject}")
+    return True
+
+
+def send_marketing_email(
+    to_email: str,
+    subject: str,
+    html_body: str,
+    text_body: Optional[str] = None,
+    unsubscribe_url: Optional[str] = None,
+) -> bool:
+    """
+    Send a non-transactional / bulk email (blog posts, campaigns, newsletters,
+    feature announcements). Uses hello@timrx.live as the from-address so the
+    transactional sender's reputation stays clean.
+
+    Set unsubscribe_url to a one-click unsubscribe endpoint to add the
+    List-Unsubscribe header (Gmail bulk-sender requirement).
+    """
+    if EMAIL_SERVICE_AVAILABLE and _send_email is not None:
+        # _send_email signature already supports from_email/from_name; the
+        # List-Unsubscribe header is handled by the underlying EmailService
+        # via the `extra_headers` path when present.
+        try:
+            return _send_email(
+                to_email=to_email,
+                subject=subject,
+                html_body=html_body,
+                text_body=text_body,
+                from_email=MARKETING_FROM_EMAIL,
+                from_name=MARKETING_FROM_NAME,
+                extra_headers=(
+                    {
+                        "List-Unsubscribe": f"<{unsubscribe_url}>",
+                        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+                    }
+                    if unsubscribe_url
+                    else None
+                ),
+            )
+        except TypeError:
+            # Older _send_email signature without extra_headers — fall back
+            return _send_email(
+                to_email=to_email,
+                subject=subject,
+                html_body=html_body,
+                text_body=text_body,
+                from_email=MARKETING_FROM_EMAIL,
+                from_name=MARKETING_FROM_NAME,
+            )
+
+    print(f"[EMAIL] (marketing) Would send to {to_email}: {subject}")
     return True
 
 
