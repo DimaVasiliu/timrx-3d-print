@@ -60,6 +60,7 @@ for _raw_provider, _account_provider in _PROVIDER_ACCOUNT_ALIASES.items():
     _ACCOUNT_MEMBERS.setdefault(_account_provider, set()).add(_raw_provider)
 
 _KNOWN_BALANCE_PROVIDERS = set(_ACCOUNT_MEMBERS.keys())
+_LEDGER_MONEY_COLUMNS_CACHE: Optional[tuple[str, str]] = None
 
 
 def _iso(val) -> Optional[str]:
@@ -102,6 +103,47 @@ def get_provider_display(provider: Optional[str]) -> Dict[str, Optional[str]]:
         "display_label": meta.get("label") or account,
         "display_subtitle": meta.get("subtitle"),
     }
+
+
+def _ledger_money_columns() -> tuple[str, str]:
+    """
+    Return the physical provider_ledger money columns.
+
+    Production was originally created with GBP-named amount/balance columns.
+    The product now displays those same numeric values as USD after the
+    currency restamp migration. Keep this read/write layer compatible with the
+    deployed schema and with a future explicit USD column rename.
+    """
+    global _LEDGER_MONEY_COLUMNS_CACHE
+    if _LEDGER_MONEY_COLUMNS_CACHE:
+        return _LEDGER_MONEY_COLUMNS_CACHE
+
+    schema = "public"
+    table = _TABLE
+    if "." in _TABLE:
+        schema, table = _TABLE.split(".", 1)
+
+    rows = query_all(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+          AND table_name = %s
+          AND column_name IN (
+              'amount_usd',
+              'amount_gbp',
+              'balance_snapshot_usd',
+              'balance_snapshot_gbp'
+          )
+        """,
+        (schema, table),
+        source="provider_ledger_money_columns",
+    )
+    names = {r["column_name"] for r in rows}
+    amount_col = "amount_usd" if "amount_usd" in names else "amount_gbp"
+    balance_col = "balance_snapshot_usd" if "balance_snapshot_usd" in names else "balance_snapshot_gbp"
+    _LEDGER_MONEY_COLUMNS_CACHE = (amount_col, balance_col)
+    return _LEDGER_MONEY_COLUMNS_CACHE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,6 +198,7 @@ def list_ledger_entries(
             pass
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    amount_col, balance_col = _ledger_money_columns()
 
     count_row = query_one(
         f"SELECT COUNT(*) AS total FROM {_TABLE} {where}",
@@ -166,8 +209,8 @@ def list_ledger_entries(
     params.extend([limit, offset])
     rows = query_all(
         f"""
-        SELECT id, provider, entry_type, amount_usd, currency,
-               balance_snapshot_usd, description, reference,
+        SELECT id, provider, entry_type, {amount_col} AS amount_usd, currency,
+               {balance_col} AS balance_snapshot_usd, description, reference,
                period_month, metadata, recorded_by, created_at
         FROM {_TABLE}
         {where}
@@ -249,14 +292,15 @@ def create_ledger_entry(
             raise ValueError("period_month must be YYYY-MM or YYYY-MM-DD format")
 
     meta_json = json.dumps(metadata, default=str) if metadata else None
+    amount_col, balance_col = _ledger_money_columns()
 
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f"""
                 INSERT INTO {_TABLE}
-                    (provider, entry_type, amount_usd, currency,
-                     balance_snapshot_usd, description, reference,
+                    (provider, entry_type, {amount_col}, currency,
+                     {balance_col}, description, reference,
                      period_month, metadata, recorded_by)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 RETURNING id, created_at
@@ -332,6 +376,7 @@ def get_monthly_spend_report(
         usage_params = tuple(members)
         ledger_filter = "AND provider = %s"
         ledger_params = (normalized_provider,)
+    amount_col, balance_col = _ledger_money_columns()
 
     # 1. Estimated usage from jobs (grouped by provider + month)
     usage_rows = query_all(
@@ -359,7 +404,7 @@ def get_monthly_spend_report(
             provider,
             COALESCE(period_month, DATE_TRUNC('month', created_at)::date) AS month,
             entry_type,
-            COALESCE(SUM(amount_usd), 0) AS total_usd,
+            COALESCE(SUM({amount_col}), 0) AS total_usd,
             COUNT(*) AS entry_count
         FROM {_TABLE}
         WHERE created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '%s months'
@@ -377,11 +422,11 @@ def get_monthly_spend_report(
         f"""
         SELECT DISTINCT ON (provider)
             provider,
-            balance_snapshot_usd,
+            {balance_col} AS balance_snapshot_usd,
             created_at
         FROM {_TABLE}
         WHERE entry_type = 'balance_snapshot'
-          AND balance_snapshot_usd IS NOT NULL
+          AND {balance_col} IS NOT NULL
           {ledger_filter}
         ORDER BY provider, created_at DESC
         """,
@@ -497,14 +542,15 @@ def get_provider_balances() -> Dict[str, Any]:
       unknown       — no snapshot recorded
     """
     now = datetime.now(timezone.utc)
+    _amount_col, balance_col = _ledger_money_columns()
 
     # 1. Latest balance snapshot per provider
     snapshot_rows = query_all(f"""
         SELECT DISTINCT ON (provider)
-            provider, balance_snapshot_usd, created_at, description
+            provider, {balance_col} AS balance_snapshot_usd, created_at, description
         FROM {_TABLE}
         WHERE entry_type = 'balance_snapshot'
-          AND balance_snapshot_usd IS NOT NULL
+          AND {balance_col} IS NOT NULL
         ORDER BY provider, created_at DESC
     """)
     snapshots: Dict[str, Dict[str, Any]] = {}
