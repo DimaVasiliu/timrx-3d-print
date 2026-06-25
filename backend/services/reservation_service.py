@@ -336,6 +336,110 @@ class ReservationService:
             }
 
     @staticmethod
+    def reserve_system_trial_credits(
+        identity_id: str,
+        action_key: str,
+        job_id: str,
+        amount_override: int,
+        trial_id: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a non-spendable, system-funded reservation for one homepage trial.
+
+        This deliberately does not grant normal wallet credits and does not
+        check/debit wallet balances. The reservation exists only so existing job
+        completion/failure hooks have a durable idempotent object to finalize or
+        release. Finalization detects the system_funded/homepage_free_trial meta
+        flags and captures the reservation without wallet ledger movement.
+        """
+        action_code = PricingService.get_db_action_code(action_key) or action_key
+        credit_type = get_credit_type_for_action(action_code)
+        cost_credits = int(amount_override or PricingService.get_action_cost(action_key) or 0)
+        if cost_credits <= 0:
+            raise ValueError(f"Invalid system trial cost for action: {action_key}")
+
+        existing = ReservationService.get_active_reservation_for_job(identity_id, job_id, action_code)
+        if existing:
+            return {
+                "reservation": ReservationService._format_reservation(existing),
+                "balance": None,
+                "reserved": None,
+                "available": None,
+                "is_existing": True,
+                "credit_type": credit_type,
+            }
+
+        trial_meta = {
+            "action_key": action_key,
+            "source": "homepage_free_generation",
+            "homepage_free_trial": True,
+            "system_funded": True,
+            "trial_id": str(trial_id),
+            **(meta or {}),
+        }
+        meta_json = json.dumps(trial_meta)
+        expiry_minutes = getattr(config, 'RESERVATION_EXPIRY_MINUTES', ReservationService.DEFAULT_EXPIRY_MINUTES)
+        provider = _derive_provider_from_action_code(action_code)
+
+        with transaction("homepage_system_trial_reserve") as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.JOBS}
+                (id, identity_id, provider, action_code, status, cost_credits, meta, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'queued', %s, %s, NOW(), NOW())
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (job_id, identity_id, provider, action_code, cost_credits, meta_json),
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {Tables.CREDIT_RESERVATIONS}
+                (identity_id, action_code, cost_credits, status, credit_type, created_at, expires_at, ref_job_id, meta)
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW() + %s * INTERVAL '1 minute', %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING *
+                """,
+                (identity_id, action_code, cost_credits, ReservationStatus.HELD, credit_type, expiry_minutes, job_id, meta_json),
+            )
+            reservation = fetch_one(cur)
+            if not reservation:
+                cur.execute(
+                    f"""
+                    SELECT id, identity_id, action_code, cost_credits, status,
+                           created_at, expires_at, captured_at, released_at, ref_job_id, meta
+                    FROM {Tables.CREDIT_RESERVATIONS}
+                    WHERE identity_id = %s
+                      AND ref_job_id = %s
+                      AND action_code = %s
+                      AND status = %s
+                      AND expires_at > NOW()
+                    LIMIT 1
+                    """,
+                    (identity_id, job_id, action_code, ReservationStatus.HELD),
+                )
+                reservation = fetch_one(cur)
+            if not reservation:
+                raise ValueError("SYSTEM_TRIAL_RESERVATION_FAILED")
+            cur.execute(
+                f"""
+                UPDATE {Tables.JOBS}
+                SET reservation_id = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (reservation["id"], job_id),
+            )
+
+        return {
+            "reservation": ReservationService._format_reservation(reservation),
+            "balance": None,
+            "reserved": None,
+            "available": None,
+            "is_existing": False,
+            "credit_type": credit_type,
+        }
+
+    @staticmethod
     def finalize_reservation(reservation_id: str) -> Dict[str, Any]:
         """
         Finalize a reservation (job completed successfully).
@@ -356,7 +460,7 @@ class ReservationService:
             # Lock and fetch reservation including credit_type
             cur.execute(
                 f"""
-                SELECT id, identity_id, action_code, cost_credits, status, ref_job_id, credit_type
+                SELECT id, identity_id, action_code, cost_credits, status, ref_job_id, credit_type, meta
                 FROM {Tables.CREDIT_RESERVATIONS}
                 WHERE id = %s
                 FOR UPDATE
@@ -374,6 +478,7 @@ class ReservationService:
                 }
 
             if reservation["status"] == ReservationStatus.FINALIZED:
+                ReservationService._mark_homepage_trial_completed(reservation_id, reservation.get("ref_job_id"))
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_finalized": True,
@@ -382,6 +487,7 @@ class ReservationService:
                 }
 
             if reservation["status"] == ReservationStatus.RELEASED:
+                ReservationService._mark_homepage_trial_failed(reservation_id, "reservation_already_released", reservation.get("ref_job_id"))
                 return {
                     "reservation": ReservationService._format_reservation(reservation),
                     "was_already_released": True,
@@ -394,6 +500,12 @@ class ReservationService:
             action_code = reservation["action_code"]
             job_id = str(reservation["ref_job_id"]) if reservation.get("ref_job_id") else None
             credit_type = reservation.get("credit_type", CreditType.GENERAL)
+            meta = reservation.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
 
             # Determine which balance column to update
             balance_column = "balance_video_credits" if credit_type == CreditType.VIDEO else "balance_credits"
@@ -409,6 +521,23 @@ class ReservationService:
                 (ReservationStatus.FINALIZED, reservation_id),
             )
             updated = fetch_one(cur)
+
+            if meta.get("homepage_free_trial") or meta.get("system_funded"):
+                ReservationService._mark_homepage_trial_completed(reservation_id, job_id)
+                provider = _derive_provider_from_action_code(action_code)
+                return {
+                    "reservation": ReservationService._format_reservation(updated),
+                    "balance": None,
+                    "was_already_finalized": False,
+                    "was_already_released": False,
+                    "not_found": False,
+                    "identity_id": identity_id,
+                    "action_code": action_code,
+                    "cost": cost_credits,
+                    "provider": provider,
+                    "credit_type": credit_type,
+                    "system_funded": True,
+                }
 
             # Create ledger entry (deduct from wallet)
             # Note: We're inside a transaction, so we need to do this manually
@@ -458,6 +587,7 @@ class ReservationService:
             # Invalidate wallet cache — balance just changed
             from backend.services.wallet_service import invalidate_wallet_cache
             invalidate_wallet_cache(identity_id)
+            ReservationService._mark_homepage_trial_completed(reservation_id, job_id)
 
             return {
                 "reservation": ReservationService._format_reservation(updated),
@@ -514,6 +644,7 @@ class ReservationService:
                 }
 
             if reservation["status"] == ReservationStatus.RELEASED:
+                ReservationService._mark_homepage_trial_failed(reservation_id, reason, reservation.get("ref_job_id"))
                 # Idempotent: already released
                 # print(f"[RESERVATION] Already released: {reservation_id}")
                 return {
@@ -524,6 +655,7 @@ class ReservationService:
                 }
 
             if reservation["status"] == ReservationStatus.FINALIZED:
+                ReservationService._mark_homepage_trial_completed(reservation_id, reservation.get("ref_job_id"))
                 # Idempotent: already finalized (job succeeded, credits captured)
                 # This is NOT an error - it means the job actually succeeded
                 # print(f"[RESERVATION] Already finalized (job succeeded): {reservation_id}")
@@ -551,6 +683,7 @@ class ReservationService:
             action_code = reservation["action_code"]
             cost_credits = reservation["cost_credits"]
             provider = _derive_provider_from_action_code(action_code)
+            ReservationService._mark_homepage_trial_failed(reservation_id, reason, reservation.get("ref_job_id"))
 
             # print(
             #     f"[RESERVATION] Released: id={reservation_id}, reason={reason}, "
@@ -588,7 +721,7 @@ class ReservationService:
                     meta = COALESCE(meta, '{{}}'::jsonb) || '{{"release_reason": "expired"}}'::jsonb
                 WHERE status = %s
                   AND expires_at <= NOW()
-                RETURNING id
+                RETURNING id, ref_job_id
                 """,
                 (ReservationStatus.RELEASED, ReservationStatus.HELD),
             )
@@ -596,9 +729,32 @@ class ReservationService:
             count = len(released)
 
             if count > 0:
-                pass  # print(f"[RESERVATION] Cleaned up {count} expired reservations")
+                for reservation in released:
+                    ReservationService._mark_homepage_trial_failed(
+                        str(reservation["id"]),
+                        "reservation_expired",
+                        reservation.get("ref_job_id"),
+                    )
 
             return count
+
+    @staticmethod
+    def _mark_homepage_trial_completed(reservation_id: str, job_id: Any = None) -> None:
+        try:
+            from backend.services.free_generation_service import mark_completed_by_reservation
+
+            mark_completed_by_reservation(str(reservation_id), str(job_id) if job_id else None)
+        except Exception as exc:
+            print(f"[HOMEPAGE_FREE] warning: could not mark trial completed for reservation={reservation_id}: {exc}")
+
+    @staticmethod
+    def _mark_homepage_trial_failed(reservation_id: str, reason: str = "reservation_released", job_id: Any = None) -> None:
+        try:
+            from backend.services.free_generation_service import mark_failed_by_reservation
+
+            mark_failed_by_reservation(str(reservation_id), reason, str(job_id) if job_id else None)
+        except Exception as exc:
+            print(f"[HOMEPAGE_FREE] warning: could not mark trial failed for reservation={reservation_id}: {exc}")
 
     # ─────────────────────────────────────────────────────────────
     # Convenience Methods

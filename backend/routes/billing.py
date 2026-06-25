@@ -653,8 +653,13 @@ def create_mollie_checkout():
             resp.headers["Retry-After"] = str(retry_after)
             return resp, 429
     except Exception as e:
-        # If table doesn't exist yet, fall through — downstream guards still protect
-        print(f"[BILLING] checkout_idempotency guard failed (non-fatal): {e}")
+        print(f"[BILLING] checkout_idempotency guard failed (checkout blocked): {e}")
+        return jsonify({
+            "ok": False,
+            "error": "checkout_idempotency_unavailable",
+            "error_code": "CHECKOUT_IDEMPOTENCY_UNAVAILABLE",
+            "message": "Checkout protection is temporarily unavailable. Please try again shortly.",
+        }), 503
 
     try:
         result = MollieService.create_checkout(
@@ -1041,10 +1046,13 @@ def _check_webhook_rate(ip: str, payment_id: str) -> bool:
 
 
 def _get_webhook_ip() -> str:
-    """Get client IP from request, handling reverse proxies."""
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+    """Get client IP for webhook abuse controls.
+
+    Do not trust X-Forwarded-For here: it is client-spoofable unless every
+    upstream hop strips it. Cloudflare/Render edge rate limits should be the
+    primary control; this in-process guard uses the direct peer address only as
+    a local backstop.
+    """
     return request.remote_addr or ""
 
 
@@ -1115,7 +1123,14 @@ def mollie_webhook():
 
     # ── Step 5: Process (outbound Mollie API call + credit grant) ──
     print(f"[BILLING] Mollie webhook processing: payment_id={payment_id}")
-    result = MollieService.handle_webhook(payment_id)
+    try:
+        result = MollieService.handle_webhook(payment_id)
+    except Exception as e:
+        print(f"[BILLING] Mollie webhook processing exception: {e}")
+        return jsonify({
+            "ok": False,
+            "error": "webhook_processing_failed",
+        }), 503
 
     if result.get("ok"):
         return jsonify({
@@ -1124,12 +1139,11 @@ def mollie_webhook():
             "message": result.get("message"),
         })
     else:
-        # Log error but still return 200 to prevent retries
         print(f"[BILLING] Mollie webhook error: {result.get('error')}")
         return jsonify({
             "ok": False,
             "error": result.get("error"),
-        })
+        }), 503
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1481,8 +1495,13 @@ def subscription_checkout():
             resp.headers["Retry-After"] = str(retry_after)
             return resp, 429
     except Exception as e:
-        # If table doesn't exist yet, fall through — downstream guards still protect
-        print(f"[BILLING] checkout_idempotency guard failed (non-fatal): {e}")
+        print(f"[BILLING] checkout_idempotency guard failed (checkout blocked): {e}")
+        return jsonify({
+            "ok": False,
+            "error": "checkout_idempotency_unavailable",
+            "error_code": "CHECKOUT_IDEMPOTENCY_UNAVAILABLE",
+            "message": "Checkout protection is temporarily unavailable. Please try again shortly.",
+        }), 503
 
     try:
         from backend.config import config

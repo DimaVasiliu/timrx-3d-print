@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
-from flask import Response, jsonify
+from flask import Response, g, jsonify
 
 from backend.config import ACTION_KEYS as CONFIG_ACTION_KEYS, config
 from backend.services.pricing_service import (
@@ -162,6 +162,49 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
         if cost == 0:
             # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - No cost for {canonical_action}, no reservation needed")
             return None, None
+
+        homepage_trial_id = getattr(g, "homepage_free_trial_id", None)
+        if homepage_trial_id:
+            max_trial_cost = int(getattr(config, "HOMEPAGE_FREE_MAX_CREDITS", 6) or 0)
+            if max_trial_cost > 0 and cost > max_trial_cost:
+                return None, _make_credit_error(
+                    "HOMEPAGE_TRIAL_COST_LIMIT",
+                    "This asset type is not available for the homepage free generation.",
+                    402,
+                    required=cost,
+                    max_allowed=max_trial_cost,
+                )
+            result = ReservationService.reserve_system_trial_credits(
+                identity_id=identity_id,
+                action_key=canonical_action,
+                job_id=internal_job_id,
+                amount_override=cost,
+                trial_id=str(homepage_trial_id),
+                meta={
+                    "requested_action_key": action_key,
+                    "base_cost": base_cost,
+                    **(job_meta or {}),
+                },
+            )
+            reservation_id = result["reservation"]["id"]
+            try:
+                from backend.services.free_generation_service import bind_trial_reservation
+
+                bind_trial_reservation(
+                    str(homepage_trial_id),
+                    str(internal_job_id),
+                    str(reservation_id),
+                    canonical_action,
+                    cost,
+                    result.get("credit_type") or get_credit_type_for_action(canonical_action),
+                )
+            except Exception as exc:
+                print(f"[HOMEPAGE_FREE] warning: could not bind trial reservation: {exc}")
+            print(
+                f"[CREDITS] SYSTEM TRIAL RESERVE: reservation_id={reservation_id} "
+                f"job_id={internal_job_id} action={canonical_action} cost={cost}"
+            )
+            return reservation_id, None
 
         credit_type = get_credit_type_for_action(canonical_action)
         balance = WalletService.get_balance(identity_id, credit_type)

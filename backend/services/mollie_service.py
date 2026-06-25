@@ -344,10 +344,8 @@ class MollieService:
                 conn.commit()
                 return row is not None
         except Exception as e:
-            # If table doesn't exist yet (pre-migration), allow processing
-            # to fall through to existing downstream idempotency guards
-            print(f"[MOLLIE] WARNING: processed_webhook_payments guard failed: {e}")
-            return True
+            print(f"[MOLLIE] ERROR: processed_webhook_payments guard failed: {e}")
+            raise RuntimeError("mollie_webhook_idempotency_unavailable") from e
 
     @staticmethod
     def _mark_payment_completed(payment_id: str, status: str, result_summary: str):
@@ -395,6 +393,29 @@ class MollieService:
         """
         if not MOLLIE_AVAILABLE:
             return {"ok": False, "error": "Mollie not configured"}
+
+        # Cheap local idempotency precheck before the outbound Mollie fetch.
+        # This avoids repeated provider API calls for payment IDs already
+        # recorded locally. If the DB check itself is unavailable, fail closed
+        # and let Mollie retry rather than risking duplicate processing.
+        try:
+            from backend.services.purchase_service import PurchaseService
+
+            existing_purchase = PurchaseService.get_purchase_by_provider_id(payment_id)
+            if existing_purchase:
+                print(
+                    f"[MOLLIE] Webhook skipped before fetch: payment already recorded "
+                    f"payment_id={payment_id} purchase_id={existing_purchase.get('id')}"
+                )
+                return {
+                    "ok": True,
+                    "status": "already_processed",
+                    "message": "Already processed (purchase exists)",
+                    "purchase_id": str(existing_purchase.get("id")),
+                }
+        except Exception as e:
+            print(f"[MOLLIE] ERROR: webhook precheck failed for payment_id={payment_id}: {e}")
+            raise RuntimeError("mollie_webhook_precheck_unavailable") from e
 
         # Fetch payment details from Mollie
         try:

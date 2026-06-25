@@ -11,7 +11,10 @@ from flask import Blueprint, jsonify, request
 from backend.services.email_service import EmailService
 from backend.config import config
 import re
+import time
+from collections import defaultdict, deque
 from datetime import datetime
+from threading import Lock
 
 bp = Blueprint("contact", __name__)
 
@@ -20,6 +23,42 @@ EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
 # Admin email to receive contact form submissions
 ADMIN_EMAIL = "admin@timrx.live"
+
+# Portfolio enquiries are intentionally public, so apply a small, bounded
+# in-process sliding-window limit before invoking the email provider. Cloudflare
+# remains the primary edge-abuse layer; this is the backend safety net.
+CONTACT_RATE_WINDOW_SECONDS = 15 * 60
+CONTACT_RATE_MAX_REQUESTS = 5
+_contact_rate_hits: dict[str, deque[float]] = defaultdict(deque)
+_contact_rate_lock = Lock()
+
+
+def _client_ip() -> str:
+    """Return the best available client address without logging form data."""
+    cloudflare_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+    if cloudflare_ip:
+        return cloudflare_ip[:64]
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    return (forwarded or request.remote_addr or "unknown")[:64]
+
+
+def _contact_rate_limited(key: str) -> tuple[bool, int]:
+    now = time.monotonic()
+    cutoff = now - CONTACT_RATE_WINDOW_SECONDS
+    with _contact_rate_lock:
+        hits = _contact_rate_hits[key]
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
+        if len(hits) >= CONTACT_RATE_MAX_REQUESTS:
+            retry_after = max(1, int(CONTACT_RATE_WINDOW_SECONDS - (now - hits[0])))
+            return True, retry_after
+        hits.append(now)
+        # Prevent an unbounded key set during long-lived processes.
+        if len(_contact_rate_hits) > 5000:
+            stale = [candidate for candidate, values in _contact_rate_hits.items() if not values or values[-1] <= cutoff]
+            for candidate in stale[:1000]:
+                _contact_rate_hits.pop(candidate, None)
+        return False, 0
 
 
 def sanitize_html(text: str) -> str:
@@ -61,6 +100,15 @@ def submit_contact():
         subject = (data.get("subject") or "").strip()
         budget = (data.get("budget") or "").strip()
         message = (data.get("message") or "").strip()
+        website = (data.get("website") or "").strip()
+
+        # Honeypot field: real users never see or fill this input. Return a
+        # generic success so automated senders do not learn how to bypass it.
+        if website:
+            return jsonify({
+                "ok": True,
+                "message": "Your message has been sent successfully."
+            }), 200
 
         # Validation
         errors = []
@@ -97,6 +145,18 @@ def submit_contact():
                     "details": errors
                 }
             }), 400
+
+        limited, retry_after = _contact_rate_limited(_client_ip())
+        if limited:
+            response = jsonify({
+                "ok": False,
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": "Too many messages were sent. Please wait before trying again."
+                }
+            })
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
 
         # Sanitize for HTML email
         safe_name = sanitize_html(name)

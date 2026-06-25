@@ -160,6 +160,24 @@ class Config:
     DB_POOL_SIZE: int = field(default_factory=lambda: _get_env_int("DB_POOL_SIZE", 5))
 
     # ─────────────────────────────────────────────────────────────
+    # Homepage Free Generation Gateway
+    # ─────────────────────────────────────────────────────────────
+    HOMEPAGE_FREE_ENABLED: bool = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"))
+    HOMEPAGE_FREE_IMAGE_PROVIDER: str = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_IMAGE_PROVIDER"))
+    HOMEPAGE_FREE_VIDEO_PROVIDER: str = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_VIDEO_PROVIDER"))
+    HOMEPAGE_FREE_3D_PROVIDER: str = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_3D_PROVIDER", "meshy"))
+    HOMEPAGE_FREE_MAX_DAILY_TOTAL: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_DAILY_TOTAL", 250))
+    HOMEPAGE_FREE_MAX_PER_IP_PER_DAY: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", 3))
+    HOMEPAGE_FREE_ALLOW_IMAGE: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_IMAGE", True))
+    HOMEPAGE_FREE_ALLOW_VIDEO: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_VIDEO", False))
+    HOMEPAGE_FREE_ALLOW_3D: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_3D", False))
+    HOMEPAGE_FREE_MAX_CREDITS: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_CREDITS", 6))
+    # Do not trust client-supplied forwarding headers by default. Enable this
+    # only when the service is behind a trusted proxy/CDN that strips spoofed
+    # headers, e.g. Cloudflare -> Render.
+    HOMEPAGE_FREE_TRUST_PROXY_HEADERS: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_TRUST_PROXY_HEADERS", False))
+
+    # ─────────────────────────────────────────────────────────────
     # Session & Auth
     # ─────────────────────────────────────────────────────────────
     SESSION_COOKIE_NAME: str = "timrx_sid"

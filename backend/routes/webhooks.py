@@ -72,11 +72,13 @@ def _webhook_secret_is_valid() -> bool:
       - Header: X-Webhook-Secret: <secret>
       - Query param: ?secret=<secret>
 
-    Returns True if secret matches or if no secret is configured.
+    Returns True only if a configured secret matches. When webhooks are enabled,
+    a missing secret must fail closed so unsigned provider callbacks cannot be
+    accepted in production by configuration drift.
     """
     secret = config.PIAPI_WEBHOOK_SECRET
     if not secret:
-        return True
+        return False
 
     header_val = request.headers.get("X-Webhook-Secret", "")
     query_val = request.args.get("secret", "")
@@ -357,9 +359,6 @@ def piapi_webhook():
         print("[PIAPI_WEBHOOK] unauthorized")
         return jsonify({"error": "unauthorized"}), 401
 
-    if not config.PIAPI_WEBHOOK_SECRET:
-        print("[PIAPI_WEBHOOK] verification disabled (no PIAPI_WEBHOOK_SECRET set)")
-
     data, err = _safe_get_json()
     if err:
         print(f"[PIAPI_WEBHOOK] bad request: {err}")
@@ -550,11 +549,13 @@ def _meshy_webhook_secret_is_valid() -> bool:
       - Header: X-Webhook-Secret: <secret>
       - Query param: ?secret=<secret>
 
-    Returns True if secret matches or if no secret is configured.
+    Returns True only if a configured secret matches. Meshy does not sign
+    callbacks, so this app-managed shared secret is mandatory whenever the
+    webhook is enabled.
     """
     secret = config.MESHY_WEBHOOK_SECRET
     if not secret:
-        return True
+        return False
 
     header_val = request.headers.get("X-Webhook-Secret", "")
     query_val = request.args.get("secret", "")
