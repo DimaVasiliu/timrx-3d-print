@@ -177,6 +177,13 @@ class Config:
     # headers, e.g. Cloudflare -> Render.
     HOMEPAGE_FREE_TRUST_PROXY_HEADERS: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_TRUST_PROXY_HEADERS", False))
 
+    # Cloudflare Turnstile. Required before anonymous/free homepage generation
+    # when enabled. Paid workspace and paid homepage requests are not blocked
+    # by this setting.
+    TURNSTILE_ENABLED: bool = field(default_factory=lambda: _get_env_bool("TURNSTILE_ENABLED", False))
+    TURNSTILE_SITE_KEY: str = field(default_factory=lambda: _get_env("TURNSTILE_SITE_KEY", "0x4AAAAAADrAmfltMdgMr9lE"))
+    TURNSTILE_SECRET_KEY: str = field(default_factory=lambda: _get_env("TURNSTILE_SECRET_KEY"))
+
     # ─────────────────────────────────────────────────────────────
     # Session & Auth
     # ─────────────────────────────────────────────────────────────

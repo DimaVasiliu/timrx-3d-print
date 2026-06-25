@@ -33,6 +33,7 @@ from backend.services.pricing_service import (
     get_video_action_code,
     get_video_credit_cost,
 )
+from backend.services.turnstile_service import is_turnstile_enabled, verify_turnstile_token
 
 bp = Blueprint("homepage_generation", __name__)
 
@@ -113,6 +114,18 @@ def _homepage_blocked_response(reason: str = "free_trial_used", status_code: int
             },
         }
     ), status_code
+
+
+def _turnstile_required_response(reason: str = "turnstile_required"):
+    return jsonify(
+        {
+            "ok": False,
+            "error": "turnstile_required",
+            "reason": reason,
+            "message": "Please verify you are human to use your free generation.",
+            "free_trial_remaining": None,
+        }
+    ), 403
 
 
 def _choose_image_provider() -> Tuple[str, str, int]:
@@ -412,6 +425,19 @@ def homepage_generate():
 
     trial = None
     if not paid_mode:
+        # Anonymous/free homepage generation is abuse-sensitive and must pass
+        # Cloudflare Turnstile before any free trial row, credit reservation, or
+        # upstream provider job can be created. Paid users with sufficient
+        # credits skip this branch and use the normal paid reservation flow.
+        if is_turnstile_enabled():
+            turnstile_result = verify_turnstile_token(body.get("turnstile_token"))
+            if not turnstile_result.ok:
+                print(
+                    f"[HOMEPAGE_GENERATION] turnstile_blocked "
+                    f"reason={turnstile_result.reason} errors={turnstile_result.errors}"
+                )
+                return _turnstile_required_response(turnstile_result.reason)
+
         if not _free_generation_enabled():
             return jsonify({
                 "ok": False,
