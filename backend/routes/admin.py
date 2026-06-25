@@ -3807,6 +3807,82 @@ def safety_summary():
         return jsonify({"ok": False, "error": f"Safety summary failed: {type(e).__name__}"}), 500
 
 
+@bp.route("/homepage-free-generation", methods=["GET"])
+@require_admin
+def homepage_free_generation_monitor():
+    """
+    Monitor homepage free-generation trials for abuse/cost leakage.
+
+    Mirrors the daily TablePlus checks:
+      - grouped counts by status + generation_type for last N hours
+      - total trial count for last N hours
+      - latest trial rows
+    """
+    try:
+        hours = max(1, min(int(request.args.get("hours", 24)), 168))
+    except (TypeError, ValueError):
+        hours = 24
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 100))
+    except (TypeError, ValueError):
+        limit = 20
+
+    try:
+        grouped = query_all(
+            """
+            SELECT status, generation_type, COUNT(*)::int AS count
+            FROM timrx_billing.free_generation_trials
+            WHERE created_at >= now() - (%s::text || ' hours')::interval
+            GROUP BY status, generation_type
+            ORDER BY status, generation_type
+            """,
+            (hours,),
+            source="admin_homepage_free_generation_grouped",
+        )
+        total_row = query_one(
+            """
+            SELECT COUNT(*)::int AS count
+            FROM timrx_billing.free_generation_trials
+            WHERE created_at >= now() - (%s::text || ' hours')::interval
+            """,
+            (hours,),
+            source="admin_homepage_free_generation_total",
+        )
+        recent_rows = query_all(
+            """
+            SELECT *
+            FROM timrx_billing.free_generation_trials
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+            source="admin_homepage_free_generation_recent",
+        )
+
+        def _json_safe(row):
+            safe = {}
+            for key, value in dict(row or {}).items():
+                if hasattr(value, "isoformat"):
+                    safe[key] = value.isoformat()
+                else:
+                    safe[key] = str(value) if value is not None and value.__class__.__name__ == "UUID" else value
+            return safe
+
+        return jsonify(
+            {
+                "ok": True,
+                "hours": hours,
+                "limit": limit,
+                "total_24h": int((total_row or {}).get("count") or 0),
+                "grouped": [_json_safe(row) for row in (grouped or [])],
+                "recent": [_json_safe(row) for row in (recent_rows or [])],
+            }
+        )
+    except Exception as e:
+        print(f"[ADMIN] Homepage free generation monitor error: {e}")
+        return jsonify({"ok": False, "error": f"Homepage free generation monitor failed: {type(e).__name__}"}), 500
+
+
 # ── Revenue & Margin Analytics ──────────────────────────────────────────────
 
 @bp.route("/margin-analytics", methods=["GET"])
