@@ -19,7 +19,7 @@ import threading as _threading
 
 from flask import Blueprint, request, jsonify, g, make_response
 
-from backend.middleware import require_session, require_session_readonly, require_email, require_verified_email, no_cache
+from backend.middleware import require_session, require_session_readonly, require_email, require_verified_email, no_cache, require_admin
 from backend.db import get_conn, get_conn_resilient, Tables, is_transient_db_error
 from backend.services.pricing_service import PricingService
 from backend.services.wallet_service import WalletService
@@ -2038,6 +2038,7 @@ def download_receipt_pdf(receipt_id):
 # Debug endpoint for testing PDF generation and email
 # ─────────────────────────────────────────────────────────────
 @bp.route("/debug/test-invoice-pdf", methods=["POST"])
+@require_admin
 def debug_test_invoice_pdf():
     """
     Debug endpoint to test PDF generation and optionally send test email.
@@ -2058,13 +2059,6 @@ def debug_test_invoice_pdf():
         "errors": []
     }
     """
-    from backend.config import config
-
-    # Only allow in dev mode or with admin token
-    admin_token = request.headers.get("X-Admin-Token") or request.args.get("admin_token")
-    if not config.IS_DEV and admin_token != config.ADMIN_TOKEN:
-        return jsonify({"error": "Forbidden - requires dev mode or admin token"}), 403
-
     errors = []
     result = {
         "ok": True,
@@ -2157,6 +2151,7 @@ def debug_test_invoice_pdf():
 
 
 @bp.route("/debug/email-preview", methods=["GET"])
+@require_admin
 def debug_email_preview():
     """
     Debug endpoint to preview email templates in browser (HTML render, no sending).
@@ -2166,13 +2161,7 @@ def debug_email_preview():
 
     Returns rendered HTML for browser preview.
     """
-    from backend.config import config
     from flask import Response
-
-    # Only allow in dev mode or with admin token
-    admin_token = request.headers.get("X-Admin-Token") or request.args.get("admin_token")
-    if not config.IS_DEV and admin_token != config.ADMIN_TOKEN:
-        return jsonify({"error": "Forbidden - requires dev mode or admin token"}), 403
 
     template = request.args.get("template", "purchase_receipt")
 

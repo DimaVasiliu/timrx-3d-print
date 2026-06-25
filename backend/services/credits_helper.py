@@ -107,6 +107,24 @@ def _make_credit_error(code: str, message: str, status: int = 400, **extra) -> T
     return jsonify(payload), status
 
 
+# Actions that produce a billable asset and must NEVER be free. If pricing
+# resolves to <= 0 for one of these it means a missing/misconfigured pricing
+# row, so we fail CLOSED rather than hand out a free generation. Adjust only if
+# an action here is intentionally free.
+PAID_GENERATION_ACTIONS = frozenset({
+    "image_generate",
+    "text_to_3d_generate",
+    "image_to_3d_generate",
+    "video_generate",
+    "video_text_generate",
+    "video_image_animate",
+    "refine",
+    "remesh",
+    "retexture",
+    "rigging",
+})
+
+
 def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[str | None, Response | None]:
     """
     Reserve credits for a paid job. Call this BEFORE calling upstream API.
@@ -137,7 +155,21 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
     # print(f"[CREDITS:DEBUG] >>> start_paid_job: requested={action_key}, canonical={canonical_action}, db_code={db_action_code}, job_id={internal_job_id}")
 
     if not CREDITS_AVAILABLE:
-        # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - system not available, allowing {canonical_action} job_id={internal_job_id}")
+        # Production must fail closed. If the credit database is unavailable
+        # while provider keys are configured, allowing dispatch here would
+        # create a direct "generate without payment" cost leak.
+        if getattr(config, "IS_PROD", False):
+            print(
+                f"[CREDITS][SECURITY] BLOCKED paid action while credits unavailable: "
+                f"action={canonical_action} job_id={internal_job_id}"
+            )
+            return None, _make_credit_error(
+                "CREDITS_UNAVAILABLE",
+                "Generation billing is temporarily unavailable. Please try again shortly.",
+                503,
+            )
+        # Local/dev fallback preserves lightweight workflows where the billing
+        # database may intentionally be absent.
         return None, None
 
     if not identity_id:
@@ -159,8 +191,21 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
             expected_cost = 0
         cost = max(base_cost, expected_cost)
         # print(f"[CREDITS:DEBUG] PricingService.get_action_cost('{canonical_action}') = {cost}")
-        if cost == 0:
-            # print(f"[CREDITS:DEBUG] !!! SKIPPING CREDITS - No cost for {canonical_action}, no reservation needed")
+        if cost <= 0:
+            # A billable generation/refinement action must never resolve to 0.
+            # If it does, the pricing row is missing/misconfigured — fail CLOSED
+            # so a config gap can never turn into free assets.
+            if canonical_action in PAID_GENERATION_ACTIONS:
+                print(
+                    f"[CREDITS][SECURITY] BLOCKED zero-cost paid action: action={canonical_action} "
+                    f"(requested={action_key}) job_id={internal_job_id} — pricing missing/zero; failing closed"
+                )
+                return None, _make_credit_error(
+                    "PRICING_UNAVAILABLE",
+                    "This action is temporarily unavailable. Please try again shortly.",
+                    503,
+                )
+            # Genuinely free (non-generation) action — no reservation needed.
             return None, None
 
         homepage_trial_id = getattr(g, "homepage_free_trial_id", None)

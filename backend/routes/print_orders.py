@@ -30,6 +30,7 @@ bp = Blueprint("print_orders", __name__)
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 POSTAL_RE = re.compile(r"^[A-Za-z0-9 \-]{2,12}$")
+MOLLIE_PAYMENT_ID_RE = re.compile(r"^[A-Za-z]{2,12}_[A-Za-z0-9]{6,80}$")
 
 # Allowed countries for shipping (mirror frontend select)
 ALLOWED_COUNTRIES = {"US", "CA", "GB", "EU", "AU", "JP", "OTHER"}
@@ -42,9 +43,13 @@ def _err(code: str, msg: str, status: int = 400):
 
 
 def _get_client_ip() -> str:
-    forwarded_for = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+    # Do not blindly trust spoofable forwarding headers. Only use
+    # CF-Connecting-IP when the deployment explicitly says requests arrive via
+    # a trusted proxy/CDN path; otherwise record Flask's peer address.
+    if getattr(config, "HOMEPAGE_FREE_TRUST_PROXY_HEADERS", False):
+        cf_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+        if cf_ip:
+            return cf_ip.split(",", 1)[0].strip()
     return request.remote_addr or ""
 
 
@@ -270,14 +275,17 @@ def webhook_mollie():
         payment_id = (body.get("id") or "").strip()
     if not payment_id:
         return jsonify({"ok": False, "error": "missing id"}), 400
+    if not MOLLIE_PAYMENT_ID_RE.match(payment_id):
+        return jsonify({"ok": False, "error": "invalid id"}), 400
 
     try:
         result = print_order_service.handle_mollie_webhook(payment_id)
     except Exception as e:
         print(f"[PRINT-ORDER] mollie webhook unexpected: {e}")
-        # Return 200 so Mollie does not endlessly retry on transient bugs;
-        # we'll see it in logs and process via admin tools if needed.
-        return jsonify({"ok": True, "swallowed": True}), 200
+        return jsonify({"ok": False, "error": "webhook_processing_failed"}), 503
+
+    if not result.get("ok"):
+        return jsonify(result), 503
 
     return jsonify(result), 200
 

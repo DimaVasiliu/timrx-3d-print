@@ -372,7 +372,7 @@ def _handle_nano_banana_image_generate(body: dict):
         }), 500
 
     # Require authentication
-    identity_id, auth_error = require_identity()
+    _identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
 
@@ -2164,9 +2164,14 @@ def proxy_image_mod():
 
 
 @bp.route("/cache-image", methods=["POST", "OPTIONS"])
+@with_session
 def cache_image_mod():
     if request.method == "OPTIONS":
         return ("", 204)
+
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
 
     body = request.get_json(silent=True) or {}
     data_url = body.get("data_url") or ""
