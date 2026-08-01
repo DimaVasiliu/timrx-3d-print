@@ -22,6 +22,7 @@ Note: All service imports are lazy (inside functions) to avoid circular import i
 """
 
 import os
+import hmac
 import time as _time
 from functools import wraps
 from flask import request, g, jsonify, make_response
@@ -542,10 +543,89 @@ def get_session_id_from_request():
     return IdentityService.get_session_id_from_request(request)
 
 
+# ─────────────────────────────────────────────────────────────
+# Admin auth hardening helpers
+# ─────────────────────────────────────────────────────────────
+_CF_JWKS_CLIENTS = {}  # certs_url -> PyJWKClient (caches JWKS internally)
+
+
+def _admin_client_ip() -> str:
+    """Best client IP behind Cloudflare/Render proxies."""
+    ip = request.headers.get("CF-Connecting-IP")
+    if ip:
+        return ip.strip()
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _record_admin_failure(ip):
+    """
+    Record a failed admin auth attempt (per-IP) in the shared rate-limit store.
+    Returns (is_rate_limited: bool, retry_after_seconds: int).
+    Fails open on infra errors so a DB hiccup never locks out a legitimate admin.
+    """
+    try:
+        from backend.config import config
+        from backend.services.auth_rate_limit_service import AuthRateLimitService
+        res = AuthRateLimitService.hit(
+            "admin_auth_fail",
+            [ip],
+            limit=config.ADMIN_AUTH_MAX_FAILURES,
+            window_seconds=config.ADMIN_AUTH_FAIL_WINDOW,
+        )
+        return (not res.get("ok", True)), int(res.get("retry_after", 0))
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[MIDDLEWARE] admin rate-limit check failed (fail-open): {e}")
+        return False, 0
+
+
+def _verify_cf_access_jwt(token):
+    """
+    Verify a Cloudflare Access (Zero Trust) JWT from the Cf-Access-Jwt-Assertion
+    header. Returns the claims dict on success, else None.
+
+    Validates signature (RS256 via Cloudflare JWKS), issuer (your team domain)
+    and audience (your Access application AUD tag).
+    """
+    try:
+        from backend.config import config
+        import jwt as _jwt
+        team = (config.CF_ACCESS_TEAM_DOMAIN or "").strip()
+        aud = (config.CF_ACCESS_AUD or "").strip()
+        if not team or not aud:
+            return None
+        if team.startswith("http"):
+            issuer = team.rstrip("/")
+        else:
+            domain = team if team.endswith("cloudflareaccess.com") else f"{team}.cloudflareaccess.com"
+            issuer = f"https://{domain}"
+        certs_url = f"{issuer}/cdn-cgi/access/certs"
+        client = _CF_JWKS_CLIENTS.get(certs_url)
+        if client is None:
+            client = _jwt.PyJWKClient(certs_url)
+            _CF_JWKS_CLIENTS[certs_url] = client
+        signing_key = client.get_signing_key_from_jwt(token)
+        return _jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=aud,
+            issuer=issuer,
+        )
+    except Exception as e:
+        print(f"[MIDDLEWARE] CF Access JWT verification failed: {e}")
+        return None
+
+
 def require_admin(f):
     """
-    Decorator that requires admin authentication.
-    Supports token-based (X-Admin-Token) and email-based auth.
+    Decorator that requires admin authentication. In priority order:
+      1. X-Admin-Token header (constant-time compare; for scripts/dashboard)
+      2. Cloudflare Access JWT (Cf-Access-Jwt-Assertion; Zero Trust identity)
+      3. Email-based session (verified admin email)
+    Failed attempts are rate-limited per IP to throttle brute force.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -558,20 +638,46 @@ def require_admin(f):
                 "error": {"code": "ADMIN_NOT_CONFIGURED", "message": "Admin authentication is not configured"}
             }), 503
 
-        # Method 1: Token-based authentication
+        ip = _admin_client_ip()
+
+        def _fail(code, message, status=403):
+            limited, retry_after = _record_admin_failure(ip)
+            if limited:
+                resp = jsonify({
+                    "error": {"code": "RATE_LIMITED", "message": "Too many failed admin attempts. Try again later."}
+                })
+                resp.headers["Retry-After"] = str(retry_after or config.ADMIN_AUTH_FAIL_WINDOW)
+                return resp, 429
+            return jsonify({"error": {"code": code, "message": message}}), status
+
+        # Method 1: Token-based authentication (constant-time compare)
         admin_token = request.headers.get("X-Admin-Token")
         if admin_token:
-            if config.ADMIN_TOKEN and admin_token == config.ADMIN_TOKEN:
+            if config.ADMIN_TOKEN and hmac.compare_digest(
+                admin_token.encode("utf-8"), config.ADMIN_TOKEN.encode("utf-8")
+            ):
                 g.admin_auth_method = "token"
                 g.admin_email = None
                 g.identity = None
                 return f(*args, **kwargs)
-            else:
-                return jsonify({
-                    "error": {"code": "INVALID_ADMIN_TOKEN", "message": "Invalid admin token"}
-                }), 403
+            return _fail("INVALID_ADMIN_TOKEN", "Invalid admin token")
 
-        # Method 2: Email-based authentication
+        # Method 2: Cloudflare Access (Zero Trust) JWT
+        cf_jwt = request.headers.get("Cf-Access-Jwt-Assertion") or request.headers.get("CF-Access-Jwt-Assertion")
+        if cf_jwt and config.CF_ACCESS_CONFIGURED:
+            claims = _verify_cf_access_jwt(cf_jwt)
+            if claims:
+                email = (claims.get("email") or "").lower().strip()
+                # If an admin allow-list is configured, enforce it as a second gate.
+                if config.ADMIN_EMAILS and not config.is_admin_email(email):
+                    return _fail("NOT_ADMIN", "You do not have admin privileges")
+                g.admin_auth_method = "cf_access"
+                g.admin_email = email or None
+                g.identity = None
+                return f(*args, **kwargs)
+            return _fail("INVALID_CF_ACCESS", "Invalid Cloudflare Access token")
+
+        # Method 3: Email-based authentication (verified session)
         try:
             identity, _ = _resolve_identity()
 
@@ -587,9 +693,7 @@ def require_admin(f):
                 }), 403
 
             if not config.is_admin_email(email):
-                return jsonify({
-                    "error": {"code": "NOT_ADMIN", "message": "You do not have admin privileges"}
-                }), 403
+                return _fail("NOT_ADMIN", "You do not have admin privileges")
 
             g.admin_auth_method = "email"
             g.admin_email = email
