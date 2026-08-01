@@ -446,6 +446,8 @@ def validate_video_rate_limits(
 AVERAGE_GENERATION_TIME = {
     "vertex": 80,               # 45–120s
     "seedance": 480,            # ~8 min (fast tier typical)
+    "seedance_mini": 240,       # ~4 min (PiAPI: ~2x faster than fast)
+    "seedance_v25": 900,        # ~15 min (premium model, heavier compute)
     "seedance_fast": 480,       # ~8 min
     "seedance_quality": 1200,   # ~20 min (highly variable)
     "seedance_preview": 1200,   # legacy alias
@@ -456,6 +458,8 @@ AVERAGE_GENERATION_TIME = {
 RENDER_TIME_RANGE = {
     "vertex": (45, 120),
     "seedance": (300, 600),          # 5-10 min (fast tier default)
+    "seedance_mini": (120, 360),     # 2-6 min (cheapest + fastest tier)
+    "seedance_v25": (420, 1800),     # 7-30 min (premium model, variable queue)
     "seedance_fast": (300, 600),     # 5-10 min
     "seedance_quality": (600, 3600), # 10-60 min (variable queue)
     "seedance_preview": (600, 3600), # legacy alias

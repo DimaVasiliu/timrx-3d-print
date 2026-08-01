@@ -28,10 +28,13 @@ POLL_INTERVAL_INITIAL = 2
 POLL_INTERVAL_MAX = 8
 POLL_TIMEOUT = 300
 
+# FLUX 3 was announced 2026-07-23, but its Image model is still early-access
+# (video/action only, to selected partners), so FLUX.2 remains the correct
+# production pin. Env-overridable for when FLUX 3 Image reaches GA.
 FLUX_MODEL_ENDPOINTS = {
-    "pro": "flux-2-pro",
+    "pro": getattr(config, "FLUX_MODEL_PRO", None) or "flux-2-pro",
     "pro_preview": "flux-2-pro-preview",
-    "flex": "flux-2-flex",
+    "flex": getattr(config, "FLUX_MODEL_FLEX", None) or "flux-2-flex",
 }
 ALLOWED_OUTPUT_FORMATS = {"jpeg", "png", "webp"}
 

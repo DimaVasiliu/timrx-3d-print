@@ -36,12 +36,14 @@ from backend.services.gemini_video_service import (
     GeminiValidationError,
 )
 from backend.services.gemini_image_service import (
+    GOOGLE_IMAGE_MODEL,
     gemini_generate_image,
     GeminiAuthError as GeminiImageAuthError,
     GeminiConfigError as GeminiImageConfigError,
     GeminiValidationError as GeminiImageValidationError,
 )
 from backend.services.google_nano_image_service import (
+    GOOGLE_NANO_MODEL,
     google_nano_generate_image,
     GoogleNanoAuthError,
     GoogleNanoConfigError,
@@ -709,6 +711,23 @@ def dispatch_openai_image_async(
         ExpenseGuard.unregister_active_job(internal_job_id)
 
 
+# Imagen exposed structured edit modes; the Gemini image API does not. These
+# phrases carry the same intent through the prompt so an existing client that
+# still sends edit_mode keeps getting the edit it asked for.
+def _openai_image_model() -> str:
+    from backend.config import config as _cfg
+    return getattr(_cfg, "OPENAI_IMAGE_MODEL", None) or "gpt-image-2"
+
+
+_EDIT_MODE_PROMPT_HINTS = {
+    "EDIT_MODE_INPAINT_INSERTION": "Insert the described element into the scene, matching its lighting and perspective.",
+    "EDIT_MODE_INPAINT_REMOVAL": "Remove the described element and plausibly fill in the background behind it.",
+    "EDIT_MODE_OUTPAINT": "Extend the image outward beyond its current borders, continuing the scene naturally.",
+    "EDIT_MODE_BGSWAP": "Replace the background while keeping the main subject unchanged.",
+    "EDIT_MODE_PRODUCT_IMAGE": "Present the product on a clean studio background suitable for e-commerce.",
+}
+
+
 def dispatch_gemini_image_async(
     internal_job_id: str,
     identity_id: str,
@@ -726,9 +745,10 @@ def dispatch_gemini_image_async(
     Async dispatch for Google image generation.
 
     Routing:
-      - text-to-image           → gemini_generate_image (Gemini Developer API, Imagen 4.0 Fast)
-      - reference / image-to-image → vertex_imagen_edit_image (Vertex AI Imagen 3 capability)
-                                     — reuses Veo's service-account auth.
+      - text-to-image              → gemini_generate_image (Gemini image API)
+      - reference / image-to-image → gemini_generate_image with inline reference
+                                     parts. Was Vertex Imagen 3 capability, which
+                                     Google discontinued on 2026-06-30.
 
     Runs in a background thread so the endpoint returns immediately with job_id.
     """
@@ -744,32 +764,34 @@ def dispatch_gemini_image_async(
         return
 
     try:
-        if reference_images:
-            # Image-to-image / reference-guided edit via Vertex AI Imagen 3 capability.
-            from backend.services.vertex_imagen_service import (
-                vertex_imagen_edit_image,
-                VertexImagenError,
+        # Both text-to-image and reference-guided editing now go through the Gemini
+        # image API. The edit path used to call vertex_imagen_edit_image
+        # (imagen-3.0-capability-001), which Google discontinued on 2026-06-30 —
+        # so that branch was already dead. The Gemini image models do editing
+        # natively by passing reference images as inline_data parts.
+        #
+        # Caveat carried over from the migration: Imagen's structured edit modes
+        # (EDIT_MODE_INPAINT_REMOVAL, EDIT_MODE_BGSWAP, …) and mask images have no
+        # direct equivalent — Gemini takes the instruction in the prompt instead.
+        # We fold the requested mode into the prompt so intent is not silently lost.
+        effective_prompt = prompt
+        if reference_images and edit_mode and edit_mode != "EDIT_MODE_DEFAULT":
+            hint = _EDIT_MODE_PROMPT_HINTS.get(edit_mode)
+            if hint:
+                effective_prompt = f"{prompt}. {hint}"
+        if reference_images and mask_image:
+            print(
+                "[GEMINI] mask_image supplied but the Gemini image API has no mask "
+                "parameter — relying on the prompt to scope the edit"
             )
-            try:
-                result = vertex_imagen_edit_image(
-                    prompt=prompt,
-                    reference_images=reference_images,
-                    mask_image=mask_image,
-                    edit_mode=edit_mode or "EDIT_MODE_DEFAULT",
-                    sample_count=sample_count,
-                )
-            except VertexImagenError as e:
-                # Vertex-specific failure — re-raise as generic RuntimeError so the
-                # outer Exception handler sanitizes and persists it.
-                raise RuntimeError(str(e)) from e
-        else:
-            # Text-to-image via Gemini Developer API (Imagen 4.0 Fast)
-            result = gemini_generate_image(
-                prompt=prompt,
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-                sample_count=sample_count,
-            )
+
+        result = gemini_generate_image(
+            prompt=effective_prompt,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+            sample_count=sample_count,
+            reference_images=reference_images or None,
+        )
 
         duration_ms = int((time.time() - start_time) * 1000)
         # print(f"[ASYNC] Gemini returned for job {internal_job_id} in {duration_ms}ms")
@@ -790,7 +812,7 @@ def dispatch_gemini_image_async(
         # Save to normalized DB (creates images row + history_items row).
         # Use the actual model returned (imagen-3.0-capability-001 for edit,
         # imagen-4.0-fast for plain generate); fall back to "imagen-4.0".
-        ai_model = result.get("model") or "imagen-4.0"
+        ai_model = result.get("model") or GOOGLE_IMAGE_MODEL
         persisted_result = save_image_to_normalized_db(
             image_id=internal_job_id,
             image_url=image_url or image_urls[0],
@@ -1075,7 +1097,7 @@ def dispatch_google_nano_image_async(
             prompt,
             store_meta,
             provider="google_nano",
-            ai_model=result.get("model") or "gemini-2.5-flash-image",
+            ai_model=result.get("model") or GOOGLE_NANO_MODEL,
             image_url=result.get("image_url"),
             image_urls=result.get("image_urls"),
             image_base64=result.get("image_base64"),
@@ -1691,7 +1713,7 @@ def _dispatch_openai_image_async(internal_job_id, identity_id, reservation_id, p
     payload = payload or {}
     prompt = payload.get("prompt") or store_meta.get("prompt") or ""
     size = payload.get("size") or store_meta.get("size") or "1024x1024"
-    model = payload.get("model") or store_meta.get("model") or "gpt-image-1.5"
+    model = payload.get("model") or store_meta.get("model") or _openai_image_model()
     n = int(payload.get("n") or store_meta.get("n") or 1)
     response_format = payload.get("response_format") or store_meta.get("response_format") or "url"
     reference_images = payload.get("reference_images") or store_meta.get("reference_images") or None
@@ -1843,6 +1865,20 @@ def _dispatch_to_seedance(
     )
     route_params["tier"] = seedance_tier
 
+    # PiAPI `-less-restriction` task type (+10% upstream). Already gated and priced
+    # by the route layer — here we only carry the decision through.
+    route_params["less_restriction"] = bool(
+        payload.get("less_restriction")
+        if payload.get("less_restriction") is not None
+        else store_meta.get("seedance_less_restriction")
+    )
+
+    # Soundtrack toggle. None means "leave it to PiAPI" (which generates audio).
+    seedance_audio = payload.get("audio")
+    if seedance_audio is None:
+        seedance_audio = store_meta.get("seedance_audio")
+    route_params["audio"] = seedance_audio
+
     if task == "reference_video":
         # PiAPI Seedance 2 GA omni_reference — mixed image/video/audio references.
         resp = seedance.start_reference_video(
@@ -1882,6 +1918,7 @@ def _dispatch_to_vertex_with_fallback(
     payload: dict,
     route_params: dict,
     router,
+    store_meta: dict | None = None,
 ) -> tuple:
     """
     Route video generation via the provider router.
@@ -1927,8 +1964,11 @@ def _dispatch_to_vertex_with_fallback(
         # Seedance 2 GA can do native first/last-frame interpolation. If PiAPI
         # is unavailable, fal Seedance remains the final transition fallback.
         try:
+            # NOTE: store_meta carries the Seedance tier / less-restriction / audio
+            # selections. It used to be referenced here without being a parameter,
+            # so this fallback always raised NameError and silently degraded to fal.
             return _dispatch_to_seedance(
-                internal_job_id, task, fp, payload, route_params.copy(), store_meta,
+                internal_job_id, task, fp, payload, route_params.copy(), store_meta or {},
             )
         except Exception as seedance_err:
             print(
@@ -2054,7 +2094,7 @@ def dispatch_gemini_video_async(
             )
         else:
             resp, provider_used = _dispatch_to_vertex_with_fallback(
-                internal_job_id, task, prompt, payload, route_params, video_router,
+                internal_job_id, task, prompt, payload, route_params, video_router, store_meta,
             )
 
         # Track which provider actually handled the request

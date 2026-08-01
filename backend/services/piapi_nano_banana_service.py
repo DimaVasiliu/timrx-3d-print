@@ -26,7 +26,9 @@ BASE_RETRY_DELAY = 2
 
 # PiAPI base URL
 PIAPI_API_BASE = "https://api.piapi.ai/api/v1"
-NANO_BANANA_MODEL = "nano-banana-2"
+# PiAPI's nano-banana-2 is Gemini 3.1 Flash Image; nano-banana-pro is Gemini 3
+# Pro Image. Env-overridable via PIAPI_NANO_BANANA_MODEL.
+NANO_BANANA_MODEL = getattr(config, "PIAPI_NANO_BANANA_MODEL", None) or "nano-banana-2"
 
 # Polling settings for get-task
 POLL_INTERVAL_INITIAL = 3       # seconds

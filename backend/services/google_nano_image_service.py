@@ -23,9 +23,13 @@ GOOGLE_NANO_TIMEOUT = (15, 180)
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 2
 GOOGLE_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-GOOGLE_NANO_MODEL = "gemini-2.5-flash-image"
+# gemini-2.5-flash-image shuts down 2026-10-02; gemini-3.1-flash-image is the
+# documented replacement (GA 2026-05-28) and also supersedes the Imagen line.
+# Env-overridable via GOOGLE_IMAGE_MODEL — see config for the deprecation table.
+GOOGLE_NANO_MODEL = getattr(config, "GOOGLE_IMAGE_MODEL", None) or "gemini-3.1-flash-image"
 ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
-ALLOWED_IMAGE_SIZES = {"1K"}
+# 3.1 Flash Image adds 2K and native 4K output; 2.5 was 1K-only.
+ALLOWED_IMAGE_SIZES = {"1K", "2K", "4K"}
 
 
 class GoogleNanoAuthError(Exception):
@@ -116,7 +120,7 @@ def google_nano_generate_image(
     reference_images: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Generate or edit an image with Gemini 2.5 Flash Image (Google Nano).
+    Generate or edit an image with the configured Gemini image model.
 
     When `reference_images` is provided, the model performs image-to-image /
     reference-guided generation (Gemini natively supports inline_data parts).

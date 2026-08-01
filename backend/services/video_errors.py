@@ -108,6 +108,15 @@ _PROVIDER_ERROR_MAP = {
     # Generation failures
     "generation_failed": ErrorCategory.INTERNAL,
     "seedance_generation_failed": ErrorCategory.INTERNAL,
+    # PiAPI Seedance 2 content review. On `-less-restriction` task types a rejection
+    # is final (no alternate review path) and PiAPI refunds the upstream charge, so
+    # these must classify as VALIDATION → terminal + credit release on our side.
+    "seedance_content_violation": ErrorCategory.VALIDATION,
+    "content_violation": ErrorCategory.VALIDATION,
+    "content_policy": ErrorCategory.VALIDATION,
+    "content review": ErrorCategory.VALIDATION,
+    "sensitive content": ErrorCategory.VALIDATION,
+    "seedance_too_many_references": ErrorCategory.VALIDATION,
     # Vertex AI
     "vertex_video_failed": ErrorCategory.INTERNAL,
     "vertex_auth_failed": ErrorCategory.AUTH,

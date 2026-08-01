@@ -5,7 +5,8 @@ Registered under /api/_mod and /api for compatibility.
 
 Active providers:
 - vertex   (Veo 3.1)       — durations 4/6/8s, aspects 16:9/9:16, resolutions 720p/1080p/4k
-- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 16:9/9:16/4:3/3:4, tiers fast/preview
+- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 21:9/16:9/4:3/1:1/3:4/9:16,
+                             tiers mini/fast/quality (PiAPI seedance-2-mini/-fast/seedance-2)
 
 Endpoints:
 - POST /video/generate   — Unified start (text2video or image2video) — legacy
@@ -26,7 +27,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from flask import Blueprint, g, jsonify, request, send_file
+from flask import Blueprint, Response, g, jsonify, request, send_file
 
 from backend.db import USE_DB, get_conn, Tables
 from backend.middleware import require_admin, with_session, with_session_readonly
@@ -78,6 +79,48 @@ _VIDEO_CONVERT_MAX_UPLOAD_MB = int(os.getenv("VIDEO_CONVERT_MAX_UPLOAD_MB", "200
 _VIDEO_CONVERT_TIMEOUT_SECONDS = int(os.getenv("VIDEO_CONVERT_TIMEOUT_SECONDS", "600"))
 _VIDEO_CONVERT_MAX_UPLOAD_BYTES = _VIDEO_CONVERT_MAX_UPLOAD_MB * 1024 * 1024
 
+# User-facing Seedance tier labels (history cards, admin display).
+# `preview` is the pre-GA frontend alias for what is now `quality`.
+_SEEDANCE_TIER_LABELS = {
+    "mini":    "Mini",
+    "fast":    "Fast",
+    "quality": "Quality",
+    "preview": "Quality",
+    "v25":     "Seedance 2.5",
+}
+
+# PiAPI's hard ceiling for `omni_reference`, per model. Seedance 2.0 allows 9 of any
+# mix; Seedance 2.5 allows 12 but budgets them by kind (9 images / 3 videos / 3 audio).
+# Our public/beta policies must never exceed the active model's ceiling (we used to
+# allow a flat 12, which PiAPI 400s on 2.0).
+PIAPI_MAX_TOTAL_REFS = 9
+PIAPI_MAX_TOTAL_REFS_V25 = 12
+PIAPI_MAX_VIDEO_REFS_V25 = 3
+PIAPI_MAX_AUDIO_REFS_V25 = 3
+
+
+def _v25_max_duration() -> int:
+    """Seedance 2.5 duration ceiling. See seedance_service for why this is settable."""
+    from backend.services.seedance_service import V25_MAX_DURATION_SECONDS
+    return V25_MAX_DURATION_SECONDS
+
+
+def _piapi_reference_ceiling(seedance_tier: str | None) -> dict:
+    """Upstream reference ceiling for the tier the request is actually using."""
+    if (seedance_tier or "").strip().lower() == "v25":
+        return {
+            "total":  PIAPI_MAX_TOTAL_REFS_V25,
+            "images": PIAPI_MAX_TOTAL_REFS,          # 9 images on both models
+            "videos": PIAPI_MAX_VIDEO_REFS_V25,
+            "audios": PIAPI_MAX_AUDIO_REFS_V25,
+        }
+    return {
+        "total":  PIAPI_MAX_TOTAL_REFS,
+        "images": PIAPI_MAX_TOTAL_REFS,
+        "videos": PIAPI_MAX_TOTAL_REFS,
+        "audios": PIAPI_MAX_TOTAL_REFS,
+    }
+
 REFERENCE_LIMITS_PUBLIC = {
     "max_total_refs": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_TOTAL_REFS", "8")),
     "max_image_refs": int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_IMAGE_REFS", "6")),
@@ -93,7 +136,8 @@ REFERENCE_LIMITS_PUBLIC = {
 }
 REFERENCE_LIMITS_BETA = {
     **REFERENCE_LIMITS_PUBLIC,
-    "max_total_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_TOTAL_REFS", "12")),
+    # Was 12 — PiAPI rejects anything above 9 combined references.
+    "max_total_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_TOTAL_REFS", "9")),
     "max_image_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_IMAGE_REFS", "6")),
     "max_video_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_VIDEO_REFS", "2")),
     "max_audio_refs": int(os.getenv("VIDEO_REFERENCE_BETA_MAX_AUDIO_REFS", "1")),
@@ -101,6 +145,13 @@ REFERENCE_LIMITS_BETA = {
     "input_retention_hours": int(os.getenv("VIDEO_REFERENCE_BETA_INPUT_RETENTION_HOURS", "168")),
 }
 REFERENCE_LIMITS_PUBLIC["max_total_upload_mb"] = int(os.getenv("VIDEO_REFERENCE_PUBLIC_MAX_TOTAL_UPLOAD_MB", "75"))
+
+# Clamp both policies to PiAPI's ceiling regardless of how the env vars are set,
+# so a misconfigured deploy can't promise the user a request PiAPI will reject.
+for _limits in (REFERENCE_LIMITS_PUBLIC, REFERENCE_LIMITS_BETA):
+    _limits["max_total_refs"] = min(_limits["max_total_refs"], PIAPI_MAX_TOTAL_REFS)
+    _limits["max_image_refs"] = min(_limits["max_image_refs"], PIAPI_MAX_TOTAL_REFS)
+    _limits["max_video_refs"] = min(_limits["max_video_refs"], PIAPI_MAX_TOTAL_REFS)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -136,6 +187,113 @@ def _reference_video_policy() -> dict:
     }
 
 
+def _prepare_reference(raw: str, *, provider: str, field: str, index: int | None = None):
+    """
+    Turn one user-supplied image into a provider-ready public URL.
+
+    Returns (url, None) on success or (None, flask_error_response) on failure.
+
+    Deliberately called from the request handler rather than the async dispatcher:
+    validation, decoding, transcoding and the S3 write all have to happen *before*
+    start_paid_job() reserves credits. Previously this ran inside the provider at
+    dispatch time, so a corrupt or unsupported image was only discovered after the
+    user had been charged and a job row created — the refund path then had to
+    clean up a job that never should have existed.
+    """
+    from backend.services.video_providers.reference_media import (
+        ReferenceMediaError,
+        prepare_image_url,
+    )
+
+    try:
+        return prepare_image_url(raw, provider=provider, field=field, index=index), None
+    except ReferenceMediaError as exc:
+        payload = {
+            "ok": False,
+            "error": "invalid_reference_media",
+            "message": exc.message,
+            "field": exc.field or field,
+        }
+        if exc.index is not None:
+            payload["index"] = exc.index
+        print(f"[VIDEO_REF] rejected field={exc.field} index={exc.index}: {exc.message}")
+        return None, (jsonify(payload), 400)
+
+
+def _prepare_reference_list(items: list, *, provider: str, kind: str, field: str):
+    """Prepare a list of references of one kind. Returns (urls, error_response)."""
+    from backend.services.video_providers.reference_media import (
+        ReferenceMediaError,
+        prepare_av_url,
+        prepare_image_url,
+    )
+
+    out = []
+    for i, item in enumerate(items or []):
+        if not item:
+            continue
+        try:
+            if kind == "image":
+                out.append(prepare_image_url(item, provider=provider, field=field, index=i))
+            else:
+                out.append(prepare_av_url(item, kind=kind, provider=provider, field=field, index=i))
+        except ReferenceMediaError as exc:
+            print(f"[VIDEO_REF] rejected {kind}[{i}]: {exc.message}")
+            return None, (jsonify({
+                "ok": False,
+                "error": "invalid_reference_media",
+                "message": exc.message,
+                "field": exc.field or field,
+                "index": i,
+            }), 400)
+    return out, None
+
+
+def _seedance_feature_policy() -> dict:
+    """
+    Feature availability for PiAPI Seedance 2 options that aren't purely cosmetic.
+
+    `less_restriction` selects PiAPI's `-less-restriction` task types, which apply a
+    permissive content review, cost 10% more upstream, and give no retry path on a
+    rejection. It stays OFF unless a deploy explicitly opts in via
+    SEEDANCE_LESS_RESTRICTION_ENABLED, and even then it is admin/beta-only unless
+    SEEDANCE_LESS_RESTRICTION_PUBLIC is also set.
+    """
+    beta_access = _has_video_beta_access()
+    lr_enabled = _env_bool("SEEDANCE_LESS_RESTRICTION_ENABLED", False)
+    lr_public = lr_enabled and _env_bool("SEEDANCE_LESS_RESTRICTION_PUBLIC", False)
+    return {
+        "tiers": ["mini", "fast", "quality", "v25"],
+        "audio_toggle": True,
+        "less_restriction": bool(lr_enabled and (lr_public or beta_access)),
+        "less_restriction_surcharge_pct": 10,
+    }
+
+
+def _resolve_less_restriction(requested) -> tuple[bool, tuple | None]:
+    """Gate the `less_restriction` flag. Returns (resolved_flag, error_response|None)."""
+    if not requested:
+        return False, None
+    if not _seedance_feature_policy()["less_restriction"]:
+        return False, (jsonify({
+            "error": "feature_not_enabled",
+            "message": "Permissive content review is not available on this account.",
+            "field": "less_restriction",
+        }), 403)
+    return True, None
+
+
+def _coerce_audio_flag(body: dict):
+    """Read the soundtrack toggle from a request body. None = use PiAPI's default (on)."""
+    for key in ("audio", "generate_audio", "soundtrack"):
+        if key in body and body[key] is not None:
+            raw = body[key]
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    return None
+
+
 def _media_payload_size_bytes(value: str) -> int:
     if not value:
         return 0
@@ -145,9 +303,17 @@ def _media_payload_size_bytes(value: str) -> int:
     return 0
 
 
-def _validate_reference_media_limits(image_urls: list, video_urls: list, audio_urls: list, input_video_seconds: float, resolution: str) -> tuple[dict, tuple | None]:
+def _validate_reference_media_limits(image_urls: list, video_urls: list, audio_urls: list, input_video_seconds: float, resolution: str, seedance_tier: str | None = None) -> tuple[dict, tuple | None]:
     policy = _reference_video_policy()
-    limits = policy["limits"]
+    # Clamp our own policy to the upstream ceiling for the model in play, so a 2.0
+    # policy value can never promise more than 2.5 accepts (or vice versa).
+    ceiling = _piapi_reference_ceiling(seedance_tier)
+    limits = dict(policy["limits"])
+    limits["max_total_refs"] = min(limits["max_total_refs"], ceiling["total"])
+    limits["max_image_refs"] = min(limits["max_image_refs"], ceiling["images"])
+    limits["max_video_refs"] = min(limits["max_video_refs"], ceiling["videos"])
+    limits["max_audio_refs"] = min(limits["max_audio_refs"], ceiling["audios"])
+    policy = {**policy, "limits": limits}
 
     if video_urls and not policy["video_refs"]:
         return policy, (jsonify({
@@ -217,6 +383,61 @@ def _validate_reference_media_limits(image_urls: list, video_urls: list, audio_u
         }), 400)
 
     return policy, None
+
+
+# ── GET /video/ref/<token> — public reference media ──────────────────────────
+@bp.route("/video/ref/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
+def video_reference_media(token: str):
+    """
+    Serve a reference image/video/audio to an external provider.
+
+    Deliberately unauthenticated and non-expiring. PiAPI's Seedance docs warn that
+    "Signed / expiring URLs may fail", and a Quality-tier job can sit queued for an
+    hour before the provider fetches its references — so a presigned S3 URL is the
+    wrong primitive here. Instead the token is an unguessable HMAC capability over
+    the S3 key: it cannot be minted or enumerated without the server secret, and
+    resolve_reference_token() refuses any key outside the reference prefix.
+
+    Objects are content-addressed, so this URL is immutable and safely cacheable.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    from backend.services.video_providers.reference_media import resolve_reference_token
+
+    s3_key = resolve_reference_token(token)
+    if not s3_key:
+        return Response("Not found", status=404, mimetype="text/plain")
+
+    try:
+        from backend.services.s3_service import _s3
+        from backend.config import config as _cfg
+
+        obj = _s3.get_object(Bucket=_cfg.AWS_BUCKET_MODELS, Key=s3_key)
+    except Exception as exc:
+        print(f"[VIDEO_REF] miss key={s3_key}: {exc}")
+        return Response("Not found", status=404, mimetype="text/plain")
+
+    content_type = obj.get("ContentType") or "application/octet-stream"
+    body = obj["Body"]
+
+    if request.method == "HEAD":
+        body.close()
+        resp = Response("", status=200, mimetype=content_type)
+    else:
+        resp = Response(body.iter_chunks(chunk_size=64 * 1024), mimetype=content_type)
+
+    length = obj.get("ContentLength")
+    if length is not None:
+        resp.headers["Content-Length"] = str(length)
+    # Immutable: the key is a content hash, so the bytes can never change.
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    # These are user uploads served from our origin — never let a browser treat
+    # one as an inline document.
+    resp.headers["Content-Disposition"] = "inline"
+    return resp
 
 
 def _safe_video_filename(name: str, fallback: str = "timrx-video") -> str:
@@ -429,20 +650,30 @@ def generate_video():
 
     seedance_variant = None
     seedance_tier = "fast"
+    seedance_less_restriction = False
+    seedance_audio = None
 
     # ── Provider-specific normalization ──
     if provider == "seedance":
+        seedance_less_restriction, lr_error = _resolve_less_restriction(body.get("less_restriction"))
+        if lr_error:
+            return lr_error
+        seedance_audio = _coerce_audio_flag(body)
         sc = normalize_seedance_params(
             duration_seconds=raw_duration,
             aspect_ratio=aspect_ratio,
             tier=body.get("seedance_tier"),
             seedance_variant=body.get("seedance_variant"),
             resolution=resolution,
+            less_restriction=seedance_less_restriction,
+            audio=seedance_audio,
         )
         duration_seconds = sc["duration_seconds"]
         aspect_ratio = sc["aspect_ratio"]
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
+        seedance_less_restriction = sc["less_restriction"]
+        seedance_audio = sc["audio"]
         resolution = sc["resolution"]  # Real Seedance 2 GA resolution (480/720/1080)
     elif provider == "fal_seedance":
         fc = normalize_fal_seedance_params(
@@ -473,6 +704,9 @@ def generate_video():
         image_data = body.get("image_data") or body.get("image") or ""
         if not image_data:
             return jsonify({"error": "invalid_params", "message": "image_data is required for image2video", "field": "image_data"}), 400
+        image_data, prep_err = _prepare_reference(image_data, provider=provider, field="image_data")
+        if prep_err:
+            return prep_err
         prompt = motion or "Animate this image with natural, smooth motion"
 
     return _dispatch_video_job(
@@ -489,6 +723,8 @@ def generate_video():
         provider=provider,
         seedance_variant=seedance_variant,
         seedance_tier=seedance_tier,
+        seedance_less_restriction=seedance_less_restriction,
+        seedance_audio=seedance_audio,
     )
 
 
@@ -508,6 +744,8 @@ def _dispatch_video_job(
     provider: str = "vertex",
     seedance_variant: str | None = None,
     seedance_tier: str = "fast",
+    seedance_less_restriction: bool = False,
+    seedance_audio: bool | None = None,
     start_image: str | None = None,
     end_image: str | None = None,
     image_urls: list | None = None,
@@ -578,11 +816,14 @@ def _dispatch_video_job(
         seedance_tier=seedance_tier,
         task=task,
         input_video_seconds=float(input_video_seconds or 0.0),
+        less_restriction=bool(seedance_less_restriction) and provider == "seedance",
     )
 
     print(
         f"[VIDEO] resolved provider={provider} task={task} duration={duration_seconds}s "
-        f"resolution={resolution} action_code={action_key} cost={expected_cost}"
+        f"resolution={resolution} action_code={action_key} cost={expected_cost} "
+        f"tier={seedance_tier if provider == 'seedance' else '-'} "
+        f"less_restriction={bool(seedance_less_restriction) and provider == 'seedance'}"
     )
 
     if expected_cost <= 0:
@@ -678,9 +919,13 @@ def _dispatch_video_job(
         # Human-readable tier label for history cards / admin display.
         # `preview` (legacy frontend) is shown as "Quality" — the actual model identity.
         "seedance_tier_label": (
-            "Quality" if (provider == "seedance" and seedance_tier in ("quality", "preview"))
-            else ("Fast" if provider == "seedance" else None)
+            _SEEDANCE_TIER_LABELS.get(seedance_tier, "Fast") if provider == "seedance" else None
         ),
+        # PiAPI `-less-restriction` task type (+10% upstream) — persisted so cost
+        # stamping and admin spend reports reconstruct the real charge.
+        "seedance_less_restriction": bool(seedance_less_restriction) if provider == "seedance" else None,
+        # Soundtrack toggle. None means "PiAPI default" (on).
+        "seedance_audio": seedance_audio if provider == "seedance" else None,
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -780,6 +1025,9 @@ def _dispatch_video_job(
         "negative_prompt": negative_prompt,
         "seed": seed,
         "seedance_variant": seedance_variant,
+        "seedance_tier": seedance_tier if provider == "seedance" else None,
+        "less_restriction": bool(seedance_less_restriction) if provider == "seedance" else False,
+        "audio": seedance_audio if provider == "seedance" else None,
     }
     if start_image:
         payload["start_image"] = start_image
@@ -808,7 +1056,9 @@ def _dispatch_video_job(
 
     # D1: Return fast — skip balance query (frontend caches wallet separately)
     from backend.services.video_limits import get_estimated_render_time
-    rtime = get_estimated_render_time(provider)
+    # Tier-aware: Mini renders ~2× faster than Fast, Quality is far slower — a
+    # provider-only estimate would tell every Seedance user the same wrong number.
+    rtime = get_estimated_render_time(provider, seedance_tier)
 
     resp_body = {
         "ok": True,
@@ -833,9 +1083,14 @@ def _dispatch_video_job(
     if provider == "seedance" and float(input_video_seconds or 0) > 0:
         try:
             from backend.services.provider_costs import estimate_seedance_provider_cost
-            base_usd = estimate_seedance_provider_cost(seedance_tier, duration_seconds, resolution)
+            base_usd = estimate_seedance_provider_cost(
+                seedance_tier, duration_seconds, resolution,
+                less_restriction=bool(seedance_less_restriction),
+            )
             total_usd = estimate_seedance_provider_cost(
-                seedance_tier, duration_seconds, resolution, input_video_seconds=float(input_video_seconds)
+                seedance_tier, duration_seconds, resolution,
+                input_video_seconds=float(input_video_seconds),
+                less_restriction=bool(seedance_less_restriction),
             )
             resp_body["cost_notice"] = {
                 "kind": "input_video_surcharge",
@@ -891,19 +1146,29 @@ def video_text():
 
     seedance_variant = None
     seedance_tier = "fast"
+    seedance_less_restriction = False
+    seedance_audio = None
 
     if provider == "seedance":
+        seedance_less_restriction, lr_error = _resolve_less_restriction(body.get("less_restriction"))
+        if lr_error:
+            return lr_error
+        seedance_audio = _coerce_audio_flag(body)
         sc = normalize_seedance_params(
             duration_seconds=raw_duration,
             aspect_ratio=aspect_ratio,
             tier=body.get("seedance_tier"),
             seedance_variant=body.get("seedance_variant"),
             resolution=resolution,
+            less_restriction=seedance_less_restriction,
+            audio=seedance_audio,
         )
         duration_seconds = sc["duration_seconds"]
         aspect_ratio = sc["aspect_ratio"]
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
+        seedance_less_restriction = sc["less_restriction"]
+        seedance_audio = sc["audio"]
         resolution = sc["resolution"]
         prompt = raw_prompt  # No style normalization for Seedance
     elif provider == "fal_seedance":
@@ -945,6 +1210,8 @@ def video_text():
         provider=provider,
         seedance_variant=seedance_variant,
         seedance_tier=seedance_tier,
+        seedance_less_restriction=seedance_less_restriction,
+        seedance_audio=seedance_audio,
     )
 
 
@@ -1001,6 +1268,14 @@ def video_animate():
             return jsonify({"error": "invalid_params", "message": "Image transition requires both start and end images", "field": "end_image"}), 400
 
         print(f"[VIDEO] animate mode=image_transition provider={provider} start_image={'present' if start_image else 'MISSING'} end_image={'present' if end_image else 'MISSING'}")
+
+        # Prepare both frames now, before any credit reservation.
+        start_image, prep_err = _prepare_reference(start_image, provider=provider, field="start_image")
+        if prep_err:
+            return prep_err
+        end_image, prep_err = _prepare_reference(end_image, provider=provider, field="end_image")
+        if prep_err:
+            return prep_err
     else:
         # Single-image animate mode
         image_data = body.get("image_data") or body.get("image_url") or body.get("image") or ""
@@ -1014,6 +1289,10 @@ def video_animate():
 
         print(f"[VIDEO] animate mode=animate_image provider={provider} image={'present' if image_data else 'MISSING'}")
 
+        image_data, prep_err = _prepare_reference(image_data, provider=provider, field="image_data")
+        if prep_err:
+            return prep_err
+
     raw_user_prompt = (body.get("prompt") or body.get("motion") or "").strip()
     raw_duration = body.get("seconds") or body.get("duration_sec") or (5 if provider in ("seedance", "fal_seedance") else 6)
     aspect_ratio = body.get("aspect_ratio") or "16:9"
@@ -1024,19 +1303,29 @@ def video_animate():
 
     seedance_variant = None
     seedance_tier = "fast"
+    seedance_less_restriction = False
+    seedance_audio = None
 
     if provider == "seedance":
+        seedance_less_restriction, lr_error = _resolve_less_restriction(body.get("less_restriction"))
+        if lr_error:
+            return lr_error
+        seedance_audio = _coerce_audio_flag(body)
         sc = normalize_seedance_params(
             duration_seconds=raw_duration,
             aspect_ratio=aspect_ratio,
             tier=body.get("seedance_tier"),
             seedance_variant=body.get("seedance_variant"),
             resolution=resolution,
+            less_restriction=seedance_less_restriction,
+            audio=seedance_audio,
         )
         duration_seconds = sc["duration_seconds"]
         aspect_ratio = sc["aspect_ratio"]
         seedance_variant = sc["task_type"]
         seedance_tier = sc["tier"]
+        seedance_less_restriction = sc["less_restriction"]
+        seedance_audio = sc["audio"]
         resolution = sc["resolution"]
         if is_transition:
             prompt = raw_user_prompt or "Smooth transition between these two images"
@@ -1084,6 +1373,8 @@ def video_animate():
         provider=provider,
         seedance_variant=seedance_variant,
         seedance_tier=seedance_tier,
+        seedance_less_restriction=seedance_less_restriction,
+        seedance_audio=seedance_audio,
         start_image=start_image if is_two_image else None,
         end_image=end_image if is_two_image else None,
     )
@@ -1096,7 +1387,7 @@ def video_reference():
     """
     Reference Video generation (PiAPI Seedance 2 GA `omni_reference`).
 
-    Accepts up to 12 combined references — images, videos, and audio — plus a
+    Accepts up to 9 combined references — images, videos, and audio — plus a
     prompt that can address them via @image1 / @video1 / @audio1. Seedance-only;
     other providers don't support multi-modal references.
 
@@ -1107,6 +1398,8 @@ def video_reference():
         video_urls:          list of video data-URIs/URLs (optional)
         audio_urls:          list of audio data-URIs/URLs (optional)
         input_video_seconds: client-reported total reference-video duration
+        audio:               generate a soundtrack (default true)
+        less_restriction:    use PiAPI's permissive-review task type (gated)
         duration_sec, aspect_ratio, resolution, seedance_tier, seedance_variant, negative_prompt, seed
     """
     if request.method == "OPTIONS":
@@ -1143,8 +1436,14 @@ def video_reference():
     total_refs = len(image_urls) + len(video_urls) + len(audio_urls)
     if total_refs == 0:
         return jsonify({"error": "invalid_params", "message": "At least one image, video, or audio reference is required", "field": "image_urls"}), 400
-    if total_refs > 12:
-        return jsonify({"error": "invalid_params", "message": "Reference Video accepts at most 12 combined references", "field": "references"}), 400
+    _req_tier = (body.get("seedance_tier") or "").strip().lower()
+    _max_refs = _piapi_reference_ceiling(_req_tier)["total"]
+    if total_refs > _max_refs:
+        return jsonify({
+            "error": "invalid_params",
+            "message": f"Reference Video accepts at most {_max_refs} combined references",
+            "field": "references",
+        }), 400
     if audio_urls and not (image_urls or video_urls):
         return jsonify({"error": "invalid_params", "message": "Audio references require at least one image or video reference", "field": "audio_urls"}), 400
 
@@ -1164,12 +1463,18 @@ def video_reference():
         input_video_seconds = 0.0
     input_video_seconds = max(0.0, input_video_seconds)
 
+    seedance_less_restriction, lr_error = _resolve_less_restriction(body.get("less_restriction"))
+    if lr_error:
+        return lr_error
+
     sc = normalize_seedance_params(
         duration_seconds=raw_duration,
         aspect_ratio=aspect_ratio,
         tier=body.get("seedance_tier"),
         seedance_variant=body.get("seedance_variant"),
         resolution=resolution,
+        less_restriction=seedance_less_restriction,
+        audio=_coerce_audio_flag(body),
     )
     reference_policy, policy_error = _validate_reference_media_limits(
         image_urls,
@@ -1177,11 +1482,28 @@ def video_reference():
         audio_urls,
         input_video_seconds,
         sc["resolution"],
+        seedance_tier=sc["tier"],
     )
     if policy_error:
         return policy_error
 
     prompt = sanitize_prompt(prompt, provider=provider)
+
+    # Prepare every reference before reserving credits. Anything unreadable,
+    # oversized or in an unsupported format fails here as a 400 with the offending
+    # index, rather than upstream after the user has been charged.
+    image_urls, prep_err = _prepare_reference_list(
+        image_urls, provider=provider, kind="image", field="image_urls")
+    if prep_err:
+        return prep_err
+    video_urls, prep_err = _prepare_reference_list(
+        video_urls, provider=provider, kind="video", field="video_urls")
+    if prep_err:
+        return prep_err
+    audio_urls, prep_err = _prepare_reference_list(
+        audio_urls, provider=provider, kind="audio", field="audio_urls")
+    if prep_err:
+        return prep_err
 
     return _dispatch_video_job(
         identity_id=identity_id or "",
@@ -1197,6 +1519,8 @@ def video_reference():
         provider=provider,
         seedance_variant=sc["task_type"],
         seedance_tier=sc["tier"],
+        seedance_less_restriction=sc["less_restriction"],
+        seedance_audio=sc["audio"],
         image_urls=image_urls,
         video_urls=video_urls,
         audio_urls=audio_urls,
@@ -1857,17 +2181,50 @@ def video_providers_catalog():
             "beta": {"extend_video": False},
         },
         "seedance": {
-            "label": "Fast / Quality",
+            "label": "Mini / Fast / Quality",
             "provider_label": "Seedance",
             "enabled": "seedance" in enabled,
             "modes": ["text_to_video", "animate_image", "image_transition", "reference_guided"],
             "durations": [5, 10, 15],
+            "tiers": [
+                {"key": "mini",    "label": "Mini",    "task_type": "seedance-2-mini",
+                 "note": "Cheapest, ~2× faster"},
+                {"key": "fast",    "label": "Fast",    "task_type": "seedance-2-fast",
+                 "note": "Drafts and social"},
+                {"key": "quality", "label": "Quality", "task_type": "seedance-2",
+                 "note": "Cinematic detail, unlocks 1080p"},
+                {"key": "v25",     "label": "Seedance 2.5", "task_type": "seedance-2.5",
+                 "note": "Newest model, best motion — premium rate, 720p max",
+                 "model": "2.5"},
+            ],
             "resolutions": {
+                "mini": ["480p", "720p"],
                 "fast": ["480p", "720p"],
                 "quality": ["480p", "720p", "1080p"],
+                "v25": ["480p", "720p"],
             },
-            "aspects": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "auto"],
+            "default_resolution": {"mini": "720p", "fast": "480p", "quality": "480p", "v25": "720p"},
+            # `auto` is accepted by PiAPI in first_last_frames mode only.
+            "aspects": ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"],
+            "aspects_by_mode": {"image_transition": ["auto"], "animate_image": ["auto"]},
+            "max_prompt_chars": 4000,
+            "audio_output": True,
+            "audio_toggle": True,
+            "features": _seedance_feature_policy(),
             "reference_guided": reference_policy,
+            "max_references": PIAPI_MAX_TOTAL_REFS,
+            # Per-model ceilings — 2.5 allows more total references but caps
+            # videos and audio at 3 each.
+            "max_references_by_tier": {
+                "mini":    _piapi_reference_ceiling("mini"),
+                "fast":    _piapi_reference_ceiling("fast"),
+                "quality": _piapi_reference_ceiling("quality"),
+                "v25":     _piapi_reference_ceiling("v25"),
+            },
+            "max_duration_by_tier": {
+                "mini": 15, "fast": 15, "quality": 15,
+                "v25": _v25_max_duration(),
+            },
             "retention": {
                 "reference_inputs_hours": reference_policy["limits"]["input_retention_hours"],
                 "failed_inputs_hours": reference_policy["limits"]["failed_input_retention_hours"],
@@ -1892,6 +2249,8 @@ def video_providers_catalog():
         "providers": providers,
         "user_facing_names": {
             "vertex": "Cinematic",
+            "seedance_v25": "Seedance 2.5",
+            "seedance_mini": "Mini",
             "seedance_fast": "Fast",
             "seedance_quality": "Quality",
             "reference_video": "Reference-Guided",

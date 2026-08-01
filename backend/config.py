@@ -352,10 +352,29 @@ class Config:
     # Option 2: Email-based (comma-separated list of allowed admin emails)
     ADMIN_EMAILS: List[str] = field(default_factory=lambda: _get_env_list("ADMIN_EMAILS"))
 
+    # Option 3: Cloudflare Access (Zero Trust) JWT — Cf-Access-Jwt-Assertion header
+    # CF_ACCESS_TEAM_DOMAIN: e.g. "yourteam" or "yourteam.cloudflareaccess.com"
+    # CF_ACCESS_AUD: the Application Audience (AUD) tag from the Access app
+    CF_ACCESS_TEAM_DOMAIN: str = field(default_factory=lambda: _get_env("CF_ACCESS_TEAM_DOMAIN"))
+    CF_ACCESS_AUD: str = field(default_factory=lambda: _get_env("CF_ACCESS_AUD"))
+
+    # Admin brute-force protection (per-IP failed-attempt throttle)
+    ADMIN_AUTH_MAX_FAILURES: int = field(default_factory=lambda: _get_env_int("ADMIN_AUTH_MAX_FAILURES", 8))
+    ADMIN_AUTH_FAIL_WINDOW: int = field(default_factory=lambda: _get_env_int("ADMIN_AUTH_FAIL_WINDOW", 300))
+
     @property
     def ADMIN_AUTH_CONFIGURED(self) -> bool:
-        """True if admin authentication is configured."""
-        return bool(self.ADMIN_TOKEN or self.ADMIN_EMAILS)
+        """True if any admin authentication method is configured."""
+        return bool(
+            self.ADMIN_TOKEN
+            or self.ADMIN_EMAILS
+            or (self.CF_ACCESS_TEAM_DOMAIN and self.CF_ACCESS_AUD)
+        )
+
+    @property
+    def CF_ACCESS_CONFIGURED(self) -> bool:
+        """True if Cloudflare Access JWT verification is configured."""
+        return bool(self.CF_ACCESS_TEAM_DOMAIN and self.CF_ACCESS_AUD)
 
     def is_admin_email(self, email: str) -> bool:
         """Check if email is in the admin list."""
@@ -622,9 +641,60 @@ class Config:
     # Vertex AI location - MUST be us-central1 for Veo quota
     VERTEX_LOCATION: str = field(default_factory=lambda: _get_env("VERTEX_LOCATION", "us-central1"))
 
-    # Vertex AI Veo models
+    # ── Provider model pins ──────────────────────────────────────────────────
+    # Every upstream model ID lives here and is env-overridable, so a vendor
+    # version bump is a config change rather than a code deploy. Providers
+    # deprecate on their own schedule (Google shut down Imagen 4 on 2026-08-17
+    # with ~2 months' notice), and hunting hardcoded strings across a dozen
+    # service files is how you find out too late.
+    #
+    # Verified against vendor docs on 2026-08-01. Re-check before bumping:
+    #   Google   https://ai.google.dev/gemini-api/docs/deprecations
+    #   OpenAI   https://developers.openai.com/api/docs/deprecations
+    #   BFL      https://docs.bfl.ai/
+    #   Recraft  https://external.api.recraft.ai/doc/
+    #   Ideogram https://ideogram.ai/api-learn/
+
+    # Vertex AI Veo models.
+    # veo-3.0-* and veo-2.0-* were shut down 2026-06-30; we are already on 3.1.
     VERTEX_MODEL_FAST: str = field(default_factory=lambda: _get_env("VERTEX_MODEL_FAST", "veo-3.1-fast-generate-001"))
     VERTEX_MODEL_HQ: str = field(default_factory=lambda: _get_env("VERTEX_MODEL_HQ", "veo-3.1-generate-001"))
+
+    # Google image generation (Gemini image API, a.k.a. "Nano Banana").
+    # Imagen is EOL: imagen-3.0-capability-001 was discontinued 2026-06-30 and
+    # every imagen-4.0-* endpoint shut down 2026-08-17. Google's documented
+    # replacement for all of them is gemini-3.1-flash-image, which speaks the
+    # Gemini :generateContent API rather than Imagen's :predict API.
+    #   gemini-3.1-flash-image       GA 2026-05-28  (replaces Imagen 4 + 2.5 Flash Image)
+    #   gemini-3-pro-image           GA 2026-05-28  (4K, complex layouts, precise text)
+    #   gemini-3.1-flash-lite-image  GA 2026-06-30  (lowest latency/cost)
+    #   gemini-2.5-flash-image       shuts down 2026-10-02
+    GOOGLE_IMAGE_MODEL: str = field(default_factory=lambda: _get_env("GOOGLE_IMAGE_MODEL", "gemini-3.1-flash-image"))
+    GOOGLE_IMAGE_PRO_MODEL: str = field(default_factory=lambda: _get_env("GOOGLE_IMAGE_PRO_MODEL", "gemini-3-pro-image"))
+
+    # OpenAI images. gpt-image-2 GA 2026-04-21, successor to gpt-image-1.5.
+    # gpt-image-1 shuts down 2026-10-23.
+    OPENAI_IMAGE_MODEL: str = field(default_factory=lambda: _get_env("OPENAI_IMAGE_MODEL", "gpt-image-2"))
+
+    # Recraft. V4.1 shipped mid-May 2026; V2/V3/V4/V4.1 all remain callable.
+    # NOTE: left on the verified-working recraftv3 identifier. Recraft does not
+    # publish the V4/V4.1 `model` enum strings in its public docs — read them
+    # from https://external.api.recraft.ai/doc/ and set these vars to upgrade.
+    RECRAFT_RASTER_MODEL: str = field(default_factory=lambda: _get_env("RECRAFT_RASTER_MODEL", "recraftv3"))
+    RECRAFT_VECTOR_MODEL: str = field(default_factory=lambda: _get_env("RECRAFT_VECTOR_MODEL", "recraftv3_vector"))
+
+    # Ideogram. 4.0 shipped 2026-06-03 on /v1/ideogram-v4/* paths. Left on the
+    # verified v3 paths; set to "ideogram-v4" once the v4 request/response shape
+    # has been confirmed against a live key.
+    IDEOGRAM_API_VERSION: str = field(default_factory=lambda: _get_env("IDEOGRAM_API_VERSION", "ideogram-v3"))
+
+    # Black Forest Labs. FLUX 3 was announced 2026-07-23 but Image is still
+    # early-access, so FLUX.2 remains the correct production pin.
+    FLUX_MODEL_PRO: str = field(default_factory=lambda: _get_env("FLUX_MODEL_PRO", "flux-2-pro"))
+    FLUX_MODEL_FLEX: str = field(default_factory=lambda: _get_env("FLUX_MODEL_FLEX", "flux-2-flex"))
+
+    # PiAPI Gemini-image passthrough. nano-banana-2 == gemini-3.1-flash-image.
+    PIAPI_NANO_BANANA_MODEL: str = field(default_factory=lambda: _get_env("PIAPI_NANO_BANANA_MODEL", "nano-banana-2"))
 
     # Video quality: "fast" or "hq" (determines which Veo model to use)
     VIDEO_QUALITY: str = field(default_factory=lambda: _get_env("VIDEO_QUALITY", "fast").lower())

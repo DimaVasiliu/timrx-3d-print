@@ -29,16 +29,20 @@ IDEOGRAM_API_BASE = "https://api.ideogram.ai"
 IDEOGRAM_TIMEOUT = (15, 180)
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 2
-IDEOGRAM_MODEL = "ideogram-v3"
+# Ideogram 4.0 shipped 2026-06-03 on /v1/ideogram-v4/* paths. Left pinned to the
+# verified v3 paths — the v4 request/response shape has not been confirmed against
+# a live key, and a wrong path breaks every image job. Set IDEOGRAM_API_VERSION
+# to "ideogram-v4" to switch once verified; the endpoint map below follows it.
+IDEOGRAM_MODEL = getattr(config, "IDEOGRAM_API_VERSION", None) or "ideogram-v3"
 IDEOGRAM_RENDERING_SPEEDS = {"FLASH", "TURBO", "DEFAULT", "QUALITY"}
 IDEOGRAM_MAGIC_PROMPTS = {"AUTO", "ON", "OFF"}
 IDEOGRAM_STYLE_TYPES = {"AUTO", "GENERAL", "REALISTIC", "DESIGN", "FICTION"}
 IDEOGRAM_OPERATIONS = {
-    "generate": "/v1/ideogram-v3/generate",
-    "generate_transparent": "/v1/ideogram-v3/generate-transparent",
-    "edit": "/v1/ideogram-v3/edit",
-    "remix": "/v1/ideogram-v3/remix",
-    "reframe": "/v1/ideogram-v3/reframe",
+    "generate": f"/v1/{IDEOGRAM_MODEL}/generate",
+    "generate_transparent": f"/v1/{IDEOGRAM_MODEL}/generate-transparent",
+    "edit": f"/v1/{IDEOGRAM_MODEL}/edit",
+    "remix": f"/v1/{IDEOGRAM_MODEL}/remix",
+    "reframe": f"/v1/{IDEOGRAM_MODEL}/reframe",
     "replace_background": "/v1/ideogram-v3/replace-background",
     "upscale": "/upscale",
 }

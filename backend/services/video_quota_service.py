@@ -3,6 +3,8 @@ Video Daily Quota Service — per-user, per-provider daily generation limits.
 
 Provider buckets:
   veo               — Vertex Veo 3.1 (all resolutions/durations)
+  seedance_v25      — Seedance 2.5              (PiAPI `seedance-2.5`, premium rate)
+  seedance_mini     — Seedance 2.0 Mini tier   (PiAPI `seedance-2-mini`)
   seedance_fast     — Seedance 2.0 Fast tier
   seedance_quality  — Seedance 2.0 Quality tier  (was "seedance_preview" pre-GA)
   fal_seedance      — fal Seedance 1.5 Pro
@@ -33,6 +35,12 @@ from backend.db import get_conn, Tables
 
 DAILY_LIMITS: Dict[str, int] = {
     "veo":              int(os.getenv("VIDEO_QUOTA_VEO", "6")),
+    # Mini is the cheapest and fastest tier — a more generous default fits its role
+    # as the "iterate freely" option.
+    "seedance_mini":    int(os.getenv("VIDEO_QUOTA_SEEDANCE_MINI", "30")),
+    # 2.5 is by far the most expensive per second ($0.60/s at 720p — above 2.0's
+    # 1080p rate), so it gets the tightest default bucket.
+    "seedance_v25":     int(os.getenv("VIDEO_QUOTA_SEEDANCE_V25", "4")),
     "seedance_fast":    int(os.getenv("VIDEO_QUOTA_SEEDANCE_FAST", "20")),
     "seedance_quality": int(os.getenv(
         "VIDEO_QUOTA_SEEDANCE_QUALITY",
@@ -46,6 +54,8 @@ DAILY_LIMITS["seedance_preview"] = DAILY_LIMITS["seedance_quality"]
 # Human-readable provider names for user-facing messages
 PROVIDER_DISPLAY_NAMES: Dict[str, str] = {
     "veo":              "Veo 3.1",
+    "seedance_mini":    "Seedance 2.0 Mini",
+    "seedance_v25":     "Seedance 2.5",
     "seedance_fast":    "Seedance 2.0 Fast",
     "seedance_quality": "Seedance 2.0 Quality",
     "seedance_preview": "Seedance 2.0 Quality",  # legacy bucket key, same display
@@ -61,10 +71,11 @@ def resolve_quota_key(provider: str, seedance_tier: Optional[str] = None) -> str
 
     Args:
         provider: normalized provider name ('vertex', 'seedance', 'fal_seedance')
-        seedance_tier: 'fast' or 'quality' (legacy 'preview' is accepted and mapped to 'quality')
+        seedance_tier: 'mini', 'fast', 'quality' or 'v25' (legacy 'preview' → 'quality')
 
     Returns:
-        Quota bucket key: 'veo', 'seedance_fast', 'seedance_quality', 'fal_seedance'
+        Quota bucket key: 'veo', 'seedance_mini', 'seedance_fast', 'seedance_quality',
+        'seedance_v25', 'fal_seedance'
     """
     p = (provider or "").lower().strip()
 
@@ -76,6 +87,10 @@ def resolve_quota_key(provider: str, seedance_tier: Optional[str] = None) -> str
         tier = (seedance_tier or "fast").lower()
         if tier in ("quality", "preview"):
             return "seedance_quality"
+        if tier == "mini":
+            return "seedance_mini"
+        if tier == "v25":
+            return "seedance_v25"
         return "seedance_fast"
 
     # Fallback — treat unknown as veo (most restrictive)
@@ -88,6 +103,8 @@ def resolve_quota_key_from_action_code(action_code: str) -> str:
 
     Examples:
         video_text_generate_8s_720p              → veo
+        seedance_v25_text_generate_5s_720p       → seedance_v25
+        seedance_mini_text_generate_5s_720p      → seedance_mini
         seedance_fast_text_generate_5s_480p      → seedance_fast
         seedance_quality_image_animate_10s_720p  → seedance_quality
         seedance_preview_image_animate_10s       → seedance_quality  (legacy alias)
@@ -99,6 +116,10 @@ def resolve_quota_key_from_action_code(action_code: str) -> str:
         return "fal_seedance"
     elif ac.startswith("seedance_quality") or ac.startswith("seedance_preview"):
         return "seedance_quality"
+    elif ac.startswith("seedance_mini"):
+        return "seedance_mini"
+    elif ac.startswith("seedance_v25"):
+        return "seedance_v25"
     elif ac.startswith("seedance_fast") or ac.startswith("seedance_"):
         return "seedance_fast"
     else:

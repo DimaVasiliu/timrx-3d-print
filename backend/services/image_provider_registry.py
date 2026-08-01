@@ -31,11 +31,22 @@ class ImageProviderSpec:
     api_key_attr: Optional[str] = None
 
 
+def _pin(attr: str, fallback: str) -> str:
+    """Read a model pin from config so the registry can't drift from the services.
+
+    Every model ID is centralised in config and env-overridable — see the
+    deprecation table there. Hardcoding them in two places is how the registry
+    ends up advertising a model the service no longer calls.
+    """
+    from backend.config import config as _cfg
+    return getattr(_cfg, attr, None) or fallback
+
+
 IMAGE_PROVIDER_REGISTRY: Dict[str, ImageProviderSpec] = {
     "openai": ImageProviderSpec(
         provider="openai",
         display_name="OpenAI",
-        model="gpt-image-1.5",
+        model=_pin("OPENAI_IMAGE_MODEL", "gpt-image-2"),
         action_keys_by_size={"1K": "image_generate", "2K": "image_generate_2k"},
         image_sizes=("1K", "2K"),
         default_image_size="1K",
@@ -43,8 +54,8 @@ IMAGE_PROVIDER_REGISTRY: Dict[str, ImageProviderSpec] = {
     ),
     "google": ImageProviderSpec(
         provider="google",
-        display_name="Google (Imagen)",
-        model="imagen-4.0-fast-generate-001",
+        display_name="Google",
+        model=_pin("GOOGLE_IMAGE_MODEL", "gemini-3.1-flash-image"),
         action_keys_by_size={"1K": "gemini_image_generate", "2K": "gemini_image_generate_2k"},
         image_sizes=("1K", "2K"),
         default_image_size="1K",
@@ -53,7 +64,7 @@ IMAGE_PROVIDER_REGISTRY: Dict[str, ImageProviderSpec] = {
     "nano_banana": ImageProviderSpec(
         provider="nano_banana",
         display_name="Nano Banana",
-        model="nano-banana-2",
+        model=_pin("PIAPI_NANO_BANANA_MODEL", "nano-banana-2"),
         action_keys_by_size={
             "1K": "piapi_image_generate",
             "2K": "piapi_image_generate_2k",
@@ -67,7 +78,7 @@ IMAGE_PROVIDER_REGISTRY: Dict[str, ImageProviderSpec] = {
     "google_nano": ImageProviderSpec(
         provider="google_nano",
         display_name="Google Nano",
-        model="gemini-2.5-flash-image",
+        model=_pin("GOOGLE_IMAGE_MODEL", "gemini-3.1-flash-image"),
         action_keys_by_size={"1K": "google_nano_image_generate"},
         image_sizes=("1K",),
         default_image_size="1K",

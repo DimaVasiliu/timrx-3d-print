@@ -549,8 +549,14 @@ def vertex_image_transition(
         f"publishers/google/models/{model_id}:predictLongRunning"
     )
 
-    # Build payload with first-frame (image) + last-frame (lastImage) conditioning.
+    # Build payload with first-frame (image) + last-frame (lastFrame) conditioning.
     # Veo 3.1 generates a video that transitions from the start image to the end image.
+    #
+    # The field is `lastFrame` — NOT `lastImage`. Vertex ignores unknown instance
+    # fields rather than erroring, so the previous `lastImage` key meant every
+    # transition silently degraded to a plain image-to-video from the start frame,
+    # discarding the end image while still charging the user full price.
+    # Confirmed against VideoGenerationModelInstance and the Veo first/last-frame guide.
     payload = {
         "instances": [{
             "prompt": prompt or "Smooth cinematic transition between these two images",
@@ -558,7 +564,7 @@ def vertex_image_transition(
                 "bytesBase64Encoded": start_bytes,
                 "mimeType": start_mime,
             },
-            "lastImage": {
+            "lastFrame": {
                 "bytesBase64Encoded": end_bytes,
                 "mimeType": end_mime,
             },
@@ -885,35 +891,29 @@ def _validate_params(aspect_ratio: str, resolution: str, duration_int: int) -> N
 
 
 def _parse_image_data(image_data: str) -> Tuple[str, str]:
-    """Parse image data from various formats."""
-    image_bytes = ""
-    mime_type = "image/png"
+    """
+    Decode any accepted image input into (base64_string, mime_type) for Veo.
 
-    if image_data.startswith("data:"):
-        parts = image_data.split(",", 1)
-        if len(parts) == 2:
-            header = parts[0]
-            image_bytes = parts[1]
-            if "image/jpeg" in header or "image/jpg" in header:
-                mime_type = "image/jpeg"
-            elif "image/webp" in header:
-                mime_type = "image/webp"
-    elif image_data.startswith("http"):
-        try:
-            resp = requests.get(image_data, timeout=30)
-            if resp.ok:
-                image_bytes = base64.b64encode(resp.content).decode('utf-8')
-                content_type = resp.headers.get('content-type', 'image/png')
-                if 'jpeg' in content_type or 'jpg' in content_type:
-                    mime_type = "image/jpeg"
-                elif 'webp' in content_type:
-                    mime_type = "image/webp"
-        except Exception as e:
-            raise RuntimeError(f"Failed to download image from URL: {e}")
-    else:
-        image_bytes = image_data
+    Delegates to the shared reference-media pipeline so Veo gets the same
+    validation, HEIC normalization and downscaling as every other provider.
 
-    return image_bytes, mime_type
+    This previously trusted the caller's declared type: it defaulted to
+    "image/png" for anything that wasn't a data URL, echoed "image/webp" straight
+    through, and passed unvalidated strings along as if they were base64. Veo
+    accepts image/jpeg and image/png ONLY, so a WEBP upload — which the file
+    picker happily accepts — was rejected upstream, and a JPEG posted as raw
+    base64 was mislabelled as PNG. The pipeline now guarantees the bytes really
+    are an image and the MIME really is one Veo takes, transcoding if needed.
+    """
+    from backend.services.video_providers.reference_media import (
+        ReferenceMediaError,
+        prepare_image_inline,
+    )
+
+    try:
+        return prepare_image_inline(image_data, provider="vertex")
+    except ReferenceMediaError as exc:
+        raise RuntimeError(f"vertex_video_failed: {exc.message}") from exc
 
 
 def _execute_video_start_request(

@@ -2,8 +2,10 @@
 OpenAI image generation service.
 
 Model history:
-  - gpt-image-1   : original (still works)
-  - gpt-image-1.5 : latest — faster, better instruction following (March 2026)
+  - gpt-image-1   : original (SHUTS DOWN 2026-10-23)
+  - gpt-image-1.5 : superseded by gpt-image-2, still callable for legacy pins
+  - gpt-image-2   : current default — GA 2026-04-21, native reasoning,
+                    explicit 1K/2K/4K output ($0.03/$0.05/$0.06 per image)
   - DALL·E 2/3    : deprecated, shutting down May 12, 2026
 
 Capabilities:
@@ -23,6 +25,11 @@ from requests.exceptions import Timeout, ConnectionError as RequestsConnectionEr
 
 from backend.config import config
 
+# Model pin lives in config so a vendor bump is an env change, not a deploy.
+_DEFAULT_OPENAI_IMAGE_MODEL = getattr(config, "OPENAI_IMAGE_MODEL", None) or "gpt-image-2"
+# Models on the modern images API: no `response_format`, base64 is returned by default.
+_OPENAI_IMAGE_MODELS = ("gpt-image-1", "gpt-image-1.5", "gpt-image-2")
+
 # OpenAI image generation can take a while, especially for high-quality images
 # gpt-image-1 can take 60-120s for complex prompts; allow generous timeout
 OPENAI_TIMEOUT = (15, 180)  # (connect_timeout, read_timeout) - 3 minutes for generation
@@ -40,7 +47,7 @@ class OpenAIServerError(Exception):
 def openai_image_generate(
     prompt: str,
     size: str = "1024x1024",
-    model: str = "gpt-image-1.5",
+    model: str = _DEFAULT_OPENAI_IMAGE_MODEL,
     n: int = 1,
     response_format: str = "url",
 ) -> dict:
@@ -58,7 +65,7 @@ def openai_image_generate(
         "n": max(1, min(4, int(n or 1))),
     }
     # gpt-image-1 and gpt-image-1.5 don't support response_format param
-    if model not in ("gpt-image-1", "gpt-image-1.5"):
+    if model not in _OPENAI_IMAGE_MODELS:
         payload["response_format"] = response_format
 
     last_error = None
@@ -134,7 +141,7 @@ def openai_image_edit(
     reference_images: List[str],
     mask_image: Optional[str] = None,
     size: str = "1024x1024",
-    model: str = "gpt-image-1.5",
+    model: str = _DEFAULT_OPENAI_IMAGE_MODEL,
     n: int = 1,
 ) -> dict:
     """

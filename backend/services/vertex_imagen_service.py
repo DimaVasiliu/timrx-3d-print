@@ -51,6 +51,17 @@ MAX_RETRIES = 3
 BASE_RETRY_DELAY = 2
 _FETCH_TIMEOUT = (15, 60)
 
+# ── DEPRECATED MODELS ────────────────────────────────────────────────────────
+# Google discontinued imagen-3.0-capability-001 on 2026-06-30 and shut down every
+# imagen-4.0-* endpoint on 2026-08-17. Calls to either now fail upstream.
+#
+# The image pipeline no longer routes here: async_dispatch sends both text-to-image
+# and reference-guided editing to the Gemini image API (config.GOOGLE_IMAGE_MODEL,
+# default gemini-3.1-flash-image), which is Google's documented replacement.
+#
+# This module is retained only so a deployment that still sets
+# VERTEX_IMAGEN_* env vars fails loudly rather than silently, and so the Vertex
+# service-account auth helper stays available. Do not add new callers.
 # Models (overridable via env)
 IMAGEN_EDIT_MODEL = (
     getattr(config, "VERTEX_IMAGEN_EDIT_MODEL", None)
@@ -73,6 +84,13 @@ ALLOWED_EDIT_MODES = {
     "EDIT_MODE_PRODUCT_IMAGE",
 }
 ALLOWED_ASPECT_RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9"}
+
+if "imagen-3.0" in IMAGEN_EDIT_MODEL or "imagen-4.0" in IMAGEN_GEN_MODEL:
+    print(
+        "[VERTEX_IMAGEN] WARNING: pinned to a retired Imagen model "
+        f"(edit={IMAGEN_EDIT_MODEL}, gen={IMAGEN_GEN_MODEL}). Google shut these down "
+        "in 2026; use the Gemini image API (config.GOOGLE_IMAGE_MODEL) instead."
+    )
 
 
 class VertexImagenError(Exception):

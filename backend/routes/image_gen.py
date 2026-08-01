@@ -34,6 +34,7 @@ from backend.services.async_dispatch import (
 from backend.services.credits_helper import get_current_balance, start_paid_job
 from backend.services.expense_guard import ExpenseGuard
 from backend.services.gemini_image_service import (
+    GOOGLE_IMAGE_MODEL,
     gemini_generate_image,
     check_gemini_configured,
     GeminiAuthError,
@@ -43,6 +44,7 @@ from backend.services.gemini_image_service import (
     ALLOWED_IMAGE_SIZES,
 )
 from backend.services.google_nano_image_service import (
+    GOOGLE_NANO_MODEL,
     check_google_nano_configured,
     ALLOWED_ASPECT_RATIOS as GOOGLE_NANO_ALLOWED_ASPECT_RATIOS,
     ALLOWED_IMAGE_SIZES as GOOGLE_NANO_ALLOWED_IMAGE_SIZES,
@@ -106,6 +108,37 @@ def _upload_validation_field(provider: str, body: dict) -> str:
 def _get_image_action_key(image_size: str = "1K", provider: str = "openai") -> str:
     """Return the provider-specific canonical action key for the given quality tier."""
     return get_registry_image_action_key(provider=provider, image_size=image_size)
+
+
+def _multi_image_expected_cost(action_key: str, count: int) -> tuple[int, int]:
+    """
+    Scale the per-image credit cost by the number of images requested.
+
+    Providers bill per image, so a request with n/sample_count > 1 must reserve
+    n × the single-image credit price. Without this, users are charged for one
+    image while the provider bills for up to MAX_IMAGES_PER_REQUEST.
+
+    Returns:
+        (clamped_count, expected_cost_credits). expected_cost is 0 when count
+        is 1 (start_paid_job falls back to the base action cost, unchanged
+        behavior), or when the per-image price can't be resolved (start_paid_job
+        then fails closed via PAID_GENERATION_ACTIONS as before).
+    """
+    from backend.services.pricing_service import PricingService
+
+    try:
+        count = int(count or 1)
+    except (TypeError, ValueError):
+        count = 1
+    # Defense in depth: never reserve for more images than the guard allows,
+    # even on routes that skip ExpenseGuard.check_image_request.
+    count = max(1, min(count, ExpenseGuard.MAX_IMAGES_PER_REQUEST))
+    if count == 1:
+        return count, 0
+    per_image = PricingService.get_action_cost(action_key)
+    if per_image <= 0:
+        return count, 0
+    return count, per_image * count
 
 
 def _validate_provider_image_size(image_size: str, provider: str):
@@ -663,11 +696,19 @@ def _handle_gemini_image_generate(body: dict):
 
     # Reserve credits (provider-specific: Gemini uses google tier)
     action_key = _get_image_action_key(image_size, "google")
+    # Provider bills per image: reserve sample_count × per-image credits.
+    sample_count, expected_cost = _multi_image_expected_cost(action_key, sample_count)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "model": "imagen-4.0", "provider": "google"},
+        {
+            "prompt": prompt[:100],
+            "model": GOOGLE_IMAGE_MODEL,
+            "provider": "google",
+            "sample_count": sample_count,
+            "expected_cost": expected_cost,
+        },
     )
     if credit_error:
         return credit_error
@@ -677,7 +718,7 @@ def _handle_gemini_image_generate(body: dict):
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": "imagen-3.0-capability-001" if reference_images else "imagen-4.0",
+        "model": GOOGLE_IMAGE_MODEL,
         "aspect_ratio": aspect_ratio,
         "image_size": image_size,
         "sample_count": sample_count,
@@ -828,7 +869,7 @@ def _handle_google_nano_image_generate(body: dict):
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "model": "gemini-2.5-flash-image", "provider": "google_nano"},
+        {"prompt": prompt[:100], "model": GOOGLE_NANO_MODEL, "provider": "google_nano"},
     )
     if credit_error:
         return credit_error
@@ -837,7 +878,7 @@ def _handle_google_nano_image_generate(body: dict):
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": "gemini-2.5-flash-image",
+        "model": GOOGLE_NANO_MODEL,
         "aspect_ratio": aspect_ratio,
         "image_size": image_size,
         "provider_variant": "direct_google",
@@ -885,7 +926,7 @@ def _handle_google_nano_image_generate(body: dict):
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
-        "model": "gemini-2.5-flash-image",
+        "model": GOOGLE_NANO_MODEL,
         "provider": "google_nano",
         "provider_variant": "direct_google",
         "operation": operation,
@@ -1391,7 +1432,7 @@ def _handle_openai_image_generate(body: dict):
             size = size_map[key]
             break
 
-    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5").strip()
+    model = (body.get("model") or getattr(config, "OPENAI_IMAGE_MODEL", None) or "gpt-image-2").strip()
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
@@ -1446,11 +1487,20 @@ def _handle_openai_image_generate(body: dict):
     image_size = (body.get("image_size") or body.get("imageSize") or "1K").upper()
     action_key = _get_image_action_key(image_size, "openai")
 
+    # Provider bills per image: reserve n × per-image credits.
+    n, expected_cost = _multi_image_expected_cost(action_key, n)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "n": n, "model": model, "size": size, "provider": "openai"},
+        {
+            "prompt": prompt[:100],
+            "n": n,
+            "model": model,
+            "size": size,
+            "provider": "openai",
+            "expected_cost": expected_cost,
+        },
     )
     if credit_error:
         return credit_error
@@ -1623,11 +1673,19 @@ def _gemini_image_mod_legacy_disabled():
 
     # Reserve credits (provider-specific: Gemini uses google tier)
     action_key = _get_image_action_key(image_size, "google")
+    # Provider bills per image: reserve sample_count × per-image credits.
+    sample_count, expected_cost = _multi_image_expected_cost(action_key, sample_count)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "model": "imagen-4.0", "provider": "google"},
+        {
+            "prompt": prompt[:100],
+            "model": GOOGLE_IMAGE_MODEL,
+            "provider": "google",
+            "sample_count": sample_count,
+            "expected_cost": expected_cost,
+        },
     )
     if credit_error:
         return credit_error
@@ -1637,7 +1695,7 @@ def _gemini_image_mod_legacy_disabled():
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": "imagen-4.0",
+        "model": GOOGLE_IMAGE_MODEL,
         "aspect_ratio": aspect_ratio,
         "image_size": image_size,
         "sample_count": sample_count,
@@ -1691,7 +1749,7 @@ def _gemini_image_mod_legacy_disabled():
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
-        "model": "imagen-4.0",
+        "model": GOOGLE_IMAGE_MODEL,
         "provider": "google",
     })
 
@@ -1765,7 +1823,7 @@ def _openai_image_mod_legacy_disabled():
             size = size_map[key]
             break
 
-    model = (body.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5").strip()
+    model = (body.get("model") or getattr(config, "OPENAI_IMAGE_MODEL", None) or "gpt-image-2").strip()
     n = int(body.get("n") or 1)
     response_format = (body.get("response_format") or "url").strip()
 
@@ -1777,11 +1835,19 @@ def _openai_image_mod_legacy_disabled():
     # DEBUG: Trace OpenAI image credit flow
     print(f"[OPENAI_IMAGE:DEBUG] >>> Route handler: identity_id={identity_id}, action_key={action_key}, job_id={internal_job_id}")
 
+    # Provider bills per image: reserve n × per-image credits.
+    n, expected_cost = _multi_image_expected_cost(action_key, n)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "n": n, "model": model, "size": size},
+        {
+            "prompt": prompt[:100],
+            "n": n,
+            "model": model,
+            "size": size,
+            "expected_cost": expected_cost,
+        },
     )
 
     print(f"[OPENAI_IMAGE:DEBUG] start_paid_job returned: reservation_id={reservation_id}, credit_error={credit_error is not None}")

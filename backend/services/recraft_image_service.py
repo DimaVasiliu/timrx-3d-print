@@ -326,7 +326,9 @@ def _resolve_edit_model(options: Dict[str, Any]) -> str:
     if requested:
         return requested
     output_mode = str(options.get("output_mode") or "raster").strip().lower()
-    return "recraftv3_vector" if output_mode == "vector_svg" else "recraftv3"
+    raster = getattr(config, "RECRAFT_RASTER_MODEL", None) or "recraftv3"
+    vector = getattr(config, "RECRAFT_VECTOR_MODEL", None) or "recraftv3_vector"
+    return vector if output_mode == "vector_svg" else raster
 
 
 def _build_controls(options: Dict[str, Any]) -> Dict[str, Any] | None:

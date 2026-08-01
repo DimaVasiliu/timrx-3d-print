@@ -1,120 +1,63 @@
 """
-Shared image URL utilities for video providers.
+Compatibility shim over the canonical reference-media pipeline.
 
-Both Seedance (PiAPI) and fal Seedance require image_url inputs to be
-publicly downloadable.  Private S3 URLs and base64 data URIs must be
-converted to presigned URLs before submission.
+The real implementation now lives in `reference_media.py`. This module keeps the
+original function names so existing provider call sites keep working, but the
+behaviour has changed in three ways that matter:
 
-This module centralizes that logic so bug fixes apply to all providers.
+  * Output is a STABLE, UNSIGNED URL (`/api/video/ref/<token>`), not a presigned
+    S3 link. PiAPI's Seedance docs state "Signed / expiring URLs may fail", and a
+    Quality-tier job can be queued longer than the old 1-hour presign TTL.
+
+  * Failures RAISE `ReferenceMediaError` instead of silently returning the raw
+    base64 data URI. The old fallback guaranteed an upstream rejection *after*
+    credits were reserved; callers now fail fast and refund nothing because
+    nothing was charged.
+
+  * Every image is validated, HEIC/MPO-normalized, transcoded into a format the
+    target provider actually accepts, and downscaled to a sane upload size.
+
+Prefer importing from `reference_media` directly in new code.
 """
 
 from __future__ import annotations
 
+from backend.services.video_providers.reference_media import (  # noqa: F401
+    ReferenceMediaError,
+    prepare_av_url,
+    prepare_image_inline,
+    prepare_image_url,
+    prepare_image_urls,
+)
+
 
 def ensure_public_image_url(image_data: str, *, provider_name: str = "provider") -> str:
     """
-    Ensure image_data is a publicly accessible URL for an external provider API.
+    Make an image reference reachable by an external provider.
 
-    Backward-compatible thin wrapper around ensure_public_media_url(kind="image").
-    Existing image-only callers stay unchanged.
+    Raises ReferenceMediaError if the image cannot be prepared — callers must let
+    that propagate so the request fails before any credit reservation.
     """
-    return ensure_public_media_url(image_data, provider_name=provider_name, kind="image")
-
-
-def ensure_public_media_url(media_data: str, *, provider_name: str = "provider", kind: str = "image") -> str:
-    """
-    Ensure media_data is a publicly accessible URL for an external provider API.
-
-    The PiAPI Seedance 2 omni_reference (Reference Video) mode accepts images,
-    videos and audio as references, all of which must be publicly downloadable
-    URLs. The S3 upload + presign path is mime-agnostic, so this generalises the
-    original image-only helper to any media kind.
-
-    Handles:
-    - Public HTTP(S) URLs → pass through
-    - Private S3 URLs (our bucket) → presign for 1h
-    - Base64 data URIs → upload to S3, presign
-    - Empty/None → return as-is
-
-    Args:
-        media_data:    Media URL string, data URI, or empty.
-        provider_name: Provider label for log messages (e.g., "seedance").
-        kind:          "image" | "video" | "audio" — used for S3 prefix + log labels.
-
-    Returns:
-        A publicly accessible URL string.
-    """
-    from backend.services.s3_service import presign_s3_key, upload_base64_to_s3
-    from backend.config import config as app_config
-
-    tag = f"{provider_name.upper()}:{kind.upper()}"
-    image_data = media_data  # internal alias keeps the proven logic below unchanged
-
     if not image_data:
         return image_data
+    return prepare_image_url(image_data, provider=provider_name)
 
-    # ── Already a URL — check if it's our private S3 bucket ──
-    if image_data.startswith("http://") or image_data.startswith("https://"):
-        bucket = getattr(app_config, "AWS_BUCKET_MODELS", "")
-        if bucket and bucket in image_data:
-            try:
-                key = image_data.split(f"{bucket}.s3.", 1)[1]
-                key = key.split(".amazonaws.com/", 1)[1]
-                presigned = presign_s3_key(key, expires_in=3600)
-                if presigned:
-                    print(f"[{tag}] presigned private S3 URL for provider access")
-                    return presigned
-            except (IndexError, Exception) as e:
-                print(f"[{tag}] WARNING: failed to presign S3 URL: {e}")
-        print(f"[{tag}] image-to-video input type=url (external)")
-        return image_data
 
-    # ── Base64 data URI — upload to S3, then presign ──
-    if image_data.startswith("data:"):
-        print(f"[{tag}] image-to-video input type=base64 ({len(image_data) // 1024}KB) -> uploading to S3")
-        try:
-            result = upload_base64_to_s3(
-                data_url=image_data,
-                prefix=f"video-input/{kind}",
-                name=f"{provider_name}_{kind}_ref",
-                user_id=provider_name,
-            )
-            s3_key = None
-            if isinstance(result, dict):
-                s3_key = result.get("key", "")
-                url = result.get("url", "")
-            else:
-                url = str(result)
+def ensure_public_media_url(
+    media_data: str,
+    *,
+    provider_name: str = "provider",
+    kind: str = "image",
+) -> str:
+    """
+    Make any reference medium (image / video / audio) reachable by a provider.
 
-            # Try presigning from the returned S3 key
-            if s3_key:
-                presigned = presign_s3_key(s3_key, expires_in=3600)
-                if presigned:
-                    print(f"[{tag}] image uploaded + presigned for provider access")
-                    return presigned
-
-            # Fallback: try to presign from the URL if it's in our bucket
-            if url:
-                bucket = getattr(app_config, "AWS_BUCKET_MODELS", "")
-                if bucket and bucket in url:
-                    try:
-                        key = url.split(f"{bucket}.s3.", 1)[1]
-                        key = key.split(".amazonaws.com/", 1)[1]
-                        presigned = presign_s3_key(key, expires_in=3600)
-                        if presigned:
-                            print(f"[{tag}] image uploaded + presigned (fallback)")
-                            return presigned
-                    except (IndexError, Exception):
-                        pass
-                print(f"[{tag}] WARNING: could not presign, returning raw URL: {url[:80]}...")
-                return url
-            else:
-                print(f"[{tag}] WARNING: S3 upload returned empty URL, falling back to raw data")
-                return image_data
-        except Exception as e:
-            print(f"[{tag}] ERROR uploading image to S3: {e} — falling back to raw data")
-            return image_data
-
-    # ── Unknown format — pass through ──
-    print(f"[{tag}] WARNING: unknown image_data format (len={len(image_data)}), passing as-is")
-    return image_data
+    Images run the full validate-normalize-transcode-downscale pipeline; video and
+    audio are stored byte-for-byte (re-encoding them would be lossy and slow) but
+    still get a stable public URL.
+    """
+    if not media_data:
+        return media_data
+    if kind == "image":
+        return prepare_image_url(media_data, provider=provider_name)
+    return prepare_av_url(media_data, kind=kind, provider=provider_name)

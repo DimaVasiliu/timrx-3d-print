@@ -1,17 +1,32 @@
 """
-Gemini Image Generation Service (Imagen 4.0 Fast).
+Google Image Generation Service (Gemini image models, "Nano Banana").
 
-Uses the Gemini Developer API for image generation via Imagen model.
-Authentication: GEMINI_API_KEY only (via x-goog-api-key header).
+Uses the Gemini Developer API. Authentication: GEMINI_API_KEY (x-goog-api-key).
 
-Model history:
-  - imagen-4.0-generate-001      : original (DEPRECATED — shutting down June 24, 2026)
-  - imagen-4.0-fast-generate-001 : fast variant — $0.02/image, 10x faster (current default)
-  - imagen-4.0-ultra              : highest quality — $0.06/image
+Endpoint: POST {base}/models/{model}:generateContent
 
-Endpoint: POST https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-fast-generate-001:predict
+MIGRATION (2026-08): this service used to call Imagen via the :predict API on
+`imagen-4.0-fast-generate-001`. Google deprecated the entire Imagen line —
+imagen-3.0-capability-001 was discontinued 2026-06-30 and every imagen-4.0-*
+endpoint shut down 2026-08-17 — with `gemini-3.1-flash-image` as the documented
+replacement for all of them.
 
-NOTE: Requires Gemini API Paid tier. Get your key from https://aistudio.google.com/apikey
+That is not a model-string swap: Imagen used :predict with
+{instances:[{prompt}], parameters:{sampleCount, imageSize, aspectRatio}} and
+returned `predictions[].bytesBase64Encoded`, whereas the Gemini image models use
+:generateContent with {contents:[{parts}], generationConfig:{responseModalities,
+imageConfig}} and return `candidates[].content.parts[].inlineData`. Both the
+request builder and the response parser below were rewritten accordingly.
+
+Behaviour changes inherited from the new API:
+  - sample_count is no longer supported (Gemini returns one image per request);
+    the parameter is kept for call-compatibility and ignored.
+  - negative_prompt is not supported (it never was on Imagen either).
+  - 4K output is now available in addition to 1K/2K.
+
+Model IDs are configured centrally — see config.GOOGLE_IMAGE_MODEL.
+
+NOTE: Requires Gemini API paid tier. Key: https://aistudio.google.com/apikey
 """
 
 from __future__ import annotations
@@ -33,13 +48,16 @@ BASE_RETRY_DELAY = 2
 # Gemini Developer API base URL
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# Imagen model for image generation
-# Was "imagen-4.0-generate-001" — deprecated, shutting down June 24, 2026
-IMAGEN_MODEL = "imagen-4.0-fast-generate-001"
+# Google image model. Env-overridable via GOOGLE_IMAGE_MODEL so the next vendor
+# bump does not need a code change. `IMAGEN_MODEL` is kept as an alias because
+# other modules import it by that name.
+GOOGLE_IMAGE_MODEL = getattr(config, "GOOGLE_IMAGE_MODEL", None) or "gemini-3.1-flash-image"
+IMAGEN_MODEL = GOOGLE_IMAGE_MODEL  # legacy alias
 
-# Allowed parameter values
-ALLOWED_ASPECT_RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9"}
-ALLOWED_IMAGE_SIZES = {"1K", "2K"}
+# Allowed parameter values. The Gemini image models accept a wider set of aspect
+# ratios than Imagen did, and add 4K.
+ALLOWED_ASPECT_RATIOS = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+ALLOWED_IMAGE_SIZES = {"1K", "2K", "4K"}
 
 
 class GeminiAuthError(Exception):
@@ -119,9 +137,10 @@ def gemini_generate_image(
     image_size: str = "1K",
     sample_count: int = 1,
     negative_prompt: Optional[str] = None,
+    reference_images: Optional[list] = None,
 ) -> Dict[str, Any]:
     """
-    Generate an image from a text prompt using Gemini Imagen 4.0.
+    Generate (or reference-edit) an image using the configured Gemini image model.
 
     Args:
         prompt: Text description of the image to generate
@@ -142,25 +161,53 @@ def gemini_generate_image(
     # Validate parameters
     validate_image_params(aspect_ratio, image_size)
 
-    # Clamp sample_count
-    sample_count = max(1, min(4, sample_count))
+    url = f"{GEMINI_API_BASE}/models/{GOOGLE_IMAGE_MODEL}:generateContent"
 
-    # Build API URL
-    url = f"{GEMINI_API_BASE}/models/{IMAGEN_MODEL}:predict"
+    parts = [{"text": prompt}]
+    if reference_images:
+        for src in reference_images:
+            img_bytes, mime = _fetch_reference_bytes(src)
+            parts.append({
+                "inline_data": {
+                    "mime_type": mime,
+                    "data": base64.b64encode(img_bytes).decode("utf-8"),
+                }
+            })
 
-    # Build payload
     payload = {
-        "instances": [{"prompt": prompt}],
-        "parameters": {
-            "sampleCount": sample_count,
-            "imageSize": image_size,
-            "aspectRatio": aspect_ratio,
-        }
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {
+                "aspectRatio": aspect_ratio,
+                "imageSize": image_size,
+            },
+        },
     }
 
-    print(f"[Gemini Imagen] Request: model={IMAGEN_MODEL}, aspectRatio={aspect_ratio}, imageSize={image_size}")
+    if sample_count and int(sample_count) > 1:
+        # Imagen could return up to 4 per call; the Gemini image API returns one.
+        print(f"[Google Image] sample_count={sample_count} ignored — the Gemini image API returns one image per request")
+
+    print(
+        f"[Google Image] Request: model={GOOGLE_IMAGE_MODEL}, aspectRatio={aspect_ratio}, "
+        f"imageSize={image_size}, refs={len(reference_images or [])}"
+    )
 
     return _execute_image_request(url, payload)
+
+
+def _fetch_reference_bytes(src: str) -> Tuple[bytes, str]:
+    """Decode a reference image (data URI or URL) into (bytes, mime) for inline_data."""
+    from backend.services.video_providers.reference_media import (
+        ReferenceMediaError,
+        prepare_image,
+    )
+    try:
+        prepared = prepare_image(src, provider="vertex")  # jpeg/png — safest for Gemini
+        return prepared.data, prepared.mime
+    except ReferenceMediaError as exc:
+        raise GeminiValidationError("reference_images", "<image>", [], str(exc)) from exc
 
 
 def _execute_image_request(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -169,13 +216,13 @@ def _execute_image_request(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"[Gemini Imagen] Attempt {attempt}/{MAX_RETRIES}")
+            print(f"[Google Image] Attempt {attempt}/{MAX_RETRIES}")
 
             r = requests.post(url, headers=_get_headers(), json=payload, timeout=GEMINI_TIMEOUT)
 
             if not r.ok:
                 error_text = r.text[:500] if r.text else "No error details"
-                print(f"[Gemini Imagen] Error {r.status_code}: {error_text}")
+                print(f"[Google Image] Error {r.status_code}: {error_text}")
 
                 if r.status_code in (401, 403):
                     raise GeminiAuthError(
@@ -201,7 +248,7 @@ def _execute_image_request(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise GeminiServerError(r.status_code, f"Gemini server error {r.status_code}: {error_text}")
 
             result = r.json()
-            print(f"[Gemini Imagen] Request successful")
+            print(f"[Google Image] Request successful")
 
             # Parse response - extract images
             return _parse_imagen_response(result)
@@ -212,10 +259,10 @@ def _execute_image_request(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             last_error = e
             if attempt < MAX_RETRIES:
                 delay = BASE_RETRY_DELAY * (2 ** (attempt - 1))
-                print(f"[Gemini Imagen] Attempt {attempt} failed, retrying in {delay}s...")
+                print(f"[Google Image] Attempt {attempt} failed, retrying in {delay}s...")
                 time.sleep(delay)
             else:
-                print(f"[Gemini Imagen] All {MAX_RETRIES} attempts failed")
+                print(f"[Google Image] All {MAX_RETRIES} attempts failed")
         except RuntimeError:
             raise
 
@@ -224,45 +271,43 @@ def _execute_image_request(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _parse_imagen_response(result: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Parse the Imagen response to extract images.
+    Parse a Gemini image :generateContent response.
 
-    Imagen response format:
+    Response shape:
     {
-      "predictions": [
-        {
-          "bytesBase64Encoded": "<base64_image_data>",
-          "mimeType": "image/png"
-        }
+      "candidates": [
+        {"content": {"parts": [{"inlineData": {"mimeType": "...", "data": "<b64>"}}]}}
       ]
     }
+
+    (Named `_parse_imagen_response` for backwards compatibility with importers;
+    the Imagen `predictions[]` shape it used to parse no longer exists.)
     """
     images = []
 
-    predictions = result.get("predictions", [])
-    if not predictions:
-        # Check for error in response
-        error = result.get("error", {})
-        if error:
-            error_msg = error.get("message", "Unknown error")
-            raise RuntimeError(f"gemini_image_failed: {error_msg}")
-        raise RuntimeError("gemini_image_failed: No images generated in response")
-
-    for pred in predictions:
-        image_base64 = pred.get("bytesBase64Encoded", "")
-        mime_type = pred.get("mimeType", "image/png")
-
-        if image_base64:
-            data_url = f"data:{mime_type};base64,{image_base64}"
-            images.append({
-                "url": data_url,
-                "base64": image_base64,
-                "mime_type": mime_type,
-            })
+    for candidate in result.get("candidates") or []:
+        content = candidate.get("content") or {}
+        for part in content.get("parts") or []:
+            inline = part.get("inlineData") or part.get("inline_data") or {}
+            data = inline.get("data")
+            mime_type = inline.get("mimeType") or inline.get("mime_type") or "image/png"
+            if data:
+                images.append({
+                    "url": f"data:{mime_type};base64,{data}",
+                    "base64": data,
+                    "mime_type": mime_type,
+                })
 
     if not images:
-        raise RuntimeError("gemini_image_failed: No valid images in response")
+        error = result.get("error", {})
+        if error:
+            raise RuntimeError(f"gemini_image_failed: {error.get('message', 'Unknown error')}")
+        # A prompt blocked by safety filters comes back with no parts and a reason.
+        blocked = (result.get("promptFeedback") or {}).get("blockReason")
+        if blocked:
+            raise RuntimeError(f"gemini_image_failed: prompt blocked ({blocked})")
+        raise RuntimeError("gemini_image_failed: No images generated in response")
 
-    # Return first image as primary, all as list
     return {
         "ok": True,
         "image_url": images[0]["url"],
@@ -271,5 +316,5 @@ def _parse_imagen_response(result: Dict[str, Any]) -> Dict[str, Any]:
         "image_urls": [img["url"] for img in images],
         "images": images,
         "provider": "google",
-        "model": IMAGEN_MODEL,
+        "model": GOOGLE_IMAGE_MODEL,
     }

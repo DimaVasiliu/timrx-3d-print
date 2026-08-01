@@ -35,6 +35,12 @@ from backend.services.reservation_service import ReservationService, Reservation
 from backend.services.pricing_service import PricingService
 
 
+
+def _job_config():
+    from backend.config import config as _cfg
+    return _cfg
+
+
 def _json_default(obj):
     """JSON serializer for objects not serializable by default json code (e.g., UUID)."""
     if isinstance(obj, uuid.UUID):
@@ -844,7 +850,7 @@ class JobService:
 
         # Normalize size
         size = payload.get("size") or payload.get("resolution") or "1024x1024"
-        model = payload.get("model") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1.5"
+        model = payload.get("model") or getattr(_job_config(), "OPENAI_IMAGE_MODEL", None) or "gpt-image-2"
         n = int(payload.get("n") or 1)
 
         openai_payload = {
