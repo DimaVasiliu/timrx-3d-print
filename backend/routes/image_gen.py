@@ -32,7 +32,7 @@ from backend.services.async_dispatch import (
     update_job_status_failed,
 )
 from backend.services.credits_helper import get_current_balance, start_paid_job
-from backend.services.expense_guard import ExpenseGuard
+from backend.services.expense_guard import ExpenseGuard, config as expense_config
 from backend.services.gemini_image_service import (
     GOOGLE_IMAGE_MODEL,
     gemini_generate_image,
@@ -132,7 +132,7 @@ def _multi_image_expected_cost(action_key: str, count: int) -> tuple[int, int]:
         count = 1
     # Defense in depth: never reserve for more images than the guard allows,
     # even on routes that skip ExpenseGuard.check_image_request.
-    count = max(1, min(count, ExpenseGuard.MAX_IMAGES_PER_REQUEST))
+    count = max(1, min(count, expense_config.MAX_IMAGES_PER_REQUEST))
     if count == 1:
         return count, 0
     per_image = PricingService.get_action_cost(action_key)
