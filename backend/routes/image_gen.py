@@ -352,29 +352,7 @@ def image_generate_unified():
             }), status_code
 
     try:
-        if provider == "nano_banana":
-            # Route to PiAPI Nano Banana 2
-            return _handle_nano_banana_image_generate(body)
-        elif provider == "google":
-            # Route to Gemini Imagen
-            return _handle_gemini_image_generate(body)
-        elif provider == "google_nano":
-            return _handle_google_nano_image_generate(body)
-        elif provider == "flux_pro":
-            return _handle_flux_pro_image_generate(body)
-        elif provider == "ideogram_v3":
-            return _handle_ideogram_v3_image_generate(body)
-        elif provider == "recraft_v4":
-            return _handle_recraft_v4_image_generate(body)
-        elif provider == "openai":
-            # Route to OpenAI (via existing endpoint logic)
-            return _handle_openai_image_generate(body)
-        else:
-            return jsonify({
-                "error": "invalid_provider",
-                "message": f"Unknown image provider: {provider}",
-                "allowed": get_allowed_image_providers(),
-            }), 400
+        return dispatch_image_provider(body)
     except UploadValidationError as e:
         print(f"[IMAGE_API] Upload validation failed provider={provider}: {e}")
         return jsonify({
@@ -391,6 +369,34 @@ def image_generate_unified():
             "message": "Image generation failed before dispatch. Please try again.",
             "details": {"provider": provider},
         }), 500
+
+
+def dispatch_image_provider(body: dict):
+    """Dispatch an already validated image request to its canonical handler.
+
+    The command bar and the public image endpoint must share this mapping. A
+    second provider map in the command route had already drifted once, which
+    made a provider work from the image panel but fail from the command bar.
+    This helper intentionally does not do request validation; callers keep
+    their own auth, safety, and provider-availability checks.
+    """
+    provider = str(body.get("provider") or "openai").lower()
+    handlers = {
+        "nano_banana": _handle_nano_banana_image_generate,
+        "google": _handle_gemini_image_generate,
+        "google_nano": _handle_google_nano_image_generate,
+        "flux_pro": _handle_flux_pro_image_generate,
+        "ideogram_v3": _handle_ideogram_v3_image_generate,
+        "recraft_v4": _handle_recraft_v4_image_generate,
+        "openai": _handle_openai_image_generate,
+    }
+    handler = handlers.get(provider)
+    if not handler:
+        return jsonify({
+            "error": "invalid_provider",
+            "message": "That image option is not available.",
+        }), 400
+    return handler(body)
 
 
 def _handle_nano_banana_image_generate(body: dict):

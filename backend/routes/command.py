@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import time
+import traceback
 import uuid
 
 import requests
@@ -130,8 +131,20 @@ def _quote_payload(plan: dict) -> dict:
     quote = quote_plan(plan)
     available, availability_error = provider_availability(plan)
     quote["available"] = available
-    quote["availability_error"] = availability_error
+    quote["availability_error"] = _public_availability_message(plan, availability_error)
     return quote
+
+
+def _public_availability_message(plan: dict, detail: str | None) -> str | None:
+    """Keep vendor credentials and internal provider ids out of the UI."""
+    if not detail:
+        return None
+    labels = {
+        "image": "Image generation is temporarily unavailable. Try again shortly.",
+        "model": "3D model generation is temporarily unavailable. Try again shortly.",
+        "video": "Video generation is temporarily unavailable. Try again shortly.",
+    }
+    return labels.get(plan.get("intent"), "This generation option is temporarily unavailable. Try again shortly.")
 
 
 def _error(exc: Exception, status: int = 422):
@@ -196,32 +209,47 @@ def _cacheable_response(response) -> dict | None:
     return data if isinstance(data, dict) and data.get("ok") else None
 
 
+def _public_failed_response(response, plan: dict):
+    """Normalize provider failures before they leave the command endpoint."""
+    status = 200
+    payload = {}
+    target = response
+    if isinstance(response, tuple):
+        target = response[0] if response else None
+        if len(response) > 1 and isinstance(response[1], int):
+            status = response[1]
+    if hasattr(target, "status_code"):
+        status = target.status_code
+    if hasattr(target, "get_json"):
+        payload = target.get_json(silent=True) or {}
+    if status < 400:
+        return response
+
+    code = str(payload.get("error") or "")
+    if code in {"insufficient_credits", "not_enough_credits", "credits_insufficient"}:
+        message = "You do not have enough credits for this generation."
+    elif status in {401, 403}:
+        message = "Your workspace session expired. Refresh and try again."
+    elif code == "prompt_safety":
+        message = "This request cannot be generated as written. Try a different prompt."
+    elif plan.get("intent") == "image":
+        message = "Image generation could not be started. Try again shortly."
+    elif plan.get("intent") == "video":
+        message = "Video generation could not be started. Try again shortly."
+    else:
+        message = "3D model generation could not be started. Try again shortly."
+    return jsonify({"ok": False, "error": "command_generation_failed", "message": message}), status
+
+
 def _execute_image(plan: dict, idempotency_key: str):
-    from backend.routes.image_gen import (
-        _handle_flux_pro_image_generate,
-        _handle_gemini_image_generate,
-        _handle_google_nano_image_generate,
-        _handle_ideogram_v3_image_generate,
-        _handle_nano_banana_image_generate,
-        _handle_openai_image_generate,
-        _handle_recraft_v4_image_generate,
-    )
+    from backend.routes.image_gen import dispatch_image_provider
     body = {
         "provider": plan["provider"], "prompt": plan["prompt"],
         "model": plan["model"], "image_size": plan["image_size"],
         "aspect_ratio": plan["aspect_ratio"], "size": plan["size"],
         "idempotency_key": idempotency_key,
     }
-    handlers = {
-        "nano_banana": _handle_nano_banana_image_generate,
-        "google": _handle_gemini_image_generate,
-        "google_nano": _handle_google_nano_image_generate,
-        "flux_pro": _handle_flux_pro_image_generate,
-        "ideogram_v3": _handle_ideogram_v3_image_generate,
-        "recraft_v4": _handle_recraft_v4_image_generate,
-        "openai": _handle_openai_image_generate,
-    }
-    return handlers[plan["provider"]](body)
+    return dispatch_image_provider(body)
 
 
 def _execute_video(plan: dict, identity_id: str):
@@ -286,6 +314,7 @@ def command_execute():
         else:
             response = _execute_video(plan, str(g.identity_id))
 
+        response = _public_failed_response(response, plan)
         cached_response = _cacheable_response(response)
         if cached_response:
             ExpenseGuard.cache_response(idempotency_key, cached_response)
@@ -293,5 +322,7 @@ def command_execute():
     except CommandPlanError as exc:
         return _error(exc)
     except Exception as exc:
-        print(f"[COMMAND] execute failed: {type(exc).__name__}: {exc}")
+        request_id = str(uuid.uuid4())
+        print(f"[COMMAND] execute failed request_id={request_id}: {type(exc).__name__}: {exc}")
+        print(traceback.format_exc())
         return jsonify({"ok": False, "error": "command_execute_failed", "message": "Generation could not be started."}), 500
