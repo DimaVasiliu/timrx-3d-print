@@ -411,7 +411,7 @@ def _handle_nano_banana_image_generate(body: dict):
         }), 500
 
     # Require authentication
-    _identity_id, auth_error = require_identity()
+    identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
 
