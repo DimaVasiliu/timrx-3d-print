@@ -12,7 +12,7 @@ from flask import Blueprint, jsonify, request, g
 
 from backend.config import ACTION_KEYS, MESHY_API_KEY
 from backend.utils import derive_display_title
-from backend.db import USE_DB, get_conn
+from backend.db import USE_DB, get_conn, dict_row
 from backend.middleware import with_session, with_session_readonly
 from backend.services.async_dispatch import (
     _dispatch_meshy_refine_async,
@@ -64,15 +64,22 @@ _FINALIZED_TTL = 1800  # 30 minutes
 
 @bp.route("/text-to-3d/start", methods=["POST", "OPTIONS"])
 @with_session
-def text_to_3d_start_mod():
+def text_to_3d_start_mod(body=None, identity_id=None):
+    """Start a Meshy preview.
+
+    ``body`` and ``identity_id`` are optional so the command execution route
+    can reuse this exact paid-job path without manufacturing a second HTTP
+    request. The normal public route still resolves both values from Flask.
+    """
     if request.method == "OPTIONS":
         return ("", 204)
 
-    identity_id, auth_error = require_identity()
-    if auth_error:
-        return auth_error
+    if identity_id is None:
+        identity_id, auth_error = require_identity()
+        if auth_error:
+            return auth_error
 
-    body = request.get_json(silent=True) or {}
+    body = body if body is not None else (request.get_json(silent=True) or {})
     log_event("text-to-3d/start:incoming[mod]", body)
     prompt = (body.get("prompt") or "").strip()
     if not prompt:

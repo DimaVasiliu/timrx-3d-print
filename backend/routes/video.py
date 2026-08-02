@@ -753,6 +753,7 @@ def _dispatch_video_job(
     audio_urls: list | None = None,
     input_video_seconds: float = 0.0,
     reference_policy: dict | None = None,
+    strict_provider: bool = False,
 ):
     """
     Shared helper: validate, reserve credits, create job row, dispatch async, return response.
@@ -771,9 +772,12 @@ def _dispatch_video_job(
                 "safety": safety,
             }), status_code
 
-    # Dynamic provider routing — auto-select cheaper provider under load
-    from backend.services.video_limits import select_video_provider
-    provider = select_video_provider(provider)
+    # Normal panel requests may use the platform's fallback router. A command
+    # plan is an explicit user instruction (for example, "use Veo"), so it
+    # must keep the requested provider all the way through execution.
+    if not strict_provider:
+        from backend.services.video_limits import select_video_provider
+        provider = select_video_provider(provider)
 
     # Vertex: final validation via gemini_video_service (catches edge cases)
     if provider == "vertex":
@@ -1028,6 +1032,7 @@ def _dispatch_video_job(
         "seedance_tier": seedance_tier if provider == "seedance" else None,
         "less_restriction": bool(seedance_less_restriction) if provider == "seedance" else False,
         "audio": seedance_audio if provider == "seedance" else None,
+        "strict_provider": bool(strict_provider),
     }
     if start_image:
         payload["start_image"] = start_image

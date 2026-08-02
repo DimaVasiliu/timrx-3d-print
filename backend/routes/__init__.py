@@ -63,6 +63,7 @@ def register_blueprints(app):
     from backend.routes.stl import bp as stl_bp
     from backend.routes.email_prefs import bp as email_prefs_bp
     from backend.routes.homepage_generation import bp as homepage_generation_bp
+    from backend.routes.command import bp as command_bp
 
     # Import inspire with explicit error handling for debugging
     inspire_bp = None
@@ -96,6 +97,7 @@ def register_blueprints(app):
 
     app.register_blueprint(health_bp, url_prefix="/api/_mod")
     app.register_blueprint(homepage_generation_bp, url_prefix="/api/_mod")
+    app.register_blueprint(command_bp, url_prefix="/api/_mod")
     app.register_blueprint(assets_bp, url_prefix="/api/_mod")
     app.register_blueprint(image_gen_bp, url_prefix="/api/_mod", name="image_gen_mod")
     app.register_blueprint(text_to_3d_bp, url_prefix="/api/_mod")

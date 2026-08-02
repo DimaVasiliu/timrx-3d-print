@@ -1776,8 +1776,9 @@ def _dispatch_to_fal_seedance(
     payload: dict,
     route_params: dict,
     store_meta: dict,
+    allow_fallback: bool = True,
 ) -> tuple:
-    """Route to fal Seedance with dispatch-time fallback to PiAPI Seedance."""
+    """Route to fal Seedance, optionally preserving an explicit provider choice."""
     from backend.services.video_router import (
         resolve_video_provider,
         ProviderUnavailableError,
@@ -1813,6 +1814,9 @@ def _dispatch_to_fal_seedance(
                 # Fall through to PiAPI Seedance fallback
         else:
             print(f"[ASYNC] fal_seedance not configured: {err}")
+
+    if not allow_fallback:
+        raise ProviderUnavailableError(f"fal Seedance failed for job {internal_job_id}: {err or 'provider error'}")
 
     # Dispatch-time fallback to PiAPI Seedance (if enabled).
     # Seedance 2 GA supports image_transition natively via mode=first_last_frames —
@@ -2083,8 +2087,23 @@ def dispatch_gemini_video_async(
         # Resolve provider (normalized by caller, but safe to re-normalize)
         requested_provider = normalize_provider_name(store_meta.get("provider"))
         prompt = payload.get("prompt", "")
+        strict_provider = bool(payload.get("strict_provider") or store_meta.get("strict_provider"))
 
-        if requested_provider == "fal_seedance":
+        if strict_provider and requested_provider == "vertex":
+            vertex = resolve_video_provider("vertex")
+            configured, config_err = vertex.is_configured() if vertex else (False, "provider unavailable")
+            if not configured:
+                raise ProviderUnavailableError(f"Veo not configured: {config_err}")
+            if task == "image2video":
+                resp = vertex.start_image_to_video(image_data=payload.get("image_data", ""), prompt=payload.get("motion") or prompt, **route_params)
+            else:
+                resp = vertex.start_text_to_video(prompt=prompt, **route_params)
+            provider_used = "vertex"
+        elif strict_provider and requested_provider == "fal_seedance":
+            resp, provider_used = _dispatch_to_fal_seedance(
+                internal_job_id, task, prompt, payload, route_params, store_meta, allow_fallback=False,
+            )
+        elif requested_provider == "fal_seedance":
             resp, provider_used = _dispatch_to_fal_seedance(
                 internal_job_id, task, prompt, payload, route_params, store_meta,
             )
