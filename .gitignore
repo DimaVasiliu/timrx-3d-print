@@ -28,3 +28,7 @@ logs/
 # Migrations folder — hidden from git (run manually via TablePlus)
 backend/migrations/
 migrations/
+
+# Local test/runtime artifacts
+.pytest_cache/
+job_store.json
