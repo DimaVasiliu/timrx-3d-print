@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -30,6 +31,9 @@ from backend.services.wallet_service import (
 FREE_TRIAL_TABLE = "timrx_billing.free_generation_trials"
 TRIAL_ACTIVE_STATUSES = ("reserved", "started")
 TRIAL_CONSUMING_STATUSES = ("reserved", "started", "completed")
+FREE_GENERATION_TYPES = ("image", "video", "3d")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -97,11 +101,16 @@ def _credit_type_for_action(action_key: str) -> str:
 def ensure_free_generation_schema() -> None:
     """DDL is intentionally not allowed in request/runtime code."""
     raise RuntimeError(
-        "free_generation_trials schema must be applied via deploy_migrations/075_homepage_free_generation_trials.sql"
+        "free_generation_trials schema must be applied through deploy_migrations/075 and 076"
     )
 
 
-def _find_existing_trial(fp: Dict[str, Optional[str]], cur=None, lock: bool = False) -> Optional[Dict[str, Any]]:
+def _find_existing_trial(
+    fp: Dict[str, Optional[str]],
+    generation_type: str | None = None,
+    cur=None,
+    lock: bool = False,
+) -> Optional[Dict[str, Any]]:
     clauses = []
     params = []
     if fp.get("identity_id"):
@@ -115,10 +124,14 @@ def _find_existing_trial(fp: Dict[str, Optional[str]], cur=None, lock: bool = Fa
         params.extend([fp["ip_hash"], fp["user_agent_hash"]])
     if not clauses:
         return None
+    type_clause = "AND generation_type = %s" if generation_type else ""
+    if generation_type:
+        params.insert(0, generation_type)
     sql = f"""
         SELECT *
         FROM {FREE_TRIAL_TABLE}
         WHERE status IN ('reserved', 'started', 'completed')
+          {type_clause}
           AND ({" OR ".join(clauses)})
         ORDER BY created_at ASC
         LIMIT 1
@@ -138,19 +151,32 @@ def get_trial_for_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def get_current_trial_state() -> Dict[str, Any]:
-    existing = _find_existing_trial(_fingerprint())
+def _state_for_type(fp: Dict[str, Optional[str]], generation_type: str) -> Dict[str, Any]:
+    existing = _find_existing_trial(fp, generation_type=generation_type)
     if not existing:
-        return {"ok": True, "eligible": True, "free_trial_remaining": True}
+        return {"eligible": True, "remaining": True, "status": "available"}
     status = existing.get("status")
     active = status in TRIAL_ACTIVE_STATUSES and existing.get("job_id")
     return {
-        "ok": True,
         "eligible": bool(active),
-        "free_trial_remaining": False,
+        "remaining": False,
         "status": status,
         "active_job_id": str(existing.get("job_id")) if active else None,
-        "generation_type": existing.get("generation_type"),
+    }
+
+
+def get_current_trial_state(generation_type: str | None = None) -> Dict[str, Any]:
+    """Return authoritative per-service entitlement state for this visitor."""
+    fp = _fingerprint()
+    entitlements = {kind: _state_for_type(fp, kind) for kind in FREE_GENERATION_TYPES}
+    requested = (generation_type or "").strip().lower()
+    selected = entitlements.get(requested) if requested in FREE_GENERATION_TYPES else None
+    return {
+        "ok": True,
+        "eligible": selected["eligible"] if selected else any(item["eligible"] for item in entitlements.values()),
+        "free_trial_remaining": selected["remaining"] if selected else any(item["remaining"] for item in entitlements.values()),
+        "generation_type": requested or None,
+        "entitlements": entitlements,
     }
 
 
@@ -162,7 +188,6 @@ def get_rate_limit_state() -> Dict[str, int]:
         SELECT COUNT(*)::int AS count
         FROM {FREE_TRIAL_TABLE}
         WHERE created_at >= date_trunc('day', now())
-          AND status IN ('reserved', 'started', 'completed')
         """,
         (),
         source="free_trial_rate_total",
@@ -175,7 +200,6 @@ def get_rate_limit_state() -> Dict[str, int]:
             FROM {FREE_TRIAL_TABLE}
             WHERE created_at >= date_trunc('day', now())
               AND ip_hash = %s
-              AND status IN ('reserved', 'started', 'completed')
             """,
             (fp["ip_hash"],),
             source="free_trial_rate_ip",
@@ -193,7 +217,12 @@ def reserve_trial(
     idempotency_key: str | None = None,
     max_daily_total: int | None = None,
     max_per_ip_per_day: int | None = None,
+    max_attempts_per_type_per_day: int | None = None,
+    source: str = "homepage_command",
 ) -> TrialDecision:
+    generation_type = (generation_type or "").strip().lower()
+    if generation_type not in FREE_GENERATION_TYPES:
+        return TrialDecision(allowed=False, blocked_reason="unsupported_generation_type")
     fp = _fingerprint()
     idem_hash = _hash_value(idempotency_key, "homepage_idempotency")
 
@@ -204,8 +233,16 @@ def reserve_trial(
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("homepage_free_generation_daily",))
             if fp.get("ip_hash"):
                 cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"homepage_free_generation_ip:{fp['ip_hash']}",))
+            cur.execute(
+                f"""
+                UPDATE {FREE_TRIAL_TABLE}
+                SET status = 'failed', blocked_reason = 'reservation_expired',
+                    failed_at = COALESCE(failed_at, now()), updated_at = now()
+                WHERE status = 'reserved' AND expires_at IS NOT NULL AND expires_at <= now()
+                """
+            )
 
-            existing = _find_existing_trial(fp, cur=cur, lock=True)
+            existing = _find_existing_trial(fp, generation_type=generation_type, cur=cur, lock=True)
             if existing:
                 status = existing.get("status")
                 active_job = (
@@ -230,7 +267,6 @@ def reserve_trial(
                     SELECT COUNT(*)::int AS count
                     FROM {FREE_TRIAL_TABLE}
                     WHERE created_at >= date_trunc('day', now())
-                      AND status IN ('reserved', 'started', 'completed')
                     """
                 )
                 total_count = int((fetch_one(cur) or {}).get("count") or 0)
@@ -244,7 +280,6 @@ def reserve_trial(
                     FROM {FREE_TRIAL_TABLE}
                     WHERE created_at >= date_trunc('day', now())
                       AND ip_hash = %s
-                      AND status IN ('reserved', 'started', 'completed')
                     """,
                     (fp["ip_hash"],),
                 )
@@ -252,12 +287,39 @@ def reserve_trial(
                 if ip_count >= int(max_per_ip_per_day):
                     return TrialDecision(allowed=False, blocked_reason="homepage_free_ip_limit")
 
+            if max_attempts_per_type_per_day is not None and int(max_attempts_per_type_per_day) > 0:
+                attempt_clauses = []
+                attempt_params: list[Any] = [generation_type]
+                if fp.get("identity_id"):
+                    attempt_clauses.append("identity_id = %s")
+                    attempt_params.append(fp["identity_id"])
+                if fp.get("anonymous_session_id"):
+                    attempt_clauses.append("anonymous_session_id = %s")
+                    attempt_params.append(fp["anonymous_session_id"])
+                if fp.get("ip_hash"):
+                    attempt_clauses.append("ip_hash = %s")
+                    attempt_params.append(fp["ip_hash"])
+                if attempt_clauses:
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*)::int AS count
+                        FROM {FREE_TRIAL_TABLE}
+                        WHERE created_at >= date_trunc('day', now())
+                          AND generation_type = %s
+                          AND ({" OR ".join(attempt_clauses)})
+                        """,
+                        tuple(attempt_params),
+                    )
+                    attempts = int((fetch_one(cur) or {}).get("count") or 0)
+                    if attempts >= int(max_attempts_per_type_per_day):
+                        return TrialDecision(allowed=False, blocked_reason="free_attempt_limit")
+
             cur.execute(
                 f"""
                 INSERT INTO {FREE_TRIAL_TABLE}
                     (identity_id, anonymous_session_id, ip_hash, user_agent_hash,
-                     generation_type, prompt_hash, status, meta)
-                VALUES (%s, %s, %s, %s, %s, %s, 'reserved', %s::jsonb)
+                     generation_type, prompt_hash, status, expires_at, meta)
+                VALUES (%s, %s, %s, %s, %s, %s, 'reserved', now() + interval '15 minutes', %s::jsonb)
                 RETURNING *
                 """,
                 (
@@ -267,14 +329,17 @@ def reserve_trial(
                     fp.get("user_agent_hash"),
                     generation_type,
                     _prompt_hash(prompt),
-                    json.dumps({"source": "homepage_chat", "idempotency_key_hash": idem_hash}),
+                    json.dumps({"source": str(source or "homepage_command")[:80], "idempotency_key_hash": idem_hash}),
                 ),
             )
             trial = fetch_one(cur)
         return TrialDecision(allowed=True, trial=trial)
-    except Exception:
+    except Exception as exc:
         # A parallel tab/request may have won the unique constraint race.
-        existing = _find_existing_trial(fp)
+        logger.exception("Free generation reservation failed", extra={"generation_type": generation_type})
+        existing = _find_existing_trial(fp, generation_type=generation_type)
+        if not existing:
+            return TrialDecision(allowed=False, blocked_reason="free_gate_unavailable")
         return TrialDecision(
             allowed=False,
             blocked_reason="active_trial" if existing and existing.get("status") in TRIAL_ACTIVE_STATUSES else "free_trial_used",

@@ -35,7 +35,12 @@ def is_turnstile_enabled() -> bool:
     return bool(getattr(config, "TURNSTILE_ENABLED", False))
 
 
-def verify_turnstile_token(token: str | None) -> TurnstileResult:
+def verify_turnstile_token(
+    token: str | None,
+    *,
+    remote_ip: str | None = None,
+    expected_action: str | None = None,
+) -> TurnstileResult:
     """
     Verify a Cloudflare Turnstile token with Siteverify.
 
@@ -56,9 +61,12 @@ def verify_turnstile_token(token: str | None) -> TurnstileResult:
         return TurnstileResult(ok=False, reason="token_missing")
 
     try:
+        form = {"secret": secret, "response": clean_token}
+        if remote_ip:
+            form["remoteip"] = remote_ip
         response = requests.post(
             SITEVERIFY_URL,
-            data={"secret": secret, "response": clean_token},
+            data=form,
             timeout=6,
         )
     except requests.RequestException as exc:
@@ -79,5 +87,18 @@ def verify_turnstile_token(token: str | None) -> TurnstileResult:
     if not payload.get("success"):
         reason = errors[0] if errors else "verification_failed"
         return TurnstileResult(ok=False, reason=reason, errors=errors, raw=payload)
+
+    configured_hosts = {
+        host.strip().lower()
+        for host in str(getattr(config, "TURNSTILE_EXPECTED_HOSTNAMES", "") or "").split(",")
+        if host.strip()
+    }
+    hostname = str(payload.get("hostname") or "").strip().lower()
+    if configured_hosts and hostname not in configured_hosts:
+        return TurnstileResult(ok=False, reason="hostname_mismatch", raw=payload)
+
+    required_action = (expected_action or getattr(config, "TURNSTILE_EXPECTED_ACTION", "") or "").strip()
+    if required_action and str(payload.get("action") or "").strip() != required_action:
+        return TurnstileResult(ok=False, reason="action_mismatch", raw=payload)
 
     return TurnstileResult(ok=True, reason="verified", raw=payload)

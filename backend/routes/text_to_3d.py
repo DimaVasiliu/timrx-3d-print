@@ -41,6 +41,7 @@ from backend.services.meshy_service import mesh_get, mesh_post, normalize_status
 from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.history_service import get_canonical_model_row
+from backend.services.prompt_safety_service import check_prompt_safety
 from backend.utils.helpers import clamp_int, log_event, log_status_summary, normalize_license, now_s
 
 bp = Blueprint("text_to_3d", __name__)
@@ -84,6 +85,9 @@ def text_to_3d_start_mod(body=None, identity_id=None):
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
         return jsonify({"ok": False, "error": "prompt required"}), 400
+    safety = check_prompt_safety(prompt, medium="3d", provider="meshy", user_id=identity_id)
+    if safety["decision"] in ("block", "warn"):
+        return jsonify({"ok": False, "error": "prompt_safety", "safety": safety}), 451 if safety["decision"] == "block" else 422
     negative_prompt = normalize_negative_prompt(body.get("negative_prompt"))
     provider_prompt = merge_negative_prompt(prompt, negative_prompt)
     if not MESHY_API_KEY:
@@ -134,8 +138,7 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         if target_polycount is not None and 100 <= target_polycount <= 300000:
             payload["target_polycount"] = target_polycount
 
-    if body.get("moderation") is not None:
-        payload["moderation"] = bool(body["moderation"])
+    payload["moderation"] = True
 
     raw_target_formats = body.get("target_formats")
     allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
@@ -738,12 +741,15 @@ def text_to_3d_status_mod(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # Short-circuit: return cached response if within TTL (avoids all DB work)
+    identity_id = g.identity_id
+    if not verify_job_ownership(job_id, identity_id):
+        return jsonify({"ok": False, "error": "job_not_found"}), 404
+
+    # Cache reads are allowed only after ownership is verified.
     cached_resp = _get_cached_status(job_id)
     if cached_resp is not None:
         return jsonify(cached_resp)
 
-    identity_id = g.identity_id
     meshy_job_id = job_id
     internal_job = None
     ownership_verified = False  # Track if we already verified ownership via DB

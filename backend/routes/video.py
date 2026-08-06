@@ -1779,14 +1779,18 @@ def _video_status_handler(job_id: str):
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # Short-circuit: return cached response if within TTL
-    cached = get_cached_status(job_id)
-    if cached is not None:
-        return jsonify(cached)
-
     identity_id, auth_error = require_identity()
     if auth_error:
         return auth_error
+
+    from backend.services.job_service import verify_job_ownership
+    if not verify_job_ownership(job_id, identity_id):
+        return jsonify({"ok": False, "error": "job_not_found"}), 404
+
+    # Cache reads are allowed only after ownership is verified.
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     # Try job store first
     store = load_store()

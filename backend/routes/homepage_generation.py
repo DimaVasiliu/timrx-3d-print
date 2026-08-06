@@ -16,7 +16,7 @@ from typing import Any, Dict, Tuple
 from flask import Blueprint, g, jsonify, request
 
 from backend.config import config
-from backend.middleware import with_session, with_session_readonly
+from backend.middleware import with_optional_session, with_session, with_session_readonly
 from backend.services.free_generation_service import (
     get_current_trial_state,
     get_trial_for_job,
@@ -60,7 +60,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _free_generation_enabled() -> bool:
-    return bool(getattr(config, "HOMEPAGE_FREE_ENABLED", True))
+    return bool(
+        getattr(config, "HOMEPAGE_FREE_ENABLED", False)
+        and getattr(config, "TURNSTILE_ENABLED", False)
+        and str(getattr(config, "TURNSTILE_SECRET_KEY", "") or "").strip()
+        and os.getenv("FREE_GENERATION_HASH_SALT", "").strip()
+    )
 
 
 def _free_type_allowed(generation_type: str) -> bool:
@@ -69,6 +74,33 @@ def _free_type_allowed(generation_type: str) -> bool:
     if generation_type == "3d":
         return bool(getattr(config, "HOMEPAGE_FREE_ALLOW_3D", False))
     return bool(getattr(config, "HOMEPAGE_FREE_ALLOW_IMAGE", True))
+
+
+def _free_cost_limit(generation_type: str) -> int:
+    limits = {
+        "image": getattr(config, "HOMEPAGE_FREE_IMAGE_MAX_CREDITS", 12),
+        "video": getattr(config, "HOMEPAGE_FREE_VIDEO_MAX_CREDITS", 80),
+        "3d": getattr(config, "HOMEPAGE_FREE_3D_MAX_CREDITS", 20),
+    }
+    return int(limits.get(generation_type, getattr(config, "HOMEPAGE_FREE_MAX_CREDITS", 120)) or 0)
+
+
+def _free_provider_ready(generation_type: str, route_params: Dict[str, Any]) -> bool:
+    if generation_type == "image":
+        expected = (getattr(config, "HOMEPAGE_FREE_IMAGE_PROVIDER", "") or "nano_banana").strip().lower()
+        return route_params.get("provider") == expected
+    if generation_type == "video":
+        expected = (getattr(config, "HOMEPAGE_FREE_VIDEO_PROVIDER", "") or "seedance").strip().lower()
+        return route_params.get("provider") == expected
+    return bool(getattr(config, "MESHY_API_KEY", ""))
+
+
+def _turnstile_remote_ip() -> str:
+    if getattr(config, "HOMEPAGE_FREE_TRUST_PROXY_HEADERS", False):
+        forwarded = (request.headers.get("CF-Connecting-IP") or "").split(",", 1)[0].strip()
+        if forwarded:
+            return forwarded
+    return request.remote_addr or ""
 
 
 def _detect_generation_type(prompt: str, requested_type: str | None = None) -> str:
@@ -134,7 +166,7 @@ def _choose_image_provider() -> Tuple[str, str, int]:
         get_image_action_key,
     )
 
-    preferred = (getattr(config, "HOMEPAGE_FREE_IMAGE_PROVIDER", "") or os.getenv("HOMEPAGE_FREE_IMAGE_PROVIDER") or "").strip().lower()
+    preferred = (getattr(config, "HOMEPAGE_FREE_IMAGE_PROVIDER", "") or os.getenv("HOMEPAGE_FREE_IMAGE_PROVIDER") or "nano_banana").strip().lower()
     enabled = list(get_enabled_image_providers())
     if not enabled:
         enabled = ["openai"]
@@ -143,7 +175,7 @@ def _choose_image_provider() -> Tuple[str, str, int]:
 
     candidates = []
     for provider in enabled:
-        action_key = get_image_action_key(provider=provider, image_size="1K")
+        action_key = get_image_action_key(provider=provider, image_size="2K")
         cost = PricingService.get_action_cost(action_key)
         if cost > 0:
             candidates.append((cost, provider, action_key))
@@ -160,7 +192,7 @@ def _choose_video_provider() -> Tuple[str, str, int, Dict[str, Any]]:
     from backend.services.video_providers.seedance_provider import normalize_seedance_params
     from backend.services.video_providers.vertex_provider import normalize_vertex_params
 
-    preferred = (getattr(config, "HOMEPAGE_FREE_VIDEO_PROVIDER", "") or os.getenv("HOMEPAGE_FREE_VIDEO_PROVIDER") or "").strip().lower()
+    preferred = (getattr(config, "HOMEPAGE_FREE_VIDEO_PROVIDER", "") or os.getenv("HOMEPAGE_FREE_VIDEO_PROVIDER") or "seedance").strip().lower()
     available = {provider.name for provider in video_router.get_available_providers()}
     preference = [preferred] if preferred in available else ["fal_seedance", "seedance", "vertex"]
     provider = next((name for name in preference if name in available), "vertex")
@@ -211,7 +243,7 @@ def _action_for_generation_type(generation_type: str) -> Tuple[str, int, Dict[st
         action_key = CanonicalActions.TEXT_TO_3D_GENERATE
         return action_key, PricingService.get_action_cost(action_key), {}
     provider, action_key, cost = _choose_image_provider()
-    return action_key, cost, {"provider": provider}
+    return action_key, cost, {"provider": provider, "image_size": "2K"}
 
 
 def _dispatch_image(prompt: str, params: Dict[str, Any]):
@@ -230,7 +262,7 @@ def _dispatch_image(prompt: str, params: Dict[str, Any]):
         **(request.get_json(silent=True) or {}),
         "prompt": prompt,
         "provider": provider,
-        "image_size": "1K",
+        "image_size": params.get("image_size") or "2K",
         "aspect_ratio": (request.get_json(silent=True) or {}).get("aspect_ratio") or "1:1",
         "source": "homepage_chat",
     }
@@ -397,11 +429,48 @@ def _asset_label(generation_type: str) -> str:
 
 
 @bp.route("/homepage/trial", methods=["GET", "OPTIONS"])
-@with_session_readonly
+@with_optional_session
 def homepage_trial_state():
     if request.method == "OPTIONS":
         return ("", 204)
-    return jsonify(get_current_trial_state())
+    return jsonify(get_current_trial_state(request.args.get("type")))
+
+
+@bp.route("/homepage/preflight", methods=["GET", "OPTIONS"])
+@with_optional_session
+def homepage_generation_preflight():
+    """Resolve entitlement and credit mode before asking for human verification."""
+    if request.method == "OPTIONS":
+        return ("", 204)
+    generation_type = _detect_generation_type("", request.args.get("type"))
+    action_key, required_credits, route_params = _action_for_generation_type(generation_type)
+    state = get_current_trial_state(generation_type)
+    entitlement = state["entitlements"][generation_type]
+    identity_id = getattr(g, "identity_id", None)
+    has_credits = bool(identity_id and has_paid_balance(identity_id, action_key, required_credits))
+    free_available = bool(
+        _free_generation_enabled()
+        and _free_type_allowed(generation_type)
+        and _free_provider_ready(generation_type, route_params)
+        and entitlement.get("remaining")
+        and (_free_cost_limit(generation_type) <= 0 or required_credits <= _free_cost_limit(generation_type))
+    )
+    return jsonify({
+        "ok": True,
+        "generation_type": generation_type,
+        "action_key": action_key,
+        "required_credits": required_credits,
+        "mode": "free" if free_available else ("paid" if has_credits else "blocked"),
+        "challenge_required": bool(free_available and is_turnstile_enabled()),
+        "entitlement": entitlement,
+        "entitlements": state["entitlements"],
+        "has_credits": has_credits,
+        "free_offer": {
+            "image": "Nano Banana 2K image",
+            "video": "Seedance 2 video, 5 seconds",
+            "3d": "Meshy 3D model",
+        }.get(generation_type),
+    })
 
 
 @bp.route("/homepage/generate", methods=["POST", "OPTIONS"])
@@ -420,17 +489,43 @@ def homepage_generate():
     generation_type = _detect_generation_type(prompt, body.get("requested_type"))
     action_key, required_credits, route_params = _action_for_generation_type(generation_type)
     identity_id = getattr(g, "identity_id", None)
-    paid_mode = bool(identity_id and has_paid_balance(identity_id, action_key, required_credits))
     idempotency_key = request.headers.get("Idempotency-Key") or body.get("idempotency_key") or ""
 
+    state = get_current_trial_state(generation_type)
+    entitlement = state["entitlements"][generation_type]
+    if entitlement.get("active_job_id"):
+        active_job_id = entitlement["active_job_id"]
+        return jsonify({
+            "ok": True,
+            "status": "queued",
+            "job_id": active_job_id,
+            "generation_type": generation_type,
+            "polling_url": f"/api/_mod/homepage/status/{active_job_id}",
+            "free_trial_remaining": False,
+            "message": "Your free generation is already running.",
+        }), 202
+
+    free_mode = bool(
+        _free_generation_enabled()
+        and _free_type_allowed(generation_type)
+        and _free_provider_ready(generation_type, route_params)
+        and entitlement.get("remaining")
+        and (_free_cost_limit(generation_type) <= 0 or required_credits <= _free_cost_limit(generation_type))
+    )
+    paid_mode = bool(not free_mode and identity_id and has_paid_balance(identity_id, action_key, required_credits))
+
     trial = None
-    if not paid_mode:
+    if free_mode:
         # Anonymous/free homepage generation is abuse-sensitive and must pass
         # Cloudflare Turnstile before any free trial row, credit reservation, or
         # upstream provider job can be created. Paid users with sufficient
         # credits skip this branch and use the normal paid reservation flow.
         if is_turnstile_enabled():
-            turnstile_result = verify_turnstile_token(body.get("turnstile_token"))
+            turnstile_result = verify_turnstile_token(
+                body.get("turnstile_token"),
+                remote_ip=_turnstile_remote_ip(),
+                expected_action="free_generation",
+            )
             if not turnstile_result.ok:
                 print(
                     f"[HOMEPAGE_GENERATION] turnstile_blocked "
@@ -438,37 +533,13 @@ def homepage_generate():
                 )
                 return _turnstile_required_response(turnstile_result.reason)
 
-        if not _free_generation_enabled():
-            return jsonify({
-                "ok": False,
-                "error": "homepage_free_disabled",
-                "message": "Homepage free generation is temporarily unavailable. Create an account or add credits to continue.",
-                "free_trial_remaining": False,
-                "actions": {"signup": "/3dprint", "buy_credits": "/hub#pricing", "workspace": "/3dprint"},
-            }), 503
-        if not _free_type_allowed(generation_type):
-            return jsonify({
-                "ok": False,
-                "error": "homepage_free_type_disabled",
-                "message": "The homepage free generation currently starts with image creation. Open the workspace to create videos or 3D models with credits.",
-                "free_trial_remaining": False,
-                "actions": {"signup": "/3dprint", "buy_credits": "/hub#pricing", "workspace": "/3dprint"},
-            }), 402
-        max_trial_credits = int(getattr(config, "HOMEPAGE_FREE_MAX_CREDITS", _env_int("HOMEPAGE_FREE_MAX_CREDITS", 6)) or 0)
-        if max_trial_credits > 0 and int(required_credits or 0) > max_trial_credits:
-            return jsonify({
-                "ok": False,
-                "error": "homepage_free_cost_limit",
-                "message": "This request is above the homepage free generation limit. Open the workspace to continue with credits.",
-                "free_trial_remaining": False,
-                "actions": {"signup": "/3dprint", "buy_credits": "/hub#pricing", "workspace": "/3dprint"},
-            }), 402
         decision = reserve_trial(
             prompt,
             generation_type,
             idempotency_key=idempotency_key,
-            max_daily_total=int(getattr(config, "HOMEPAGE_FREE_MAX_DAILY_TOTAL", _env_int("HOMEPAGE_FREE_MAX_DAILY_TOTAL", 250))),
-            max_per_ip_per_day=int(getattr(config, "HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", _env_int("HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", 3))),
+            max_daily_total=int(getattr(config, "HOMEPAGE_FREE_MAX_DAILY_TOTAL", _env_int("HOMEPAGE_FREE_MAX_DAILY_TOTAL", 50))),
+            max_per_ip_per_day=int(getattr(config, "HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", _env_int("HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", 6))),
+            max_attempts_per_type_per_day=int(getattr(config, "HOMEPAGE_FREE_MAX_ATTEMPTS_PER_TYPE_PER_DAY", 2)),
         )
         if not decision.allowed:
             if decision.active_job:
@@ -483,7 +554,7 @@ def homepage_generate():
                         "message": "Your free generation is already running.",
                     }
                 ), 202
-            if decision.blocked_reason in {"homepage_free_daily_limit", "homepage_free_ip_limit"}:
+            if decision.blocked_reason in {"homepage_free_daily_limit", "homepage_free_ip_limit", "free_attempt_limit"}:
                 print(f"[HOMEPAGE_FREE] rate_limit reason={decision.blocked_reason}")
                 return jsonify({
                     "ok": False,
@@ -495,6 +566,9 @@ def homepage_generate():
             return _homepage_blocked_response(decision.blocked_reason or "free_trial_used")
         trial = decision.trial
         g.homepage_free_trial_id = str(trial["id"])
+        g.homepage_free_generation_type = generation_type
+    elif not paid_mode:
+        return _homepage_blocked_response("free_trial_used")
 
     result = _dispatch_generation(generation_type, prompt, route_params)
     data, status_code = _response_json(result)

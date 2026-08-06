@@ -166,12 +166,16 @@ class Config:
     HOMEPAGE_FREE_IMAGE_PROVIDER: str = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_IMAGE_PROVIDER"))
     HOMEPAGE_FREE_VIDEO_PROVIDER: str = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_VIDEO_PROVIDER"))
     HOMEPAGE_FREE_3D_PROVIDER: str = field(default_factory=lambda: _get_env("HOMEPAGE_FREE_3D_PROVIDER", "meshy"))
-    HOMEPAGE_FREE_MAX_DAILY_TOTAL: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_DAILY_TOTAL", 250))
-    HOMEPAGE_FREE_MAX_PER_IP_PER_DAY: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", 3))
+    HOMEPAGE_FREE_MAX_DAILY_TOTAL: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_DAILY_TOTAL", 50))
+    HOMEPAGE_FREE_MAX_PER_IP_PER_DAY: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", 6))
+    HOMEPAGE_FREE_MAX_ATTEMPTS_PER_TYPE_PER_DAY: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_ATTEMPTS_PER_TYPE_PER_DAY", 2))
     HOMEPAGE_FREE_ALLOW_IMAGE: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_IMAGE", True))
-    HOMEPAGE_FREE_ALLOW_VIDEO: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_VIDEO", False))
-    HOMEPAGE_FREE_ALLOW_3D: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_3D", False))
-    HOMEPAGE_FREE_MAX_CREDITS: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_CREDITS", 6))
+    HOMEPAGE_FREE_ALLOW_VIDEO: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_VIDEO", True))
+    HOMEPAGE_FREE_ALLOW_3D: bool = field(default_factory=lambda: _get_env_bool("HOMEPAGE_FREE_ALLOW_3D", True))
+    HOMEPAGE_FREE_MAX_CREDITS: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_MAX_CREDITS", 120))
+    HOMEPAGE_FREE_IMAGE_MAX_CREDITS: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_IMAGE_MAX_CREDITS", 12))
+    HOMEPAGE_FREE_VIDEO_MAX_CREDITS: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_VIDEO_MAX_CREDITS", 80))
+    HOMEPAGE_FREE_3D_MAX_CREDITS: int = field(default_factory=lambda: _get_env_int("HOMEPAGE_FREE_3D_MAX_CREDITS", 20))
     # Do not trust client-supplied forwarding headers by default. Enable this
     # only when the service is behind a trusted proxy/CDN that strips spoofed
     # headers, e.g. Cloudflare -> Render.
@@ -183,6 +187,8 @@ class Config:
     TURNSTILE_ENABLED: bool = field(default_factory=lambda: _get_env_bool("TURNSTILE_ENABLED", False))
     TURNSTILE_SITE_KEY: str = field(default_factory=lambda: _get_env("TURNSTILE_SITE_KEY", "0x4AAAAAADrAmfltMdgMr9lE"))
     TURNSTILE_SECRET_KEY: str = field(default_factory=lambda: _get_env("TURNSTILE_SECRET_KEY"))
+    TURNSTILE_EXPECTED_HOSTNAMES: str = field(default_factory=lambda: _get_env("TURNSTILE_EXPECTED_HOSTNAMES", "timrx.live,www.timrx.live"))
+    TURNSTILE_EXPECTED_ACTION: str = field(default_factory=lambda: _get_env("TURNSTILE_EXPECTED_ACTION", "free_generation"))
 
     # ─────────────────────────────────────────────────────────────
     # Session & Auth
@@ -969,6 +975,10 @@ class Config:
                 warnings.append("CSRF_SECRET not set - falling back to DATABASE_URL-derived secret")
             if not self.CSRF_PROTECT:
                 warnings.append("CSRF_PROTECT=false in production - state-changing browser requests are not CSRF-protected")
+            if self.HOMEPAGE_FREE_ENABLED and not _get_env("FREE_GENERATION_HASH_SALT"):
+                warnings.append("FREE_GENERATION_HASH_SALT is required when homepage free generation is enabled")
+            if self.HOMEPAGE_FREE_ENABLED and (not self.TURNSTILE_ENABLED or not self.TURNSTILE_SECRET_KEY):
+                warnings.append("Homepage free generation is enabled without complete Turnstile protection")
 
         return warnings
 

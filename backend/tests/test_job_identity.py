@@ -206,6 +206,22 @@ class TestNoDbMode:
             monkeypatch.setattr(job_service_module, "USE_DB", original_use_db)
 
 
+def test_ownership_check_fails_closed_on_database_error(monkeypatch):
+    import backend.services.job_service as job_service_module
+
+    monkeypatch.setattr(job_service_module, "USE_DB", True)
+    monkeypatch.setattr(job_service_module, "load_store", lambda: {})
+
+    def broken_connection():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(job_service_module, "get_conn", broken_connection)
+    result = job_service_module.verify_job_ownership_detailed("job-1", "identity-1")
+    assert result["authorized"] is False
+    assert result["found"] is False
+    assert result["source"] == "error_fallback"
+
+
 def test_missing_identity_error():
     """Basic test for MissingIdentityError."""
     error = MissingIdentityError("test_op", "job-123")

@@ -2084,9 +2084,10 @@ def verify_job_ownership_detailed(job_id: str, identity_id: str) -> dict:
 
     except Exception as e:
         print(f"[DB] verify_job_ownership_detailed failed for {job_id}: {type(e).__name__}: {e}")
-        # On DB error, be permissive to not block users
-        result["found"] = True
-        result["authorized"] = True
+        # Ownership checks protect private generation output. A database outage
+        # must never turn into authorization bypass.
+        result["found"] = False
+        result["authorized"] = False
         result["source"] = "error_fallback"
         return result
 

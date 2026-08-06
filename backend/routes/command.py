@@ -24,6 +24,13 @@ from backend.services.command_planner import (
     quote_plan,
 )
 from backend.services.expense_guard import ExpenseGuard
+from backend.services.free_generation_service import (
+    get_current_trial_state,
+    has_paid_balance,
+    mark_trial_failed,
+    reserve_trial,
+)
+from backend.services.turnstile_service import is_turnstile_enabled, verify_turnstile_token
 
 bp = Blueprint("command", __name__)
 
@@ -135,6 +142,71 @@ def _quote_payload(plan: dict) -> dict:
     return quote
 
 
+def _generation_type(plan: dict) -> str:
+    return "3d" if plan.get("intent") == "model" else str(plan.get("intent") or "image")
+
+
+def _apply_free_offer(plan: dict) -> dict:
+    """Pin an unused free entitlement to the advertised bounded-cost product."""
+    generation_type = _generation_type(plan)
+    state = get_current_trial_state(generation_type)
+    if not state["entitlements"][generation_type].get("remaining") or not _free_type_enabled(generation_type):
+        return plan
+    pinned = dict(plan)
+    if generation_type == "image":
+        from backend.services.image_provider_registry import get_image_provider_spec
+
+        spec = get_image_provider_spec("nano_banana")
+        pinned.update({"provider": "nano_banana", "model": spec.model if spec else "nano-banana-2", "image_size": "2K"})
+    elif generation_type == "video":
+        pinned.update({
+            "provider": "seedance", "model": "seedance-2", "video_tier": "fast",
+            "video_duration_seconds": 5, "video_resolution": "480p",
+            "seedance_variant": None, "video_mode": "text2video",
+        })
+    return pinned
+
+
+def _free_cost_limit(generation_type: str) -> int:
+    return int({
+        "image": getattr(config, "HOMEPAGE_FREE_IMAGE_MAX_CREDITS", 12),
+        "video": getattr(config, "HOMEPAGE_FREE_VIDEO_MAX_CREDITS", 80),
+        "3d": getattr(config, "HOMEPAGE_FREE_3D_MAX_CREDITS", 20),
+    }.get(generation_type, 0) or 0)
+
+
+def _free_type_enabled(generation_type: str) -> bool:
+    attr = {"image": "HOMEPAGE_FREE_ALLOW_IMAGE", "video": "HOMEPAGE_FREE_ALLOW_VIDEO", "3d": "HOMEPAGE_FREE_ALLOW_3D"}[generation_type]
+    return bool(
+        getattr(config, "HOMEPAGE_FREE_ENABLED", False)
+        and getattr(config, attr, False)
+        and getattr(config, "TURNSTILE_ENABLED", False)
+        and str(getattr(config, "TURNSTILE_SECRET_KEY", "") or "").strip()
+        and os.getenv("FREE_GENERATION_HASH_SALT", "").strip()
+    )
+
+
+def _access_payload(plan: dict, quote: dict) -> dict:
+    generation_type = _generation_type(plan)
+    state = get_current_trial_state(generation_type)
+    entitlement = state["entitlements"][generation_type]
+    credits = int(quote.get("credits") or 0)
+    free_available = bool(
+        quote.get("available") and entitlement.get("remaining") and _free_type_enabled(generation_type)
+        and (_free_cost_limit(generation_type) <= 0 or credits <= _free_cost_limit(generation_type))
+    )
+    paid_available = bool(
+        quote.get("available") and has_paid_balance(str(g.identity_id), str(quote.get("action_key") or ""), credits)
+    )
+    return {
+        "mode": "free" if free_available else ("paid" if paid_available else "blocked"),
+        "challenge_required": bool(free_available and is_turnstile_enabled()),
+        "generation_type": generation_type,
+        "entitlement": entitlement,
+        "has_credits": paid_available,
+    }
+
+
 def _public_availability_message(plan: dict, detail: str | None) -> str | None:
     """Keep vendor credentials and internal provider ids out of the UI."""
     if not detail:
@@ -162,11 +234,14 @@ def command_plan():
         return _error(CommandPlanError("Enter a request between 3 and 2,000 characters."), 400)
     try:
         plan, source = _plan_from_text(text)
+        plan = _apply_free_offer(plan)
         quote = _quote_payload(plan)
+        access = _access_payload(plan, quote)
         return jsonify({
             "ok": True,
             "plan": plan,
             "quote": quote,
+            "access": access,
             "plan_token": _new_token(plan, str(g.identity_id)),
             "planner": source,
             "expires_in": _PLAN_TTL_SECONDS,
@@ -193,8 +268,9 @@ def command_quote():
             plan = normalize_plan(str(body["plan"].get("prompt") or ""), body["plan"])
         else:
             raise CommandPlanError("A generation plan is required.")
+        plan = _apply_free_offer(plan)
         quote = _quote_payload(plan)
-        return jsonify({"ok": True, "plan": plan, "quote": quote, "plan_token": _new_token(plan, str(g.identity_id))})
+        return jsonify({"ok": True, "plan": plan, "quote": quote, "access": _access_payload(plan, quote), "plan_token": _new_token(plan, str(g.identity_id))})
     except CommandPlanError as exc:
         return _error(exc)
     except Exception as exc:
@@ -302,6 +378,50 @@ def command_execute():
         if cached:
             return jsonify(cached)
 
+        from backend.services.prompt_safety_service import check_prompt_safety
+        safety = check_prompt_safety(
+            plan["prompt"], medium=_generation_type(plan), provider=plan["provider"], user_id=str(g.identity_id)
+        )
+        if safety["decision"] in {"block", "warn"}:
+            return jsonify({"ok": False, "error": "prompt_safety", "safety": safety}), 451 if safety["decision"] == "block" else 422
+
+        access = _access_payload(plan, quote)
+        if access["mode"] == "blocked":
+            return jsonify({
+                "ok": False,
+                "error": "insufficient_credits",
+                "message": "Your free generation for this service has been used and your credit balance is too low.",
+                "access": access,
+            }), 402
+
+        trial = None
+        if access["mode"] == "free":
+            if is_turnstile_enabled():
+                remote_ip = request.headers.get("CF-Connecting-IP") if getattr(config, "HOMEPAGE_FREE_TRUST_PROXY_HEADERS", False) else request.remote_addr
+                verification = verify_turnstile_token(
+                    body.get("turnstile_token"), remote_ip=remote_ip, expected_action="free_generation"
+                )
+                if not verification.ok:
+                    return jsonify({
+                        "ok": False, "error": "turnstile_required",
+                        "message": "Verify you are human to claim this free generation.",
+                        "reason": verification.reason,
+                    }), 403
+            decision = reserve_trial(
+                plan["prompt"], access["generation_type"],
+                idempotency_key=str(request.headers.get("Idempotency-Key") or body.get("idempotency_key") or ""),
+                max_daily_total=int(getattr(config, "HOMEPAGE_FREE_MAX_DAILY_TOTAL", 50)),
+                max_per_ip_per_day=int(getattr(config, "HOMEPAGE_FREE_MAX_PER_IP_PER_DAY", 6)),
+                max_attempts_per_type_per_day=int(getattr(config, "HOMEPAGE_FREE_MAX_ATTEMPTS_PER_TYPE_PER_DAY", 2)),
+                source="workspace_command",
+            )
+            if not decision.allowed:
+                status = 429 if decision.blocked_reason in {"homepage_free_daily_limit", "homepage_free_ip_limit", "free_attempt_limit"} else 409
+                return jsonify({"ok": False, "error": decision.blocked_reason, "message": "This free generation cannot be claimed."}), status
+            trial = decision.trial
+            g.homepage_free_trial_id = str(trial["id"])
+            g.homepage_free_generation_type = access["generation_type"]
+
         if plan["intent"] == "image":
             response = _execute_image(plan, idempotency_key)
         elif plan["intent"] == "model":
@@ -315,6 +435,9 @@ def command_execute():
             response = _execute_video(plan, str(g.identity_id))
 
         response = _public_failed_response(response, plan)
+        response_status = response[1] if isinstance(response, tuple) and len(response) > 1 else getattr(response, "status_code", 200)
+        if trial and int(response_status or 200) >= 400:
+            mark_trial_failed(str(trial["id"]), "command_dispatch_failed")
         cached_response = _cacheable_response(response)
         if cached_response:
             ExpenseGuard.cache_response(idempotency_key, cached_response)

@@ -3850,7 +3850,10 @@ def homepage_free_generation_monitor():
         )
         recent_rows = query_all(
             """
-            SELECT *
+            SELECT id, generation_type, status, blocked_reason,
+                   trial_credit_amount, trial_credit_type,
+                   job_id, reservation_id,
+                   created_at, started_at, completed_at, failed_at, updated_at
             FROM timrx_billing.free_generation_trials
             ORDER BY created_at DESC
             LIMIT %s

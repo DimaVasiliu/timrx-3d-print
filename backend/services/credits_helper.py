@@ -210,7 +210,13 @@ def start_paid_job(identity_id, action_key, internal_job_id, job_meta) -> tuple[
 
         homepage_trial_id = getattr(g, "homepage_free_trial_id", None)
         if homepage_trial_id:
-            max_trial_cost = int(getattr(config, "HOMEPAGE_FREE_MAX_CREDITS", 6) or 0)
+            trial_type = str(getattr(g, "homepage_free_generation_type", "") or "").lower()
+            type_limits = {
+                "image": getattr(config, "HOMEPAGE_FREE_IMAGE_MAX_CREDITS", 12),
+                "video": getattr(config, "HOMEPAGE_FREE_VIDEO_MAX_CREDITS", 80),
+                "3d": getattr(config, "HOMEPAGE_FREE_3D_MAX_CREDITS", 20),
+            }
+            max_trial_cost = int(type_limits.get(trial_type, getattr(config, "HOMEPAGE_FREE_MAX_CREDITS", 120)) or 0)
             if max_trial_cost > 0 and cost > max_trial_cost:
                 return None, _make_credit_error(
                     "HOMEPAGE_TRIAL_COST_LIMIT",
