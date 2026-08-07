@@ -14,7 +14,7 @@ def _make_items(kind: str, count: int):
             "id": f"{kind}-{idx}",
             "type": kind,
             "title": f"{kind} title {idx}",
-            "prompt": f"{kind} prompt {idx}",
+            "prompt": f"collectible fantasy dragon creature model {idx}" if kind == "model" else f"{kind} prompt {idx}",
             "created_at": now,
             "thumb_preview": f"https://cdn.example/{kind}-{idx}.jpg",
             "thumbnail_url": f"https://cdn.example/{kind}-{idx}.jpg",
@@ -49,6 +49,8 @@ def _build_test_client(monkeypatch):
 
     monkeypatch.setattr(inspire_module, "USE_DB", True)
     monkeypatch.setattr(inspire_module, "get_conn", lambda: _DummyConn())
+    monkeypatch.setattr(inspire_module, "get_conn_resilient", lambda *_args, **_kwargs: _DummyConn())
+    monkeypatch.setattr(inspire_module, "_inspire_cache", {})
     monkeypatch.setattr(
         inspire_module,
         "_get_prompt_of_the_day",
@@ -91,3 +93,18 @@ def test_inspire_sequential_mix_can_be_model_only(monkeypatch):
     assert data["ok"] is True
     assert len(data["cards"]) == 24
     assert all(card["type"] == "model" for card in data["cards"])
+
+
+def test_homepage_shuffles_only_inside_ranked_model_window(monkeypatch):
+    client = _build_test_client(monkeypatch)
+
+    res = client.get(
+        "/api/_mod/inspire/feed?surface=homepage&type=all&limit=24&shuffle=true&mix=balanced&seed=qa"
+    )
+    assert res.status_code == 200
+
+    data = res.get_json()
+    assert data["source"] == "inspire_curated"
+    assert data["surface"] == "homepage"
+    assert data["curation"]["models_ranked"] == 120
+    assert data["curation"]["models_in_quality_window"] == 16

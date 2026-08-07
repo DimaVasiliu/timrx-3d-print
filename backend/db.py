@@ -1086,6 +1086,21 @@ def ensure_schema() -> None:
                 ON {_APP_SCHEMA}.videos (upstream_id)
                 WHERE upstream_id IS NOT NULL
             """)
+            for tbl in ('models', 'images', 'videos'):
+                cur.execute(f"""
+                    ALTER TABLE {_APP_SCHEMA}.{tbl}
+                    ADD COLUMN IF NOT EXISTS share_to_inspire BOOLEAN DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS inspire_status TEXT NOT NULL DEFAULT 'auto',
+                    ADD COLUMN IF NOT EXISTS quality_score SMALLINT NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS moderation_reason TEXT,
+                    ADD COLUMN IF NOT EXISTS curated_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS curated_by TEXT
+                """)
+                cur.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{tbl}_inspire_curated
+                    ON {_APP_SCHEMA}.{tbl} (inspire_status, quality_score DESC, created_at DESC)
+                    WHERE share_to_inspire = TRUE
+                """)
 
         print("[DB] Schema indexes ensured")
 
@@ -1167,11 +1182,16 @@ def _ensure_schema_direct() -> None:
                     ON {_APP_SCHEMA}.videos (upstream_id)
                     WHERE upstream_id IS NOT NULL
                 """)
-                # Inspire opt-in column on models/images/videos
+                # Inspire consent and editorial curation metadata.
                 for tbl in ('models', 'images', 'videos'):
                     cur.execute(f"""
                         ALTER TABLE {_APP_SCHEMA}.{tbl}
-                        ADD COLUMN IF NOT EXISTS share_to_inspire BOOLEAN DEFAULT FALSE
+                        ADD COLUMN IF NOT EXISTS share_to_inspire BOOLEAN DEFAULT FALSE,
+                        ADD COLUMN IF NOT EXISTS inspire_status TEXT NOT NULL DEFAULT 'auto',
+                        ADD COLUMN IF NOT EXISTS quality_score SMALLINT NOT NULL DEFAULT 0,
+                        ADD COLUMN IF NOT EXISTS moderation_reason TEXT,
+                        ADD COLUMN IF NOT EXISTS curated_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS curated_by TEXT
                     """)
                 cur.execute(f"""
                     CREATE INDEX IF NOT EXISTS idx_models_inspire
@@ -1188,6 +1208,12 @@ def _ensure_schema_direct() -> None:
                     ON {_APP_SCHEMA}.videos (share_to_inspire, created_at DESC)
                     WHERE share_to_inspire = TRUE
                 """)
+                for tbl in ('models', 'images', 'videos'):
+                    cur.execute(f"""
+                        CREATE INDEX IF NOT EXISTS idx_{tbl}_inspire_curated
+                        ON {_APP_SCHEMA}.{tbl} (inspire_status, quality_score DESC, created_at DESC)
+                        WHERE share_to_inspire = TRUE
+                    """)
 
                 # STL pack entitlements (storefront purchases)
                 cur.execute("""

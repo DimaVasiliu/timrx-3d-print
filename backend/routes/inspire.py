@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 from math import ceil
 from typing import List, Dict, Any, Optional
 
-from flask import Blueprint, jsonify, request, Response
+from flask import Blueprint, jsonify, request, Response, g
 
 from backend.db import USE_DB, get_conn, get_conn_resilient, get_conn_direct, dict_row, is_transient_db_error
+from backend.middleware import require_admin
 from backend.services.identity_service import require_identity
+from backend.services.inspire_curation_service import curate_feed_assets
 
 # Debug: confirm module loads
 print("[INSPIRE] Module loaded successfully")
@@ -154,9 +156,13 @@ _INSPIRE_CACHE_TTL_RANDOM = 15    # 15s for random (non-seeded) requests
 _INSPIRE_CACHE_MAX = 50
 
 
-def _inspire_cache_key(limit, filter_type, mix_mode, shuffle, seed):
+def invalidate_inspire_cache() -> None:
+    _inspire_cache.clear()
+
+
+def _inspire_cache_key(limit, filter_type, mix_mode, shuffle, seed, surface):
     """Build a cache key from all parameters that affect the response."""
-    return (limit, filter_type, mix_mode, shuffle, seed or "__random__")
+    return (limit, filter_type, mix_mode, shuffle, seed or "__random__", surface)
 
 
 def _get_cached_inspire(key, seed):
@@ -190,6 +196,29 @@ def _seeded_shuffle(items: List[Any], seed: str) -> List[Any]:
     result = items[:]
     rng.shuffle(result)
     return result
+
+
+def _model_quality_window(
+    models: List[Dict],
+    limit: int,
+    filter_type: str,
+    surface: str,
+) -> List[Dict]:
+    """Keep randomisation inside a surface-appropriate, quality-ranked pool."""
+    if not models:
+        return models
+
+    requested_models = (
+        limit
+        if filter_type in ("model", "models")
+        else max(1, (limit + 2) // 3)
+    )
+    pool_multiplier = {
+        "homepage": 2,
+        "workspace": 3,
+        "inspire": 4,
+    }.get(surface, 3)
+    return models[:max(requested_models, requested_models * pool_multiplier)]
 
 
 def _interleave_lists(*lists: List[Any]) -> List[Any]:
@@ -272,7 +301,6 @@ def _fetch_models(
     cursor,
     limit: Optional[int] = None,
     debug: bool = False,
-    shared_only: bool = True,
 ) -> List[Dict]:
     """
     Fetch models with valid thumbnails. Accepts various success status values.
@@ -287,22 +315,28 @@ def _fetch_models(
     # For preview models: look for textured/refined versions as thumb_refined
     # For texture/remesh/refine models: look for preview version as thumb_refined (shows before/after)
     # Status filter: accept 'ready', 'succeeded', 'success', 'completed', 'done', 'finished' (case-insensitive)
-    share_clause = "share_to_inspire = TRUE AND" if shared_only else ""
     cursor.execute(f"""
         WITH base_models AS (
             SELECT
                 id,
+                identity_id,
                 title,
                 prompt,
                 root_prompt,
                 thumbnail_url,
                 glb_url,
+                content_hash,
                 stage,
                 upstream_job_id,
+                upstream_id,
+                meta,
+                COALESCE(inspire_status, 'auto') AS inspire_status,
+                COALESCE(quality_score, 0) AS quality_score,
                 created_at
             FROM timrx_app.models
-            WHERE {share_clause}
-              thumbnail_url IS NOT NULL
+            WHERE share_to_inspire = TRUE
+              AND COALESCE(inspire_status, 'auto') IN ('auto', 'approved')
+              AND thumbnail_url IS NOT NULL
               AND thumbnail_url != ''
               AND glb_url IS NOT NULL
               AND glb_url != ''
@@ -316,8 +350,30 @@ def _fetch_models(
             'model' as type,
             m.title,
             COALESCE(m.prompt, m.root_prompt) as prompt,
+            m.root_prompt,
             m.thumbnail_url as thumb_preview,
             m.glb_url,
+            m.content_hash,
+            m.inspire_status,
+            m.quality_score,
+            COALESCE(
+                m.meta->>'action',
+                m.meta->>'source_type',
+                (SELECT h.payload->>'action'
+                 FROM timrx_app.history_items h
+                 WHERE h.model_id = m.id
+                 ORDER BY h.created_at DESC LIMIT 1)
+            ) AS generation_action,
+            (SELECT root.payload->>'action'
+             FROM timrx_app.history_items h
+             JOIN timrx_app.history_items root
+               ON root.id = COALESCE(h.lineage_origin_id, h.id)
+             WHERE h.model_id = m.id
+             ORDER BY h.created_at DESC LIMIT 1) AS source_generation_action,
+            (SELECT COALESCE(h.lineage_origin_id, h.id)::text
+             FROM timrx_app.history_items h
+             WHERE h.model_id = m.id
+             ORDER BY h.created_at DESC LIMIT 1) AS lineage_origin_id,
             -- For preview: find textured/refined version; For texture/refine: find preview version
             CASE
                 WHEN m.stage IS NULL OR LOWER(m.stage) IN ('preview', 'initial', 'image3d', '') THEN
@@ -352,8 +408,7 @@ def _fetch_models(
 
     # Debug logging
     if debug:
-        scope = "shared" if shared_only else "fallback_all"
-        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} models after filtering ({scope})")
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} shared models after filtering")
         if len(rows) == 0:
             # Show what statuses/stages exist in DB to help diagnose
             cursor.execute("""
@@ -374,7 +429,6 @@ def _fetch_images(
     cursor,
     limit: Optional[int] = None,
     debug: bool = False,
-    shared_only: bool = True,
 ) -> List[Dict]:
     """
     Fetch images with valid thumbnails or image URLs.
@@ -384,8 +438,6 @@ def _fetch_images(
     order = "ORDER BY created_at DESC"
     limit_clause = f"LIMIT {limit}" if limit else ""
 
-    share_clause = "share_to_inspire = TRUE AND" if shared_only else ""
-
     cursor.execute(f"""
         SELECT
             id::text as id,
@@ -393,6 +445,10 @@ def _fetch_images(
             title,
             prompt,
             COALESCE(thumbnail_url, image_url) as thumb_preview,
+            image_url,
+            content_hash,
+            COALESCE(inspire_status, 'auto') AS inspire_status,
+            COALESCE(quality_score, 0) AS quality_score,
             -- For images: use full image_url as "refined" if different from thumbnail
             CASE
                 WHEN thumbnail_url IS NOT NULL AND image_url IS NOT NULL AND thumbnail_url != image_url
@@ -403,8 +459,9 @@ def _fetch_images(
             height,
             created_at
         FROM timrx_app.images
-        WHERE {share_clause}
-          ((thumbnail_url IS NOT NULL AND thumbnail_url != '')
+        WHERE share_to_inspire = TRUE
+          AND COALESCE(inspire_status, 'auto') IN ('auto', 'approved')
+          AND ((thumbnail_url IS NOT NULL AND thumbnail_url != '')
             OR (image_url IS NOT NULL AND image_url != ''))
         {order}
         {limit_clause}
@@ -412,8 +469,7 @@ def _fetch_images(
 
     rows = cursor.fetchall()
     if debug:
-        scope = "shared" if shared_only else "fallback_all"
-        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} images after filtering ({scope})")
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} shared images after filtering")
     return [dict(r) for r in rows]
 
 
@@ -421,7 +477,6 @@ def _fetch_videos(
     cursor,
     limit: Optional[int] = None,
     debug: bool = False,
-    shared_only: bool = True,
 ) -> List[Dict]:
     """
     Fetch videos with valid thumbnails.
@@ -431,8 +486,6 @@ def _fetch_videos(
     order = "ORDER BY created_at DESC"
     limit_clause = f"LIMIT {limit}" if limit else ""
 
-    share_clause = "share_to_inspire = TRUE AND" if shared_only else ""
-
     cursor.execute(f"""
         SELECT
             id::text as id,
@@ -440,13 +493,17 @@ def _fetch_videos(
             title,
             prompt,
             thumbnail_url as thumb_preview,
+            content_hash,
+            COALESCE(inspire_status, 'auto') AS inspire_status,
+            COALESCE(quality_score, 0) AS quality_score,
             NULL as thumb_refined,
             video_url,
             duration_seconds,
             created_at
         FROM timrx_app.videos
-        WHERE {share_clause}
-          thumbnail_url IS NOT NULL
+        WHERE share_to_inspire = TRUE
+          AND COALESCE(inspire_status, 'auto') IN ('auto', 'approved')
+          AND thumbnail_url IS NOT NULL
           AND thumbnail_url != ''
           AND video_url IS NOT NULL
         {order}
@@ -455,8 +512,7 @@ def _fetch_videos(
 
     rows = cursor.fetchall()
     if debug:
-        scope = "shared" if shared_only else "fallback_all"
-        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} videos after filtering ({scope})")
+        print(f"[INSPIRE] DEBUG: Fetched {len(rows)} shared videos after filtering")
     return [dict(r) for r in rows]
 
 
@@ -627,11 +683,14 @@ def inspire_feed() -> Response:
         seed = request.args.get("seed")
         filter_type = request.args.get("type", "all").lower()
         mix_mode = request.args.get("mix", "balanced").lower()
+        surface = request.args.get("surface", "inspire").strip().lower()
+        if surface not in ("inspire", "homepage", "workspace"):
+            surface = "inspire"
         if mix_mode not in ("balanced", "sequential"):
             mix_mode = "balanced"
 
         # Short-circuit: return cached response if within TTL
-        _cache_key = _inspire_cache_key(limit, filter_type, mix_mode, shuffle, seed)
+        _cache_key = _inspire_cache_key(limit, filter_type, mix_mode, shuffle, seed, surface)
         cached = _get_cached_inspire(_cache_key, seed)
         if cached is not None:
             response = jsonify(cached)
@@ -639,9 +698,11 @@ def inspire_feed() -> Response:
             return response
 
         # ── DB fetch with pool→direct fallback ──
-        # Cap per-type fetch to 3x the requested limit. This prevents full table
-        # scans while leaving enough headroom for balanced mix reallocation.
+        # Models need a broader candidate pool because prompt/source curation is
+        # intentionally stricter than the image and video feeds. Both remain
+        # bounded to avoid an unbounded public-feed table scan.
         _fetch_cap = min(limit * 3, 200)
+        _model_fetch_cap = min(max(limit * 10, 200), 600)
 
         def _inspire_db_read(conn_getter):
             """Run all inspire DB reads inside one connection."""
@@ -651,37 +712,18 @@ def inspire_feed() -> Response:
                 _t_start = _itime.monotonic()
                 cursor = conn.cursor(row_factory=dict_row)
                 potd = _get_prompt_of_the_day(cursor)
-                used_shared_fallback = False
                 if filter_type == "all":
-                    models = _fetch_models(cursor, limit=_fetch_cap, debug=True)
+                    models = _fetch_models(cursor, limit=_model_fetch_cap, debug=True)
                     images = _fetch_images(cursor, limit=_fetch_cap, debug=True)
                     videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True)
-                    if not (models or images or videos):
-                        used_shared_fallback = True
-                        print("[INSPIRE] Shared feed empty, falling back to recent ready assets")
-                        models = _fetch_models(cursor, limit=_fetch_cap, debug=True, shared_only=False)
-                        images = _fetch_images(cursor, limit=_fetch_cap, debug=True, shared_only=False)
-                        videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                 elif filter_type in ("model", "models"):
-                    models = _fetch_models(cursor, limit=_fetch_cap, debug=True)
-                    if not models:
-                        used_shared_fallback = True
-                        print("[INSPIRE] Shared models feed empty, falling back to recent ready models")
-                        models = _fetch_models(cursor, limit=_fetch_cap, debug=True, shared_only=False)
+                    models = _fetch_models(cursor, limit=_model_fetch_cap, debug=True)
                     images, videos = [], []
                 elif filter_type in ("image", "images"):
                     images = _fetch_images(cursor, limit=_fetch_cap, debug=True)
-                    if not images:
-                        used_shared_fallback = True
-                        print("[INSPIRE] Shared images feed empty, falling back to recent images")
-                        images = _fetch_images(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                     models, videos = [], []
                 elif filter_type in ("video", "videos"):
                     videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True)
-                    if not videos:
-                        used_shared_fallback = True
-                        print("[INSPIRE] Shared videos feed empty, falling back to recent videos")
-                        videos = _fetch_videos(cursor, limit=_fetch_cap, debug=True, shared_only=False)
                     models, images = [], []
                 else:
                     models, images, videos = [], [], []
@@ -691,7 +733,7 @@ def inspire_feed() -> Response:
                 _ms_query = int((_t_done - _t_start) * 1000)
                 print(f"[INSPIRE] DB: conn={_ms_conn}ms query={_ms_query}ms "
                       f"models={len(models)} images={len(images)} videos={len(videos)} "
-                      f"fallback={'yes' if used_shared_fallback else 'no'}")
+                      "fallback=no")
                 return potd, models, images, videos
 
         try:
@@ -703,7 +745,12 @@ def inspire_feed() -> Response:
             else:
                 raise
 
+        models, images, videos, curation_stats = curate_feed_assets(models, images, videos)
         total_available = len(models) + len(images) + len(videos)
+        ranked_model_count = len(models)
+        models = _model_quality_window(models, limit, filter_type, surface)
+        curation_stats["models_ranked"] = ranked_model_count
+        curation_stats["models_in_quality_window"] = len(models)
         already_shuffled = False
 
         if filter_type == "all":
@@ -776,7 +823,9 @@ def inspire_feed() -> Response:
             "cards": cards,
             "total": len(cards),
             "total_available": total_available,
-            "source": "inspire"
+            "source": "inspire_curated",
+            "surface": surface,
+            "curation": curation_stats,
         }
         _set_cached_inspire(_cache_key, result)
         response = jsonify(result)
@@ -868,7 +917,79 @@ def inspire_share() -> Response:
                 if not row:
                     return jsonify({"ok": False, "error": "Asset not found or not owned by you"}), 404
             conn.commit()
+        invalidate_inspire_cache()
         return jsonify({"ok": True, "shared": share})
     except Exception as e:
         print(f"[INSPIRE] share toggle failed: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/inspire/moderate", methods=["GET", "POST", "OPTIONS"])
+@require_admin
+def inspire_moderate() -> Response:
+    """Admin review queue and moderation mutation for public-feed assets."""
+    if request.method == "OPTIONS":
+        return Response("", status=204)
+
+    table_map = {"model": "models", "image": "images", "video": "videos"}
+    if request.method == "GET":
+        asset_type = request.args.get("type", "model").strip().lower()
+        table = table_map.get(asset_type)
+        if not table:
+            return jsonify({"ok": False, "error": "Invalid asset type"}), 400
+        try:
+            limit = min(max(int(request.args.get("limit", 50)), 1), 100)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "limit must be an integer"}), 400
+        with get_conn("inspire_moderation_queue") as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(f"""
+                    SELECT id::text AS id, title, prompt, thumbnail_url,
+                           inspire_status, quality_score, moderation_reason,
+                           created_at
+                    FROM timrx_app.{table}
+                    WHERE share_to_inspire = TRUE
+                    ORDER BY
+                      CASE inspire_status WHEN 'auto' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+                      quality_score DESC,
+                      created_at DESC
+                    LIMIT %s
+                """, (limit,))
+                assets = [dict(row) for row in cur.fetchall()]
+        for asset in assets:
+            if asset.get("created_at"):
+                asset["created_at"] = asset["created_at"].isoformat()
+        return jsonify({"ok": True, "type": asset_type, "assets": assets})
+
+    body = request.get_json(silent=True) or {}
+    asset_id = str(body.get("id") or "").strip()
+    asset_type = str(body.get("type") or "").strip().lower()
+    status = str(body.get("status") or "").strip().lower()
+    reason = str(body.get("reason") or "").strip()[:500] or None
+    table = table_map.get(asset_type)
+    if not asset_id or not table or status not in {"auto", "approved", "rejected"}:
+        return jsonify({"ok": False, "error": "id, valid type, and valid status are required"}), 400
+    try:
+        score = max(-100, min(100, int(body.get("quality_score", 0))))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "quality_score must be an integer"}), 400
+
+    reviewer = getattr(g, "admin_email", None) or getattr(g, "admin_auth_method", None) or "admin"
+    with get_conn("inspire_moderation_update") as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(f"""
+                UPDATE timrx_app.{table}
+                SET inspire_status = %s,
+                    quality_score = %s,
+                    moderation_reason = %s,
+                    curated_at = NOW(),
+                    curated_by = %s
+                WHERE id = %s
+                RETURNING id::text AS id
+            """, (status, score, reason, reviewer, asset_id))
+            row = cur.fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "Asset not found"}), 404
+        conn.commit()
+    invalidate_inspire_cache()
+    return jsonify({"ok": True, "id": str(row["id"]), "status": status, "quality_score": score})
