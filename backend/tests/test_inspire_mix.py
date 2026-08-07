@@ -108,3 +108,23 @@ def test_homepage_shuffles_only_inside_ranked_model_window(monkeypatch):
     assert data["surface"] == "homepage"
     assert data["curation"]["models_ranked"] == 120
     assert data["curation"]["models_in_quality_window"] == 16
+
+
+def test_empty_public_feed_uses_real_bundled_assets(monkeypatch):
+    client = _build_test_client(monkeypatch)
+    monkeypatch.setattr(inspire_module, "_fetch_models", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(inspire_module, "_fetch_images", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(inspire_module, "_fetch_videos", lambda *_args, **_kwargs: [])
+
+    res = client.get(
+        "/api/_mod/inspire/feed?surface=workspace&type=all&limit=18&shuffle=false&mix=balanced"
+    )
+
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["source"] == "inspire_bundled"
+    assert data["total"] == 18
+    assert {card["type"] for card in data["cards"]} == {"model", "image", "video"}
+    assert all(not card["thumb_preview"].startswith("data:image/svg") for card in data["cards"])
+    assert all(card.get("glb_url") for card in data["cards"] if card["type"] == "model")
+    assert all(card.get("video_url") for card in data["cards"] if card["type"] == "video")

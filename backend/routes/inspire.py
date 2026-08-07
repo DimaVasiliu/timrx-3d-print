@@ -144,6 +144,69 @@ CURATED_PROMPT_LIBRARY: List[Dict[str, str]] = [
     },
 ]
 
+
+def _bundled_fallback_assets() -> List[Dict[str, Any]]:
+    """Return real TimrX showcase files when no DB rows are publicly shared."""
+    model_prompts = [
+        "detailed fantasy creature collectible with a clean game-ready silhouette",
+        "stylized character model prepared for a polished 3D workflow",
+        "production-ready sci-fi character with refined surface detail",
+        "ornate fantasy model built as a premium digital collectible",
+        "detailed creature sculpture with a strong printable silhouette",
+        "hero character asset with cinematic materials and proportions",
+    ]
+    image_prompts = [
+        "cinematic AI concept artwork generated in TimrX",
+        "detailed editorial visual generated in TimrX",
+        "premium character artwork generated in TimrX",
+        "atmospheric production artwork generated in TimrX",
+        "high-detail creative image generated in TimrX",
+        "polished AI visual generated in TimrX",
+    ]
+    video_prompts = [
+        "cinematic motion study generated in TimrX",
+        "short-form AI video generated in TimrX",
+        "dynamic character sequence generated in TimrX",
+        "cinematic environment clip generated in TimrX",
+        "creative motion concept generated in TimrX",
+        "production-style AI video generated in TimrX",
+    ]
+    assets: List[Dict[str, Any]] = []
+    for index, prompt in enumerate(model_prompts, start=1):
+        assets.append({
+            "id": f"repo-model-{index}",
+            "type": "model",
+            "title": prompt.capitalize(),
+            "prompt": prompt,
+            "thumb_preview": f"/img/model-posters/mod{index}.png",
+            "glb_url": f"/vid/models/mod{index}.glb",
+            "created_at": None,
+        })
+    for index, prompt in enumerate(image_prompts, start=1):
+        filename = f"AI-img-gen-{index}.png" if index < 6 else "AI-img-gen-6%2019.07.03.png"
+        assets.append({
+            "id": f"repo-image-{index}",
+            "type": "image",
+            "title": prompt.capitalize(),
+            "prompt": prompt,
+            "thumb_preview": f"/img/{filename}",
+            "width": 1024,
+            "height": 1280,
+            "created_at": None,
+        })
+    for index, prompt in enumerate(video_prompts, start=1):
+        assets.append({
+            "id": f"repo-video-{index}",
+            "type": "video",
+            "title": prompt.capitalize(),
+            "prompt": prompt,
+            "thumb_preview": f"/img/video-posters/vid{index}.jpg",
+            "video_url": f"/vid/vid{index}.mp4",
+            "duration_seconds": 5,
+            "created_at": None,
+        })
+    return assets
+
 # ── Inspire feed response cache ──
 # The feed content changes slowly (admin publishes models/images/videos).
 # Seeded requests produce deterministic results, so cache by full param set.
@@ -747,6 +810,14 @@ def inspire_feed() -> Response:
 
         models, images, videos, curation_stats = curate_feed_assets(models, images, videos)
         total_available = len(models) + len(images) + len(videos)
+        using_bundled_fallback = total_available == 0
+        if using_bundled_fallback:
+            bundled = _bundled_fallback_assets()
+            models = [item for item in bundled if item["type"] == "model"]
+            images = [item for item in bundled if item["type"] == "image"]
+            videos = [item for item in bundled if item["type"] == "video"]
+            total_available = len(bundled)
+            curation_stats["bundled_fallback"] = total_available
         ranked_model_count = len(models)
         models = _model_quality_window(models, limit, filter_type, surface)
         curation_stats["models_ranked"] = ranked_model_count
@@ -823,7 +894,7 @@ def inspire_feed() -> Response:
             "cards": cards,
             "total": len(cards),
             "total_available": total_available,
-            "source": "inspire_curated",
+            "source": "inspire_bundled" if using_bundled_fallback else "inspire_curated",
             "surface": surface,
             "curation": curation_stats,
         }
