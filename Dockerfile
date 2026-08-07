@@ -30,4 +30,4 @@ COPY . .
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "gunicorn backend.app_modular:app --workers ${WEB_CONCURRENCY:-1} --threads 2 --timeout 300 --bind 0.0.0.0:${PORT:-10000}"]
+CMD ["sh", "-c", "gunicorn app_modular:app --workers ${WEB_CONCURRENCY:-1} --threads 2 --timeout 300 --bind 0.0.0.0:${PORT:-10000}"]
