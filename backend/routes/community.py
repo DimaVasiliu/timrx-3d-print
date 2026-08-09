@@ -410,6 +410,155 @@ def community_feed_mod():
         return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
 
 
+@bp.route("/community/showcase-models", methods=["GET", "OPTIONS"])
+def community_showcase_models_mod():
+    """Curated public GLB models for the workspace background carousel.
+
+    This intentionally does not expose the full model table. It only returns
+    published community posts with a loadable GLB/animated GLB, ranked and
+    capped for decorative showcase use.
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if not USE_DB:
+        return jsonify({"ok": False, "error": {"code": "DB_UNAVAILABLE", "message": "Database not configured"}}), 503
+
+    try:
+        limit = min(max(int(request.args.get("limit", 10)), 4), 12)
+        min_score = max(float(request.args.get("min_score", 0)), 0)
+        sort_key = (request.args.get("sort") or "curated").strip().lower()
+        search_query = _normalize_search_query(request.args.get("q"))
+
+        order_by_sql = {
+            "newest": "created_at DESC",
+            "popular": "score DESC, created_at DESC",
+            "curated": "score DESC, created_at DESC",
+            "trending": "(score / GREATEST((EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600.0) + 2.0, 1.0)) DESC, created_at DESC",
+        }.get(sort_key, "score DESC, created_at DESC")
+
+        search_sql = ""
+        params: list = []
+        if search_query:
+            like = f"%{search_query}%"
+            search_sql = """
+                AND (
+                    COALESCE(cp.prompt_public, '') ILIKE %s
+                    OR COALESCE(cp.display_name, '') ILIKE %s
+                    OR COALESCE(m.title, '') ILIKE %s
+                    OR COALESCE(h.title, '') ILIKE %s
+                )
+            """
+            params.extend([like, like, like, like])
+
+        params.extend([min_score, limit])
+
+        with get_conn("community_showcase_models") as conn:
+            cursor = _cur(conn)
+            cursor.execute(f"""
+                WITH metrics AS (
+                    SELECT
+                        cp.id AS post_id,
+                        COALESCE(rc.reaction_count, 0)::float AS reaction_count,
+                        COALESCE(tc.tip_total, 0)::float AS tip_total,
+                        COALESCE(cc.comment_count, 0)::float AS comment_count
+                    FROM timrx_app.community_posts cp
+                    LEFT JOIN (
+                        SELECT post_id, COUNT(*)::int AS reaction_count
+                        FROM timrx_app.community_reactions
+                        GROUP BY post_id
+                    ) rc ON rc.post_id = cp.id
+                    LEFT JOIN (
+                        SELECT post_id, COALESCE(SUM(amount), 0)::int AS tip_total
+                        FROM timrx_app.community_tips
+                        GROUP BY post_id
+                    ) tc ON tc.post_id = cp.id
+                    LEFT JOIN (
+                        SELECT post_id, COUNT(*)::int AS comment_count
+                        FROM timrx_app.community_comments
+                        WHERE status = 'published'
+                        GROUP BY post_id
+                    ) cc ON cc.post_id = cp.id
+                ),
+                showcase AS (
+                    SELECT
+                        cp.id::text AS post_id,
+                        COALESCE(m.id::text, h.id::text) AS asset_id,
+                        COALESCE(NULLIF(m.title, ''), NULLIF(h.title, ''), 'Community model') AS title,
+                        COALESCE(NULLIF(h.payload->>'animation_glb_url', ''), NULLIF(h.glb_url, ''), NULLIF(m.glb_url, '')) AS glb_url,
+                        COALESCE(NULLIF(m.thumbnail_url, ''), NULLIF(h.thumbnail_url, '')) AS thumbnail_url,
+                        CASE WHEN cp.show_prompt THEN cp.prompt_public ELSE NULL END AS prompt,
+                        cp.display_name,
+                        cp.created_at,
+                        (
+                            metrics.reaction_count
+                            + (metrics.comment_count * 2.0)
+                            + (metrics.tip_total * 0.2)
+                        ) AS score
+                    FROM timrx_app.community_posts cp
+                    LEFT JOIN timrx_app.models m ON cp.model_id = m.id
+                    LEFT JOIN timrx_app.history_items h ON cp.history_item_id = h.id
+                    LEFT JOIN metrics ON metrics.post_id = cp.id
+                    WHERE cp.status = 'published'
+                      AND cp.deleted_at IS NULL
+                      AND (
+                          (cp.model_id IS NOT NULL AND NULLIF(m.glb_url, '') IS NOT NULL)
+                          OR (
+                              cp.history_item_id IS NOT NULL
+                              AND COALESCE(h.item_type, '') != 'video'
+                              AND (
+                                  NULLIF(h.payload->>'animation_glb_url', '') IS NOT NULL
+                                  OR NULLIF(h.glb_url, '') IS NOT NULL
+                              )
+                          )
+                      )
+                      {search_sql}
+                )
+                SELECT post_id, asset_id, title, glb_url, thumbnail_url, prompt, display_name, created_at, score
+                FROM showcase
+                WHERE glb_url IS NOT NULL AND score >= %s
+                ORDER BY {order_by_sql}
+                LIMIT %s
+            """, tuple(params))
+            rows = cursor.fetchall()
+            cursor.close()
+
+        models = []
+        for row in rows:
+            post_id, asset_id, title, glb_url, thumbnail_url, prompt, display_name, created_at, score = row
+            models.append({
+                "id": asset_id or post_id,
+                "post_id": post_id,
+                "name": title,
+                "url": glb_url,
+                "thumbnail_url": thumbnail_url,
+                "prompt": prompt,
+                "display_name": display_name,
+                "created_at": created_at.isoformat() if created_at else None,
+                "score": float(score or 0),
+                "source": "community",
+            })
+
+        return jsonify({
+            "ok": True,
+            "models": models,
+            "count": len(models),
+            "filters": {
+                "type": "model",
+                "visibility": "published",
+                "min_score": min_score,
+                "sort": sort_key,
+                "q": search_query,
+                "limit": limit,
+            },
+        })
+
+    except Exception as e:
+        print(f"[COMMUNITY][mod] Error in showcase models: {e}")
+        print(traceback.format_exc())
+        return jsonify({"ok": False, "error": {"code": "SERVER_ERROR", "message": "Something went wrong. Please try again."}}), 500
+
+
 @bp.route("/community/stats", methods=["GET", "OPTIONS"])
 def community_stats_mod():
     if request.method == "OPTIONS":
