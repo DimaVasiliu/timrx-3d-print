@@ -22,10 +22,19 @@ from backend.db import USE_DB, get_conn, Tables, query_one
 
 ACTION_CODE_COST_USD: Dict[str, float] = {
     # Meshy 3D generation
-    "MESHY_TEXT_TO_3D":   0.05,
-    "MESHY_IMAGE_TO_3D":  0.06,
-    "MESHY_REFINE":       0.03,
-    "MESHY_RETEXTURE":    0.02,
+    "MESHY_TEXT_TO_3D":   0.40,
+    "MESHY_IMAGE_TO_3D":  0.60,
+    "MESHY_REFINE":       0.20,
+    "MESHY_REMESH":       0.10,
+    "MESHY_RETEXTURE":    0.20,
+    "MESHY_CONVERT":      0.02,
+    "MESHY_RESIZE":       0.02,
+    "MESHY_UV_UNWRAP":    0.10,
+    "MESHY_PRINT_REPAIR": 0.20,
+    "MESHY_PRINT_ANALYZE": 0.00,
+    "MESHY_RIGGING":      0.10,
+    "MESHY_ANIMATION":    0.06,
+    "MESHY_MULTI_COLOR_PRINT": 0.20,
 
     # OpenAI image generation (gpt-image-1)
     "OPENAI_IMAGE":       0.04,

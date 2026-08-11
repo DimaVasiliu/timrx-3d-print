@@ -19,13 +19,102 @@ from backend.services.credits_helper import finalize_job_credits, get_current_ba
 from backend.services.identity_service import require_identity
 from backend.services.history_service import get_canonical_model_row
 from backend.services.job_service import create_internal_job_row, get_job_by_idempotency_key, get_job_metadata, load_store, resolve_meshy_job_id, save_store, verify_job_ownership_detailed, _update_job_status_ready
-from backend.services.meshy_service import build_source_payload, mesh_get, mesh_post, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_service import (
+    MESHY_STANDARD_MODELS,
+    build_source_payload,
+    expected_meshy_platform_cost,
+    mesh_get,
+    mesh_post,
+    meshy_alpha_thumbnail,
+    meshy_texture_resolution,
+    normalize_meshy_model,
+    normalize_meshy_task,
+    normalize_target_formats,
+    MeshyTaskNotFoundError,
+    terminalize_expired_meshy_job,
+)
 from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.status_cache import get_cached_status, cache_status
 from backend.utils.helpers import log_event, log_status_summary, now_s
 
 bp = Blueprint("mesh_operations", __name__)
+
+
+def _start_mesh_processing_task(
+    *,
+    body: dict,
+    identity_id: str,
+    action_key: str,
+    stage: str,
+    provider_path: str,
+    payload: dict,
+    source_task_id: str | None,
+    source_task_id_input: str | None,
+    meta_extra: dict | None = None,
+):
+    """Start a Meshy async mesh-processing task that shares remesh status handling."""
+    internal_job_id = str(uuid.uuid4())
+    store = load_store()
+    source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
+    original_prompt = source_meta.get("prompt") or body.get("prompt") or ""
+    root_prompt = source_meta.get("root_prompt") or original_prompt
+    title = derive_display_title(original_prompt, body.get("title") or source_meta.get("title"), root_prompt=root_prompt)
+    job_meta = {
+        "prompt": original_prompt,
+        "root_prompt": root_prompt,
+        "title": title,
+        "stage": stage,
+        "source_task_id": source_task_id,
+        **(meta_extra or {}),
+    }
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
+
+    create_internal_job_row(
+        internal_job_id=internal_job_id,
+        identity_id=identity_id,
+        provider="meshy",
+        action_key=action_key,
+        prompt=original_prompt,
+        meta=job_meta,
+        reservation_id=reservation_id,
+        status="queued",
+    )
+
+    try:
+        resp = mesh_post(provider_path, payload)
+        log_event(f"mesh/{stage}:meshy-resp[mod]", resp)
+        meshy_task_id = resp.get("result") or resp.get("id")
+        if not meshy_task_id:
+            release_job_credits(reservation_id, "meshy_no_job_id", internal_job_id)
+            return jsonify({"ok": False, "error": "MODEL_PROCESSING_FAILED", "message": "Mesh processing failed. Please try again."}), 502
+    except Exception as e:
+        release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
+        from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+        return jsonify(sanitize_provider_error(provider="meshy", error=e, job_id=internal_job_id, code=MODEL_GENERATION_FAILED)), 502
+
+    update_job_with_upstream_id(internal_job_id, meshy_task_id)
+    store[meshy_task_id] = {
+        **job_meta,
+        "created_at": now_s() * 1000,
+        "user_id": identity_id,
+        "identity_id": identity_id,
+        "reservation_id": reservation_id,
+        "internal_job_id": internal_job_id,
+    }
+    save_store(store)
+
+    balance_info = get_current_balance(identity_id)
+    return jsonify({
+        "ok": True,
+        "job_id": meshy_task_id,
+        "reservation_id": reservation_id,
+        "new_balance": balance_info["available"] if balance_info else None,
+        "source": "modular",
+    })
 
 
 def _resolve_and_validate_source_task(source_task_id_input: str, store: dict) -> tuple[str | None, dict | None]:
@@ -99,45 +188,41 @@ def mesh_remesh_mod():
             }), 409
 
     internal_job_id = str(uuid.uuid4())
-    action_key = ACTION_KEYS["remesh"]
-    raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "fbx", "obj", "usdz", "blend", "stl", "3mf"}
-    target_formats = []
-    if isinstance(raw_target_formats, str):
-        raw_target_formats = [raw_target_formats]
-    if isinstance(raw_target_formats, list):
-        seen_formats = set()
-        for item in raw_target_formats:
-            value = str(item or "").strip().lower()
-            if not value:
-                continue
-            if value not in allowed_target_formats:
-                return jsonify({"ok": False, "error": f"Unsupported target format: {value}"}), 400
-            if value in seen_formats:
-                continue
-            seen_formats.add(value)
-            target_formats.append(value)
+    convert_format_only = False
+    if body.get("convert_format_only") is not None:
+        convert_format_only = bool(body.get("convert_format_only"))
+    action_key = ACTION_KEYS["convert"] if convert_format_only else ACTION_KEYS["remesh"]
+    try:
+        target_formats = normalize_target_formats(
+            body.get("target_formats"),
+            allowed={"glb", "fbx", "obj", "usdz", "blend", "stl", "3mf"},
+            require_glb=not convert_format_only,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    alpha_thumbnail = meshy_alpha_thumbnail(body)
 
     payload = {**source}
 
-    topology = (body.get("topology") or "").strip().lower()
-    if topology in {"triangle", "quad"}:
-        payload["topology"] = topology
-    try:
-        decimation_mode = int(body.get("decimation_mode"))
-        if decimation_mode in {1, 2, 3, 4}:
-            payload["decimation_mode"] = decimation_mode
-    except Exception:
-        pass
-    try:
-        tp = int(body.get("target_polycount"))
-        if tp > 0 and "decimation_mode" not in payload:
-            payload["target_polycount"] = tp
-    except Exception:
-        pass
+    if not convert_format_only:
+        topology = (body.get("topology") or "").strip().lower()
+        if topology in {"triangle", "quad"}:
+            payload["topology"] = topology
+        try:
+            decimation_mode = int(body.get("decimation_mode"))
+            if decimation_mode in {1, 2, 3, 4}:
+                payload["decimation_mode"] = decimation_mode
+        except Exception:
+            pass
+        try:
+            tp = int(body.get("target_polycount"))
+            if tp > 0 and "decimation_mode" not in payload:
+                payload["target_polycount"] = tp
+        except Exception:
+            pass
 
     auto_size = False
-    if body.get("auto_size") is not None:
+    if body.get("auto_size") is not None and not convert_format_only:
         auto_size = bool(body.get("auto_size"))
         payload["auto_size"] = auto_size
 
@@ -166,13 +251,8 @@ def mesh_remesh_mod():
         pass
 
     origin_at = (body.get("origin_at") or "").strip().lower()
-    if origin_at in {"bottom", "center"}:
+    if origin_at in {"bottom", "center"} and not convert_format_only:
         payload["origin_at"] = origin_at
-
-    convert_format_only = False
-    if body.get("convert_format_only") is not None:
-        convert_format_only = bool(body.get("convert_format_only"))
-        payload["convert_format_only"] = convert_format_only
 
     if convert_format_only and not target_formats:
         return jsonify({"ok": False, "error": "target_formats required when convert_format_only is enabled"}), 400
@@ -185,6 +265,8 @@ def mesh_remesh_mod():
         target_formats.insert(0, "glb")
 
     payload["target_formats"] = target_formats
+    if alpha_thumbnail is not None and not convert_format_only:
+        payload["alpha_thumbnail"] = alpha_thumbnail
 
     # Check for source task ID in various field names (frontend sends input_task_id)
     source_task_id_input = body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id")
@@ -212,7 +294,7 @@ def mesh_remesh_mod():
         "prompt": original_prompt,
         "root_prompt": root_prompt,
         "title": title,
-        "stage": "remesh",
+        "stage": "convert" if convert_format_only else "remesh",
         "source_task_id": source_task_id,  # Use resolved ID
         "topology": payload.get("topology"),
         "target_polycount": payload.get("target_polycount"),
@@ -223,6 +305,7 @@ def mesh_remesh_mod():
         "auto_size": bool(payload.get("auto_size")),
         "origin_at": payload.get("origin_at"),
         "convert_format_only": convert_format_only,
+        "alpha_thumbnail": bool(alpha_thumbnail),
         "print_height_mm": print_height_mm,
     }
 
@@ -269,7 +352,8 @@ def mesh_remesh_mod():
         }), 503
 
     try:
-        resp = mesh_post("/openapi/v1/remesh", payload)
+        endpoint_path = "/openapi/v1/convert" if convert_format_only else "/openapi/v1/remesh"
+        resp = mesh_post(endpoint_path, payload)
         log_event("mesh/remesh:meshy-resp[mod]", resp)
         meshy_task_id = resp.get("result") or resp.get("id")
         if not meshy_task_id:
@@ -291,7 +375,7 @@ def mesh_remesh_mod():
     update_job_with_upstream_id(internal_job_id, meshy_task_id)
 
     store[meshy_task_id] = {
-        "stage": "remesh",
+        "stage": "convert" if convert_format_only else "remesh",
         "source_task_id": source_task_id,
         "created_at": now_s() * 1000,
         "prompt": original_prompt,
@@ -324,6 +408,115 @@ def mesh_remesh_mod():
     })
 
 
+@bp.route("/mesh/convert", methods=["POST", "OPTIONS"])
+@with_session
+def mesh_convert_mod():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    body = request.get_json(silent=True) or {}
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="model_url")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    try:
+        target_formats = normalize_target_formats(
+            body.get("target_formats"),
+            allowed={"glb", "fbx", "obj", "usdz", "blend", "stl", "3mf"},
+            require_glb=False,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    if not target_formats:
+        return jsonify({"ok": False, "error": "target_formats required"}), 400
+    return _start_mesh_processing_task(
+        body=body,
+        identity_id=identity_id,
+        action_key=ACTION_KEYS["convert"],
+        stage="convert",
+        provider_path="/openapi/v1/convert",
+        payload={**source, "target_formats": target_formats},
+        source_task_id=source.get("input_task_id") or body.get("source_task_id"),
+        source_task_id_input=body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id"),
+        meta_extra={"target_formats": target_formats},
+    )
+
+
+@bp.route("/mesh/resize", methods=["POST", "OPTIONS"])
+@with_session
+def mesh_resize_mod():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    body = request.get_json(silent=True) or {}
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="model_url")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    resize_fields = []
+    payload = {**source}
+    for key in ("resize_height", "resize_longest_side"):
+        try:
+            val = float(body.get(key))
+            if val > 0:
+                payload[key] = val
+                resize_fields.append(key)
+        except (TypeError, ValueError):
+            pass
+    if body.get("auto_size") is not None and bool(body.get("auto_size")):
+        payload["auto_size"] = True
+        resize_fields.append("auto_size")
+    if len(resize_fields) != 1:
+        return jsonify({"ok": False, "error": "Exactly one of resize_height, resize_longest_side, or auto_size is required"}), 400
+    origin_at = (body.get("origin_at") or "").strip().lower()
+    if origin_at in {"bottom", "center"}:
+        payload["origin_at"] = origin_at
+    return _start_mesh_processing_task(
+        body=body,
+        identity_id=identity_id,
+        action_key=ACTION_KEYS["resize"],
+        stage="resize",
+        provider_path="/openapi/v1/resize",
+        payload=payload,
+        source_task_id=source.get("input_task_id") or body.get("source_task_id"),
+        source_task_id_input=body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id"),
+        meta_extra={k: payload.get(k) for k in ("resize_height", "resize_longest_side", "auto_size", "origin_at") if k in payload},
+    )
+
+
+@bp.route("/mesh/uv-unwrap", methods=["POST", "OPTIONS"])
+@with_session
+def mesh_uv_unwrap_mod():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not MESHY_API_KEY:
+        return jsonify({"ok": False, "error": "MESHY_API_KEY not configured"}), 503
+    identity_id, auth_error = require_identity()
+    if auth_error:
+        return auth_error
+    body = request.get_json(silent=True) or {}
+    source, err = build_source_payload(body, identity_id=identity_id, prefer="input_task_id")
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return _start_mesh_processing_task(
+        body=body,
+        identity_id=identity_id,
+        action_key=ACTION_KEYS["uv-unwrap"],
+        stage="uv_unwrap",
+        provider_path="/openapi/v1/uv-unwrap",
+        payload={**source},
+        source_task_id=source.get("input_task_id") or body.get("source_task_id"),
+        source_task_id_input=body.get("source_task_id") or body.get("model_task_id") or body.get("input_task_id"),
+    )
+
+
 @bp.route("/mesh/remesh/<job_id>", methods=["GET", "OPTIONS"])
 @with_session_readonly
 def mesh_remesh_status_mod(job_id: str):
@@ -345,9 +538,23 @@ def mesh_remesh_status_mod(job_id: str):
     if not ownership["authorized"]:
         return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
 
+    store = load_store()
+    meta = get_job_metadata(job_id, store)
+    stage_hint = meta.get("stage") or ""
+    if bool(meta.get("convert_format_only")):
+        stage_hint = "convert"
+    provider_path_by_stage = {
+        "convert": "convert",
+        "resize": "resize",
+        "uv_unwrap": "uv-unwrap",
+        "uv-unwrap": "uv-unwrap",
+    }
+    provider_path = provider_path_by_stage.get(stage_hint, "remesh")
+    stage = stage_hint if stage_hint in provider_path_by_stage else "remesh"
+
     try:
-        ms = mesh_get(f"/openapi/v1/remesh/{job_id}")
-        log_event("mesh/remesh/status:meshy-resp[mod]", ms)
+        ms = mesh_get(f"/openapi/v1/{provider_path}/{job_id}")
+        log_event(f"mesh/{stage}/status:meshy-resp[mod]", ms)
     except MeshyTaskNotFoundError:
         print(f"[MESHY] Task expired: remesh job_id={job_id}")
         terminalize_expired_meshy_job(job_id, identity_id)
@@ -355,7 +562,7 @@ def mesh_remesh_status_mod(job_id: str):
     except Exception as e:
         print(f"[PROVIDER_ERROR] provider=meshy job_id={job_id} error={e}")
         return jsonify({"error": "MODEL_GENERATION_FAILED", "message": "Failed to fetch job status. Please try again."}), 502
-    out = normalize_meshy_task(ms, stage="remesh")
+    out = normalize_meshy_task(ms, stage=stage)
 
     # Extract STL URL from model_urls if available
     stl_url = None
@@ -393,8 +600,6 @@ def mesh_remesh_status_mod(job_id: str):
             print(f"[mesh/remesh] credit finalize on done failed: {e}")
 
     if out["status"] == "done" and (out.get("glb_url") or out.get("thumbnail_url")):
-        store = load_store()
-        meta = get_job_metadata(job_id, store)
         if identity_id and not meta.get("identity_id"):
             meta["identity_id"] = identity_id
             meta["user_id"] = identity_id
@@ -537,12 +742,40 @@ def mesh_retexture_mod():
     if source_mode == "model_url":
         force_no_original_uv = True  # external/S3 models: let Meshy create fresh UVs
 
+    try:
+        ai_model = normalize_meshy_model(
+            body.get("ai_model") or body.get("model"),
+            default="latest",
+            allowed=MESHY_STANDARD_MODELS,
+        )
+        texture_resolution = meshy_texture_resolution(body, ai_model)
+        target_formats = normalize_target_formats(body.get("target_formats"), allowed={"glb", "obj", "fbx", "stl", "usdz", "3mf"})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    alpha_thumbnail = meshy_alpha_thumbnail(body)
+
+    raw_multiview = body.get("multiview_image_urls")
+    multiview_image_urls: list[str] = []
+    if isinstance(raw_multiview, str):
+        raw_multiview = [raw_multiview]
+    if isinstance(raw_multiview, list):
+        multiview_image_urls = [str(u or "").strip() for u in raw_multiview if str(u or "").strip()]
+        if not (1 <= len(multiview_image_urls) <= 4):
+            return jsonify({"error": "multiview_image_urls must contain 1-4 image URLs"}), 400
+        if ai_model not in {"meshy-7", "latest"}:
+            return jsonify({"error": "multiview_image_urls requires ai_model meshy-7 or latest"}), 400
+
     # ── Prompt handling ──────────────────────────────────────────────────
     prompt = (body.get("text_style_prompt") or "").strip()
     negative_prompt = normalize_negative_prompt(body.get("negative_prompt") or body.get("texture_negative_prompt"))
     style_img = (body.get("image_style_url") or "").strip()
-    if not prompt and not style_img:
-        return jsonify({"error": "text_style_prompt or image_style_url required"}), 400
+    if multiview_image_urls:
+        prompt = ""
+        style_img = ""
+    elif style_img:
+        prompt = ""
+    if not prompt and not style_img and not multiview_image_urls:
+        return jsonify({"error": "text_style_prompt, image_style_url, or multiview_image_urls required"}), 400
 
     # Sanitize: ensure prompt describes texture style, not model geometry
     original_prompt_len = len(prompt)
@@ -580,28 +813,7 @@ def mesh_retexture_mod():
 
     enable_pbr = bool(body.get("enable_pbr", False))
     remove_lighting = bool(body.get("remove_lighting", True))
-    ai_model = (body.get("ai_model") or "").strip() or "latest"
-    hd_texture = bool(body.get("hd_texture", False)) if ai_model != "meshy-5" else False
-
-    raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
-    target_formats = []
-    if isinstance(raw_target_formats, str):
-        raw_target_formats = [raw_target_formats]
-    if isinstance(raw_target_formats, list):
-        seen_formats = set()
-        for item in raw_target_formats:
-            value = str(item or "").strip().lower()
-            if not value:
-                continue
-            if value not in allowed_target_formats:
-                return jsonify({"error": f"Unsupported target format: {value}"}), 400
-            if value in seen_formats:
-                continue
-            seen_formats.add(value)
-            target_formats.append(value)
-
-    if ai_model == "meshy-5":
+    if ai_model != "meshy-6":
         remove_lighting = False
 
     # ── Final source validation BEFORE reserving credits ─────────────────
@@ -623,12 +835,16 @@ def mesh_retexture_mod():
         "texture_prompt": prompt or None,
         "texture_style_mode": "image" if style_img else "text",
         "uses_image_style": bool(style_img),
+        "uses_multiview_style": bool(multiview_image_urls),
         "enable_pbr": enable_pbr,
         "enable_original_uv": enable_original_uv,
         "remove_lighting": remove_lighting,
-        "hd_texture": hd_texture,
+        "texture_resolution": texture_resolution or "2k",
+        "hd_texture": texture_resolution == "4k",
+        "alpha_thumbnail": bool(alpha_thumbnail),
         "target_formats": target_formats,
         "ai_model": ai_model,
+        "expected_cost": expected_meshy_platform_cost(10, texture_resolution=texture_resolution),
     }
     if negative_prompt:
         job_meta["negative_prompt"] = negative_prompt
@@ -655,16 +871,20 @@ def mesh_retexture_mod():
         "enable_pbr": enable_pbr,
         "remove_lighting": remove_lighting,
     }
-    if hd_texture:
-        payload["hd_texture"] = hd_texture
+    if texture_resolution:
+        payload["texture_resolution"] = texture_resolution
     if prompt:
         payload["text_style_prompt"] = prompt
-    if style_img:
+    elif style_img:
         payload["image_style_url"] = style_img
+    elif multiview_image_urls:
+        payload["multiview_image_urls"] = multiview_image_urls
     if ai_model:
         payload["ai_model"] = ai_model
     if target_formats:
         payload["target_formats"] = target_formats
+    if alpha_thumbnail is not None:
+        payload["alpha_thumbnail"] = alpha_thumbnail
 
     # ── Structured diagnostics ───────────────────────────────────────────
     _log_retexture_diagnostics(

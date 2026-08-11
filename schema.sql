@@ -113,7 +113,13 @@ VALUES
  ('MESHY_TEXT_TO_3D',  20, 'meshy'),
  ('MESHY_IMAGE_TO_3D', 30, 'meshy'),
  ('MESHY_REFINE',      10, 'meshy'),
- ('MESHY_RETEXTURE',   15, 'meshy'),
+ ('MESHY_REMESH',       5, 'meshy'),
+ ('MESHY_RETEXTURE',   10, 'meshy'),
+ ('MESHY_CONVERT',      1, 'meshy'),
+ ('MESHY_RESIZE',       1, 'meshy'),
+ ('MESHY_UV_UNWRAP',    5, 'meshy'),
+ ('MESHY_PRINT_ANALYZE', 0, 'meshy'),
+ ('MESHY_PRINT_REPAIR', 10, 'meshy'),
  ('OPENAI_IMAGE',      10, 'openai'),
  ('OPENAI_IMAGE_2K',   15, 'openai'),
  ('OPENAI_IMAGE_4K',   20, 'openai'),
@@ -430,9 +436,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_models_provider_content_hash
 ON timrx_app.models(provider, content_hash)
 WHERE content_hash IS NOT NULL;
 
-ALTER TABLE timrx_app.models
-ADD CONSTRAINT IF NOT EXISTS models_provider_upstream_id_uniq UNIQUE (provider, upstream_id);
-
 CREATE UNIQUE INDEX IF NOT EXISTS ux_models_provider_upstream
 ON timrx_app.models(provider, upstream_id)
 WHERE upstream_id IS NOT NULL;
@@ -491,9 +494,6 @@ CREATE TABLE IF NOT EXISTS timrx_app.images (
 
 ALTER TABLE timrx_app.images
 ADD COLUMN IF NOT EXISTS content_hash TEXT;
-
-ALTER TABLE timrx_app.images
-ADD CONSTRAINT IF NOT EXISTS images_provider_upstream_id_uniq UNIQUE (provider, upstream_id);
 
 CREATE INDEX IF NOT EXISTS idx_images_identity_created
 ON timrx_app.images(identity_id, created_at DESC);
@@ -663,13 +663,9 @@ ALTER TABLE timrx_app.asset_saves
 ALTER TABLE timrx_app.asset_saves
   DROP CONSTRAINT IF EXISTS asset_saves_provider_upstream_id_stage_key;
 
-ALTER TABLE timrx_app.asset_saves
-  ADD CONSTRAINT IF NOT EXISTS asset_saves_provider_upstream_asset_type_uniq
-  UNIQUE (provider, upstream_id, asset_type);
-
-ALTER TABLE timrx_app.asset_saves
-  ADD CONSTRAINT IF NOT EXISTS asset_saves_provider_upstream_asset_type_uniq_idx
-  UNIQUE (provider, upstream_id, asset_type);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_asset_saves_provider_upstream_asset_type
+ON timrx_app.asset_saves(provider, upstream_id, asset_type)
+WHERE upstream_id IS NOT NULL AND asset_type IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_asset_saves_upstream
 ON timrx_app.asset_saves(provider, upstream_id, stage);

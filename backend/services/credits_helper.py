@@ -121,7 +121,13 @@ PAID_GENERATION_ACTIONS = frozenset({
     "refine",
     "remesh",
     "retexture",
+    "convert",
+    "resize",
+    "uv_unwrap",
+    "print_repair",
     "rigging",
+    "animation",
+    "multi_color_print",
 })
 
 

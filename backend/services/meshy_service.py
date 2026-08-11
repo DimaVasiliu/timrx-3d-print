@@ -34,16 +34,96 @@ class MeshyTaskNotFoundError(RuntimeError):
     pass
 
 
+MESHY_MODEL_FORMATS = {"glb", "obj", "fbx", "stl", "usdz", "blend", "3mf"}
+MESHY_TEXTURE_RESOLUTIONS = {"2k", "4k", "8k"}
+MESHY_STANDARD_MODELS = {"meshy-5", "meshy-6", "meshy-7", "latest"}
+MESHY_TEXT_REFINE_MODELS = {"meshy-5", "meshy-6", "latest"}
+MESHY_SMART_TOPOLOGY_MODELS = {"meshy-t1", "meshy-t2"}
+
+
 def _filter_model_urls(urls: Any) -> dict:
-    """Filter model URLs dict to include glb, obj, stl, and 3mf formats."""
+    """Filter model URLs dict to include every Meshy export format we surface."""
     if not isinstance(urls, dict):
         return {}
     filtered: dict[str, str] = {}
-    for key in ("glb", "obj", "stl", "3mf"):
+    for key in ("glb", "obj", "fbx", "stl", "usdz", "blend", "3mf", "pre_remeshed_glb"):
         val = urls.get(key)
         if val:
             filtered[key] = val
     return filtered
+
+
+def normalize_meshy_model(value: Any, *, default: str = "latest", allowed: set[str] | None = None) -> str:
+    """Normalize and validate a Meshy model identifier without accepting retired Meshy 4 values."""
+    model = str(value or default).strip().lower() or default
+    if model in {"meshy-4", "meshy4"}:
+        raise ValueError("Meshy 4 is no longer supported. Use meshy-5, meshy-6, meshy-7, or latest.")
+    if allowed and model not in allowed:
+        raise ValueError(f"Unsupported Meshy model: {model}")
+    return model
+
+
+def normalize_target_formats(raw: Any, *, allowed: set[str] | None = None, require_glb: bool = True) -> list[str]:
+    """Return a de-duped Meshy target_formats list, preserving user order."""
+    allowed = allowed or MESHY_MODEL_FORMATS
+    if isinstance(raw, str):
+        raw = [raw]
+    target_formats: list[str] = []
+    if isinstance(raw, list):
+        seen: set[str] = set()
+        for item in raw:
+            value = str(item or "").strip().lower()
+            if not value:
+                continue
+            if value not in allowed:
+                raise ValueError(f"Unsupported target format: {value}")
+            if value in seen:
+                continue
+            seen.add(value)
+            target_formats.append(value)
+    if require_glb and target_formats and "glb" in allowed and "glb" not in target_formats:
+        target_formats.insert(0, "glb")
+    return target_formats
+
+
+def meshy_texture_resolution(body: dict, ai_model: str, *, allow_meshy7: bool = True) -> str | None:
+    """
+    Prefer Meshy's current texture_resolution field and translate legacy hd_texture.
+    Returns None when the caller should omit the field and use Meshy's default.
+    """
+    raw = body.get("texture_resolution")
+    if raw is None and body.get("hd_texture") is not None:
+        raw = "4k" if bool(body.get("hd_texture")) else "2k"
+    if raw is None:
+        return None
+    res = str(raw or "").strip().lower()
+    if res not in MESHY_TEXTURE_RESOLUTIONS:
+        raise ValueError("texture_resolution must be one of: 2k, 4k, 8k")
+    if ai_model == "meshy-5" and res in {"4k", "8k"}:
+        raise ValueError("4K and 8K textures require meshy-6, meshy-7, or latest")
+    if not allow_meshy7 and ai_model == "meshy-7":
+        raise ValueError("meshy-7 is not supported on this endpoint")
+    return res
+
+
+def meshy_alpha_thumbnail(body: dict) -> bool | None:
+    if body.get("alpha_thumbnail") is None:
+        return None
+    return bool(body.get("alpha_thumbnail"))
+
+
+def expected_meshy_platform_cost(base_cost: int, *, texture_resolution: str | None = None, ultra_mode: bool = False) -> int:
+    """
+    Keep TimrX billing aligned with Meshy's current variable surcharges.
+    Values here are TimrX credits; existing base costs already match the common
+    Meshy tasks, so only provider-added deltas are applied.
+    """
+    cost = int(base_cost)
+    if texture_resolution == "8k":
+        cost += 5
+    if ultra_mode:
+        cost += 5
+    return cost
 
 
 def _auth_headers() -> dict[str, str]:
@@ -303,13 +383,20 @@ def normalize_status(ms: dict) -> dict:
         "stage": stage,
         "message": message,
         "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
+        "alpha_thumbnail_url": _pick_first(containers, ["alpha_thumbnail_url"]),
+        "thumbnail_urls": _pick_first(containers, ["thumbnail_urls"]),
         "glb_url": glb_url,
         "model_urls": model_urls,
         "textured_model_urls": textured_model_urls,
         "textured_glb_url": textured_glb_url,
+        "texture_urls": _pick_first(containers, ["texture_urls", "textures"]),
         "rigged_character_glb_url": rigged_glb,
         "rigged_character_fbx_url": rigged_fbx,
         "created_at": normalize_epoch_ms(_pick_first(containers, ["created_at", "created_at_ts", "created_time"])),
+        "started_at": normalize_epoch_ms(_pick_first(containers, ["started_at"])),
+        "finished_at": normalize_epoch_ms(_pick_first(containers, ["finished_at"])),
+        "consumed_credits": _pick_first(containers, ["consumed_credits"]),
+        "preceding_tasks": _pick_first(containers, ["preceding_tasks"]),
         "preview_task_id": _pick_first(containers, ["preview_task_id", "preview_task"]),
     }
 
@@ -345,6 +432,8 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
         "pct": pct,
         "stage": (_pick_first(containers, ["stage"]) or "").strip().lower() or stage,
         "thumbnail_url": _pick_first(containers, ["thumbnail_url", "cover_image_url", "image"]),
+        "alpha_thumbnail_url": _pick_first(containers, ["alpha_thumbnail_url"]),
+        "thumbnail_urls": _pick_first(containers, ["thumbnail_urls"]),
         "glb_url": glb_url,
         "model_urls": model_urls,
         "textured_model_urls": textured_model_urls,
@@ -354,6 +443,10 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
         "rigged_character_glb_url": rigged_glb,
         "rigged_character_fbx_url": rigged_fbx,
         "created_at": normalize_epoch_ms(_pick_first(containers, ["created_at", "created_at_ts", "created_time"])),
+        "started_at": normalize_epoch_ms(_pick_first(containers, ["started_at"])),
+        "finished_at": normalize_epoch_ms(_pick_first(containers, ["finished_at"])),
+        "consumed_credits": _pick_first(containers, ["consumed_credits"]),
+        "preceding_tasks": _pick_first(containers, ["preceding_tasks"]),
         # Parent job reference for derived jobs (texture/remesh/rig) - used for metadata inheritance
         "original_job_id": _pick_first(containers, ["original_job_id", "source_task_id", "preview_task_id", "input_task_id"]),
     }

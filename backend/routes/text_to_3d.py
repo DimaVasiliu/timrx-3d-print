@@ -37,7 +37,19 @@ from backend.services.job_service import (
     save_store,
     verify_job_ownership,
 )
-from backend.services.meshy_service import mesh_get, mesh_post, normalize_status, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_service import (
+    MESHY_TEXT_REFINE_MODELS,
+    expected_meshy_platform_cost,
+    mesh_get,
+    mesh_post,
+    meshy_alpha_thumbnail,
+    meshy_texture_resolution,
+    normalize_meshy_model,
+    normalize_status,
+    normalize_target_formats,
+    MeshyTaskNotFoundError,
+    terminalize_expired_meshy_job,
+)
 from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.history_service import get_canonical_model_row
@@ -95,11 +107,14 @@ def text_to_3d_start_mod(body=None, identity_id=None):
 
     internal_job_id = str(uuid.uuid4())
     action_key = ACTION_KEYS["text-to-3d-preview"]
-    ai_model = body.get("model") or "latest"
-
-    # Block removed Meshy 4
-    if ai_model in ("meshy-4", "meshy4"):
-        return jsonify({"ok": False, "error": "Meshy 4 is no longer supported. Use meshy-5 or latest."}), 400
+    try:
+        ai_model = normalize_meshy_model(
+            body.get("model") or body.get("ai_model"),
+            default="latest",
+            allowed=MESHY_TEXT_REFINE_MODELS,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
 
     payload = {
         "mode": "preview",
@@ -140,23 +155,16 @@ def text_to_3d_start_mod(body=None, identity_id=None):
 
     payload["moderation"] = True
 
-    raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
-    target_formats = []
-    if isinstance(raw_target_formats, str):
-        raw_target_formats = [raw_target_formats]
-    if isinstance(raw_target_formats, list):
-        seen_formats = set()
-        for item in raw_target_formats:
-            value = str(item or "").strip().lower()
-            if not value or value not in allowed_target_formats or value in seen_formats:
-                continue
-            seen_formats.add(value)
-            target_formats.append(value)
+    try:
+        target_formats = normalize_target_formats(body.get("target_formats"), allowed={"glb", "obj", "fbx", "stl", "usdz", "3mf"})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     if target_formats:
-        if "glb" not in target_formats:
-            target_formats.insert(0, "glb")
         payload["target_formats"] = target_formats
+
+    alpha_thumbnail = meshy_alpha_thumbnail(body)
+    if alpha_thumbnail is not None:
+        payload["alpha_thumbnail"] = alpha_thumbnail
 
     auto_size = False
     if body.get("auto_size") is not None:
@@ -223,6 +231,7 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         "target_polycount": payload.get("target_polycount"),
         "moderation": bool(payload.get("moderation")),
         "target_formats": payload.get("target_formats") or [],
+        "alpha_thumbnail": bool(payload.get("alpha_thumbnail")),
         "auto_size": bool(payload.get("auto_size")),
         "origin_at": payload.get("origin_at"),
         "batch_count": batch_count,
@@ -254,6 +263,7 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         "target_polycount": payload.get("target_polycount"),
         "moderation": bool(payload.get("moderation")),
         "target_formats": payload.get("target_formats") or [],
+        "alpha_thumbnail": bool(payload.get("alpha_thumbnail")),
         "auto_size": bool(payload.get("auto_size")),
         "origin_at": payload.get("origin_at"),
         "batch_count": batch_count,
@@ -460,28 +470,23 @@ def text_to_3d_refine_mod():
         texture_prompt = merge_negative_prompt(texture_prompt, texture_negative_prompt)
     texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip() or None
     enable_pbr = bool(body.get("enable_pbr", True))
-    ai_model = (body.get("ai_model") or body.get("model") or "latest").strip() or "latest"
+    try:
+        ai_model = normalize_meshy_model(
+            body.get("ai_model") or body.get("model"),
+            default="latest",
+            allowed=MESHY_TEXT_REFINE_MODELS,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     remove_lighting = None
     if body.get("remove_lighting") is not None:
         remove_lighting = bool(body.get("remove_lighting"))
-    hd_texture = None
-    if body.get("hd_texture") is not None and ai_model != "meshy-5":
-        hd_texture = bool(body.get("hd_texture"))
-    raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
-    target_formats = []
-    if isinstance(raw_target_formats, str):
-        raw_target_formats = [raw_target_formats]
-    if isinstance(raw_target_formats, list):
-        seen_formats = set()
-        for item in raw_target_formats:
-            value = str(item or "").strip().lower()
-            if not value or value not in allowed_target_formats or value in seen_formats:
-                continue
-            seen_formats.add(value)
-            target_formats.append(value)
-    if target_formats and "glb" not in target_formats:
-        target_formats.insert(0, "glb")
+    try:
+        texture_resolution = meshy_texture_resolution(body, ai_model, allow_meshy7=False)
+        target_formats = normalize_target_formats(body.get("target_formats"), allowed={"glb", "obj", "fbx", "stl", "usdz", "3mf"})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    alpha_thumbnail = meshy_alpha_thumbnail(body)
     texture_style_mode = "text" if texture_prompt else ("image" if texture_image_url else "text")
     # Derive title from prompt/root_prompt - derive_display_title handles generic titles automatically
     explicit_title = body.get("title") or preview_meta.get("title")
@@ -497,6 +502,7 @@ def text_to_3d_refine_mod():
         "preview_task_id": preview_task_id,
         "enable_pbr": enable_pbr,
         "ai_model": ai_model,
+        "expected_cost": expected_meshy_platform_cost(10, texture_resolution=texture_resolution),
         "texture_style_mode": texture_style_mode,
         "uses_image_style": texture_style_mode == "image",
     }
@@ -508,10 +514,13 @@ def text_to_3d_refine_mod():
         job_meta["texture_negative_prompt"] = texture_negative_prompt
     if remove_lighting is not None:
         job_meta["remove_lighting"] = remove_lighting
-    if hd_texture is not None:
-        job_meta["hd_texture"] = hd_texture
+    if texture_resolution:
+        job_meta["texture_resolution"] = texture_resolution
+        job_meta["hd_texture"] = texture_resolution == "4k"
     if target_formats:
         job_meta["target_formats"] = target_formats
+    if alpha_thumbnail is not None:
+        job_meta["alpha_thumbnail"] = alpha_thumbnail
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
@@ -529,10 +538,12 @@ def text_to_3d_refine_mod():
         payload["texture_image_url"] = texture_image_url
     if remove_lighting is not None:
         payload["remove_lighting"] = remove_lighting
-    if hd_texture is not None:
-        payload["hd_texture"] = hd_texture
+    if texture_resolution:
+        payload["texture_resolution"] = texture_resolution
     if target_formats:
         payload["target_formats"] = target_formats
+    if alpha_thumbnail is not None:
+        payload["alpha_thumbnail"] = alpha_thumbnail
 
     store_meta = {
         "stage": "refine",
@@ -546,7 +557,9 @@ def text_to_3d_refine_mod():
         "ai_model": ai_model,
         "texture_style_mode": texture_style_mode,
         "uses_image_style": texture_style_mode == "image",
-        "hd_texture": bool(hd_texture),
+        "texture_resolution": texture_resolution or "2k",
+        "hd_texture": texture_resolution == "4k",
+        "alpha_thumbnail": bool(alpha_thumbnail),
         "target_formats": target_formats,
         "user_id": identity_id,
         "identity_id": identity_id,

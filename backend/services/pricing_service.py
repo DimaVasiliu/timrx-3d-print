@@ -22,9 +22,14 @@ CANONICAL ACTION KEYS (use these in new code):
 - recraft_v4_vector_generate (10c) - Recraft V4 SVG vector image
 - text_to_3d_generate  (20c) - Text to 3D preview generation
 - image_to_3d_generate (30c) - Image to 3D conversion
-- refine               (6c)  - Refine/upscale 3D model
-- remesh               (6c)  - Remesh 3D model (same cost as refine)
-- retexture            (5c)  - Apply new texture to 3D model
+- refine               (10c) - Refine/upscale 3D model
+- remesh               (5c)  - Remesh 3D model
+- retexture            (10c) - Apply new texture to 3D model
+- convert              (1c)  - Convert 3D model formats
+- resize               (1c)  - Resize 3D model to real-world dimensions
+- uv_unwrap            (5c)  - Generate UV layout for a 3D model
+- print_repair         (10c) - Repair model for printability
+- print_analyze        (0c)  - Analyze model printability
 - rigging              (5c)  - Rig a 3D model for animation
 - animation            (3c)  - Animate a rigged 3D model
 - video_generate       (96c) - Generic video generation (Vertex 8s 720p base)
@@ -77,6 +82,11 @@ class CanonicalActions:
     REFINE = "refine"
     REMESH = "remesh"
     RETEXTURE = "retexture"
+    CONVERT = "convert"
+    RESIZE = "resize"
+    UV_UNWRAP = "uv_unwrap"
+    PRINT_REPAIR = "print_repair"
+    PRINT_ANALYZE = "print_analyze"
     # Video generation (uses general credits under unified model)
     VIDEO_GENERATE = "video_generate"
     VIDEO_TEXT_GENERATE = "video_text_generate"
@@ -108,8 +118,13 @@ CANONICAL_TO_DB = {
     CanonicalActions.TEXT_TO_3D_GENERATE: "MESHY_TEXT_TO_3D",
     CanonicalActions.IMAGE_TO_3D_GENERATE: "MESHY_IMAGE_TO_3D",
     CanonicalActions.REFINE: "MESHY_REFINE",
-    CanonicalActions.REMESH: "MESHY_REFINE",  # Remesh uses same cost as refine
+    CanonicalActions.REMESH: "MESHY_REMESH",
     CanonicalActions.RETEXTURE: "MESHY_RETEXTURE",
+    CanonicalActions.CONVERT: "MESHY_CONVERT",
+    CanonicalActions.RESIZE: "MESHY_RESIZE",
+    CanonicalActions.UV_UNWRAP: "MESHY_UV_UNWRAP",
+    CanonicalActions.PRINT_REPAIR: "MESHY_PRINT_REPAIR",
+    CanonicalActions.PRINT_ANALYZE: "MESHY_PRINT_ANALYZE",
     CanonicalActions.RIGGING: "MESHY_RIGGING",
     CanonicalActions.ANIMATION: "MESHY_ANIMATION",
     CanonicalActions.MULTI_COLOR_PRINT: "MESHY_MULTI_COLOR_PRINT",
@@ -150,6 +165,18 @@ ALIAS_TO_CANONICAL = {
 
     # Retexture aliases
     "texture": CanonicalActions.RETEXTURE,
+
+    # Mesh processing aliases
+    "convert": CanonicalActions.CONVERT,
+    "mesh-convert": CanonicalActions.CONVERT,
+    "resize": CanonicalActions.RESIZE,
+    "mesh-resize": CanonicalActions.RESIZE,
+    "uv-unwrap": CanonicalActions.UV_UNWRAP,
+    "uv_unwrap": CanonicalActions.UV_UNWRAP,
+    "print-repair": CanonicalActions.PRINT_REPAIR,
+    "print_repair": CanonicalActions.PRINT_REPAIR,
+    "print-analyze": CanonicalActions.PRINT_ANALYZE,
+    "print_analyze": CanonicalActions.PRINT_ANALYZE,
 
     # Rigging / Animation aliases
     "rig": CanonicalActions.RIGGING,
@@ -329,8 +356,14 @@ DEFAULT_ACTION_COSTS = [
     # ── 3D Generation (target ~3–5x markup) ──
     {"action_code": "MESHY_TEXT_TO_3D", "cost_credits": 20, "provider": "meshy"},
     {"action_code": "MESHY_IMAGE_TO_3D", "cost_credits": 30, "provider": "meshy"},
-    {"action_code": "MESHY_REFINE", "cost_credits": 6, "provider": "meshy"},
-    {"action_code": "MESHY_RETEXTURE", "cost_credits": 5, "provider": "meshy"},
+    {"action_code": "MESHY_REFINE", "cost_credits": 10, "provider": "meshy"},
+    {"action_code": "MESHY_REMESH", "cost_credits": 5, "provider": "meshy"},
+    {"action_code": "MESHY_RETEXTURE", "cost_credits": 10, "provider": "meshy"},
+    {"action_code": "MESHY_CONVERT", "cost_credits": 1, "provider": "meshy"},
+    {"action_code": "MESHY_RESIZE", "cost_credits": 1, "provider": "meshy"},
+    {"action_code": "MESHY_UV_UNWRAP", "cost_credits": 5, "provider": "meshy"},
+    {"action_code": "MESHY_PRINT_REPAIR", "cost_credits": 10, "provider": "meshy"},
+    {"action_code": "MESHY_PRINT_ANALYZE", "cost_credits": 0, "provider": "meshy"},
     {"action_code": "MESHY_RIGGING", "cost_credits": 5, "provider": "meshy"},
     {"action_code": "MESHY_ANIMATION", "cost_credits": 3, "provider": "meshy"},
     {"action_code": "MESHY_MULTI_COLOR_PRINT", "cost_credits": 10, "provider": "meshy"},
@@ -879,7 +912,13 @@ class PricingService:
         "MESHY_TEXT_TO_3D": CanonicalActions.TEXT_TO_3D_GENERATE,
         "MESHY_IMAGE_TO_3D": CanonicalActions.IMAGE_TO_3D_GENERATE,
         "MESHY_REFINE": CanonicalActions.REFINE,
+        "MESHY_REMESH": CanonicalActions.REMESH,
         "MESHY_RETEXTURE": CanonicalActions.RETEXTURE,
+        "MESHY_CONVERT": CanonicalActions.CONVERT,
+        "MESHY_RESIZE": CanonicalActions.RESIZE,
+        "MESHY_UV_UNWRAP": CanonicalActions.UV_UNWRAP,
+        "MESHY_PRINT_REPAIR": CanonicalActions.PRINT_REPAIR,
+        "MESHY_PRINT_ANALYZE": CanonicalActions.PRINT_ANALYZE,
         "OPENAI_IMAGE": CanonicalActions.IMAGE_GENERATE,
         "VIDEO_GENERATE": CanonicalActions.VIDEO_GENERATE,
         "VIDEO_TEXT_GENERATE": CanonicalActions.VIDEO_TEXT_GENERATE,
@@ -1107,6 +1146,13 @@ class PricingService:
         for canonical_key, db_code in CANONICAL_TO_DB.items():
             if db_code in db_costs:
                 result[canonical_key] = db_costs[db_code]
+
+        # Fill in checked-in defaults for newly introduced action codes that
+        # may not exist yet in older production databases.
+        default_db_costs = {row["action_code"]: int(row["cost_credits"]) for row in DEFAULT_ACTION_COSTS}
+        for canonical_key, db_code in CANONICAL_TO_DB.items():
+            if canonical_key not in result and db_code in default_db_costs:
+                result[canonical_key] = default_db_costs[db_code]
 
         # Also include all aliases for backwards compatibility
         for alias, canonical_key in ALIAS_TO_CANONICAL.items():

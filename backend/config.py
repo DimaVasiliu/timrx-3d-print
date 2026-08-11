@@ -830,6 +830,14 @@ class Config:
             "image-to-3d": "image_to_3d_generate",        # Canonical
             "remesh": "remesh",                           # Already canonical
             "retexture": "retexture",                     # Already canonical
+            "convert": "convert",
+            "resize": "resize",
+            "uv-unwrap": "uv_unwrap",
+            "uv_unwrap": "uv_unwrap",
+            "print-repair": "print_repair",
+            "print_repair": "print_repair",
+            "print-analyze": "print_analyze",
+            "print_analyze": "print_analyze",
             "openai-image": "image_generate",             # Canonical
             # Additional canonical mappings
             "image_generate": "image_generate",

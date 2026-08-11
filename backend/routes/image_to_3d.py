@@ -27,7 +27,19 @@ from backend.services.job_service import (
     verify_job_ownership,
 )
 from backend.services.history_service import get_canonical_model_row
-from backend.services.meshy_service import mesh_get, normalize_meshy_task, MeshyTaskNotFoundError, terminalize_expired_meshy_job
+from backend.services.meshy_service import (
+    MESHY_SMART_TOPOLOGY_MODELS,
+    MESHY_STANDARD_MODELS,
+    expected_meshy_platform_cost,
+    mesh_get,
+    meshy_alpha_thumbnail,
+    meshy_texture_resolution,
+    normalize_meshy_model,
+    normalize_meshy_task,
+    normalize_target_formats,
+    MeshyTaskNotFoundError,
+    terminalize_expired_meshy_job,
+)
 from backend.services.meshy_prompting import merge_negative_prompt, normalize_negative_prompt
 from backend.services.s3_service import save_finished_job_to_normalized_db
 from backend.services.status_cache import get_cached_status, cache_status
@@ -74,11 +86,25 @@ def image_to_3d_start_mod():
         job_meta["provider_prompt"] = provider_prompt
     if source_image_history_id:
         job_meta["source_task_id"] = source_image_history_id
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
-    if credit_error:
-        return credit_error
 
-    ai_model = body.get("model") or "latest"
+    model_type = (body.get("model_type") or "").strip().lower()
+    if model_type and model_type not in {"standard", "smart-topology", "lowpoly"}:
+        return jsonify({"ok": False, "error": "model_type must be standard, smart-topology, or lowpoly"}), 400
+    model_type = model_type or "standard"
+
+    try:
+        allowed_models = MESHY_SMART_TOPOLOGY_MODELS if model_type == "smart-topology" else MESHY_STANDARD_MODELS
+        ai_model = normalize_meshy_model(body.get("model") or body.get("ai_model"), default="latest", allowed=allowed_models)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    ultra_mode = bool(body.get("ultra_mode", False)) if ai_model in {"meshy-7", "latest"} and model_type == "standard" else False
+    try:
+        texture_resolution = meshy_texture_resolution(body, ai_model)
+        target_formats = normalize_target_formats(body.get("target_formats"), allowed={"glb", "obj", "fbx", "stl", "usdz", "3mf"})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    alpha_thumbnail = meshy_alpha_thumbnail(body)
 
     payload = {
         "image_url": image_url,
@@ -86,13 +112,17 @@ def image_to_3d_start_mod():
         "ai_model": ai_model,
         "enable_pbr": True,
     }
+    if model_type != "standard":
+        payload["model_type"] = model_type
+    if ultra_mode:
+        payload["ultra_mode"] = True
 
     if body.get("should_texture") is not None:
         payload["should_texture"] = bool(body.get("should_texture"))
     if body.get("enable_pbr") is not None:
         payload["enable_pbr"] = bool(body.get("enable_pbr"))
-    if body.get("hd_texture") is not None and ai_model != "meshy-5":
-        payload["hd_texture"] = bool(body.get("hd_texture"))
+    if texture_resolution:
+        payload["texture_resolution"] = texture_resolution
 
     texture_prompt = (body.get("texture_prompt") or "").strip()
     texture_negative_prompt = normalize_negative_prompt(body.get("texture_negative_prompt") or body.get("negative_prompt"))
@@ -113,7 +143,7 @@ def image_to_3d_start_mod():
         payload["should_remesh"] = bool(should_remesh)
 
     # topology + target_polycount only matter when should_remesh is true
-    if payload.get("should_remesh"):
+    if payload.get("should_remesh") and model_type == "standard":
         topo = (body.get("topology") or "").strip().lower()
         if topo in ("triangle", "quad"):
             payload["topology"] = topo
@@ -132,9 +162,16 @@ def image_to_3d_start_mod():
             except (ValueError, TypeError):
                 pass
 
-    model_type = (body.get("model_type") or "").strip().lower()
-    if model_type in {"standard", "lowpoly"}:
-        payload["model_type"] = model_type
+    if model_type == "smart-topology" and ai_model == "meshy-t2":
+        try:
+            tpc = int(body.get("target_polycount"))
+            if 100 <= tpc <= 15000:
+                payload["target_polycount"] = tpc
+        except (ValueError, TypeError):
+            pass
+
+    if body.get("save_pre_remeshed_model") is not None and model_type == "standard":
+        payload["save_pre_remeshed_model"] = bool(body.get("save_pre_remeshed_model"))
 
     # image_enhancement — let Meshy optimize the input image or keep
     # the original.  Default is unset (Meshy decides).
@@ -150,23 +187,12 @@ def image_to_3d_start_mod():
     if moderation is not None:
         payload["moderation"] = bool(moderation)
 
-    raw_target_formats = body.get("target_formats")
-    allowed_target_formats = {"glb", "obj", "fbx", "stl", "usdz", "3mf"}
-    target_formats = []
-    if isinstance(raw_target_formats, str):
-        raw_target_formats = [raw_target_formats]
-    if isinstance(raw_target_formats, list):
-        seen_formats = set()
-        for item in raw_target_formats:
-            value = str(item or "").strip().lower()
-            if not value or value not in allowed_target_formats or value in seen_formats:
-                continue
-            seen_formats.add(value)
-            target_formats.append(value)
     if target_formats:
-        if "glb" not in target_formats:
-            target_formats.insert(0, "glb")
         payload["target_formats"] = target_formats
+    if alpha_thumbnail is not None:
+        payload["alpha_thumbnail"] = alpha_thumbnail
+    if body.get("multi_view_thumbnails") is not None:
+        payload["multi_view_thumbnails"] = bool(body.get("multi_view_thumbnails"))
 
     auto_size = None
     if body.get("auto_size") is not None:
@@ -175,8 +201,16 @@ def image_to_3d_start_mod():
     origin_at = (body.get("origin_at") or "").strip().lower()
     if auto_size and origin_at in {"bottom", "center"}:
         payload["origin_at"] = origin_at
-    if auto_size and body.get("multi_view_thumbnails") is not None:
-        payload["multi_view_thumbnails"] = bool(body.get("multi_view_thumbnails"))
+
+    job_meta["expected_cost"] = expected_meshy_platform_cost(
+        30,
+        texture_resolution=texture_resolution,
+        ultra_mode=ultra_mode,
+    )
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
 
     store_meta = {
         "stage": "image3d",
@@ -186,6 +220,9 @@ def image_to_3d_start_mod():
         "title": title,
         "original_image_url": image_url,
         "ai_model": ai_model,
+        "model_type": payload.get("model_type") or "standard",
+        "ultra_mode": ultra_mode,
+        "texture_resolution": texture_resolution or "2k",
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
@@ -193,13 +230,14 @@ def image_to_3d_start_mod():
         "source_task_id": source_image_history_id,
         "should_remesh": bool(payload.get("should_remesh", False)),
         "image_enhancement": payload.get("image_enhancement"),
-        "model_type": payload.get("model_type"),
         "decimation_mode": payload.get("decimation_mode"),
+        "save_pre_remeshed_model": bool(payload.get("save_pre_remeshed_model")),
         "target_formats": payload.get("target_formats") or [],
+        "alpha_thumbnail": bool(payload.get("alpha_thumbnail")),
         "auto_size": bool(payload.get("auto_size")),
         "origin_at": payload.get("origin_at"),
         "multi_view_thumbnails": bool(payload.get("multi_view_thumbnails")),
-        "hd_texture": bool(payload.get("hd_texture")),
+        "hd_texture": texture_resolution == "4k",
         "remove_lighting": payload.get("remove_lighting"),
         "texture_prompt": payload.get("texture_prompt"),
         "texture_style_mode": "text" if texture_prompt else ("image" if texture_image_url else None),
@@ -502,17 +540,47 @@ def multi_image_to_3d_start_mod():
     if negative_prompt:
         job_meta["negative_prompt"] = negative_prompt
         job_meta["provider_prompt"] = provider_prompt
-    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
-    if credit_error:
-        return credit_error
+
+    model_type = (body.get("model_type") or "").strip().lower()
+    if model_type and model_type not in {"standard", "lowpoly"}:
+        return jsonify({"error": "model_type must be standard or lowpoly for multi-image generation"}), 400
+    model_type = model_type or "standard"
+    try:
+        ai_model = normalize_meshy_model(body.get("model") or body.get("ai_model"), default="latest", allowed=MESHY_STANDARD_MODELS)
+        texture_resolution = meshy_texture_resolution(body, ai_model)
+        target_formats = normalize_target_formats(body.get("target_formats"), allowed={"glb", "obj", "fbx", "stl", "usdz", "3mf"})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    alpha_thumbnail = meshy_alpha_thumbnail(body)
 
     payload = {
         "image_urls": image_urls,
-        "ai_model": body.get("model") or "latest",
+        "ai_model": ai_model,
         "enable_pbr": body.get("enable_pbr", True),
     }
+    if model_type != "standard":
+        payload["model_type"] = model_type
+    if texture_resolution:
+        payload["texture_resolution"] = texture_resolution
     if provider_prompt:
         payload["prompt"] = provider_prompt
+    if body.get("should_texture") is not None:
+        payload["should_texture"] = bool(body.get("should_texture"))
+    if body.get("image_enhancement") is not None:
+        payload["image_enhancement"] = bool(body.get("image_enhancement"))
+    if body.get("remove_lighting") is not None and ai_model != "meshy-5":
+        payload["remove_lighting"] = bool(body.get("remove_lighting"))
+    if body.get("multi_view_thumbnails") is not None:
+        payload["multi_view_thumbnails"] = bool(body.get("multi_view_thumbnails"))
+    if target_formats:
+        payload["target_formats"] = target_formats
+    if alpha_thumbnail is not None:
+        payload["alpha_thumbnail"] = alpha_thumbnail
+    job_meta["expected_cost"] = expected_meshy_platform_cost(30, texture_resolution=texture_resolution)
+
+    reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
+    if credit_error:
+        return credit_error
 
     store_meta = {
         "stage": "image3d",
@@ -522,6 +590,11 @@ def multi_image_to_3d_start_mod():
         "title": title,
         "original_image_urls": image_urls,
         "ai_model": payload.get("ai_model"),
+        "model_type": payload.get("model_type") or "standard",
+        "texture_resolution": texture_resolution or "2k",
+        "target_formats": target_formats,
+        "alpha_thumbnail": bool(alpha_thumbnail),
+        "multi_view_thumbnails": bool(payload.get("multi_view_thumbnails")),
         "user_id": identity_id,
         "identity_id": identity_id,
         "reservation_id": reservation_id,
