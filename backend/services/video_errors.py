@@ -267,3 +267,53 @@ FAILURE_MESSAGES = {
 def get_failure_message(error_code: str) -> str:
     """Get a human-readable failure message for an error code."""
     return FAILURE_MESSAGES.get(error_code, f"Video generation failed ({error_code})")
+
+
+# ── Upstream-reason humanizer ────────────────────────────────
+# PiAPI's public error message is often generic ("Your content violated
+# community guidelines.") while the ACTIONABLE reason rides in the task's
+# logs[] array ("The request was rejected due to copyright restrictions...").
+# This maps both onto clear user-facing guidance. Curated on purpose: raw
+# provider text can leak internal detail (plan limits, point balances,
+# task ids), so anything unrecognized returns None and callers fall back
+# to the generic taxonomy message.
+
+def humanize_upstream_failure(error_message: str = "", provider_logs=None):
+    """Return an actionable user-facing message for a provider failure,
+    or None when the upstream text matches no known pattern."""
+    parts = [str(error_message or "")]
+    if provider_logs:
+        if isinstance(provider_logs, (list, tuple)):
+            parts.extend(str(entry) for entry in provider_logs)
+        else:
+            parts.append(str(provider_logs))
+    text = " ".join(parts).lower()
+    if not text.strip():
+        return None
+
+    if "copyright" in text:
+        return (
+            "Rejected by the provider's copyright filter — the prompt likely "
+            "references a brand, product name, or copyrighted character. "
+            "Remove brand names and franchise references, then try again."
+        )
+    if "maximum length" in text or "prompt exceeds" in text:
+        return "The prompt is too long for this model — shorten it and try again."
+    if (
+        "community guidelines" in text
+        or "content violat" in text
+        or "sensitive content" in text
+        or "content review" in text
+        or "content policy" in text
+    ):
+        return (
+            "Rejected by the provider's content filter. Rephrase or remove the "
+            "flagged parts of your prompt and try again."
+        )
+    if "invalid duration" in text:
+        return "The requested clip length isn't supported by this model — pick a different duration."
+    if "active task count" in text or "plan limit" in text:
+        return "The provider is at capacity right now — wait a minute and try again."
+    if "insufficient" in text and ("credit" in text or "point" in text or "balance" in text):
+        return "The provider couldn't start this job. Please try again shortly."
+    return None

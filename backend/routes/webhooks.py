@@ -328,12 +328,18 @@ def _webhook_mark_failed(
         except Exception as e:
             print(f"[WEBHOOK] credit release error job={job_id}: {e}")
 
+    # Surface the actionable upstream reason (copyright / prompt length / …)
+    # instead of the provider's generic wording where we recognize it.
+    from backend.services.video_errors import humanize_upstream_failure
+    _friendly = humanize_upstream_failure(error_msg, meta.get("provider_logs"))
+
     _transition_job_status(job_id, "failed", {
         "completed_at": "NOW()",
         "claimed_by": None,
     }, meta_patch={
         "error_code": error_code,
         "error_message": error_msg[:500],
+        "failure_reason": (_friendly or error_msg)[:300],
         "failure_provider": provider_name,
         "webhook_failed": True,
         "webhook_failed_at": time.time(),

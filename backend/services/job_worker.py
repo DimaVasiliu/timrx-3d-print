@@ -1804,8 +1804,16 @@ def _fail_job(
         # No specific message for this code — try the generic suffix
         user_message = get_failure_message(suffix) if suffix != error_code else error_msg
 
+    # Prefer the ACTUAL upstream reason when it maps to something actionable —
+    # PiAPI's logs[] often name the real cause (copyright, prompt length) that
+    # the generic error message hides. See humanize_upstream_failure.
+    from backend.services.video_errors import humanize_upstream_failure
+    _upstream_reason = humanize_upstream_failure(error_msg, meta.get("provider_logs"))
+    if _upstream_reason:
+        user_message = _upstream_reason
+
     # Build richer user-facing message with resolution context
-    if resolution and resolution != "unknown" and resolution != "720p":
+    if not _upstream_reason and resolution and resolution != "unknown" and resolution != "720p":
         # Add resolution context for non-standard resolutions so user knows why it failed
         if "deadline" in error_msg.lower() or "timeout" in error_code.lower():
             user_message = f"{resolution} generation timed out — try a lower resolution"
