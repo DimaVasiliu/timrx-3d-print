@@ -193,14 +193,11 @@ V25_MAX_TOTAL_REFERENCES = 15  # 9 images + 3 videos + 3 audio — PiAPI states 
 V25_MAX_IMAGE_REFERENCES = 9
 V25_MAX_VIDEO_REFERENCES = 3
 V25_MAX_AUDIO_REFERENCES = 3
-# PiAPI's 2.5 docs still contradict each other: the product page says "4-30
-# seconds" but the prompts guide says "4-15" and notes the live API wins when
-# pages differ. VERIFIED 2026-08-12 against the live API: duration=30 -> 400,
-# so 15 is the real ceiling. If PiAPI ever enables 30s, set
-# SEEDANCE_25_MAX_DURATION=30 (no deploy needed) — the 20/25/30s action-cost
-# rows are already in the DB (migration 082) and the frontend duration list
-# reads from one constant (V25_DURATIONS in 3dprint-app.js).
-V25_MAX_DURATION_SECONDS = int(os.getenv("SEEDANCE_25_MAX_DURATION", "15"))
+# VERIFIED against the live API 2026-08-12 (validation probes): duration=30 is
+# accepted on seedance-2.5; out-of-range values are logged and clamped to 5 by
+# PiAPI rather than rejected. The earlier "30s fails" readings were actually a
+# prompt byte-length error. 20/25/30s action-cost rows: migration 082.
+V25_MAX_DURATION_SECONDS = int(os.getenv("SEEDANCE_25_MAX_DURATION", "30"))
 
 # Per-task-type resolution support and defaults (PiAPI: Mini and 2.5 default to
 # 720p; `seedance-2` is the only task type offering 1080p).
@@ -287,7 +284,7 @@ def create_seedance_task(
     Create a Seedance video generation task via PiAPI.
 
     Args:
-        prompt:       Text prompt for video generation (max 4000 chars — truncated if longer).
+        prompt:       Text prompt for video generation (max 4000 UTF-8 bytes — truncated if longer).
         duration:     Video duration in seconds (4–15 for GA; 5/10/15 for legacy preview).
         aspect_ratio: Output aspect ratio (GA: 21:9 / 16:9 / 4:3 / 1:1 / 3:4 / 9:16, plus
                       `auto` in first_last_frames mode only; legacy: 16:9 / 9:16 / 4:3 / 3:4).
@@ -339,14 +336,18 @@ def create_seedance_task(
         resolved_task_type = upgraded
         is_ga = True
 
-    # PiAPI enforces prompt maxLength=4000 — truncate rather than 400 on the user.
+    # PiAPI enforces prompt maxLength=4000 — but it counts UTF-8 BYTES, not
+    # characters (verified 2026-08-12: a 4000-char prompt with em-dashes was
+    # rejected as "4022 provided"). Truncate on byte length at a clean UTF-8
+    # boundary rather than 400 on the user.
     safe_prompt = prompt or ""
-    if len(safe_prompt) > MAX_PROMPT_CHARS:
+    _encoded = safe_prompt.encode("utf-8")
+    if len(_encoded) > MAX_PROMPT_CHARS:
         print(
-            f"[Seedance] prompt exceeds {MAX_PROMPT_CHARS} chars "
-            f"({len(safe_prompt)}) — truncating per PiAPI limit"
+            f"[Seedance] prompt exceeds {MAX_PROMPT_CHARS} bytes "
+            f"({len(_encoded)}) — truncating per PiAPI limit"
         )
-        safe_prompt = safe_prompt[:MAX_PROMPT_CHARS]
+        safe_prompt = _encoded[:MAX_PROMPT_CHARS].decode("utf-8", errors="ignore")
 
     # Clamp to the range this task type accepts instead of letting PiAPI 400.
     duration_ceiling = max_duration_for(resolved_task_type)
@@ -550,7 +551,7 @@ def create_seedance_task(
     # Log response immediately (safe: no secrets in response)
     print(
         f"[Seedance] RESPONSE status={resp.status_code} "
-        f"body={resp.text[:500]}"
+        f"body={resp.text[:500] if resp.ok else resp.text[:4000]}"
     )
 
     if resp.status_code == 401 or resp.status_code == 403:
@@ -560,7 +561,7 @@ def create_seedance_task(
         raise SeedanceQuotaError(f"PiAPI rate limited: {resp.text[:200]}")
 
     if resp.status_code >= 400:
-        raise RuntimeError(f"seedance_api_error: {resp.status_code} {resp.text[:300]}")
+        raise RuntimeError(f"seedance_api_error: {resp.status_code} {resp.text[:2000]}")
 
     data = resp.json()
 
