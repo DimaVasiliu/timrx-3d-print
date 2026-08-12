@@ -344,6 +344,17 @@ def validate_video_rate_limits(
     if not getattr(cfg, "VIDEO_ENFORCE_LIMITS", True):
         return None
 
+    # Admin exemption — same list that bypasses daily quotas (ADMIN_EMAILS /
+    # VIDEO_QUOTA_EXEMPT_IDENTITIES). Owner accounts skip cooldown, concurrency,
+    # hourly and spend caps entirely.
+    try:
+        from backend.services.video_quota_service import is_video_exempt
+        if is_video_exempt(identity_id):
+            print(f"[VIDEO_LIMITS] EXEMPT identity={identity_id} — all rate limits bypassed (admin)")
+            return None
+    except Exception as _exempt_err:
+        print(f"[VIDEO_LIMITS] exempt check failed (continuing with normal limits): {_exempt_err}")
+
     limits = get_video_plan_limits(identity_id)
     tier = limits["tier"]
     now = datetime.now(timezone.utc)

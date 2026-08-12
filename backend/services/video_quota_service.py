@@ -126,6 +126,50 @@ def resolve_quota_key_from_action_code(action_code: str) -> str:
         return "veo"
 
 
+# ── Exemptions ──────────────────────────────────────────────────────────────
+# Two ways to exempt an account from video quotas and rate limits:
+#   1. VIDEO_QUOTA_EXEMPT_IDENTITIES — comma-separated identity ids (env)
+#   2. config.ADMIN_EMAILS — any identity whose email is on the admin list
+# Results are cached per process; a new admin email takes effect on restart.
+
+_EXEMPT_IDENTITY_IDS = {
+    s.strip() for s in os.getenv("VIDEO_QUOTA_EXEMPT_IDENTITIES", "").split(",") if s.strip()
+}
+_exempt_cache: Dict[str, bool] = {}
+
+
+def is_video_exempt(identity_id: str) -> bool:
+    """True if this identity is exempt from video quotas and rate limits."""
+    if not identity_id:
+        return False
+    if identity_id in _EXEMPT_IDENTITY_IDS:
+        return True
+    cached = _exempt_cache.get(identity_id)
+    if cached is not None:
+        return cached
+    exempt = False
+    try:
+        from backend.config import config
+        admin_emails = getattr(config, "ADMIN_EMAILS", None) or []
+        if admin_emails:
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT email FROM {Tables.IDENTITIES} WHERE id = %s",
+                        (identity_id,),
+                    )
+                    row = cur.fetchone()
+            email = (row or {}).get("email") or ""
+            exempt = bool(email) and config.is_admin_email(email)
+    except Exception as e:
+        print(f"[QUOTA] exempt lookup failed for {identity_id}: {e}")
+        return False  # fail closed, do not cache
+    _exempt_cache[identity_id] = exempt
+    if exempt:
+        print(f"[QUOTA] identity {identity_id[:8]}… is EXEMPT (admin)")
+    return exempt
+
+
 # ── Core quota operations ───────────────────────────────────────────────────
 
 def _utc_today() -> datetime:
@@ -161,6 +205,18 @@ def check_quota(
     """
     limit = DAILY_LIMITS.get(provider_key, 6)
     today = _utc_today()
+
+    if is_video_exempt(identity_id):
+        return {
+            "allowed": True,
+            "exempt": True,
+            "provider_key": provider_key,
+            "provider_name": PROVIDER_DISPLAY_NAMES.get(provider_key, provider_key),
+            "used_today": 0,
+            "limit": 0,
+            "remaining": 999,
+            "resets_at": _next_reset_iso(),
+        }
 
     try:
         with get_conn() as conn:
@@ -351,3 +407,40 @@ def get_daily_quota_report(
     except Exception as e:
         print(f"[QUOTA] Report failed: {e}")
         return {"date": str(target_date), "limits": DAILY_LIMITS, "users": []}
+
+
+# ── Failure refunds ─────────────────────────────────────────────────────────
+
+def decrement_quota(identity_id: str, provider_key: str) -> None:
+    """Give back one daily-quota slot (floored at 0). Used when a job fails
+    upstream or is cancelled — an attempt that produced nothing should not
+    consume a generation from the user's day."""
+    today = _utc_today()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {Tables.VIDEO_DAILY_USAGE}
+                    SET job_count = GREATEST(job_count - 1, 0)
+                    WHERE identity_id = %s AND provider_key = %s AND usage_date = %s
+                    """,
+                    (identity_id, provider_key, today),
+                )
+        print(f"[QUOTA] refunded 1 {provider_key} slot to {identity_id[:8]}…")
+    except Exception as e:
+        print(f"[QUOTA] decrement failed for {identity_id}/{provider_key}: {e}")
+
+
+_VIDEO_ACTION_PREFIXES = ("video_", "seedance_", "fal_seedance", "gemini_video")
+
+
+def refund_quota_for_action(identity_id: str, action_code: str) -> None:
+    """Refund a quota slot for a failed/cancelled VIDEO job, resolved from its
+    action code. No-op for non-video action codes (safe to call from generic
+    credit-release paths). Runs at most once per reservation because the
+    caller (release success) is itself idempotent."""
+    ac = (action_code or "").lower()
+    if not identity_id or not ac.startswith(_VIDEO_ACTION_PREFIXES):
+        return
+    decrement_quota(identity_id, resolve_quota_key_from_action_code(ac))

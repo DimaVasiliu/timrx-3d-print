@@ -479,6 +479,15 @@ def release_job_credits(reservation_id: str, reason: str = "job_failed", job_id:
             cost = result.get("cost", "unknown")
             print(f"[CREDITS] *** RELEASE SUCCESS: reservation_id={reservation_id} job_id={job_id} reason={reason} cost={cost} (credits returned to wallet)")
 
+            # A released video reservation means the job produced nothing —
+            # hand the daily quota slot back too. Idempotent: this branch runs
+            # exactly once per reservation. No-op for non-video action codes.
+            try:
+                from backend.services.video_quota_service import refund_quota_for_action
+                refund_quota_for_action(result.get("identity_id"), result.get("action_code"))
+            except Exception as _q_err:
+                print(f"[CREDITS] quota refund skipped: {_q_err}")
+
             # Structured logging for audit trail
             log_generation_event(
                 event="credits_released",
