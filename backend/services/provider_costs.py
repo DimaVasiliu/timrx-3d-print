@@ -61,6 +61,10 @@ ACTION_CODE_COST_USD: Dict[str, float] = {
     "PIAPI_IMAGE_GENERATE":     0.048,
     "PIAPI_IMAGE_GENERATE_2K":  0.064,
     "PIAPI_IMAGE_GENERATE_4K":  0.096,
+    # PiAPI Nano Banana Pro (Gemini 3 Pro Image): list $0.105 1K/2K, $0.18 4K
+    "PIAPI_PRO_IMAGE_GENERATE":     0.084,
+    "PIAPI_PRO_IMAGE_GENERATE_2K":  0.084,
+    "PIAPI_PRO_IMAGE_GENERATE_4K":  0.144,
     # Direct Google Nano (Gemini 2.5 Flash Image)
     "GOOGLE_NANO_IMAGE":              0.031,
     "GOOGLE_NANO_IMAGE_GENERATE":     0.031,
@@ -87,7 +91,8 @@ ACTION_CODE_COST_USD: Dict[str, float] = {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PiAPI Seedance 2.0 list pricing (USD per second), Aug 2026:
-#   seedance-2.5          480p $0.30   720p $0.60     (no 1080p) — separate model
+#   seedance-2.5          480p $0.15   720p $0.35     (no 1080p) — separate model
+#                         (list price cut ~50% at 2.5 GA, Aug 2026; was $0.30/$0.60)
 #   seedance-2-mini       480p $0.07   720p $0.14     (no 1080p)
 #   seedance-2-fast       480p $0.08   720p $0.16     (no 1080p)
 #   seedance-2            480p $0.10   720p $0.20   1080p $0.50
@@ -100,11 +105,26 @@ ACTION_CODE_COST_USD: Dict[str, float] = {
 # Multiplier PiAPI applies to `-less-restriction` task types.
 SEEDANCE_LESS_RESTRICTION_MULTIPLIER = 1.10
 
+# PiAPI Seedance 2.0 launch promotion (announced 2026-08-08): mini variants pay
+# 60% of list, fast variants pay 80%, through Sep 7 2026 06:00 UTC. Applied to
+# PROVIDER cost estimates only — user credit prices deliberately hold steady so
+# they don't yo-yo when the promo lapses. The gate self-expires; delete after.
+_SEEDANCE_PROMO_END_UTC = (2026, 9, 7, 6, 0, 0)
+_SEEDANCE_PROMO_MULTIPLIER = {"seedance_mini": 0.60, "seedance_fast": 0.80}
+
+
+def _seedance_promo_multiplier(variant: str) -> float:
+    """Promo multiplier for a seedance_* variant, 1.0 once the promo has ended."""
+    from datetime import datetime, timezone
+    if datetime.now(timezone.utc) >= datetime(*_SEEDANCE_PROMO_END_UTC, tzinfo=timezone.utc):
+        return 1.0
+    return _SEEDANCE_PROMO_MULTIPLIER.get(variant, 1.0)
+
 # Per-second USD rates by (variant, resolution). Used as both an explicit
 # lookup and the source for legacy duration-keyed tables.
 _SEEDANCE_RATE_USD: Dict[Tuple[str, str], float] = {
-    ("seedance_v25",     "480p"): 0.240,  # $0.30 × 0.80
-    ("seedance_v25",     "720p"): 0.480,  # $0.60 × 0.80
+    ("seedance_v25",     "480p"): 0.120,  # $0.15 × 0.80
+    ("seedance_v25",     "720p"): 0.280,  # $0.35 × 0.80
     ("seedance_mini",    "480p"): 0.056,  # $0.07 × 0.80
     ("seedance_mini",    "720p"): 0.112,  # $0.14 × 0.80
     ("seedance_fast",    "480p"): 0.064,  # $0.08 × 0.80
@@ -146,6 +166,7 @@ def estimate_seedance_provider_cost(
         rate = 0.08  # generic Seedance fallback
     if less_restriction:
         rate *= SEEDANCE_LESS_RESTRICTION_MULTIPLIER
+    rate *= _seedance_promo_multiplier(variant)
     base = rate * int(duration_seconds)
     surcharge = (rate / 2.0) * max(0.0, float(input_video_seconds or 0.0))
     return round(base + surcharge, 4)
@@ -156,10 +177,10 @@ VIDEO_COST_USD: Dict[Tuple[str, int], float] = {
     ("vertex", 4):            0.30,
     ("vertex", 6):            0.45,
     ("vertex", 8):            0.60,
-    # Seedance 2.5 (480p baseline — PiAPI $0.30/s)
-    ("seedance_v25", 5):      round(0.240 * 5,  4),
-    ("seedance_v25", 10):     round(0.240 * 10, 4),
-    ("seedance_v25", 15):     round(0.240 * 15, 4),
+    # Seedance 2.5 (480p baseline — PiAPI $0.15/s since the Aug 2026 GA price cut)
+    ("seedance_v25", 5):      round(0.120 * 5,  4),
+    ("seedance_v25", 10):     round(0.120 * 10, 4),
+    ("seedance_v25", 15):     round(0.120 * 15, 4),
     # Seedance 2.0 Mini (480p baseline — PiAPI $0.07/s)
     ("seedance_mini", 5):     round(0.056 * 5,  4),
     ("seedance_mini", 10):    round(0.056 * 10, 4),
@@ -184,7 +205,7 @@ VIDEO_COST_USD: Dict[Tuple[str, int], float] = {
 # Fallback per-second rates for unknown durations (USD)
 _VIDEO_FALLBACK_RATE: Dict[str, float] = {
     "vertex":           0.075,
-    "seedance_v25":     0.240,   # 480p baseline; 720p costs 2× this
+    "seedance_v25":     0.120,   # 480p baseline; 720p ≈2.3× this ($0.35/s list)
     "seedance_mini":    0.056,   # 480p baseline; 720p costs ~2× this
     "seedance_fast":    0.064,   # 480p baseline; 720p costs ~2× this
     "seedance_quality": 0.080,   # 480p baseline; 720p ~2×, 1080p ~5×

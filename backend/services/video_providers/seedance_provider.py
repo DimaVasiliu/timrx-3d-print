@@ -108,6 +108,8 @@ VARIANT_MAP = {
     # Seedance 2.5
     "seedance-2.5":              ("seedance-2.5",    "v25"),
     "seedance-2-5":              ("seedance-2.5",    "v25"),  # hyphen spelling, tolerated
+    "seedance-2.5-less-restriction": ("seedance-2.5", "v25"),
+    "seedance-2-5-less-restriction": ("seedance-2.5", "v25"),  # hyphen spelling, tolerated
     # GA — strict moderation
     "seedance-2-mini":           ("seedance-2-mini", "mini"),
     "seedance-2-fast":           ("seedance-2-fast", "fast"),
@@ -240,13 +242,6 @@ def normalize_seedance_params(
         ar = DEFAULT_ASPECT
     if ar == "auto" and is_v25(resolved_task_type):
         ar = DEFAULT_ASPECT
-
-    # Seedance 2.5 ships as a single model with no `-less-restriction` twin, so the
-    # flag can't be honoured there. Drop it rather than emitting a task type PiAPI
-    # doesn't recognise (and rather than silently charging the +10% surcharge).
-    if resolved_lr and is_v25(resolved_task_type):
-        print("[Seedance] less_restriction ignored — seedance-2.5 has no permissive-review variant")
-        resolved_lr = False
 
     if resolved_lr:
         resolved_task_type = apply_less_restriction(resolved_task_type)

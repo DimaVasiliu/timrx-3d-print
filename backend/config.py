@@ -699,8 +699,10 @@ class Config:
     FLUX_MODEL_PRO: str = field(default_factory=lambda: _get_env("FLUX_MODEL_PRO", "flux-2-pro"))
     FLUX_MODEL_FLEX: str = field(default_factory=lambda: _get_env("FLUX_MODEL_FLEX", "flux-2-flex"))
 
-    # PiAPI Gemini-image passthrough. nano-banana-2 == gemini-3.1-flash-image.
+    # PiAPI Gemini-image passthrough. nano-banana-2 == gemini-3.1-flash-image;
+    # nano-banana-pro == gemini-3-pro-image (premium text rendering, 4K).
     PIAPI_NANO_BANANA_MODEL: str = field(default_factory=lambda: _get_env("PIAPI_NANO_BANANA_MODEL", "nano-banana-2"))
+    PIAPI_NANO_BANANA_PRO_MODEL: str = field(default_factory=lambda: _get_env("PIAPI_NANO_BANANA_PRO_MODEL", "nano-banana-pro"))
 
     # Video quality: "fast" or "hq" (determines which Veo model to use)
     VIDEO_QUALITY: str = field(default_factory=lambda: _get_env("VIDEO_QUALITY", "fast").lower())

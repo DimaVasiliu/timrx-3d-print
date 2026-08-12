@@ -75,6 +75,20 @@ IMAGE_PROVIDER_REGISTRY: Dict[str, ImageProviderSpec] = {
         provider_variant="piapi",
         api_key_attr="PIAPI_API_KEY",
     ),
+    "nano_banana_pro": ImageProviderSpec(
+        provider="nano_banana_pro",
+        display_name="Nano Banana Pro",
+        model=_pin("PIAPI_NANO_BANANA_PRO_MODEL", "nano-banana-pro"),
+        action_keys_by_size={
+            "1K": "piapi_pro_image_generate",
+            "2K": "piapi_pro_image_generate_2k",
+            "4K": "piapi_pro_image_generate_4k",
+        },
+        image_sizes=("1K", "2K", "4K"),
+        default_image_size="1K",
+        provider_variant="piapi",
+        api_key_attr="PIAPI_API_KEY",
+    ),
     "google_nano": ImageProviderSpec(
         provider="google_nano",
         display_name="Google Nano",

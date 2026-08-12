@@ -27,16 +27,19 @@ BASE_RETRY_DELAY = 2
 # PiAPI base URL
 PIAPI_API_BASE = "https://api.piapi.ai/api/v1"
 # PiAPI's nano-banana-2 is Gemini 3.1 Flash Image; nano-banana-pro is Gemini 3
-# Pro Image. Env-overridable via PIAPI_NANO_BANANA_MODEL.
+# Pro Image. Env-overridable via PIAPI_NANO_BANANA_MODEL / PIAPI_NANO_BANANA_PRO_MODEL.
 NANO_BANANA_MODEL = getattr(config, "PIAPI_NANO_BANANA_MODEL", None) or "nano-banana-2"
+NANO_BANANA_PRO_MODEL = getattr(config, "PIAPI_NANO_BANANA_PRO_MODEL", None) or "nano-banana-pro"
+# Task types this service may emit — used to validate an explicit task_type arg.
+ALLOWED_TASK_TYPES = {NANO_BANANA_MODEL, NANO_BANANA_PRO_MODEL, "nano-banana-2", "nano-banana-pro"}
 
 # Polling settings for get-task
 POLL_INTERVAL_INITIAL = 3       # seconds
 POLL_INTERVAL_MAX = 8           # seconds
 POLL_TIMEOUT = 300              # seconds total before giving up (was 180, PiAPI recommends 300+ for 1K/2K)
 
-# Allowed parameter values
-ALLOWED_ASPECT_RATIOS = {"1:1", "9:16", "16:9", "3:4", "4:3"}
+# Allowed parameter values — PiAPI expanded nano-banana-2 / -pro to ten ratios (Aug 2026).
+ALLOWED_ASPECT_RATIOS = {"21:9", "16:9", "4:3", "3:2", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"}
 ALLOWED_RESOLUTIONS = {"1K", "2K", "4K"}
 ALLOWED_OUTPUT_FORMATS = {"png", "jpg"}
 
@@ -117,18 +120,21 @@ def create_nano_banana_task(
     resolution: str = "1K",
     output_format: str = "png",
     reference_images: Optional[list] = None,
+    task_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Create a Nano Banana 2 image generation task on PiAPI.
+    Create a Nano Banana image generation task on PiAPI.
 
     Args:
         prompt: Text description of the image to generate.
-        aspect_ratio: "1:1", "9:16", "16:9", "3:4", "4:3"
+        aspect_ratio: one of ALLOWED_ASPECT_RATIOS (ten ratios, 21:9 … 9:16)
         resolution: "1K", "2K", or "4K"
         output_format: "png" or "jpg"
         reference_images: Optional list of public/HTTPS image URLs to enable
                           image-to-image. PiAPI accepts `image` (single ref) or
                           `images` (multi). Items must be publicly reachable.
+        task_type: PiAPI task type — NANO_BANANA_MODEL (default) or
+                   NANO_BANANA_PRO_MODEL for the premium Gemini 3 Pro Image tier.
 
     Returns:
         Dict with task_id and raw response.
@@ -141,6 +147,9 @@ def create_nano_banana_task(
         RuntimeError: For other API errors.
     """
     validate_nano_banana_params(aspect_ratio, resolution, output_format)
+    resolved_task_type = (task_type or NANO_BANANA_MODEL).strip()
+    if resolved_task_type not in ALLOWED_TASK_TYPES:
+        raise PiAPIValidationError("task_type", resolved_task_type, sorted(ALLOWED_TASK_TYPES))
 
     url = f"{PIAPI_API_BASE}/task"
     input_block: Dict[str, Any] = {
@@ -161,7 +170,7 @@ def create_nano_banana_task(
 
     payload = {
         "model": "gemini",
-        "task_type": NANO_BANANA_MODEL,
+        "task_type": resolved_task_type,
         "input": input_block,
         "config": {
             "webhook_config": {
@@ -173,7 +182,7 @@ def create_nano_banana_task(
 
     # Loud log so we can see the exact request shape in production logs.
     print(
-        f"[PiAPI NanoBanana] Creating task: aspect_ratio={aspect_ratio}, "
+        f"[PiAPI NanoBanana] Creating task: task_type={resolved_task_type}, aspect_ratio={aspect_ratio}, "
         f"resolution={resolution}, format={output_format}, refs={len(refs)}, "
         f"input_keys={list(input_block.keys())}"
     )

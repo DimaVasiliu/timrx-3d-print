@@ -923,7 +923,8 @@ def dispatch_piapi_nano_banana_async(
     reference_images: Optional[list] = None,
 ):
     """
-    Async dispatch for PiAPI Nano Banana 2 image generation.
+    Async dispatch for PiAPI Nano Banana image generation (nano-banana-2 or
+    nano-banana-pro — the task type rides in store_meta["model"]).
 
     When `reference_images` is provided, Nano Banana 2 runs in image-to-image
     mode (image guides the generation). Public/HTTPS URLs required.
@@ -943,6 +944,7 @@ def dispatch_piapi_nano_banana_async(
             resolution=resolution,
             output_format=output_format,
             reference_images=reference_images,
+            task_type=store_meta.get("model"),
         )
         upstream_task_id = task_result["task_id"]
         print(f"[ASYNC] PiAPI task created: upstream_task_id={upstream_task_id} for job {internal_job_id}")

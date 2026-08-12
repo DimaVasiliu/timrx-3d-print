@@ -5,7 +5,7 @@ Registered under /api/_mod and /api for compatibility.
 
 Active providers:
 - vertex   (Veo 3.1)       — durations 4/6/8s, aspects 16:9/9:16, resolutions 720p/1080p/4k
-- seedance (Seedance 2.0)  — durations 5/10/15s, aspects 21:9/16:9/4:3/1:1/3:4/9:16,
+- seedance (Seedance 2.0/2.5) — durations 5/10/15s (2.5: up to 30s), aspects 21:9/16:9/4:3/1:1/3:4/9:16,
                              tiers mini/fast/quality (PiAPI seedance-2-mini/-fast/seedance-2)
 
 Endpoints:
@@ -94,7 +94,7 @@ _SEEDANCE_TIER_LABELS = {
 # Our public/beta policies must never exceed the active model's ceiling (we used to
 # allow a flat 12, which PiAPI 400s on 2.0).
 PIAPI_MAX_TOTAL_REFS = 9
-PIAPI_MAX_TOTAL_REFS_V25 = 12
+PIAPI_MAX_TOTAL_REFS_V25 = 15  # 9 img + 3 vid + 3 aud — PiAPI states no flat total on 2.5
 PIAPI_MAX_VIDEO_REFS_V25 = 3
 PIAPI_MAX_AUDIO_REFS_V25 = 3
 

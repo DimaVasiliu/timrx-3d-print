@@ -70,6 +70,9 @@ class CanonicalActions:
     PIAPI_IMAGE_GENERATE = "piapi_image_generate"          # Nano Banana standard 1K (7c)
     PIAPI_IMAGE_GENERATE_2K = "piapi_image_generate_2k"    # Nano Banana 2K (12c)
     PIAPI_IMAGE_GENERATE_4K = "piapi_image_generate_4k"    # Nano Banana 4K (18c) — EXCLUSIVE
+    PIAPI_PRO_IMAGE_GENERATE = "piapi_pro_image_generate"          # Nano Banana Pro 1K (16c)
+    PIAPI_PRO_IMAGE_GENERATE_2K = "piapi_pro_image_generate_2k"    # Nano Banana Pro 2K (16c — PiAPI prices 1K/2K the same)
+    PIAPI_PRO_IMAGE_GENERATE_4K = "piapi_pro_image_generate_4k"    # Nano Banana Pro 4K (27c)
     # Image generation — direct Google Nano / BFL / Ideogram / Recraft
     GOOGLE_NANO_IMAGE_GENERATE = "google_nano_image_generate"
     FLUX_PRO_IMAGE_GENERATE = "flux_pro_image_generate"
@@ -109,6 +112,9 @@ CANONICAL_TO_DB = {
     CanonicalActions.PIAPI_IMAGE_GENERATE: "PIAPI_IMAGE",
     CanonicalActions.PIAPI_IMAGE_GENERATE_2K: "PIAPI_IMAGE_2K",
     CanonicalActions.PIAPI_IMAGE_GENERATE_4K: "PIAPI_IMAGE_4K",
+    CanonicalActions.PIAPI_PRO_IMAGE_GENERATE: "PIAPI_PRO_IMAGE",
+    CanonicalActions.PIAPI_PRO_IMAGE_GENERATE_2K: "PIAPI_PRO_IMAGE_2K",
+    CanonicalActions.PIAPI_PRO_IMAGE_GENERATE_4K: "PIAPI_PRO_IMAGE_4K",
     CanonicalActions.GOOGLE_NANO_IMAGE_GENERATE: "GOOGLE_NANO_IMAGE",
     CanonicalActions.FLUX_PRO_IMAGE_GENERATE: "FLUX_PRO_IMAGE",
     CanonicalActions.IDEOGRAM_V3_IMAGE_GENERATE: "IDEOGRAM_V3_IMAGE",
@@ -379,6 +385,11 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "PIAPI_IMAGE", "cost_credits": 7, "provider": "nano_banana"},        # Standard 1K
     {"action_code": "PIAPI_IMAGE_2K", "cost_credits": 12, "provider": "nano_banana"},    # 2K
     {"action_code": "PIAPI_IMAGE_4K", "cost_credits": 18, "provider": "nano_banana"},    # 4K — EXCLUSIVE
+    # Nano Banana Pro (PiAPI gemini/nano-banana-pro): list $0.105 1K/2K, $0.18 4K.
+    # Priced on the same ~187 credits/$ ratio as Nano Banana 2K/4K (migration 081).
+    {"action_code": "PIAPI_PRO_IMAGE", "cost_credits": 16, "provider": "nano_banana_pro"},
+    {"action_code": "PIAPI_PRO_IMAGE_2K", "cost_credits": 16, "provider": "nano_banana_pro"},
+    {"action_code": "PIAPI_PRO_IMAGE_4K", "cost_credits": 27, "provider": "nano_banana_pro"},
     # ── Image Generation — direct Google Nano / FLUX / Ideogram / Recraft ──
     {"action_code": "GOOGLE_NANO_IMAGE", "cost_credits": 5, "provider": "google_nano"},
     {"action_code": "FLUX_PRO_IMAGE", "cost_credits": 8, "provider": "flux_pro"},
@@ -406,30 +417,30 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "video_image_transition_8s_1080p", "cost_credits": 120, "provider": "vertex"},
     {"action_code": "video_image_transition_8s_4k", "cost_credits": 156, "provider": "vertex"},
     # ── Seedance 2.5 — premium model (mirror of migration 077) ──
-    {"action_code": "seedance_v25_text_generate_5s_480p",                  "cost_credits": 180,  "provider": "seedance"},
-    {"action_code": "seedance_v25_text_generate_10s_480p",                 "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_text_generate_15s_480p",                 "cost_credits": 540,  "provider": "seedance"},
-    {"action_code": "seedance_v25_text_generate_5s_720p",                  "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_text_generate_10s_720p",                 "cost_credits": 720,  "provider": "seedance"},
-    {"action_code": "seedance_v25_text_generate_15s_720p",                 "cost_credits": 1080, "provider": "seedance"},
-    {"action_code": "seedance_v25_image_animate_5s_480p",                  "cost_credits": 180,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_animate_10s_480p",                 "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_animate_15s_480p",                 "cost_credits": 540,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_animate_5s_720p",                  "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_animate_10s_720p",                 "cost_credits": 720,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_animate_15s_720p",                 "cost_credits": 1080, "provider": "seedance"},
-    {"action_code": "seedance_v25_image_transition_5s_480p",               "cost_credits": 180,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_transition_10s_480p",              "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_transition_15s_480p",              "cost_credits": 540,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_transition_5s_720p",               "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_transition_10s_720p",              "cost_credits": 720,  "provider": "seedance"},
-    {"action_code": "seedance_v25_image_transition_15s_720p",              "cost_credits": 1080, "provider": "seedance"},
-    {"action_code": "seedance_v25_reference_video_5s_480p",                "cost_credits": 180,  "provider": "seedance"},
-    {"action_code": "seedance_v25_reference_video_10s_480p",               "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_reference_video_15s_480p",               "cost_credits": 540,  "provider": "seedance"},
-    {"action_code": "seedance_v25_reference_video_5s_720p",                "cost_credits": 360,  "provider": "seedance"},
-    {"action_code": "seedance_v25_reference_video_10s_720p",               "cost_credits": 720,  "provider": "seedance"},
-    {"action_code": "seedance_v25_reference_video_15s_720p",               "cost_credits": 1080, "provider": "seedance"},
+    {"action_code": "seedance_v25_text_generate_5s_480p",                  "cost_credits": 90,  "provider": "seedance"},
+    {"action_code": "seedance_v25_text_generate_10s_480p",                 "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_text_generate_15s_480p",                 "cost_credits": 270,  "provider": "seedance"},
+    {"action_code": "seedance_v25_text_generate_5s_720p",                  "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_text_generate_10s_720p",                 "cost_credits": 360,  "provider": "seedance"},
+    {"action_code": "seedance_v25_text_generate_15s_720p",                 "cost_credits": 540, "provider": "seedance"},
+    {"action_code": "seedance_v25_image_animate_5s_480p",                  "cost_credits": 90,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_animate_10s_480p",                 "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_animate_15s_480p",                 "cost_credits": 270,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_animate_5s_720p",                  "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_animate_10s_720p",                 "cost_credits": 360,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_animate_15s_720p",                 "cost_credits": 540, "provider": "seedance"},
+    {"action_code": "seedance_v25_image_transition_5s_480p",               "cost_credits": 90,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_transition_10s_480p",              "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_transition_15s_480p",              "cost_credits": 270,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_transition_5s_720p",               "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_transition_10s_720p",              "cost_credits": 360,  "provider": "seedance"},
+    {"action_code": "seedance_v25_image_transition_15s_720p",              "cost_credits": 540, "provider": "seedance"},
+    {"action_code": "seedance_v25_reference_video_5s_480p",                "cost_credits": 90,  "provider": "seedance"},
+    {"action_code": "seedance_v25_reference_video_10s_480p",               "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_reference_video_15s_480p",               "cost_credits": 270,  "provider": "seedance"},
+    {"action_code": "seedance_v25_reference_video_5s_720p",                "cost_credits": 180,  "provider": "seedance"},
+    {"action_code": "seedance_v25_reference_video_10s_720p",               "cost_credits": 360,  "provider": "seedance"},
+    {"action_code": "seedance_v25_reference_video_15s_720p",               "cost_credits": 540, "provider": "seedance"},
 
     # ── Seedance 2.0 GA — Mini tier (mirror of migration 076) ──
     {"action_code": "seedance_mini_text_generate_5s_480p",      "cost_credits": 70,  "provider": "seedance"},
@@ -597,12 +608,12 @@ VIDEO_IMAGE_CREDIT_COSTS = {
 
 SEEDANCE_CREDIT_COSTS: Dict[str, Dict[str, Dict[int, int]]] = {
     # Seedance 2.5 (PiAPI `seedance-2.5`): a newer model, not a 2.0 speed tier.
-    # $0.30/s 480p and $0.60/s 720p — more per second at 720p than 2.0 Quality is at
-    # 1080p, so it is priced on the same credits-per-$/s ratio (120) that migration 069
-    # settled on for the 1080p tier. No 1080p option on this model.
+    # PiAPI cut the 2.5 list price ~50% at GA (Aug 2026): $0.15/s 480p, $0.35/s 720p.
+    # Same credits-per-$/s ratio (120) as before, so user prices halve with it
+    # (migration 081). No 1080p option on this model.
     "v25": {
-        "480p":  {5: 180, 10: 360, 15: 540},
-        "720p":  {5: 360, 10: 720, 15: 1080},
+        "480p":  {5: 90,  10: 180, 15: 270},
+        "720p":  {5: 210, 10: 420, 15: 630},
     },
     # Mini (PiAPI `seedance-2-mini`, added Aug 2026): $0.07/s 480p, $0.14/s 720p —
     # 12.5% cheaper upstream than Fast at every resolution, so we price it at
@@ -635,9 +646,9 @@ SEEDANCE_LEGACY_CREDIT_COSTS: Dict[str, Dict[int, int]] = {
 
 # Approximate CPS for fallback only (DB values are authoritative)
 SEEDANCE_CREDITS_PER_SEC = {
-    # 2.5 at its 480p baseline (36 c/s). Also the fallback if the duration ceiling is
-    # raised past 15s via SEEDANCE_25_MAX_DURATION — no new action-code rows required.
-    "v25":     36,   # 180c / 5s (480p baseline)
+    # 2.5 at its 480p baseline (18 c/s since the Aug 2026 list-price cut). Also the
+    # fallback for durations past 15s (2.5 supports up to 30s) — no new rows required.
+    "v25":     18,   # 90c / 5s (480p baseline)
     "mini":    14,   # 70c / 5s (480p baseline)
     "fast":    16,   # 80c / 5s (480p baseline)
     "quality": 20,   # 100c / 5s (480p baseline)

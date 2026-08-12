@@ -120,12 +120,14 @@ GA_TASK_TYPES = frozenset({
     "seedance-2-less-restriction",
     "seedance-2-fast-less-restriction",
     "seedance-2-mini-less-restriction",
-    # Seedance 2.5 — separate model, single variant (no fast/mini/LR split).
+    # Seedance 2.5 — separate model (no fast/mini split). PiAPI added a
+    # `-less-restriction` twin on 2.5 in Aug 2026 (+10%, same permissive review).
     "seedance-2.5",
+    "seedance-2.5-less-restriction",
 })
 
 # Seedance 2.5 task types. Kept as a set so future point releases slot in cleanly.
-V25_TASK_TYPES = frozenset({"seedance-2.5"})
+V25_TASK_TYPES = frozenset({"seedance-2.5", "seedance-2.5-less-restriction"})
 
 
 def is_v25(task_type: str) -> bool:
@@ -137,11 +139,13 @@ LESS_RESTRICTION_TASK_TYPES = frozenset({
     "seedance-2-less-restriction",
     "seedance-2-fast-less-restriction",
     "seedance-2-mini-less-restriction",
+    "seedance-2.5-less-restriction",
 })
 _STRICT_TO_LR = {
     "seedance-2":      "seedance-2-less-restriction",
     "seedance-2-fast": "seedance-2-fast-less-restriction",
     "seedance-2-mini": "seedance-2-mini-less-restriction",
+    "seedance-2.5":    "seedance-2.5-less-restriction",
 }
 _LR_TO_STRICT = {v: k for k, v in _STRICT_TO_LR.items()}
 
@@ -185,17 +189,15 @@ AUTO_ASPECT_MODES = frozenset({"first_last_frames"})
 # 2.5 splits its reference budget by kind instead of using one flat ceiling, and
 # drops `auto` entirely (first_last_frames takes its shape from the frames, so we
 # omit aspect_ratio for that mode rather than sending a value PiAPI ignores).
-V25_MAX_TOTAL_REFERENCES = 12
+V25_MAX_TOTAL_REFERENCES = 15  # 9 images + 3 videos + 3 audio — PiAPI states no flat total
 V25_MAX_IMAGE_REFERENCES = 9
 V25_MAX_VIDEO_REFERENCES = 3
 V25_MAX_AUDIO_REFERENCES = 3
-# PiAPI's docs disagree on the 2.5 ceiling: the product page and model blog both say
-# "4 to 15 seconds, with 15 seconds as the generation cap", while the API-specs blog
-# says "1 to 30 seconds". The model's headline is 30s single-shot output, but two of
-# three sources call 15 a hard cap, so we enforce 15 and make it overridable — set
-# SEEDANCE_25_MAX_DURATION=30 once verified against a live key, no deploy needed.
-# Pricing needs no new rows if raised: the per-second fallback covers any duration.
-V25_MAX_DURATION_SECONDS = int(os.getenv("SEEDANCE_25_MAX_DURATION", "15"))
+# PiAPI's 2.5 docs converged (Aug 2026): product page and API specs both say
+# "4-30 seconds, integer values, default 5". Enforce 30, still env-overridable in
+# case upstream regresses. Pricing needs no new rows past 15s: the per-second
+# fallback in pricing_service covers any duration.
+V25_MAX_DURATION_SECONDS = int(os.getenv("SEEDANCE_25_MAX_DURATION", "30"))
 
 # Per-task-type resolution support and defaults (PiAPI: Mini and 2.5 default to
 # 720p; `seedance-2` is the only task type offering 1080p).
@@ -204,12 +206,14 @@ TASK_TYPE_RESOLUTIONS: Dict[str, frozenset] = {
     "seedance-2-fast": frozenset({"480p", "720p"}),
     "seedance-2-mini": frozenset({"480p", "720p"}),
     "seedance-2.5":    frozenset({"480p", "720p"}),
+    "seedance-2.5-less-restriction": frozenset({"480p", "720p"}),
 }
 TASK_TYPE_DEFAULT_RESOLUTION: Dict[str, str] = {
     "seedance-2":      "480p",
     "seedance-2-fast": "480p",
     "seedance-2-mini": "720p",
     "seedance-2.5":    "720p",
+    "seedance-2.5-less-restriction": "720p",
 }
 
 

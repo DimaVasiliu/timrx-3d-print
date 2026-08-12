@@ -236,6 +236,7 @@ ALLOWED_IMAGE_HOSTS = {
 
 _IMAGE_PROVIDER_PUBLIC_ORDER = (
     "nano_banana",
+    "nano_banana_pro",
     "openai",
     "google",
     "google_nano",
@@ -383,6 +384,7 @@ def dispatch_image_provider(body: dict):
     provider = str(body.get("provider") or "openai").lower()
     handlers = {
         "nano_banana": _handle_nano_banana_image_generate,
+        "nano_banana_pro": _handle_nano_banana_pro_image_generate,
         "google": _handle_gemini_image_generate,
         "google_nano": _handle_google_nano_image_generate,
         "flux_pro": _handle_flux_pro_image_generate,
@@ -399,8 +401,21 @@ def dispatch_image_provider(body: dict):
     return handler(body)
 
 
-def _handle_nano_banana_image_generate(body: dict):
-    """Handle PiAPI Nano Banana 2 image generation (async, returns job_id for polling)."""
+def _handle_nano_banana_pro_image_generate(body: dict):
+    """Handle PiAPI Nano Banana Pro (gemini/nano-banana-pro) — premium tier."""
+    return _handle_nano_banana_image_generate(body, provider="nano_banana_pro")
+
+
+def _handle_nano_banana_image_generate(body: dict, provider: str = "nano_banana"):
+    """Handle PiAPI Nano Banana image generation (async, returns job_id for polling).
+
+    `provider` selects the tier: "nano_banana" → nano-banana-2 (Gemini 3.1 Flash
+    Image), "nano_banana_pro" → nano-banana-pro (Gemini 3 Pro Image). Same PiAPI
+    endpoint and polling pipeline; only the task type, action keys and labels differ.
+    """
+    from backend.services.image_provider_registry import get_image_provider_spec
+    spec = get_image_provider_spec(provider)
+    piapi_model = spec.model if spec else NANO_BANANA_MODEL
     # Fail-fast: Check if PiAPI is configured
     is_configured, config_error = check_piapi_configured()
     if not is_configured:
@@ -447,7 +462,7 @@ def _handle_nano_banana_image_generate(body: dict):
     for index, asset in enumerate(raw_refs, start=1):
         asset_url = ensure_asset_url(
             asset,
-            provider="nano_banana",
+            provider=provider,
             identity_id=identity_id,
             prefix="source_images",
             name=f"nano-banana-ref-{index}",
@@ -481,12 +496,12 @@ def _handle_nano_banana_image_generate(body: dict):
     if client_idempotency_key:
         idempotency_key = ExpenseGuard.compute_idempotency_key(
             identity_id or "", "image_generate", client_idempotency_key,
-            provider="nano_banana", refs=len(reference_images),
+            provider=provider, refs=len(reference_images),
         )
     else:
         idempotency_key = ExpenseGuard.compute_idempotency_key(
             identity_id or "", "image_generate", prompt,
-            provider="nano_banana", aspect_ratio=aspect_ratio, resolution=resolution,
+            provider=provider, aspect_ratio=aspect_ratio, resolution=resolution,
             refs=len(reference_images),
         )
     cached = ExpenseGuard.is_duplicate_request(idempotency_key)
@@ -515,12 +530,12 @@ def _handle_nano_banana_image_generate(body: dict):
     internal_job_id = str(uuid.uuid4())
 
     # Reserve credits (provider-specific: Nano Banana is premium)
-    action_key = _get_image_action_key(resolution, "nano_banana")
+    action_key = _get_image_action_key(resolution, provider)
     reservation_id, credit_error = start_paid_job(
         identity_id,
         action_key,
         internal_job_id,
-        {"prompt": prompt[:100], "model": NANO_BANANA_MODEL, "provider": "nano_banana"},
+        {"prompt": prompt[:100], "model": piapi_model, "provider": provider},
     )
     if credit_error:
         return credit_error
@@ -530,7 +545,7 @@ def _handle_nano_banana_image_generate(body: dict):
         "stage": "image",
         "created_at": now_s() * 1000,
         "prompt": prompt,
-        "model": NANO_BANANA_MODEL,
+        "model": piapi_model,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "output_format": output_format,
@@ -541,7 +556,7 @@ def _handle_nano_banana_image_generate(body: dict):
         "reservation_id": reservation_id,
         "internal_job_id": internal_job_id,
         "status": "queued",
-        "provider": "nano_banana",
+        "provider": provider,
     }
 
     # Save to in-memory store
@@ -553,7 +568,7 @@ def _handle_nano_banana_image_generate(body: dict):
     create_internal_job_row(
         internal_job_id=internal_job_id,
         identity_id=identity_id,
-        provider="nano_banana",
+        provider=provider,
         action_key=action_key,
         prompt=prompt,
         meta=store_meta,
@@ -578,7 +593,7 @@ def _handle_nano_banana_image_generate(body: dict):
         reference_images,
     )
 
-    log_event("image/generate:nano_banana:queued", {"internal_job_id": internal_job_id})
+    log_event(f"image/generate:{provider}:queued", {"internal_job_id": internal_job_id})
 
     # Return immediately with job_id for polling
     balance_info = get_current_balance(identity_id)
@@ -589,8 +604,8 @@ def _handle_nano_banana_image_generate(body: dict):
         "reservation_id": reservation_id,
         "new_balance": balance_info["available"] if balance_info else None,
         "status": "queued",
-        "model": NANO_BANANA_MODEL,
-        "provider": "nano_banana",
+        "model": piapi_model,
+        "provider": provider,
     }
 
     # Cache response for idempotency
