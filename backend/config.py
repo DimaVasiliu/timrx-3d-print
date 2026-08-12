@@ -25,6 +25,7 @@ import os
 import re
 from pathlib import Path
 from typing import Optional, List
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
@@ -747,8 +748,22 @@ class Config:
     PIAPI_WEBHOOK_LOG_BODY: bool = field(default_factory=lambda: _get_env_bool("PIAPI_WEBHOOK_LOG_BODY", False))
 
     # Meshy webhook settings
+    #
+    # Meshy registers webhooks per ACCOUNT in the Meshy dashboard (API settings
+    # page), not per task — the current Meshy API reference lists no webhook_url
+    # request parameter for text-to-3d / image-to-3d / multi-image-to-3d
+    # (https://docs.meshy.ai/en/api/webhooks, checked 2026-08-12).  Meshy also
+    # sends no signature or custom headers, so the callback URL itself has to
+    # carry the shared secret as a query param — see MESHY_WEBHOOK_URL below.
     MESHY_WEBHOOK_ENABLED: bool = field(default_factory=lambda: _get_env_bool("MESHY_WEBHOOK_ENABLED", False))
     MESHY_WEBHOOK_SECRET: str = field(default_factory=lambda: _get_env("MESHY_WEBHOOK_SECRET"))
+    # Optional explicit override for the derived callback URL (e.g. when the
+    # receiver sits behind a different host than PUBLIC_BASE_URL).
+    MESHY_WEBHOOK_URL_OVERRIDE: str = field(default_factory=lambda: _get_env("MESHY_WEBHOOK_URL"))
+    # Opt-in: also send webhook_url inside each Meshy task payload.  Off by
+    # default because it is undocumented in the current Meshy API reference;
+    # turn it on only after confirming Meshy accepts the field.
+    MESHY_WEBHOOK_SEND_TASK_URL: bool = field(default_factory=lambda: _get_env_bool("MESHY_WEBHOOK_SEND_TASK_URL", False))
 
     @property
     def PIAPI_WEBHOOK_URL(self) -> str:
@@ -767,15 +782,46 @@ class Config:
     @property
     def MESHY_WEBHOOK_URL(self) -> str:
         """
-        Full URL for Meshy task-level webhook callbacks.
+        Full URL for Meshy webhook callbacks — the exact string to paste into
+        the Meshy dashboard API settings page.
 
-        Derived from PUBLIC_BASE_URL. Empty string when PUBLIC_BASE_URL is
-        not set or Meshy webhooks are disabled.
+        Derived from MESHY_WEBHOOK_URL (explicit override) or PUBLIC_BASE_URL,
+        with ?secret=<MESHY_WEBHOOK_SECRET> appended because Meshy sends no
+        signature header — /api/webhooks/meshy/task fails closed without it.
+
+        Returns "" when webhooks are disabled, no base URL is configured, or
+        no secret is set (an unauthenticated callback URL would be rejected by
+        the receiver anyway).
         """
-        if not self.MESHY_WEBHOOK_ENABLED or not self.PUBLIC_BASE_URL:
+        if not self.MESHY_WEBHOOK_ENABLED or not self.MESHY_WEBHOOK_SECRET:
             return ""
-        base = self.PUBLIC_BASE_URL.rstrip("/")
-        return f"{base}/api/webhooks/meshy/task"
+
+        override = self.MESHY_WEBHOOK_URL_OVERRIDE.strip()
+        if override:
+            url = override
+        elif self.PUBLIC_BASE_URL:
+            url = f"{self.PUBLIC_BASE_URL.rstrip('/')}/api/webhooks/meshy/task"
+        else:
+            return ""
+
+        if "secret=" in url:
+            return url
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}secret={quote(self.MESHY_WEBHOOK_SECRET, safe='')}"
+
+    @property
+    def MESHY_TASK_WEBHOOK_URL(self) -> str:
+        """
+        Webhook URL to embed in Meshy task creation payloads.
+
+        Empty unless MESHY_WEBHOOK_SEND_TASK_URL is explicitly enabled: the
+        current Meshy API reference documents no per-task webhook_url field,
+        so task payloads stay clean by default and dashboard registration of
+        MESHY_WEBHOOK_URL is the supported path.
+        """
+        if not self.MESHY_WEBHOOK_SEND_TASK_URL:
+            return ""
+        return self.MESHY_WEBHOOK_URL
 
     # ─────────────────────────────────────────────────────────────
     # fal.ai Seedance 1.5 Pro Video Generation
@@ -973,8 +1019,13 @@ class Config:
                 warnings.append("IMAGE_PROVIDER_IDEOGRAM_V3_ENABLED=true but IDEOGRAM_API_KEY is not set")
             if self.IMAGE_PROVIDER_RECRAFT_V4_ENABLED and not self.RECRAFT_API_KEY:
                 warnings.append("IMAGE_PROVIDER_RECRAFT_V4_ENABLED=true but RECRAFT_API_KEY is not set")
-            if self.MESHY_WEBHOOK_ENABLED and not self.PUBLIC_BASE_URL:
+            if self.MESHY_WEBHOOK_ENABLED and not (self.PUBLIC_BASE_URL or self.MESHY_WEBHOOK_URL_OVERRIDE):
                 warnings.append("MESHY_WEBHOOK_ENABLED=true but PUBLIC_BASE_URL is not set")
+            if self.MESHY_WEBHOOK_ENABLED and not self.MESHY_WEBHOOK_SECRET:
+                warnings.append(
+                    "MESHY_WEBHOOK_ENABLED=true but MESHY_WEBHOOK_SECRET is not set - "
+                    "Meshy callbacks cannot be authenticated, so the webhook stays disabled"
+                )
             if self.PIAPI_WEBHOOK_ENABLED and not self.PUBLIC_BASE_URL:
                 warnings.append("PIAPI_WEBHOOK_ENABLED=true but PUBLIC_BASE_URL is not set")
             if not self.ALLOWED_ORIGINS:

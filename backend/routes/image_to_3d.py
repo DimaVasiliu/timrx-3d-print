@@ -535,7 +535,12 @@ def multi_image_to_3d_start_mod():
         "prompt": prompt,
         "root_prompt": prompt,
         "title": title,
+        # stage stays "image3d" so history/print/webhook stage filters keep
+        # treating these as image-to-3D models; job_kind is what tells job
+        # recovery to poll /multi-image-to-3d/status instead of the
+        # single-image route (Meshy retrieves them from different endpoints).
         "stage": "image3d",
+        "job_kind": "multi_image_to_3d",
     }
     if negative_prompt:
         job_meta["negative_prompt"] = negative_prompt
@@ -584,6 +589,7 @@ def multi_image_to_3d_start_mod():
 
     store_meta = {
         "stage": "image3d",
+        "job_kind": "multi_image_to_3d",
         "created_at": now_s() * 1000,
         "prompt": prompt,
         "root_prompt": prompt,

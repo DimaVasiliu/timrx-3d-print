@@ -1225,6 +1225,17 @@ class JobService:
     # ─────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _job_meta_dict(job: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a job's meta as a dict (rows may carry it as a JSON string)."""
+        meta = job.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        return meta if isinstance(meta, dict) else {}
+
+    @staticmethod
     def _resolve_resume_fields(job: Dict[str, Any]) -> tuple:
         """
         Determine the canonical resume identity for a job.
@@ -1245,8 +1256,19 @@ class JobService:
         stage = (job.get("stage") or "").lower()
         upstream = job.get("upstream_job_id")
         internal_id = str(job["id"])
+        meta = JobService._job_meta_dict(job)
 
         provider_job_id = upstream or None
+
+        # Multi-image-to-3D shares the "image3d" stage and MESHY_IMAGE_TO_3D
+        # action with single-image jobs, but Meshy retrieves it from a separate
+        # endpoint (GET /openapi/v1/multi-image-to-3d/:id), so it needs its own
+        # resume strategy. original_image_urls covers jobs created before
+        # job_kind was stamped into meta.
+        is_multi_image = (
+            meta.get("job_kind") == "multi_image_to_3d"
+            or bool(meta.get("original_image_urls"))
+        )
 
         # Determine resume_strategy from stage first (most reliable), then action_code
         if stage == "multi_color_print" or "multi_color" in action or "multi-color" in action:
@@ -1262,7 +1284,9 @@ class JobService:
         elif stage == "refine" or "refine" in action:
             resume_strategy = "meshy_refine"
         elif stage == "image3d" or "image_to_3d" in action:
-            resume_strategy = "meshy_image_to_3d"
+            resume_strategy = (
+                "meshy_multi_image_to_3d" if is_multi_image else "meshy_image_to_3d"
+            )
         elif stage == "preview" or "text_to_3d" in action:
             resume_strategy = "meshy_text_to_3d"
         elif stage == "video" or "video" in action or "seedance" in action:
@@ -1288,12 +1312,7 @@ class JobService:
         provider_job_id, frontend_resume_id, resume_strategy = (
             JobService._resolve_resume_fields(job)
         )
-        meta = job.get("meta") or {}
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except Exception:
-                meta = {}
+        meta = JobService._job_meta_dict(job)
         return {
             # Existing fields (preserved for compatibility)
             "id": str(job["id"]),

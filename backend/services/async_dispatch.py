@@ -17,7 +17,7 @@ from typing import Optional
 
 import requests
 
-from backend.config import AWS_BUCKET_MODELS
+from backend.config import AWS_BUCKET_MODELS, config
 from backend.db import USE_DB, get_conn, Tables
 from backend.services.credits_helper import finalize_job_credits, release_job_credits
 from backend.services.expense_guard import ExpenseGuard
@@ -305,7 +305,7 @@ def dispatch_meshy_text_to_3d_async(
         return
 
     try:
-        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        webhook_url = config.MESHY_TASK_WEBHOOK_URL
         if webhook_url:
             payload["webhook_url"] = webhook_url
         resp = mesh_post("/openapi/v2/text-to-3d", payload)
@@ -370,7 +370,7 @@ def dispatch_meshy_refine_async(
         return
 
     try:
-        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        webhook_url = config.MESHY_TASK_WEBHOOK_URL
         if webhook_url:
             payload["webhook_url"] = webhook_url
         # Meshy has eventual consistency: a just-completed preview may not be
@@ -521,7 +521,7 @@ def dispatch_meshy_image_to_3d_async(
         except Exception as preflight_err:
             print(f"[MESHY_PREFLIGHT] Normalization failed (proceeding with original): {preflight_err}")
 
-        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        webhook_url = config.MESHY_TASK_WEBHOOK_URL
         if webhook_url:
             payload["webhook_url"] = webhook_url
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
@@ -1648,7 +1648,7 @@ def dispatch_meshy_multi_image_to_3d_async(
         except Exception as preflight_err:
             print(f"[MESHY_PREFLIGHT] Multi-image normalization failed (proceeding with originals): {preflight_err}")
 
-        webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+        webhook_url = config.MESHY_TASK_WEBHOOK_URL
         if webhook_url:
             payload["webhook_url"] = webhook_url
         resp = mesh_post("/openapi/v1/multi-image-to-3d", payload)

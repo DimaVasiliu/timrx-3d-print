@@ -46,6 +46,7 @@ import traceback
 import uuid
 from typing import Any, Dict, Optional
 
+from backend.config import config
 from backend.db import USE_DB, get_conn, transaction, Tables
 from backend.services.video_errors import (
     TERMINAL_STATES as _SHARED_TERMINAL_STATES,
@@ -705,7 +706,7 @@ def _auto_retry_meshy(
             if meta.get("preview_task_id"):
                 payload["preview_task_id"] = meta["preview_task_id"]
 
-    webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+    webhook_url = config.MESHY_TASK_WEBHOOK_URL
     if webhook_url:
         payload["webhook_url"] = webhook_url
 
@@ -858,7 +859,7 @@ def _dispatch_meshy_to_provider(job: Dict[str, Any], meta: Dict[str, Any]):
                 payload["preview_task_id"] = meta["preview_task_id"]
 
     # Add webhook URL if configured
-    webhook_url = os.getenv("MESHY_WEBHOOK_URL", "")
+    webhook_url = config.MESHY_TASK_WEBHOOK_URL
     if webhook_url:
         payload["webhook_url"] = webhook_url
 
