@@ -193,11 +193,14 @@ V25_MAX_TOTAL_REFERENCES = 15  # 9 images + 3 videos + 3 audio — PiAPI states 
 V25_MAX_IMAGE_REFERENCES = 9
 V25_MAX_VIDEO_REFERENCES = 3
 V25_MAX_AUDIO_REFERENCES = 3
-# PiAPI's 2.5 docs converged (Aug 2026): product page and API specs both say
-# "4-30 seconds, integer values, default 5". Enforce 30, still env-overridable in
-# case upstream regresses. Pricing needs no new rows past 15s: the per-second
-# fallback in pricing_service covers any duration.
-V25_MAX_DURATION_SECONDS = int(os.getenv("SEEDANCE_25_MAX_DURATION", "30"))
+# PiAPI's 2.5 docs still contradict each other: the product page says "4-30
+# seconds" but the prompts guide says "4-15" and notes the live API wins when
+# pages differ. VERIFIED 2026-08-12 against the live API: duration=30 -> 400,
+# so 15 is the real ceiling. If PiAPI ever enables 30s, set
+# SEEDANCE_25_MAX_DURATION=30 (no deploy needed) — the 20/25/30s action-cost
+# rows are already in the DB (migration 082) and the frontend duration list
+# reads from one constant (V25_DURATIONS in 3dprint-app.js).
+V25_MAX_DURATION_SECONDS = int(os.getenv("SEEDANCE_25_MAX_DURATION", "15"))
 
 # Per-task-type resolution support and defaults (PiAPI: Mini and 2.5 default to
 # 720p; `seedance-2` is the only task type offering 1080p).
