@@ -1,12 +1,15 @@
 """
 OpenAI image generation service.
 
-Model history:
-  - gpt-image-1   : original (SHUTS DOWN 2026-10-23)
-  - gpt-image-1.5 : superseded by gpt-image-2, still callable for legacy pins
-  - gpt-image-2   : current default — GA 2026-04-21, native reasoning,
-                    explicit 1K/2K/4K output ($0.03/$0.05/$0.06 per image)
-  - DALL·E 2/3    : deprecated, shutting down May 12, 2026
+Model history (checked against OpenAI deprecations on 2026-08-13):
+  - gpt-image-2   : current default — GA 2026-04-21, native reasoning.
+                    Billed per token, NOT per image: $5.00/1M text input,
+                    $8.00/1M image input, $30.00/1M output tokens. Cost per
+                    image therefore varies with prompt length, reference-image
+                    count and `quality`.
+  - gpt-image-1.5 : deprecated, shuts down 2026-12-01 -> gpt-image-2
+  - gpt-image-1   : deprecated, shuts down 2026-10-23 -> gpt-image-2
+  - DALL·E 2/3    : shut down 2026-05-12, no longer callable
 
 Capabilities:
   - openai_image_generate(...) : text-to-image  via POST /v1/images/generations
@@ -27,8 +30,10 @@ from backend.config import config
 
 # Model pin lives in config so a vendor bump is an env change, not a deploy.
 _DEFAULT_OPENAI_IMAGE_MODEL = getattr(config, "OPENAI_IMAGE_MODEL", None) or "gpt-image-2"
-# Models on the modern images API: no `response_format`, base64 is returned by default.
-_OPENAI_IMAGE_MODELS = ("gpt-image-1", "gpt-image-1.5", "gpt-image-2")
+# Every model on the modern images API is `gpt-image-*`: it rejects `response_format`
+# and returns base64 by default. Prefix-matched rather than enumerated so snapshot pins
+# (e.g. gpt-image-2-2026-04-21) and future revisions don't silently take the legacy path.
+_MODERN_IMAGE_MODEL_PREFIX = "gpt-image"
 
 # OpenAI image generation can take a while, especially for high-quality images
 # gpt-image-1 can take 60-120s for complex prompts; allow generous timeout
@@ -64,8 +69,9 @@ def openai_image_generate(
         "size": size,
         "n": max(1, min(4, int(n or 1))),
     }
-    # gpt-image-1 and gpt-image-1.5 don't support response_format param
-    if model not in _OPENAI_IMAGE_MODELS:
+    # gpt-image-* models reject `response_format` and always return b64_json.
+    # Only a non-gpt-image pin (all of which are now shut down) would take this path.
+    if not str(model).startswith(_MODERN_IMAGE_MODEL_PREFIX):
         payload["response_format"] = response_format
 
     last_error = None
@@ -107,7 +113,7 @@ def openai_image_generate(
 
 # ---------------------------------------------------------------------------
 # Image-to-image / edit via POST /v1/images/edits
-# Supports gpt-image-1 and gpt-image-1.5. Accepts up to 10 reference images
+# Supports the gpt-image-* family. Accepts up to 10 reference images
 # (sent as image[] multipart files) and an optional mask for inpainting.
 # ---------------------------------------------------------------------------
 _OPENAI_FETCH_TIMEOUT = (15, 60)
@@ -152,7 +158,7 @@ def openai_image_edit(
         reference_images: List of URLs (http/https) or data: URLs (1-10).
         mask_image: Optional URL/data: URL for inpainting (transparent = region to edit).
         size: "1024x1024" | "1024x1536" | "1536x1024"
-        model: "gpt-image-1" or "gpt-image-1.5" (default)
+        model: a gpt-image-* id (defaults to config.OPENAI_IMAGE_MODEL, i.e. gpt-image-2)
         n: 1-4 images
 
     Returns:

@@ -122,6 +122,10 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         "ai_model": ai_model,
     }
 
+    # symmetry_mode is DEPRECATED in the Meshy API ("This parameter no longer
+    # affects output" — https://docs.meshy.ai/en/api/text-to-3d, checked
+    # 2026-08-13). Kept because TimrX history/meta still carries it and Meshy
+    # still accepts the field; it simply has no effect on the generated mesh.
     symmetry_mode = (body.get("symmetry_mode") or "").strip().lower()
     if symmetry_mode in {"off", "auto", "on"}:
         payload["symmetry_mode"] = symmetry_mode
@@ -146,12 +150,28 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         topology = (body.get("topology") or "").strip().lower()
         if topology in {"triangle", "quad"}:
             payload["topology"] = topology
-        try:
-            target_polycount = int(body.get("target_polycount"))
-        except (TypeError, ValueError):
-            target_polycount = None
-        if target_polycount is not None and 100 <= target_polycount <= 300000:
-            payload["target_polycount"] = target_polycount
+
+        # decimation_mode: adaptive polycount level 1-4 (1=ultra, 2=high,
+        # 3=medium, 4=low). Only meaningful with should_remesh, and Meshy
+        # ignores target_polycount whenever it is set
+        # (https://docs.meshy.ai/en/api/text-to-3d, checked 2026-08-13).
+        raw_decimation = body.get("decimation_mode")
+        if raw_decimation is not None and str(raw_decimation).strip() != "":
+            try:
+                decimation_mode = int(raw_decimation)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "decimation_mode must be an integer between 1 and 4"}), 400
+            if decimation_mode not in {1, 2, 3, 4}:
+                return jsonify({"ok": False, "error": "decimation_mode must be an integer between 1 and 4"}), 400
+            payload["decimation_mode"] = decimation_mode
+
+        if "decimation_mode" not in payload:
+            try:
+                target_polycount = int(body.get("target_polycount"))
+            except (TypeError, ValueError):
+                target_polycount = None
+            if target_polycount is not None and 100 <= target_polycount <= 300000:
+                payload["target_polycount"] = target_polycount
 
     payload["moderation"] = True
 
@@ -228,6 +248,7 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         "model_type": payload.get("model_type") or "standard",
         "should_remesh": bool(payload.get("should_remesh")),
         "topology": payload.get("topology"),
+        "decimation_mode": payload.get("decimation_mode"),
         "target_polycount": payload.get("target_polycount"),
         "moderation": bool(payload.get("moderation")),
         "target_formats": payload.get("target_formats") or [],
@@ -260,6 +281,7 @@ def text_to_3d_start_mod(body=None, identity_id=None):
         "model_type": payload.get("model_type") or "standard",
         "should_remesh": bool(payload.get("should_remesh")),
         "topology": payload.get("topology"),
+        "decimation_mode": payload.get("decimation_mode"),
         "target_polycount": payload.get("target_polycount"),
         "moderation": bool(payload.get("moderation")),
         "target_formats": payload.get("target_formats") or [],

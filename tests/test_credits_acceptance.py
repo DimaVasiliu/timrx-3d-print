@@ -336,7 +336,7 @@ class CreditsAcceptanceTests:
         # Try to generate image
         status, data = self.api("POST", "/api/_mod/image/openai", {
             "prompt": "A test image",
-            "model": "dall-e-3",
+            "model": "gpt-image-2",
             "size": "1024x1024",
         }, session=fresh_ts.session)
 
@@ -375,7 +375,7 @@ class CreditsAcceptanceTests:
         # Start image generation
         status, data = self.api("POST", "/api/_mod/image/openai", {
             "prompt": f"A simple red cube test_{RUN_ID}",
-            "model": "dall-e-3",
+            "model": "gpt-image-2",
             "size": "1024x1024",
         }, timeout=120)
 
@@ -808,7 +808,7 @@ curl -c cookies2.txt -b cookies2.txt "$BASE/api/me" | jq
 curl -X POST "$BASE/api/_mod/image/openai" \\
   -H "Content-Type: application/json" \\
   -b cookies2.txt \\
-  -d '{"prompt":"test","model":"dall-e-3","size":"1024x1024"}' | jq
+  -d '{"prompt":"test","model":"gpt-image-2","size":"1024x1024"}' | jq
 
 # Expected: 402, code: INSUFFICIENT_CREDITS
 
@@ -819,7 +819,7 @@ curl -X POST "$BASE/api/_mod/image/openai" \\
 JOB_RESPONSE=$(curl -s -X POST "$BASE/api/_mod/image/openai" \\
   -H "Content-Type: application/json" \\
   -b cookies.txt \\
-  -d '{"prompt":"A red cube","model":"dall-e-3","size":"1024x1024"}')
+  -d '{"prompt":"A red cube","model":"gpt-image-2","size":"1024x1024"}')
 
 echo $JOB_RESPONSE | jq
 JOB_ID=$(echo $JOB_RESPONSE | jq -r '.job_id')

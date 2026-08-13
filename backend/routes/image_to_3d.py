@@ -106,9 +106,13 @@ def image_to_3d_start_mod():
         return jsonify({"ok": False, "error": str(exc)}), 400
     alpha_thumbnail = meshy_alpha_thumbnail(body)
 
+    # NOTE: Meshy Image-to-3D has no generic "prompt" parameter — the model
+    # input is the image, and text guidance is texture-only via texture_prompt
+    # (https://docs.meshy.ai/en/api/image-to-3d, checked 2026-08-13). The
+    # incoming prompt/negative_prompt are kept for TimrX titles and history
+    # only, and are never forwarded to the provider.
     payload = {
         "image_url": image_url,
-        "prompt": provider_prompt,
         "ai_model": ai_model,
         "enable_pbr": True,
     }
@@ -124,8 +128,11 @@ def image_to_3d_start_mod():
     if texture_resolution:
         payload["texture_resolution"] = texture_resolution
 
+    # Texture guidance must come from explicit texture fields only — the
+    # model-level negative prompt is not texture guidance and must not be
+    # folded into texture_prompt.
     texture_prompt = (body.get("texture_prompt") or "").strip()
-    texture_negative_prompt = normalize_negative_prompt(body.get("texture_negative_prompt") or body.get("negative_prompt"))
+    texture_negative_prompt = normalize_negative_prompt(body.get("texture_negative_prompt"))
     if texture_prompt and texture_negative_prompt:
         texture_prompt = merge_negative_prompt(texture_prompt, texture_negative_prompt)
     texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip()
@@ -179,8 +186,13 @@ def image_to_3d_start_mod():
     if img_enhance is not None:
         payload["image_enhancement"] = bool(img_enhance)
 
+    # remove_lighting is documented for Image-to-3D as meshy-6 only
+    # (https://docs.meshy.ai/en/api/image-to-3d, checked 2026-08-13).
+    # Sending it with meshy-7/latest/smart-topology is not supported, so it is
+    # dropped rather than forwarded. The single-image modal exposes no toggle
+    # for it today; retexture/refine keep their own meshy-6-gated controls.
     remove_lighting = body.get("remove_lighting")
-    if remove_lighting is not None and ai_model != "meshy-5":
+    if remove_lighting is not None and ai_model == "meshy-6":
         payload["remove_lighting"] = bool(remove_lighting)
 
     moderation = body.get("moderation")
@@ -567,8 +579,16 @@ def multi_image_to_3d_start_mod():
         payload["model_type"] = model_type
     if texture_resolution:
         payload["texture_resolution"] = texture_resolution
-    if provider_prompt:
-        payload["prompt"] = provider_prompt
+    # Like Image-to-3D, Multi-Image-to-3D documents no generic "prompt"
+    # parameter — only texture_prompt / texture_image_url for texture guidance
+    # (https://docs.meshy.ai/en/api/multi-image-to-3d, checked 2026-08-13).
+    # The name/negative prompt stay in TimrX metadata only.
+    texture_prompt = (body.get("texture_prompt") or "").strip()
+    texture_image_url = (body.get("texture_image_url") or body.get("image_style_url") or "").strip()
+    if texture_prompt:
+        payload["texture_prompt"] = texture_prompt
+    elif texture_image_url:
+        payload["texture_image_url"] = texture_image_url
     if body.get("should_texture") is not None:
         payload["should_texture"] = bool(body.get("should_texture"))
     if body.get("image_enhancement") is not None:

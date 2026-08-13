@@ -36,7 +36,11 @@ ACTION_CODE_COST_USD: Dict[str, float] = {
     "MESHY_ANIMATION":    0.06,
     "MESHY_MULTI_COLOR_PRINT": 0.20,
 
-    # OpenAI image generation (gpt-image-1)
+    # OpenAI image generation.
+    # STALE: these are flat per-image estimates from gpt-image-1's per-image pricing.
+    # gpt-image-2 bills per token ($5/1M text in, $8/1M image in, $30/1M out), so real
+    # cost varies with prompt length, reference-image count and `quality` (currently
+    # unset => "auto"). Re-derive before trusting the provider ledger's cost figures.
     "OPENAI_IMAGE":       0.04,
     "OPENAI_IMAGE_2K":    0.08,
     "OPENAI_IMAGE_4K":    0.12,

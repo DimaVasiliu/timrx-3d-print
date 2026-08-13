@@ -296,7 +296,7 @@ def image_generate_unified():
         "aspect_ratio": "16:9",           # For Google: "1:1", "3:4", "4:3", "9:16", "16:9"
         "image_size": "1K",               # For Google: "1K" or "2K"
         "size": "1024x1024",              # For OpenAI
-        "model": "gpt-image-1.5",          # For OpenAI (default; gpt-image-1 still supported)
+        "model": "gpt-image-2",            # For OpenAI (default; gpt-image-1/1.5 are shutting down)
         "n": 1                            # Number of images
     }
 
@@ -1832,7 +1832,8 @@ def _openai_image_mod_legacy_disabled():
         return jsonify({"error": "prompt required"}), 400
 
     size_raw = (body.get("size") or body.get("resolution") or "1024x1024").lower()
-    # GPT Image 1 supported sizes (gpt-image-1)
+    # Sizes we expose. gpt-image-2 also accepts arbitrary WxH (edges multiple of 16,
+    # max 3840x2160, aspect within 3:1) if we ever want to widen this.
     size_map = {
         "1024x1024": "1024x1024",
         "1024x1536": "1024x1536",
