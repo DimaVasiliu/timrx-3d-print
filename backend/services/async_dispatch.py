@@ -159,6 +159,74 @@ def get_executor() -> ThreadPoolExecutor:
     return _background_executor
 
 
+# ---------------------------------------------------------------------------
+# Async-dispatch claim: prevents the durable job worker from re-dispatching a
+# queued job while a slow preflight (S3 upload / image normalization) is still
+# running in this process. The worker's claim query respects claimed_by +
+# heartbeat_at (HEARTBEAT_TIMEOUT = 180s), so marking the row here makes the
+# 30-second "stale queued" re-dispatch skip it. The claim is cleared when
+# update_job_with_upstream_id records the provider task id.
+# ---------------------------------------------------------------------------
+ASYNC_DISPATCH_CLAIMANT = "async-dispatch"
+
+
+def claim_job_for_async_dispatch(job_id: str) -> bool:
+    """Mark a queued job as being dispatched by this process.
+
+    Returns False when another claimant (e.g. the durable job worker) already
+    holds the job or the job already has an upstream id — the caller must then
+    abort to avoid a duplicate provider submission. Fails open (returns True)
+    on unexpected DB errors so a transient outage never blocks dispatch.
+    """
+    if not USE_DB or not job_id:
+        return True
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET claimed_by = %s, heartbeat_at = NOW(), updated_at = NOW()
+                    WHERE id::text = %s
+                      AND upstream_job_id IS NULL
+                      AND (claimed_by IS NULL
+                           OR claimed_by = %s
+                           OR heartbeat_at < NOW() - INTERVAL '180 seconds')
+                    RETURNING id
+                    """,
+                    (ASYNC_DISPATCH_CLAIMANT, job_id, ASYNC_DISPATCH_CLAIMANT),
+                )
+                claimed = cursor.fetchone()
+            conn.commit()
+        if not claimed:
+            print(f"[ASYNC] Job {job_id} already claimed/dispatched elsewhere — skipping duplicate dispatch")
+            return False
+        return True
+    except Exception as e:
+        print(f"[ASYNC] WARNING: claim_job_for_async_dispatch failed for {job_id}: {e} (failing open)")
+        return True
+
+
+def heartbeat_async_dispatch(job_id: str) -> None:
+    """Refresh heartbeat_at on our claim right before the provider call."""
+    if not USE_DB or not job_id:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE {Tables.JOBS}
+                    SET heartbeat_at = NOW()
+                    WHERE id::text = %s AND claimed_by = %s
+                    """,
+                    (job_id, ASYNC_DISPATCH_CLAIMANT),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[ASYNC] WARNING: heartbeat_async_dispatch failed for {job_id}: {e}")
+
+
 def _resolve_persisted_image_result(
     persisted_result,
     image_url: Optional[str],
@@ -292,6 +360,11 @@ def dispatch_meshy_text_to_3d_async(
     payload: dict,
     store_meta: dict,
 ):
+    # Claim before dispatch so a slow/hanging Meshy call can't overlap with
+    # the job worker's 30s stale-queued re-dispatch (same guard as image-to-3d).
+    if not claim_job_for_async_dispatch(internal_job_id):
+        return
+
     start_time = time.time()
     stage = store_meta.get("stage", "preview")
     breaker = _breakers.get("meshy")
@@ -357,6 +430,13 @@ def dispatch_meshy_refine_async(
     payload: dict,
     store_meta: dict,
 ):
+    # The fourth dispatcher, and the one the original double-model fix missed.
+    # Its retry loop sleeps 3+5+8s plus HTTP timeouts, which comfortably
+    # outlives the worker's 30s stale-queued window — the exact race that
+    # produced two models from one click.
+    if not claim_job_for_async_dispatch(internal_job_id):
+        return
+
     start_time = time.time()
     preview_id = payload.get("preview_task_id", "?")
     breaker = _breakers.get("meshy")
@@ -448,6 +528,12 @@ def dispatch_meshy_image_to_3d_async(
     store_meta: dict,
     image_url: str,
 ):
+    # Claim the row first: the slow preflight below (S3 upload + normalization)
+    # can exceed the worker's 30s "stale queued" window, and an unclaimed row
+    # would get dispatched a second time by job_worker → two Meshy models.
+    if not claim_job_for_async_dispatch(internal_job_id):
+        return
+
     start_time = time.time()
     # print(f"[ASYNC] Starting Meshy image-to-3d dispatch for job {internal_job_id}")
     # print(f"[JOB] provider_started job_id={internal_job_id} provider=meshy action=image-to-3d reservation_id={reservation_id}")
@@ -524,6 +610,7 @@ def dispatch_meshy_image_to_3d_async(
         webhook_url = config.MESHY_TASK_WEBHOOK_URL
         if webhook_url:
             payload["webhook_url"] = webhook_url
+        heartbeat_async_dispatch(internal_job_id)
         resp = mesh_post("/openapi/v1/image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
 
@@ -1371,11 +1458,13 @@ def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
                 cursor.execute(
                     f"""
                     UPDATE {Tables.JOBS}
-                    SET upstream_job_id = %s, status = 'processing', updated_at = NOW()
+                    SET upstream_job_id = %s, status = 'processing', updated_at = NOW(),
+                        claimed_by = CASE WHEN claimed_by = %s THEN NULL ELSE claimed_by END
                     WHERE id::text = %s
+                      AND status NOT IN ('cancelled', 'canceled', 'failed')
                     RETURNING id
                     """,
-                    (upstream_job_id, job_id),
+                    (upstream_job_id, ASYNC_DISPATCH_CLAIMANT, job_id),
                 )
                 result = cursor.fetchone()
             conn.commit()
@@ -1384,7 +1473,12 @@ def update_job_with_upstream_id(job_id: str, upstream_job_id: str):
                 # print(f"[ASYNC] Updated job {job_id} with upstream_job_id={upstream_job_id}")
                 return True
             else:
-                print(f"[ASYNC] WARNING: No job row to update for job_id={job_id}")
+                # Either the row is gone, or the user cancelled while our
+                # provider call was in flight. Recording the upstream id would
+                # flip a cancelled job back to 'processing' after its credits
+                # were already refunded, and the worker would then poll it to
+                # completion.
+                print(f"[ASYNC] No updatable job row for job_id={job_id} (cancelled, failed, or missing)")
                 return False
     except Exception as e:
         print(f"[ASYNC] ERROR updating job {job_id}: {e}")
@@ -1575,6 +1669,11 @@ def dispatch_meshy_multi_image_to_3d_async(
     image_urls: list,
 ):
     """Dispatch a multi-image-to-3D job to Meshy (POST /openapi/v1/multi-image-to-3d)."""
+    # Claim first — multi-image preflight uploads N images and can easily
+    # exceed the worker's 30s stale-queued re-dispatch window.
+    if not claim_job_for_async_dispatch(internal_job_id):
+        return
+
     start_time = time.time()
 
     try:
@@ -1651,6 +1750,7 @@ def dispatch_meshy_multi_image_to_3d_async(
         webhook_url = config.MESHY_TASK_WEBHOOK_URL
         if webhook_url:
             payload["webhook_url"] = webhook_url
+        heartbeat_async_dispatch(internal_job_id)
         resp = mesh_post("/openapi/v1/multi-image-to-3d", payload)
         meshy_task_id = resp.get("result") or resp.get("id")
 

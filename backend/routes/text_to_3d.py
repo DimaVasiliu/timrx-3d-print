@@ -509,6 +509,17 @@ def text_to_3d_refine_mod():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     alpha_thumbnail = meshy_alpha_thumbnail(body)
+    # auto_size / origin_at are supported on refine tasks
+    # (https://docs.meshy.ai/en/api/text-to-3d, checked 2026-08-13).
+    auto_size = None
+    if body.get("auto_size") is not None:
+        auto_size = bool(body.get("auto_size"))
+    origin_at = (body.get("origin_at") or "").strip().lower()
+    if origin_at and origin_at not in {"bottom", "center"}:
+        return jsonify({"ok": False, "error": "origin_at must be bottom or center"}), 400
+    # Origin only applies while Meshy is auto-sizing the mesh.
+    if not auto_size:
+        origin_at = ""
     texture_style_mode = "text" if texture_prompt else ("image" if texture_image_url else "text")
     # Derive title from prompt/root_prompt - derive_display_title handles generic titles automatically
     explicit_title = body.get("title") or preview_meta.get("title")
@@ -543,6 +554,10 @@ def text_to_3d_refine_mod():
         job_meta["target_formats"] = target_formats
     if alpha_thumbnail is not None:
         job_meta["alpha_thumbnail"] = alpha_thumbnail
+    if auto_size is not None:
+        job_meta["auto_size"] = auto_size
+    if origin_at:
+        job_meta["origin_at"] = origin_at
 
     reservation_id, credit_error = start_paid_job(identity_id, action_key, internal_job_id, job_meta)
     if credit_error:
@@ -566,6 +581,10 @@ def text_to_3d_refine_mod():
         payload["target_formats"] = target_formats
     if alpha_thumbnail is not None:
         payload["alpha_thumbnail"] = alpha_thumbnail
+    if auto_size is not None:
+        payload["auto_size"] = auto_size
+    if auto_size and origin_at:
+        payload["origin_at"] = origin_at
 
     store_meta = {
         "stage": "refine",
@@ -582,6 +601,8 @@ def text_to_3d_refine_mod():
         "texture_resolution": texture_resolution or "2k",
         "hd_texture": texture_resolution == "4k",
         "alpha_thumbnail": bool(alpha_thumbnail),
+        "auto_size": bool(auto_size),
+        "origin_at": origin_at or None,
         "target_formats": target_formats,
         "user_id": identity_id,
         "identity_id": identity_id,

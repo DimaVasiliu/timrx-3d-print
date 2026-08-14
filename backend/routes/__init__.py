@@ -49,6 +49,7 @@ def register_blueprints(app):
     from backend.routes.mesh_operations import bp as mesh_ops_bp
     from backend.routes.rigging import bp as rigging_bp
     from backend.routes.history import bp as history_bp
+    from backend.routes.library import bp as library_bp
     from backend.routes.community import bp as community_bp
     from backend.routes.contact import bp as contact_bp
     from backend.routes.video import bp as video_bp
@@ -105,6 +106,7 @@ def register_blueprints(app):
     app.register_blueprint(mesh_ops_bp, url_prefix="/api/_mod")
     app.register_blueprint(rigging_bp, url_prefix="/api/_mod")
     app.register_blueprint(history_bp, url_prefix="/api/_mod")
+    app.register_blueprint(library_bp, url_prefix="/api/_mod")
     app.register_blueprint(community_bp, url_prefix="/api/_mod")
     app.register_blueprint(video_bp, url_prefix="/api/_mod")
     app.register_blueprint(prompt_enhance_bp, url_prefix="/api/_mod")
@@ -129,6 +131,7 @@ def register_blueprints(app):
     # Also register under /api for backward compatibility (cached frontend)
     # These must match the legacy app.py routes exactly
     app.register_blueprint(history_bp, url_prefix="/api", name="history_compat")
+    app.register_blueprint(library_bp, url_prefix="/api", name="library_compat")
     app.register_blueprint(text_to_3d_bp, url_prefix="/api", name="text_to_3d_compat")
     app.register_blueprint(image_to_3d_bp, url_prefix="/api", name="image_to_3d_compat")
     app.register_blueprint(health_bp, url_prefix="/api", name="health_compat")
