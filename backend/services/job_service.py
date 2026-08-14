@@ -1275,6 +1275,12 @@ class JobService:
             resume_strategy = "meshy_multi_color_print"
         elif stage == "texture" or "retexture" in action:
             resume_strategy = "meshy_retexture"
+        elif stage == "convert" or "convert" in action:
+            resume_strategy = "meshy_convert"
+        elif stage == "resize" or "resize" in action:
+            resume_strategy = "meshy_resize"
+        elif stage in ("uv_unwrap", "uv-unwrap") or "uv_unwrap" in action or "uv-unwrap" in action:
+            resume_strategy = "meshy_uv_unwrap"
         elif stage == "remesh" or ("remesh" in action) or ("upscale" in action):
             resume_strategy = "meshy_remesh"
         elif stage == "rig" or "rigging" in action:
@@ -1301,6 +1307,9 @@ class JobService:
         # need the upstream (provider) task ID. Others resolve internally.
         uses_upstream_id = upstream and resume_strategy in (
             "meshy_retexture", "meshy_remesh", "meshy_rig", "meshy_animation",
+            # Convert/resize/uv-unwrap share the remesh status handler, which
+            # passes the URL param straight to the Meshy API.
+            "meshy_convert", "meshy_resize", "meshy_uv_unwrap",
         )
         frontend_resume_id = upstream if uses_upstream_id else internal_id
 
