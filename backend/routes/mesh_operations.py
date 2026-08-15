@@ -54,6 +54,30 @@ def _start_mesh_processing_task(
     meta_extra: dict | None = None,
 ):
     """Start a Meshy async mesh-processing task that shares remesh status handling."""
+    # Same double-submit guard the remesh route uses: without it a double-click
+    # starts two paid jobs (convert/resize are cheap, but they still charge).
+    idempotency_key = (
+        request.headers.get("Idempotency-Key") or body.get("idempotency_key") or ""
+    ).strip() or None
+    if idempotency_key:
+        existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+        if existing_job and existing_job.get("upstream_job_id"):
+            balance_info = get_current_balance(identity_id)
+            return jsonify({
+                "ok": True,
+                "job_id": existing_job["upstream_job_id"],
+                "reservation_id": existing_job.get("reservation_id"),
+                "new_balance": balance_info["available"] if balance_info else None,
+                "source": "modular",
+                "was_existing": True,
+            })
+        if existing_job:
+            return jsonify({
+                "ok": False,
+                "error": "JOB_ALREADY_STARTING",
+                "message": "This request is already being started. Please wait a moment.",
+            }), 409
+
     internal_job_id = str(uuid.uuid4())
     store = load_store()
     source_meta = get_job_metadata(source_task_id_input, store) or get_job_metadata(source_task_id, store) or {}
@@ -82,6 +106,7 @@ def _start_mesh_processing_task(
         meta=job_meta,
         reservation_id=reservation_id,
         status="queued",
+        idempotency_key=idempotency_key,
     )
 
     try:

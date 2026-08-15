@@ -134,6 +134,24 @@ CANONICAL_TO_DB = {
     CanonicalActions.RIGGING: "MESHY_RIGGING",
     CanonicalActions.ANIMATION: "MESHY_ANIMATION",
     CanonicalActions.MULTI_COLOR_PRINT: "MESHY_MULTI_COLOR_PRINT",
+    # Creative Lab + Meshy-native images (plan Stage 7). Keys are plain
+    # strings: these are productized endpoints, not core CanonicalActions.
+    "creative_lab_keychain_prototype": "MESHY_CL_KEYCHAIN_PROTOTYPE",
+    "creative_lab_keychain_build": "MESHY_CL_KEYCHAIN_BUILD",
+    "creative_lab_fridge_magnet_prototype": "MESHY_CL_FRIDGE_MAGNET_PROTOTYPE",
+    "creative_lab_fridge_magnet_build": "MESHY_CL_FRIDGE_MAGNET_BUILD",
+    "creative_lab_figure_prototype": "MESHY_CL_FIGURE_PROTOTYPE",
+    "creative_lab_figure_build": "MESHY_CL_FIGURE_BUILD",
+    "creative_lab_vinyl_figure_prototype": "MESHY_CL_VINYL_FIGURE_PROTOTYPE",
+    "creative_lab_vinyl_figure_build": "MESHY_CL_VINYL_FIGURE_BUILD",
+    "creative_lab_brick_figure_prototype": "MESHY_CL_BRICK_FIGURE_PROTOTYPE",
+    "creative_lab_brick_figure_build": "MESHY_CL_BRICK_FIGURE_BUILD",
+    "creative_lab_lamp_prototype": "MESHY_CL_LAMP_PROTOTYPE",
+    "creative_lab_lamp_build": "MESHY_CL_LAMP_BUILD",
+    "creative_lab_keycap_prototype": "MESHY_CL_KEYCAP_PROTOTYPE",
+    "creative_lab_keycap_build": "MESHY_CL_KEYCAP_BUILD",
+    "meshy_text_to_image": "MESHY_TEXT_TO_IMAGE",
+    "meshy_image_to_image": "MESHY_IMAGE_TO_IMAGE",
     # Video generation
     CanonicalActions.VIDEO_GENERATE: "VIDEO_GENERATE",
     CanonicalActions.VIDEO_TEXT_GENERATE: "VIDEO_TEXT_GENERATE",
@@ -373,6 +391,23 @@ DEFAULT_ACTION_COSTS = [
     {"action_code": "MESHY_RIGGING", "cost_credits": 5, "provider": "meshy"},
     {"action_code": "MESHY_ANIMATION", "cost_credits": 3, "provider": "meshy"},
     {"action_code": "MESHY_MULTI_COLOR_PRINT", "cost_credits": 10, "provider": "meshy"},
+    # ── Creative Lab: 1:1 with Meshy's own prototype/build credits ──
+    {"action_code": "MESHY_CL_KEYCHAIN_PROTOTYPE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_CL_KEYCHAIN_BUILD", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_CL_FRIDGE_MAGNET_PROTOTYPE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_CL_FRIDGE_MAGNET_BUILD", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_CL_FIGURE_PROTOTYPE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_CL_FIGURE_BUILD", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_CL_VINYL_FIGURE_PROTOTYPE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_CL_VINYL_FIGURE_BUILD", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_CL_BRICK_FIGURE_PROTOTYPE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_CL_BRICK_FIGURE_BUILD", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_CL_LAMP_PROTOTYPE", "cost_credits": 6, "provider": "meshy"},
+    {"action_code": "MESHY_CL_LAMP_BUILD", "cost_credits": 30, "provider": "meshy"},
+    {"action_code": "MESHY_CL_KEYCAP_PROTOTYPE", "cost_credits": 12, "provider": "meshy"},
+    {"action_code": "MESHY_CL_KEYCAP_BUILD", "cost_credits": 50, "provider": "meshy"},
+    {"action_code": "MESHY_TEXT_TO_IMAGE", "cost_credits": 9, "provider": "meshy"},
+    {"action_code": "MESHY_IMAGE_TO_IMAGE", "cost_credits": 12, "provider": "meshy"},
     # ── Image Generation — OpenAI (4c / 8c / 12c) ──
     {"action_code": "OPENAI_IMAGE", "cost_credits": 4, "provider": "openai"},        # Standard 1K
     {"action_code": "OPENAI_IMAGE_2K", "cost_credits": 8, "provider": "openai"},     # 2K

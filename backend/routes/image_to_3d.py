@@ -558,10 +558,13 @@ def multi_image_to_3d_start_mod():
         job_meta["negative_prompt"] = negative_prompt
         job_meta["provider_prompt"] = provider_prompt
 
-    model_type = (body.get("model_type") or "").strip().lower()
-    if model_type and model_type not in {"standard", "lowpoly"}:
-        return jsonify({"error": "model_type must be standard or lowpoly for multi-image generation"}), 400
-    model_type = model_type or "standard"
+    # Meshy's Multi-Image reference documents no model_type parameter
+    # (https://docs.meshy.ai/en/api/multi-image-to-3d, checked 2026-08-15), so
+    # multi-image always runs standard geometry and the field is never sent.
+    requested_model_type = (body.get("model_type") or "").strip().lower()
+    if requested_model_type and requested_model_type != "standard":
+        print(f"[multi-image-to-3d] ignoring unsupported model_type={requested_model_type}")
+    model_type = "standard"
     try:
         ai_model = normalize_meshy_model(body.get("model") or body.get("ai_model"), default="latest", allowed=MESHY_STANDARD_MODELS)
         texture_resolution = meshy_texture_resolution(body, ai_model)
@@ -575,10 +578,30 @@ def multi_image_to_3d_start_mod():
         "ai_model": ai_model,
         "enable_pbr": body.get("enable_pbr", True),
     }
-    if model_type != "standard":
-        payload["model_type"] = model_type
     if texture_resolution:
         payload["texture_resolution"] = texture_resolution
+
+    # Remesh controls are documented for multi-image and only apply when
+    # should_remesh is on, mirroring the single-image route.
+    if body.get("should_remesh") is not None:
+        payload["should_remesh"] = bool(body.get("should_remesh"))
+    if payload.get("should_remesh"):
+        topology = (body.get("topology") or "").strip().lower()
+        if topology in {"triangle", "quad"}:
+            payload["topology"] = topology
+        try:
+            decimation_mode = int(body.get("decimation_mode"))
+            if decimation_mode in {1, 2, 3, 4}:
+                payload["decimation_mode"] = decimation_mode
+        except (TypeError, ValueError):
+            pass
+        if "decimation_mode" not in payload:
+            try:
+                target_polycount = int(body.get("target_polycount"))
+                if 100 <= target_polycount <= 300000:
+                    payload["target_polycount"] = target_polycount
+            except (TypeError, ValueError):
+                pass
     # Like Image-to-3D, Multi-Image-to-3D documents no generic "prompt"
     # parameter — only texture_prompt / texture_image_url for texture guidance
     # (https://docs.meshy.ai/en/api/multi-image-to-3d, checked 2026-08-13).
@@ -616,7 +639,11 @@ def multi_image_to_3d_start_mod():
         "title": title,
         "original_image_urls": image_urls,
         "ai_model": payload.get("ai_model"),
-        "model_type": payload.get("model_type") or "standard",
+        "model_type": "standard",
+        "should_remesh": bool(payload.get("should_remesh")),
+        "topology": payload.get("topology"),
+        "decimation_mode": payload.get("decimation_mode"),
+        "target_polycount": payload.get("target_polycount"),
         "texture_resolution": texture_resolution or "2k",
         "target_formats": target_formats,
         "alpha_thumbnail": bool(alpha_thumbnail),

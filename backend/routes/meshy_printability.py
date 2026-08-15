@@ -40,6 +40,7 @@ from backend.services.job_service import (
     _update_job_status_failed,
     _update_job_status_ready,
     create_internal_job_row,
+    get_job_by_idempotency_key,
     get_job_metadata,
     load_store,
     save_store,
@@ -154,8 +155,32 @@ def normalize_printability(ms: dict) -> dict | None:
 def _start_printability_task(*, stage: str, body: dict, identity_id: str, payload: dict):
     """Reserve credits, create the job row, and dispatch to Meshy."""
     provider_segment, action_key, label = _PRINTABILITY_OPS[stage]
-    internal_job_id = str(uuid.uuid4())
 
+    # Repair costs 10 credits, so a double submit must not start two jobs.
+    idempotency_key = (
+        request.headers.get("Idempotency-Key") or body.get("idempotency_key") or ""
+    ).strip() or None
+    if idempotency_key:
+        existing_job = get_job_by_idempotency_key(identity_id, idempotency_key)
+        if existing_job and existing_job.get("upstream_job_id"):
+            balance_info = get_current_balance(identity_id)
+            return jsonify({
+                "ok": True,
+                "job_id": existing_job["upstream_job_id"],
+                "reservation_id": existing_job.get("reservation_id"),
+                "new_balance": balance_info["available"] if balance_info else None,
+                "stage": stage,
+                "source": "modular",
+                "was_existing": True,
+            })
+        if existing_job:
+            return jsonify({
+                "ok": False,
+                "error": "JOB_ALREADY_STARTING",
+                "message": f"{label} is already being started. Please wait a moment.",
+            }), 409
+
+    internal_job_id = str(uuid.uuid4())
     store = load_store()
     source_task_id = payload.get("input_task_id") or body.get("source_task_id")
     source_meta = get_job_metadata(source_task_id, store) or {}
@@ -190,6 +215,7 @@ def _start_printability_task(*, stage: str, body: dict, identity_id: str, payloa
         meta=job_meta,
         reservation_id=reservation_id,
         status="queued",
+        idempotency_key=idempotency_key,
     )
 
     try:

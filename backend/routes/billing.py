@@ -196,9 +196,14 @@ def get_action_costs():
             print(f"[BILLING] Returning {len(action_costs)} action costs: {[c['action_key'] for c in action_costs]}")
         else:
             print("[BILLING] WARNING: No action costs returned from PricingService!")
+        from backend.services.meshy_service import MESHY_SURCHARGES
+
         response = make_response(jsonify({
             "ok": True,
             "action_costs": action_costs,
+            # Provider-tier deltas applied on top of the base cost at
+            # reservation time (see expected_meshy_platform_cost).
+            "meshy_surcharges": MESHY_SURCHARGES,
         }))
         return _add_cache_headers(response)
     except Exception as e:
@@ -207,17 +212,27 @@ def get_action_costs():
         traceback.print_exc()
         # Return hardcoded fallback if DB fails (must match DEFAULT_ACTION_COSTS in pricing_service.py)
         # Last updated: March 2026 pricing refactor
+        from backend.services.meshy_service import MESHY_SURCHARGES
+
         return jsonify({
             "ok": True,
+            "meshy_surcharges": MESHY_SURCHARGES,
             "action_costs": [
-                # 3D generation
+                # 3D generation — keep in step with pricing_service.DEFAULT_ACTION_COSTS
                 {"action_key": "text_to_3d_generate", "credits": 20},
                 {"action_key": "image_to_3d_generate", "credits": 30},
-                {"action_key": "refine", "credits": 6},
-                {"action_key": "remesh", "credits": 6},
-                {"action_key": "retexture", "credits": 5},
+                {"action_key": "refine", "credits": 10},
+                {"action_key": "remesh", "credits": 5},
+                {"action_key": "retexture", "credits": 10},
                 {"action_key": "rigging", "credits": 5},
                 {"action_key": "animation", "credits": 3},
+                # Mesh operations + printability
+                {"action_key": "convert", "credits": 1},
+                {"action_key": "resize", "credits": 1},
+                {"action_key": "uv_unwrap", "credits": 5},
+                {"action_key": "print_analyze", "credits": 0},
+                {"action_key": "print_repair", "credits": 10},
+                {"action_key": "multi_color_print", "credits": 10},
                 # Image generation — OpenAI/Gemini (4c / 8c — no 4K)
                 {"action_key": "image_generate", "credits": 4},
                 {"action_key": "image_generate_2k", "credits": 8},

@@ -891,6 +891,23 @@ class Config:
             "print_repair": "print_repair",
             "print-analyze": "print_analyze",
             "print_analyze": "print_analyze",
+            # Creative Lab (Stage 7.2) and Meshy-native images (Stage 7.3)
+            "creative-lab-keychain-prototype": "creative_lab_keychain_prototype",
+            "creative-lab-keychain-build": "creative_lab_keychain_build",
+            "creative-lab-fridge-magnet-prototype": "creative_lab_fridge_magnet_prototype",
+            "creative-lab-fridge-magnet-build": "creative_lab_fridge_magnet_build",
+            "creative-lab-figure-prototype": "creative_lab_figure_prototype",
+            "creative-lab-figure-build": "creative_lab_figure_build",
+            "creative-lab-vinyl-figure-prototype": "creative_lab_vinyl_figure_prototype",
+            "creative-lab-vinyl-figure-build": "creative_lab_vinyl_figure_build",
+            "creative-lab-brick-figure-prototype": "creative_lab_brick_figure_prototype",
+            "creative-lab-brick-figure-build": "creative_lab_brick_figure_build",
+            "creative-lab-lamp-prototype": "creative_lab_lamp_prototype",
+            "creative-lab-lamp-build": "creative_lab_lamp_build",
+            "creative-lab-keycap-prototype": "creative_lab_keycap_prototype",
+            "creative-lab-keycap-build": "creative_lab_keycap_build",
+            "meshy-text-to-image": "meshy_text_to_image",
+            "meshy-image-to-image": "meshy_image_to_image",
             "openai-image": "image_generate",             # Canonical
             # Additional canonical mappings
             "image_generate": "image_generate",

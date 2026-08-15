@@ -88,6 +88,72 @@ def get_stats():
         return jsonify({"ok": False, "error": "Database error"}), 500
 
 
+@bp.route("/meshy/balance", methods=["GET"])
+@require_admin
+def meshy_balance():
+    """
+    Meshy provider credit balance (admin only).
+
+    Wraps Meshy's GET /openapi/v1/balance
+    (https://docs.meshy.ai/en/api/balance, checked 2026-08-15), which returns
+    the API account's remaining provider credits. These are Meshy's credits,
+    not TimrX wallet credits — use it to spot a provider account running dry
+    before generations start failing.
+
+    Returns:
+        - balance: provider credits remaining (null if Meshy omitted it)
+        - provider_status: "ok" | "unconfigured" | "unavailable"
+        - checked_at: unix seconds of this check
+        - raw: Meshy's untouched response, for debugging
+    """
+    from backend.config import MESHY_API_KEY
+    from backend.utils.helpers import now_s
+
+    checked_at = now_s()
+    if not MESHY_API_KEY:
+        return jsonify({
+            "ok": True,
+            "balance": None,
+            "provider": "meshy",
+            "provider_status": "unconfigured",
+            "message": "MESHY_API_KEY is not configured on this environment.",
+            "checked_at": checked_at,
+        })
+
+    try:
+        from backend.services.meshy_service import mesh_get
+
+        raw = mesh_get("/openapi/v1/balance")
+    except Exception as exc:
+        print(f"[ADMIN] Meshy balance lookup failed: {exc}")
+        return jsonify({
+            "ok": False,
+            "balance": None,
+            "provider": "meshy",
+            "provider_status": "unavailable",
+            "error": "MESHY_BALANCE_UNAVAILABLE",
+            "message": "Could not read the Meshy account balance. Check the API key and Meshy status.",
+            "checked_at": checked_at,
+        }), 502
+
+    balance = None
+    if isinstance(raw, dict):
+        for key in ("balance", "credits", "remaining_credits"):
+            value = raw.get(key)
+            if isinstance(value, (int, float)):
+                balance = value
+                break
+
+    return jsonify({
+        "ok": True,
+        "balance": balance,
+        "provider": "meshy",
+        "provider_status": "ok",
+        "checked_at": checked_at,
+        "raw": raw,
+    })
+
+
 @bp.route("/metrics/video", methods=["GET"])
 @require_admin
 def video_metrics():

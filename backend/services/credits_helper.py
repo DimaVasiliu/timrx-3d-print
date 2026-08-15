@@ -128,6 +128,22 @@ PAID_GENERATION_ACTIONS = frozenset({
     "rigging",
     "animation",
     "multi_color_print",
+    "creative_lab_keychain_prototype",
+    "creative_lab_keychain_build",
+    "creative_lab_fridge_magnet_prototype",
+    "creative_lab_fridge_magnet_build",
+    "creative_lab_figure_prototype",
+    "creative_lab_figure_build",
+    "creative_lab_vinyl_figure_prototype",
+    "creative_lab_vinyl_figure_build",
+    "creative_lab_brick_figure_prototype",
+    "creative_lab_brick_figure_build",
+    "creative_lab_lamp_prototype",
+    "creative_lab_lamp_build",
+    "creative_lab_keycap_prototype",
+    "creative_lab_keycap_build",
+    "meshy_text_to_image",
+    "meshy_image_to_image",
 })
 
 

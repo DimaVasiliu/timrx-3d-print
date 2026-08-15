@@ -112,17 +112,29 @@ def meshy_alpha_thumbnail(body: dict) -> bool | None:
     return bool(body.get("alpha_thumbnail"))
 
 
+# Provider-tier surcharges, in TimrX credits, added on top of the DB base cost
+# at reservation time. Exposed through /api/billing/action-costs so the UI can
+# show the same number the wallet is charged instead of hard-coding it.
+MESHY_SURCHARGES = {
+    "texture_8k": 5,
+    "ultra_mode": 5,
+}
+
+
 def expected_meshy_platform_cost(base_cost: int, *, texture_resolution: str | None = None, ultra_mode: bool = False) -> int:
     """
     Keep TimrX billing aligned with Meshy's current variable surcharges.
     Values here are TimrX credits; existing base costs already match the common
     Meshy tasks, so only provider-added deltas are applied.
+
+    Callers pass the result as job_meta["expected_cost"], and start_paid_job
+    reserves max(base_cost, expected_cost).
     """
     cost = int(base_cost)
     if texture_resolution == "8k":
-        cost += 5
+        cost += MESHY_SURCHARGES["texture_8k"]
     if ultra_mode:
-        cost += 5
+        cost += MESHY_SURCHARGES["ultra_mode"]
     return cost
 
 
