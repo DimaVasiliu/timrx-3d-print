@@ -1945,6 +1945,9 @@ def resolve_meshy_job_id(input_id: str) -> str:
                         SELECT payload->>'original_job_id' as original_job_id,
                                payload->>'job_id' as job_id_field,
                                payload->>'preview_task_id' as preview_task_id,
+                               payload->>'source_task_id' as source_task_id,
+                               payload->>'upstream_job_id' as upstream_job_id,
+                               payload->>'task_id' as task_id,
                                payload->>'stage' as stage
                         FROM {Tables.HISTORY_ITEMS}
                         WHERE id::text = %s
@@ -1956,9 +1959,23 @@ def resolve_meshy_job_id(input_id: str) -> str:
                     if row:
                         hist_stage = (row.get("stage") or "").lower()
                         if hist_stage in ("remesh", "rig"):
-                            print(f"[Resolve] history: {input_id} is stage={hist_stage}, keeping as-is")
-                            return input_id
-                        candidate = row.get("original_job_id") or row.get("job_id_field") or row.get("preview_task_id")
+                            candidate = (
+                                row.get("job_id_field")
+                                or row.get("upstream_job_id")
+                                or row.get("task_id")
+                                or row.get("preview_task_id")
+                                or row.get("source_task_id")
+                                or row.get("original_job_id")
+                            )
+                        else:
+                            candidate = (
+                                row.get("upstream_job_id")
+                                or row.get("task_id")
+                                or row.get("original_job_id")
+                                or row.get("job_id_field")
+                                or row.get("preview_task_id")
+                                or row.get("source_task_id")
+                            )
                         if candidate and candidate != input_id:
                             print(f"[Resolve] history: {input_id} -> {candidate}")
                             return candidate

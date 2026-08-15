@@ -477,6 +477,9 @@ def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: 
     if not input_task_id and not model_url:
         return None, "input_task_id or model_url required"
 
+    if model_url.startswith("blob:"):
+        return None, "Browser preview URLs cannot be used for rigging. Open a saved model from history or upload the GLB file."
+
     if model_url.startswith("data:"):
         try:
             from backend.services.s3_service import ensure_s3_url_for_data_uri
@@ -496,6 +499,9 @@ def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: 
         if not uploaded_url:
             return None, "Invalid or unsupported model upload"
         model_url = uploaded_url
+
+    if model_url and not model_url.startswith(("http://", "https://")):
+        return None, "Model URL must be a public http(s) URL or uploaded model file"
 
     # When caller prefers model_url and we have one, skip input_task_id entirely
     if prefer == "model_url" and model_url:
