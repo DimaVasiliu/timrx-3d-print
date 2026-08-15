@@ -56,6 +56,7 @@ def register_blueprints(app):
     from backend.routes.prompt_enhance import bp as prompt_enhance_bp
     from backend.routes.webhooks import bp as webhooks_bp
     from backend.routes.notifications import bp as notifications_bp
+    from backend.routes.meshy_printability import bp as meshy_printability_bp
     from backend.routes.print_check import bp as print_check_bp
     from backend.routes.stl_repair import bp as stl_repair_bp
     from backend.routes.multi_color_print import bp as multi_color_print_bp
@@ -119,6 +120,7 @@ def register_blueprints(app):
     else:
         print("[ROUTES] WARNING: inspire_bp is None, skipping registration!")
     app.register_blueprint(notifications_bp, url_prefix="/api/_mod")
+    app.register_blueprint(meshy_printability_bp, url_prefix="/api/_mod")
     app.register_blueprint(print_check_bp, url_prefix="/api/_mod")
     app.register_blueprint(stl_repair_bp, url_prefix="/api/_mod")
     app.register_blueprint(multi_color_print_bp, url_prefix="/api/_mod")

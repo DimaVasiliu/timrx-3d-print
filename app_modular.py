@@ -59,6 +59,40 @@ def create_app() -> Flask:
     else:
         origins = config.ALLOWED_ORIGINS
 
+    def _cors_origin_for_request():
+        origin = request.headers.get("Origin")
+        if not origin:
+            return None
+        if config.ALLOW_ALL_ORIGINS:
+            return origin
+        if origin in config.ALLOWED_ORIGINS:
+            return origin
+        return None
+
+    @app.after_request
+    def _cors_failsafe(response):
+        """Ensure every API response keeps the browser CORS contract."""
+        if not request.path.startswith("/api/"):
+            return response
+
+        cors_origin = _cors_origin_for_request()
+        if not cors_origin:
+            return response
+
+        requested_headers = request.headers.get("Access-Control-Request-Headers", "")
+        default_headers = (
+            "Authorization, Content-Type, Idempotency-Key, "
+            "X-Admin-Token, X-CSRF-Token, X-Requested-With"
+        )
+
+        response.headers["Access-Control-Allow-Origin"] = cors_origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Expose-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = requested_headers or default_headers
+        response.headers.add("Vary", "Origin")
+        return response
+
     CORS(
         app,
         resources={r"/api/*": {"origins": origins}},
@@ -198,10 +232,11 @@ def create_app() -> Flask:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        response.headers.setdefault(
-            "Access-Control-Allow-Headers",
-            ", ".join(sorted(allowed_headers, key=str.lower)),
-        )
+        if not request.path.startswith("/api/"):
+            response.headers.setdefault(
+                "Access-Control-Allow-Headers",
+                ", ".join(sorted(allowed_headers, key=str.lower)),
+            )
 
         existing_csp = response.headers.get("Content-Security-Policy", "").strip()
         frame_ancestors_policy = "frame-ancestors 'none'"

@@ -64,6 +64,31 @@ class SecurityHardeningTests(unittest.TestCase):
         self.assertEqual(response.headers.get("X-Content-Type-Options"), "nosniff")
         self.assertIn("frame-ancestors 'none'", response.headers.get("Content-Security-Policy", ""))
 
+    def test_rig_start_preflight_allows_frontend_origin_and_headers(self):
+        try:
+            from app_modular import app
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"Flask app dependencies unavailable: {exc}")
+
+        response = app.test_client().open(
+            "/api/_mod/rig/start",
+            method="OPTIONS",
+            headers={
+                "Origin": "https://timrx.live",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,x-csrf-token,idempotency-key",
+            },
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), "https://timrx.live")
+        self.assertEqual(response.headers.get("Access-Control-Allow-Credentials"), "true")
+        self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
+        self.assertEqual(
+            response.headers.get("Access-Control-Allow-Headers"),
+            "content-type,x-csrf-token,idempotency-key",
+        )
+
     def test_parse_data_url_decodes_png(self):
         mime, data = parse_data_url(
             "data:image/png;base64,"

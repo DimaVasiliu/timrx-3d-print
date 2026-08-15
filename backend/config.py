@@ -560,7 +560,6 @@ class Config:
         raw = self._ALLOWED_ORIGINS_RAW
 
         if not raw:
-            # Dev defaults
             if self.IS_DEV:
                 return [
                     "http://localhost:3000",
@@ -574,7 +573,13 @@ class Config:
                     "http://127.0.0.1:5500",
                     "http://127.0.0.1:5503",
                 ]
-            return []
+            # Production defaults keep the public frontend and 3D subdomain
+            # connected even if the hosting env misses ALLOWED_ORIGINS.
+            return [
+                "https://timrx.live",
+                "https://www.timrx.live",
+                "https://3d.timrx.live",
+            ]
 
         if raw == "*":
             return ["*"]

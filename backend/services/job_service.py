@@ -1275,6 +1275,12 @@ class JobService:
             resume_strategy = "meshy_multi_color_print"
         elif stage == "texture" or "retexture" in action:
             resume_strategy = "meshy_retexture"
+        elif stage == "print_repair" or "print_repair" in action:
+            resume_strategy = "meshy_print_repair"
+        elif stage == "print_analyze" or "print_analyze" in action:
+            # Analyze is free, fast and driven entirely by the open print
+            # panel — recovery must not adopt it after a reload.
+            resume_strategy = "skip"
         elif stage == "convert" or "convert" in action:
             resume_strategy = "meshy_convert"
         elif stage == "resize" or "resize" in action:
@@ -1310,6 +1316,8 @@ class JobService:
             # Convert/resize/uv-unwrap share the remesh status handler, which
             # passes the URL param straight to the Meshy API.
             "meshy_convert", "meshy_resize", "meshy_uv_unwrap",
+            # Printability repair status also takes the Meshy task id.
+            "meshy_print_repair",
         )
         frontend_resume_id = upstream if uses_upstream_id else internal_id
 
