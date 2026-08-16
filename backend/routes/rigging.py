@@ -493,14 +493,13 @@ def rig_status(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # Short-circuit: return cached response if within TTL
-    cached = get_cached_status(job_id)
-    if cached is not None:
-        return jsonify(cached)
-
     import time as _time
     _t0 = _time.monotonic()
 
+    # AUDIT P0-3: ownership MUST be verified before the status cache is read.
+    # status_cache keys on job_id alone with a 300s terminal TTL, so reading it
+    # first let any authenticated session that knew a Meshy task ID pull another
+    # tenant's rigged_character_glb_url/fbx_url for five minutes after completion.
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
     _t_own = _time.monotonic()
@@ -508,6 +507,11 @@ def rig_status(job_id: str):
         return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
     if not ownership["authorized"]:
         return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     try:
         ms = get_rigging_task(job_id)
@@ -853,14 +857,10 @@ def rig_animate_status(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # Short-circuit: return cached response if within TTL
-    cached = get_cached_status(job_id)
-    if cached is not None:
-        return jsonify(cached)
-
     import time as _time
     _t0 = _time.monotonic()
 
+    # AUDIT P0-3: ownership before cache read — see rig_status above.
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
     _t_own = _time.monotonic()
@@ -868,6 +868,11 @@ def rig_animate_status(job_id: str):
         return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
     if not ownership["authorized"]:
         return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     try:
         ms = get_animation_task(job_id)

@@ -551,17 +551,20 @@ def mesh_remesh_status_mod(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # Short-circuit: return cached response if within TTL
-    cached = get_cached_status(job_id)
-    if cached is not None:
-        return jsonify(cached)
-
+    # AUDIT P0-3: ownership MUST be verified before the status cache is read.
+    # status_cache keys on job_id alone, so a cache-first read leaked completed
+    # asset URLs to any authenticated session that knew the task ID.
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
     if not ownership["found"]:
         return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
     if not ownership["authorized"]:
         return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     store = load_store()
     meta = get_job_metadata(job_id, store)
@@ -1189,17 +1192,18 @@ def mesh_retexture_status_mod(job_id: str):
     if not MESHY_API_KEY:
         return jsonify({"error": "MESHY_API_KEY not configured"}), 503
 
-    # Short-circuit: return cached response if within TTL
-    cached = get_cached_status(job_id)
-    if cached is not None:
-        return jsonify(cached)
-
+    # AUDIT P0-3: ownership before cache read — see mesh_remesh_status_mod above.
     identity_id = g.identity_id
     ownership = verify_job_ownership_detailed(job_id, identity_id)
     if not ownership["found"]:
         return jsonify({"error": "Job not found", "code": "JOB_NOT_FOUND"}), 404
     if not ownership["authorized"]:
         return jsonify({"error": "Access denied", "code": "FORBIDDEN"}), 403
+
+    # Short-circuit: return cached response if within TTL
+    cached = get_cached_status(job_id)
+    if cached is not None:
+        return jsonify(cached)
 
     try:
         ms = mesh_get(f"/openapi/v1/retexture/{job_id}")

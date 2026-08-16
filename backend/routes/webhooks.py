@@ -176,6 +176,22 @@ def _find_and_claim_job(upstream_id: str, new_status: str) -> Optional[Dict[str,
         return None
 
 
+# Map jobs.meta["stage"] → the job_type string save_finished_job_to_normalized_db
+# and history_service branch on. Job meta written by the rigging blueprint carries
+# only "stage" (never "task"), so without this map every rig/animate webhook was
+# persisted as "text-to-3d". Keep in sync with the job_type values passed by the
+# polling paths in routes/rigging.py and routes/mesh_operations.py.
+# Deliberately narrow: only the stages this audit proved were mis-typed. Every
+# other stage keeps its previous "text-to-3d" fallback so working flows are
+# untouched by this change.
+_JOB_TYPE_BY_STAGE = {
+    "rig": "rig",
+    "rigging": "rig",
+    "animate": "animate",
+    "animation": "animate",
+}
+
+
 def _transition_job_status(
     job_id: str,
     new_status: str,
@@ -666,8 +682,57 @@ def _meshy_webhook_finalize_success(
             status_out["stage"] = "multi_color_print"
             status_out["content_type_override"] = "model/3mf"
 
-        # Determine the job type from meta
-        job_type = "multi_color_print" if is_multi_color else (meta.get("task", "text-to-3d") or "text-to-3d")
+        # ── Determine the job type (AUDIT P0-4) ──
+        # Rig and animate job meta carries {"stage": "rig"} / {"stage": "animate"}
+        # and has NO "task" key, so this previously fell through to "text-to-3d"
+        # for every rig/animate webhook — skipping all the rig/animate handling in
+        # history_service (parent thumbnail inheritance, lineage, animation output
+        # fields) and persisting a different shape than the polling path.
+        job_type = (
+            "multi_color_print" if is_multi_color
+            else (meta.get("task") or _JOB_TYPE_BY_STAGE.get(stage) or "text-to-3d")
+        )
+
+        # For rig/animate, reuse the exact normalizers the polling path uses so
+        # both paths persist an identical payload. extract_model_urls alone does
+        # not surface rigged_character_*/animation_* fields that history_service
+        # reads for these stages.
+        if job_type in ("rig", "animate"):
+            from backend.services.rigging_service import (
+                normalize_rigging_response,
+                normalize_animation_response,
+            )
+            normalized = (
+                normalize_rigging_response(task_data) if job_type == "rig"
+                else normalize_animation_response(task_data)
+            )
+            # Keep the webhook's own terminal status; Meshy's payload is SUCCEEDED here.
+            normalized["status"] = "done"
+            if not normalized.get("thumbnail_url"):
+                normalized["thumbnail_url"] = status_out.get("thumbnail_url") or ""
+            primary = (
+                normalized.get("rigged_character_glb_url")
+                or normalized.get("animation_glb_url")
+                or status_out.get("glb_url")
+                or ""
+            )
+            normalized["glb_url"] = primary
+            normalized.setdefault("model_urls", model_urls or {})
+            normalized.setdefault("textured_model_urls", textured_model_urls or {})
+            status_out = normalized
+            if not primary:
+                # Nothing usable to persist — do NOT capture credits for an empty
+                # asset. Park for the polling path / worker to retry.
+                print(f"[MESHY_WEBHOOK] {job_type} job={job_id} produced no model URL; deferring finalize")
+                # Back to 'processing', NOT 'stalled': the polling path can still
+                # finalize it, and 'processing' is a status the stuck-job janitor
+                # can eventually refund. 'stalled' is matched by no reaper today,
+                # so it would leak the reservation until expiry.
+                _transition_job_status(job_id, "processing", meta_patch={
+                    "webhook_deferred_reason": f"{job_type}_no_model_url",
+                    "webhook_deferred_at": time.time(),
+                })
+                return
 
         # Save to normalized DB tables (history/items/models/images)
         save_finished_job_to_normalized_db(

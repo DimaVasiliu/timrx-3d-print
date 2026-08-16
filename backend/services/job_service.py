@@ -1733,15 +1733,62 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
         store = load_store()
 
     meta = store.get(job_id, {})
-    if meta and (meta.get("prompt") or meta.get("title")):
+    if meta and (meta.get("prompt") or meta.get("title")) and meta.get("reservation_id"):
         return meta
 
     if not USE_DB:
         return meta
 
+    # ── Credit refs (AUDIT P0-1) ──
+    # reservation_id / internal_job_id used to live ONLY in the per-process
+    # in-memory store, so under multi-worker gunicorn a status poll landing on a
+    # different worker than the submit could never finalize the reservation:
+    # the job was delivered, never billed, and later auto-failed + refunded by
+    # the stuck-job janitor. These now come from the DB on every lookup and are
+    # merged into whichever branch below resolves the descriptive metadata.
+    credit_refs: dict = {}
+
+    def _with_credit_refs(base: dict) -> dict:
+        """Fill credit/ownership refs into a metadata dict without clobbering it."""
+        merged = dict(base or {})
+        for key, value in credit_refs.items():
+            if value and not merged.get(key):
+                merged[key] = value
+        return merged
+
     try:
         with get_conn() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT id::text AS id,
+                           reservation_id::text AS reservation_id,
+                           identity_id::text AS identity_id,
+                           status
+                    FROM {Tables.JOBS}
+                    WHERE id::text = %s OR upstream_job_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (job_id, job_id),
+                )
+                credit_row = cur.fetchone()
+                if credit_row:
+                    if credit_row.get("reservation_id"):
+                        credit_refs["reservation_id"] = credit_row["reservation_id"]
+                    if credit_row.get("id"):
+                        credit_refs["internal_job_id"] = credit_row["id"]
+                    if credit_row.get("identity_id"):
+                        credit_refs["identity_id"] = credit_row["identity_id"]
+                        credit_refs.setdefault("user_id", credit_row["identity_id"])
+                    if credit_row.get("status"):
+                        credit_refs["job_status"] = credit_row["status"]
+
+                # Store entry (when present) is authoritative for descriptive
+                # fields; DB credit refs fill the gaps it cannot carry.
+                if meta and (meta.get("prompt") or meta.get("title")):
+                    return _with_credit_refs(meta)
+
                 cur.execute(
                     f"""
                     SELECT identity_id, related_history_id
@@ -1790,7 +1837,7 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                             payload = json.loads(payload)
                         except Exception:
                             payload = {}
-                    return {
+                    return _with_credit_refs({
                         "prompt": row["prompt"] or payload.get("prompt"),
                         "title": row["title"] or payload.get("title"),
                         "root_prompt": payload.get("root_prompt") or row["prompt"] or payload.get("prompt"),
@@ -1801,7 +1848,7 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                         "source_task_id": payload.get("source_task_id"),
                         "source_history_id": payload.get("source_history_id"),
                         "preview_task_id": payload.get("preview_task_id"),
-                    }
+                    })
 
                 # Fallback: check models table by upstream_job_id when no history_items found
                 cur.execute(
@@ -1821,14 +1868,14 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                             model_meta = json.loads(model_meta)
                         except Exception:
                             model_meta = {}
-                    return {
+                    return _with_credit_refs({
                         "prompt": model_row["prompt"] or model_meta.get("prompt"),
                         "title": model_row["title"] or model_meta.get("title"),
                         "root_prompt": model_row["root_prompt"] or model_row["prompt"] or model_meta.get("root_prompt"),
                         "art_style": model_meta.get("art_style"),
                         "stage": model_row["stage"] or model_meta.get("stage"),
                         "user_id": str(model_row["identity_id"]) if model_row["identity_id"] else active_user_id,
-                    }
+                    })
 
                 # Fallback: check timrx_billing.jobs table for metadata (includes source_task_id)
                 cur.execute(
@@ -1848,7 +1895,7 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                             jobs_meta = json.loads(jobs_meta)
                         except Exception:
                             jobs_meta = {}
-                    return {
+                    return _with_credit_refs({
                         "prompt": jobs_row["prompt"] or jobs_meta.get("prompt"),
                         "title": jobs_meta.get("title"),
                         "root_prompt": jobs_meta.get("root_prompt") or jobs_row["prompt"] or jobs_meta.get("prompt"),
@@ -1859,10 +1906,15 @@ def get_job_metadata(job_id: str, store: dict | None = None) -> dict:
                         "source_history_id": jobs_meta.get("source_history_id"),
                         "preview_task_id": jobs_meta.get("preview_task_id"),
                         "identity_id": str(jobs_row["identity_id"]) if jobs_row["identity_id"] else None,
-                    }
+                    })
 
                 if active_job:
-                    return {"user_id": active_user_id}
+                    return _with_credit_refs({"user_id": active_user_id})
+
+                # No descriptive metadata anywhere — still return the credit refs
+                # so the caller can finalize the reservation.
+                if credit_refs:
+                    return _with_credit_refs(meta)
     except Exception as e:
         print(f"[Metadata] ERROR: Failed to get job metadata for {job_id}: {e}")
     return meta
@@ -2253,10 +2305,38 @@ def create_internal_job_row(
         return False
 
 
+# How long an idempotency key stays binding. A key older than this is treated
+# as a fresh request: retrying the same operation days later is a new job, not a
+# duplicate submit.
+IDEMPOTENCY_WINDOW_HOURS = 24
+
+# Rows in these states must never satisfy an idempotency lookup. A submit that
+# died before dispatch used to leave a `queued` row with no upstream_job_id,
+# which then answered 409 JOB_ALREADY_STARTING forever for that key — the caller
+# could never retry, because a retry produced the same key and found the corpse.
+_IDEMPOTENCY_DEAD_STATUSES = (
+    "failed", "cancelled", "canceled", "error",
+    "abandoned_legacy", "deleted_by_user", "upstream_timeout_final",
+)
+
+
 def get_job_by_idempotency_key(identity_id: str, idempotency_key: str) -> Optional[Dict[str, Any]]:
-    """Return an existing job row for a repeated request idempotency key."""
+    """
+    Return an existing job row for a repeated request idempotency key.
+
+    Only rows that are still meaningfully "the same request" qualify (AUDIT P0-2):
+      * created within IDEMPOTENCY_WINDOW_HOURS, and
+      * not in a dead/terminal-failure state, and
+      * either already dispatched (has upstream_job_id) or genuinely still
+        starting — a row stuck with no upstream_job_id for more than
+        STARTING_GRACE_MINUTES is a crashed submit, not an in-flight one.
+    """
     if not USE_DB or not identity_id or not idempotency_key:
         return None
+    # A submit only holds the "already starting" claim for this long. Beyond it
+    # the row is presumed dead (worker killed between INSERT and dispatch) and a
+    # retry is allowed through.
+    STARTING_GRACE_MINUTES = 10
     try:
         row = query_one(
             f"""
@@ -2270,10 +2350,22 @@ def get_job_by_idempotency_key(identity_id: str, idempotency_key: str) -> Option
             FROM {Tables.JOBS}
             WHERE identity_id = %s
               AND idempotency_key = %s
+              AND created_at > NOW() - (%s * INTERVAL '1 hour')
+              AND COALESCE(status, '') <> ALL(%s)
+              AND (
+                    upstream_job_id IS NOT NULL
+                 OR created_at > NOW() - (%s * INTERVAL '1 minute')
+              )
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (identity_id, idempotency_key),
+            (
+                identity_id,
+                idempotency_key,
+                IDEMPOTENCY_WINDOW_HOURS,
+                list(_IDEMPOTENCY_DEAD_STATUSES),
+                STARTING_GRACE_MINUTES,
+            ),
         )
         return dict(row) if row else None
     except Exception as e:

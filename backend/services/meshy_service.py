@@ -306,6 +306,13 @@ def extract_model_urls(ms: dict):
                     c.get("gltf_download_url"),
                     pick_url(c.get("model_urls") or {}),
                     pick_url(c.get("output_model_urls") or {}),
+                    # Animation API outputs (AUDIT P0-4). Without these the
+                    # webhook path resolved glb_url="" for every animate task
+                    # and persisted an empty asset while still capturing credits.
+                    c.get("animation_glb_url"),
+                    c.get("animation_fbx_url"),
+                    c.get("processed_animation_fps_fbx_url"),
+                    c.get("processed_armature_fbx_url"),
                 ]
                 if url
             ]
@@ -536,7 +543,14 @@ def build_source_payload(body: dict, identity_id: str | None = None, *, prefer: 
             if model_url:
                 print(f"[build_source_payload] input_task_id resolution failed ({e}), falling back to model_url")
             else:
-                return {"input_task_id": input_task_id}, None
+                # AUDIT P0-5: fail CLOSED. This previously returned the raw
+                # caller-supplied input_task_id with no ownership check, so any
+                # exception in resolve/verify (DB pool exhaustion, import error)
+                # let a caller rig another tenant's Meshy task. Matches the
+                # fail-closed contract of verify_job_ownership_detailed.
+                print(f"[build_source_payload] SECURITY: ownership check errored for "
+                      f"input_task_id={str(input_task_id)[:24]} identity={str(identity_id)[:8]} error={e}")
+                return None, "Could not verify ownership of the source model. Please try again."
 
     # Normalize proxy URLs (our proxy includes `u` query param)
     if model_url and ("/api/proxy-glb" in model_url or "/api/_mod/proxy-glb" in model_url):
