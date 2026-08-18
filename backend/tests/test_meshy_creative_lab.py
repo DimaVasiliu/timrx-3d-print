@@ -217,3 +217,36 @@ def test_routes_are_registered_under_the_modular_prefix():
     assert "/api/_mod/meshy-image/text-to-image" in paths
     assert "/api/_mod/meshy-image/image-to-image" in paths
     assert "/api/_mod/meshy-image/<kind>/status/<job_id>" in paths
+
+
+# ── Recovery contract ────────────────────────────────────────────
+# A build that is in flight when the page reloads must resume on the product's
+# own status route. Before this was wired it fell through to the text-to-3D
+# watcher, which polls the wrong endpoint and never saves the model.
+
+def test_build_resumes_on_its_own_status_route():
+    from backend.services.job_service import JobService
+
+    job = {"id": "internal-1", "provider": "meshy", "action_code": "MESHY_CL_KEYCHAIN_BUILD",
+           "stage": "creative_lab_keychain_build", "upstream_job_id": "meshy-build-task", "meta": {}}
+    _provider, resume_id, strategy = JobService._resolve_resume_fields(job)
+
+    assert strategy == "meshy_creative_lab_build"
+    assert resume_id == "meshy-build-task"
+
+
+@pytest.mark.parametrize("stage,action", [
+    ("creative_lab_keychain_prototype", "MESHY_CL_KEYCHAIN_PROTOTYPE"),
+    ("meshy_text_to_image", "MESHY_TEXT_TO_IMAGE"),
+    ("meshy_image_to_image", "MESHY_IMAGE_TO_IMAGE"),
+])
+def test_panel_scoped_stages_are_not_adopted_by_recovery(stage, action):
+    """Prototypes and Meshy images are panel-driven; the generic watchers would
+    poll the wrong endpoint, so recovery must leave them alone."""
+    from backend.services.job_service import JobService
+
+    job = {"id": "internal-2", "provider": "meshy", "action_code": action,
+           "stage": stage, "upstream_job_id": "up", "meta": {}}
+    _provider, _resume_id, strategy = JobService._resolve_resume_fields(job)
+
+    assert strategy == "skip"

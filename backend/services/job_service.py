@@ -1275,6 +1275,17 @@ class JobService:
             resume_strategy = "meshy_multi_color_print"
         elif stage == "texture" or "retexture" in action:
             resume_strategy = "meshy_retexture"
+        elif stage.startswith("creative_lab_") and stage.endswith("_build"):
+            # Creative Lab builds produce a model and must resume on the
+            # product's own status route, not the text-to-3D watcher.
+            resume_strategy = "meshy_creative_lab_build"
+        elif stage.startswith("creative_lab_"):
+            # Prototypes are cheap, image-only and driven by the open panel.
+            resume_strategy = "skip"
+        elif stage in ("meshy_text_to_image", "meshy_image_to_image"):
+            # Meshy-native images have their own status route; the shared image
+            # watcher would poll the wrong endpoint, so recovery leaves them.
+            resume_strategy = "skip"
         elif stage == "print_repair" or "print_repair" in action:
             resume_strategy = "meshy_print_repair"
         elif stage == "print_analyze" or "print_analyze" in action:
@@ -1318,6 +1329,8 @@ class JobService:
             "meshy_convert", "meshy_resize", "meshy_uv_unwrap",
             # Printability repair status also takes the Meshy task id.
             "meshy_print_repair",
+            # Creative Lab build status takes the Meshy task id too.
+            "meshy_creative_lab_build",
         )
         frontend_resume_id = upstream if uses_upstream_id else internal_id
 
