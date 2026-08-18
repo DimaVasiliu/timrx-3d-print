@@ -159,6 +159,44 @@ def sanitize_internal_error(
     return user_safe_error(SERVER_ERROR)
 
 
+# Known provider failure causes we can explain in plain language. Checked
+# BEFORE the generic flattening in sanitize_job_error_message and used by the
+# live status normalizers (meshy_service, rigging_service) and the webhook, so
+# async failures reach the user with the real, actionable reason instead of
+# "Generation failed". Matching is idempotent: each friendly message re-matches
+# its own keywords, so double-sanitizing never degrades it.
+_FAILURE_EXPLANATIONS = (
+    (("file too large", "model file too large", "file is too large", "file size"),
+     "The model file is too large for the provider to process. Run Remesh with a lower polygon target to create a smaller optimised copy, then retry using that version."),
+    (("face limit", "too many faces", "max faces", "polycount"),
+     "The model has too many faces for this operation. Remesh it to a lower polygon count first, then try again."),
+    (("pose estimation", "humanoid pose", "no humanoid"),
+     "Could not detect a humanoid pose. Rigging needs a clear bipedal character with visible arms and legs."),
+    (("nsfw", "content policy", "content moderation", "flagged", "safety system", "safety filter"),
+     "The provider's safety filter declined this content. Adjust the prompt or source model and try again."),
+    (("prompt is too long", "prompt too long", "prompt length"),
+     "The prompt is too long for this provider. Shorten it and try again."),
+    (("url is not accessible", "could not download", "failed to download", "unable to download"),
+     "The provider could not download the source file. Try uploading the file directly."),
+)
+
+
+def humanize_provider_failure(raw_error: Optional[str]) -> Optional[str]:
+    """Map a raw provider failure onto a friendly, actionable explanation.
+
+    Returns None when the cause is not recognised — callers decide whether to
+    fall back to the raw text (live status paths) or a generic message
+    (stored job errors).
+    """
+    if not raw_error:
+        return None
+    lower = str(raw_error).lower()
+    for keywords, message in _FAILURE_EXPLANATIONS:
+        if any(k in lower for k in keywords):
+            return message
+    return None
+
+
 def sanitize_job_error_message(raw_error: Optional[str]) -> Optional[str]:
     """Sanitize an error_message stored in the jobs table before returning to users.
 
@@ -173,6 +211,13 @@ def sanitize_job_error_message(raw_error: Optional[str]) -> Optional[str]:
     # Check for wallet/quota — return availability message
     if any(kw in lower for kw in WALLET_KEYWORDS):
         return "Generation temporarily unavailable. Please try again shortly."
+
+    # Known causes get their specific, actionable explanation — this must run
+    # before the generic flattening below, or "model file too large" turns
+    # into a useless "Generation failed. Please try again."
+    explained = humanize_provider_failure(raw_error)
+    if explained:
+        return explained
 
     # Expired preview / model — pass through so frontend shows the nice modal
     if "preview task not found" in lower or "task not found" in lower:

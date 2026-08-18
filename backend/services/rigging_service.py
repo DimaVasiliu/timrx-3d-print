@@ -130,6 +130,9 @@ def normalize_rigging_response(ms: dict) -> dict:
         error_msg = task_error.get("message")
     elif isinstance(task_error, str) and task_error:
         error_msg = task_error
+    if error_msg:
+        from backend.services.error_sanitizer import humanize_provider_failure
+        error_msg = humanize_provider_failure(error_msg) or error_msg
 
     result = {
         "id": _pick_first(containers, ["id", "task_id"]),
@@ -307,6 +310,9 @@ def normalize_animation_response(ms: dict) -> dict:
         error_msg = task_error.get("message")
     elif isinstance(task_error, str) and task_error:
         error_msg = task_error
+    if error_msg:
+        from backend.services.error_sanitizer import humanize_provider_failure
+        error_msg = humanize_provider_failure(error_msg) or error_msg
 
     result = {
         "id": _pick_first(containers, ["id", "task_id"]),

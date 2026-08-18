@@ -388,6 +388,8 @@ def normalize_status(ms: dict) -> dict:
             message = task_error
         else:
             message = _pick_first(containers, ["message", "error_message", "fail_reason"]) or "Generation failed"
+        from backend.services.error_sanitizer import humanize_provider_failure
+        message = humanize_provider_failure(message) or message
     elif status == "running":
         message = f"Generating 3D {stage}..." if stage != "preview" else "Generating 3D preview..."
     elif status == "pending":
@@ -442,6 +444,9 @@ def normalize_meshy_task(ms: dict, *, stage: str) -> dict:
             error_message = task_error
         if not error_message:
             error_message = _pick_first(containers, ["message", "error_message", "fail_reason"])
+        if error_message:
+            from backend.services.error_sanitizer import humanize_provider_failure
+            error_message = humanize_provider_failure(error_message) or error_message
         task_id = _pick_first(containers, ["id", "task_id"])
         print(f"[MESHY_TASK_FAILED] task_id={task_id} stage={stage} error={error_message} raw_status={st_raw}")
 

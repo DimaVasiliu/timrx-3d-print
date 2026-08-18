@@ -115,11 +115,19 @@ def _extract_video_url(task_data: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_error_message(task_data: Dict[str, Any]) -> str:
-    """Extract a human-readable error message from a failed task payload."""
+    """Extract a human-readable error message from a failed task payload.
+
+    Known causes (file too large, face limit, pose estimation, safety filter)
+    are translated into friendly, actionable text before being stored on the
+    job row, so history and job-status reads show the real reason.
+    """
     error = task_data.get("error", {})
     if isinstance(error, dict):
-        return error.get("message", "") or error.get("code", "") or "Provider generation failed"
-    return str(error) or "Provider generation failed"
+        raw = error.get("message", "") or error.get("code", "") or "Provider generation failed"
+    else:
+        raw = str(error) or "Provider generation failed"
+    from backend.services.error_sanitizer import humanize_provider_failure
+    return humanize_provider_failure(raw) or raw
 
 
 # ── DB helpers ───────────────────────────────────────────────
