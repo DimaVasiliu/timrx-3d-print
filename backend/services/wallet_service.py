@@ -224,6 +224,9 @@ GENERAL_ACTION_CODES = {
     "PIAPI_IMAGE",
     "PIAPI_IMAGE_2K",
     "PIAPI_IMAGE_4K",
+    "PIAPI_PRO_IMAGE",
+    "PIAPI_PRO_IMAGE_2K",
+    "PIAPI_PRO_IMAGE_4K",
     "GOOGLE_NANO_IMAGE",
     "FLUX_PRO_IMAGE",
     "IDEOGRAM_V3_IMAGE",
@@ -257,6 +260,32 @@ GENERAL_ACTION_CODES = {
     "MESHY_RIGGING",
     "MESHY_ANIMATION",
     "MESHY_MULTI_COLOR_PRINT",
+    # Meshy API parity (stages 1-7) — pricing_service seeds these codes and
+    # resolves reservations to them, so the wallet must know every one or the
+    # route 400s with "Unknown action code" before the provider is even called.
+    "MESHY_REMESH",
+    "MESHY_CONVERT",
+    "MESHY_RESIZE",
+    "MESHY_UV_UNWRAP",
+    "MESHY_PRINT_ANALYZE",
+    "MESHY_PRINT_REPAIR",
+    "MESHY_TEXT_TO_IMAGE",
+    "MESHY_IMAGE_TO_IMAGE",
+    # Creative lab (stage 6-7)
+    "MESHY_CL_FIGURE_PROTOTYPE",
+    "MESHY_CL_FIGURE_BUILD",
+    "MESHY_CL_BRICK_FIGURE_PROTOTYPE",
+    "MESHY_CL_BRICK_FIGURE_BUILD",
+    "MESHY_CL_VINYL_FIGURE_PROTOTYPE",
+    "MESHY_CL_VINYL_FIGURE_BUILD",
+    "MESHY_CL_KEYCAP_PROTOTYPE",
+    "MESHY_CL_KEYCAP_BUILD",
+    "MESHY_CL_KEYCHAIN_PROTOTYPE",
+    "MESHY_CL_KEYCHAIN_BUILD",
+    "MESHY_CL_FRIDGE_MAGNET_PROTOTYPE",
+    "MESHY_CL_FRIDGE_MAGNET_BUILD",
+    "MESHY_CL_LAMP_PROTOTYPE",
+    "MESHY_CL_LAMP_BUILD",
 }
 
 # All known action codes (union of video + general)
