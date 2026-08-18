@@ -384,9 +384,15 @@ def rig_start():
                 "ok": False,
                 "error": "MODEL_GENERATION_FAILED",
                 "message": "Rigging failed. Please try again.",
-            }), 502
+            }), 422
+            # 422, not 502: Cloudflare replaces origin 502s with its own error
+            # page that carries no CORS headers, so the browser reports an
+            # opaque "Failed to fetch" and the JSON message above never
+            # reaches the UI. Applies to every provider-failure response in
+            # the submit paths below.
     except Exception as e:
         err_str = str(e)[:2000].lower()  # Truncate to avoid huge Meshy error payloads
+        fallback_err_str = ""
 
         # Auto-retry with model_url when input_task_id expired on Meshy
         if ("input task not found" in err_str or "task not found" in err_str) and source.get("input_task_id"):
@@ -412,6 +418,7 @@ def rig_start():
                             meshy_task_id = None
                     except Exception as retry_err:
                         print(f"[RIG_SUBMIT] model_url fallback also failed: {retry_err}")
+                        fallback_err_str = str(retry_err)[:2000].lower()
                         meshy_task_id = None
                 else:
                     meshy_task_id = None
@@ -422,11 +429,21 @@ def rig_start():
                 else:
                     release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
                     _fail_job("Source model expired and fallback failed")
+                    # Surface the *fallback* failure reason when we have one —
+                    # "expired" is misleading when Meshy actually rejected the
+                    # S3 GLB (e.g. file too large).
+                    fb_msg = "The source model has expired on Meshy and the fallback URL also failed. Please generate a new model or upload a GLB file directly."
+                    fb_error = "MODEL_GENERATION_FAILED"
+                    if "too large" in fallback_err_str or "file size" in fallback_err_str:
+                        fb_error = "MODEL_TOO_LARGE"
+                        fb_msg = "Meshy rejected this model for rigging: the file is too large. Remesh/optimise the model to reduce its size, then rig the optimised version."
+                    elif "pose estimation" in fallback_err_str:
+                        fb_msg = "Rigging failed: could not detect a humanoid pose. Make sure the model is a clear bipedal character with visible limbs."
                     return jsonify({
                         "ok": False,
-                        "error": "MODEL_GENERATION_FAILED",
-                        "message": "The source model has expired on Meshy and the fallback URL also failed. Please generate a new model or upload a GLB file directly.",
-                    }), 502
+                        "error": fb_error,
+                        "message": fb_msg,
+                    }), 422
             else:
                 release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
                 _fail_job("Source model expired on provider")
@@ -434,13 +451,15 @@ def rig_start():
                     "ok": False,
                     "error": "MODEL_GENERATION_FAILED",
                     "message": "The source model has expired or is no longer available on Meshy. Please generate a new model or upload a GLB file directly.",
-                }), 502
+                }), 422
         else:
             release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
             _fail_job(str(e)[:500])
             from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
             user_msg = None
-            if "face limit" in err_str or "exceeds the" in err_str:
+            if "too large" in err_str or "file size" in err_str:
+                user_msg = "Meshy rejected this model for rigging: the file is too large. Remesh/optimise the model to reduce its size, then rig the optimised version."
+            elif "face limit" in err_str or "exceeds the" in err_str:
                 user_msg = "Model has too many faces for rigging (max 300K). Please remesh the model first, then try rigging again."
             elif "pose estimation" in err_str:
                 user_msg = "Rigging failed: could not detect a humanoid pose. Make sure the model is a clear bipedal character with visible limbs."
@@ -450,7 +469,7 @@ def rig_start():
                 provider="meshy", error=e, job_id=internal_job_id,
                 code=MODEL_GENERATION_FAILED,
                 message=user_msg,
-            )), 502
+            )), 422
 
     # Credits: do NOT finalize now — rigging is async.
     # Finalize on terminal success in status endpoint; release on failure.
@@ -529,7 +548,7 @@ def rig_status(job_id: str):
         return jsonify({
             "error": "MODEL_GENERATION_FAILED",
             "message": "Failed to fetch rigging status. Please try again.",
-        }), 502
+        }), 503
 
     _t_meshy = _time.monotonic()
     out = normalize_rigging_response(ms)
@@ -808,14 +827,21 @@ def rig_animate():
                 "ok": False,
                 "error": "MODEL_GENERATION_FAILED",
                 "message": "Animation failed. Please try again.",
-            }), 502
+            }), 422
     except Exception as e:
         release_job_credits(reservation_id, "meshy_api_error", internal_job_id)
         from backend.services.error_sanitizer import sanitize_provider_error, MODEL_GENERATION_FAILED
+        anim_err = str(e)[:2000].lower()
+        anim_msg = None
+        if "too large" in anim_err or "file size" in anim_err:
+            anim_msg = "Meshy rejected this model for animation: the file is too large. Remesh/optimise the model to reduce its size, then try again."
+        elif "pose estimation" in anim_err:
+            anim_msg = "Animation failed: could not detect a humanoid pose on the rigged model."
         return jsonify(sanitize_provider_error(
             provider="meshy", error=e, job_id=internal_job_id,
             code=MODEL_GENERATION_FAILED,
-        )), 502
+            message=anim_msg,
+        )), 422
 
     # Credits: do NOT finalize now — animation is async.
     # Finalize on terminal success in status endpoint; release on failure.
@@ -890,7 +916,7 @@ def rig_animate_status(job_id: str):
         return jsonify({
             "error": "MODEL_GENERATION_FAILED",
             "message": "Failed to fetch animation status. Please try again.",
-        }), 502
+        }), 503
 
     _t_meshy = _time.monotonic()
     out = normalize_animation_response(ms)
